@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use serialist_core::{LineId, LineSource, SearchMatch, Style, StyledLine};
 
+use crate::config::Config;
 use crate::prelude::*;
 use crate::terminal::cache::Lru;
 use crate::terminal::layout::{self, OneRowEach, RowCounter, Span, Viewport, wrap_rows};
@@ -35,7 +36,7 @@ use crate::terminal::palette::{ResolvedStyle, TerminalPalette};
 use crate::terminal::scroll::TerminalScrollHandle;
 use crate::terminal::selection::{Selection, SelectionPoint, column_of_byte};
 use crate::terminal::stats::{FrameSample, FrameStats};
-use crate::terminal::timestamps::{Clock, TimestampMode, TimestampModeExt};
+use crate::terminal::timestamps::{Clock, TimestampMode};
 use crate::terminal::view::TerminalView;
 
 /// Space between the element's left edge and the gutter or the text.
@@ -563,10 +564,18 @@ impl Element for TerminalElement {
         bounds: Bounds<Pixels>,
         _: &mut (),
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> TerminalLayout {
         let started = Instant::now();
         let inputs = &self.inputs;
+        // The format of absolute stamps follows the settings, live: read here every
+        // frame, so a saved change shows on the next one. Without a configuration (a
+        // test window) the stamps take the default format.
+        let timestamp_format = (inputs.timestamps == TimestampMode::Absolute)
+            .then(|| cx.try_global::<Config>())
+            .flatten()
+            .map(|config| config.timestamp_format().to_owned());
+        let timestamp_format = timestamp_format.as_deref();
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         inputs.scroll.set_bounds(bounds);
 
@@ -579,7 +588,7 @@ impl Element for TerminalElement {
             window,
         );
         let (cell_width, row_height) = (metrics.cell_width, metrics.row_height);
-        let gutter_cells = inputs.timestamps.width();
+        let gutter_cells = inputs.clock.width(inputs.timestamps, timestamp_format);
         let gutter_width = if gutter_cells > 0 {
             cell_width * (gutter_cells + 1) as f32
         } else {
@@ -786,11 +795,12 @@ impl Element for TerminalElement {
                     .then(|| frame.lines.get(&LineId(row.line.0 - 1)))
                     .flatten()
                     .map(|line| line.received_at);
-                let Some(stamp) =
-                    inputs
-                        .clock
-                        .format(inputs.timestamps, line.received_at, previous)
-                else {
+                let Some(stamp) = inputs.clock.format(
+                    inputs.timestamps,
+                    timestamp_format,
+                    line.received_at,
+                    previous,
+                ) else {
                     continue;
                 };
                 let run = TextRun {
