@@ -228,7 +228,7 @@ fn a_user_keymap_is_appended_after_the_defaults() {
     let user = dir.write(
         "keymap.json",
         r#"[ { "context": "Workspace",
-               "bindings": { "cmd-k": "terminal::JumpToBottom", "cmd-p": null, "cmd-1": "x::New" } } ]"#,
+               "bindings": { "cmd-k": "terminal::JumpToBottom", "cmd-p": null, "cmd-alt-1": "x::New" } } ]"#,
     );
     let defaults = Keymap::bundled(Platform::MacOs);
     let keymap = load_keymap_for(Platform::MacOs, Some(&user)).unwrap();
@@ -247,7 +247,7 @@ fn a_user_keymap_is_appended_after_the_defaults() {
     assert_eq!(tail[1], KeyBinding::unbind(Some("Workspace"), "cmd-p"));
     assert_eq!(
         tail[2],
-        KeyBinding::bind(Some("Workspace"), "cmd-1", "x::New")
+        KeyBinding::bind(Some("Workspace"), "cmd-alt-1", "x::New")
     );
 
     // Applying in order, the user's bindings win and the unbind removes the default.
@@ -260,7 +260,7 @@ fn a_user_keymap_is_appended_after_the_defaults() {
     };
     assert_eq!(find("Workspace", "cmd-k"), Some("terminal::JumpToBottom"));
     assert_eq!(find("Workspace", "cmd-p"), None);
-    assert_eq!(find("Workspace", "cmd-1"), Some("x::New"));
+    assert_eq!(find("Workspace", "cmd-alt-1"), Some("x::New"));
     assert_eq!(find("Workspace", "cmd-s"), Some("terminal::Export"));
     // The same keystroke in another context is a different binding.
     assert_eq!(find("Terminal", "cmd-f"), Some("terminal::Search"));
@@ -447,7 +447,20 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
         vec![
             (None, "cmd-q", "serialist::Quit"),
             (workspace, "cmd-k", "terminal::Clear"),
-            (workspace, "cmd-w", "serial::Disconnect"),
+            (workspace, "cmd-w", "tabs::CloseTab"),
+            (workspace, "cmd-shift-w", "serial::Disconnect"),
+            (workspace, "cmd-t", "tabs::NewTab"),
+            (workspace, "cmd-shift-]", "tabs::NextTab"),
+            (workspace, "cmd-shift-[", "tabs::PreviousTab"),
+            (workspace, "cmd-1", "tabs::ActivateTab1"),
+            (workspace, "cmd-2", "tabs::ActivateTab2"),
+            (workspace, "cmd-3", "tabs::ActivateTab3"),
+            (workspace, "cmd-4", "tabs::ActivateTab4"),
+            (workspace, "cmd-5", "tabs::ActivateTab5"),
+            (workspace, "cmd-6", "tabs::ActivateTab6"),
+            (workspace, "cmd-7", "tabs::ActivateTab7"),
+            (workspace, "cmd-8", "tabs::ActivateTab8"),
+            (workspace, "cmd-9", "tabs::ActivateTab9"),
             (workspace, "cmd-p", "terminal::Pause"),
             (workspace, "cmd-s", "terminal::Export"),
             (workspace, "cmd-shift-r", "terminal::ToggleRecord"),
@@ -500,7 +513,22 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
         vec![
             (None, "ctrl-q", "serialist::Quit"),
             (workspace, "ctrl-shift-k", "terminal::Clear"),
-            (workspace, "ctrl-shift-w", "serial::Disconnect"),
+            (workspace, "ctrl-shift-w", "tabs::CloseTab"),
+            (workspace, "ctrl-alt-w", "serial::Disconnect"),
+            (workspace, "ctrl-shift-t", "tabs::NewTab"),
+            (workspace, "ctrl-shift-]", "tabs::NextTab"),
+            (workspace, "ctrl-shift-[", "tabs::PreviousTab"),
+            (workspace, "ctrl-pagedown", "tabs::NextTab"),
+            (workspace, "ctrl-pageup", "tabs::PreviousTab"),
+            (workspace, "ctrl-1", "tabs::ActivateTab1"),
+            (workspace, "ctrl-2", "tabs::ActivateTab2"),
+            (workspace, "ctrl-3", "tabs::ActivateTab3"),
+            (workspace, "ctrl-4", "tabs::ActivateTab4"),
+            (workspace, "ctrl-5", "tabs::ActivateTab5"),
+            (workspace, "ctrl-6", "tabs::ActivateTab6"),
+            (workspace, "ctrl-7", "tabs::ActivateTab7"),
+            (workspace, "ctrl-8", "tabs::ActivateTab8"),
+            (workspace, "ctrl-9", "tabs::ActivateTab9"),
             (workspace, "ctrl-p", "terminal::Pause"),
             (workspace, "ctrl-shift-s", "terminal::Export"),
             (workspace, "ctrl-shift-r", "terminal::ToggleRecord"),
@@ -552,7 +580,11 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
             (inline, "shift-pageup", "terminal::PageUp"),
             (inline, "shift-pagedown", "terminal::PageDown"),
             (inline, "ctrl-shift-k", "terminal::Clear"),
-            (inline, "ctrl-shift-w", "serial::Disconnect"),
+            (inline, "ctrl-shift-w", "tabs::CloseTab"),
+            (inline, "ctrl-alt-w", "serial::Disconnect"),
+            (inline, "ctrl-shift-t", "tabs::NewTab"),
+            (inline, "ctrl-shift-]", "tabs::NextTab"),
+            (inline, "ctrl-shift-[", "tabs::PreviousTab"),
             (inline, "ctrl-shift-p", "terminal::Pause"),
             (inline, "ctrl-shift-s", "terminal::Export"),
             (inline, "ctrl-shift-r", "terminal::ToggleRecord"),
