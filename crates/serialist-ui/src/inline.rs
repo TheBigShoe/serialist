@@ -42,11 +42,16 @@
 //!
 //! # Local echo
 //!
-//! With local echo on, typed text is echoed into the scrollback as a `Tx` line when
-//! Enter sends it (or when inline mode ends). The store's local lines always start a
-//! line of their own, so echoing key by key would split the device's own line at every
-//! keystroke; until Enter the terminal shows the pending text in a strip at its foot.
-//! Control keys echo as nothing and Backspace takes back the last character.
+//! With local echo on, what is typed appears in the scrollback as it is typed: each
+//! key's [`Echo`] goes to the session's ingest thread, which types it into a `Tx` line
+//! with [`IngestHandle::append_local_inline`](serialist_core::IngestHandle::append_local_inline).
+//! Text grows the line, Backspace takes the last character back
+//! ([`truncate_local_line`](serialist_core::IngestHandle::truncate_local_line)), Enter
+//! ends the line, and control keys echo as nothing. A received line in progress (a
+//! prompt without its newline) is not interrupted: the typed line follows it, and a
+//! line the device prints between two keystrokes splits what was typed in two. The
+//! store's module docs give the exact rules under "Typing in line". Leaving inline mode
+//! ends the line being typed.
 
 use std::time::{Duration, Instant};
 
@@ -403,62 +408,25 @@ impl EscapeChord {
 
 // --- Local echo --------------------------------------------------------------------
 
-/// The line typed since the last Enter, echoed into the scrollback when it is sent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EchoLine {
-    text: String,
-}
-
-impl EchoLine {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    /// Apply one key. Returns the finished line when the key is Enter.
-    pub fn key(&mut self, echo: &Echo) -> Option<String> {
-        match echo {
-            Echo::Text(text) => {
-                self.text.push_str(text);
-                None
-            }
-            Echo::Backspace => {
-                self.text.pop();
-                None
-            }
-            Echo::Enter => Some(std::mem::take(&mut self.text)),
-            Echo::Nothing => None,
-        }
-    }
-
-    /// Apply pasted text: every line break finishes a line. Returns the finished lines.
-    pub fn paste(&mut self, text: &str) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut chars = text.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\r' | '\n' => {
-                    if c == '\r' && chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    lines.push(std::mem::take(&mut self.text));
+/// The text that echoes a paste of `text` in the scrollback: `text` with every line break
+/// (CRLF, LF or a lone CR, as [`paste_bytes`] sends them) as one `\n`, which ends the
+/// echoed line. The store drops other control characters and expands tabs.
+pub fn paste_echo(text: &str) -> String {
+    let mut echo = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
-                c if c.is_control() => {}
-                c => self.text.push(c),
+                echo.push('\n');
             }
+            c => echo.push(c),
         }
-        lines
     }
-
-    /// The pending text, leaving the line empty.
-    pub fn take(&mut self) -> String {
-        std::mem::take(&mut self.text)
-    }
+    echo
 }
-
 // --- Paste -------------------------------------------------------------------------
 
 /// The bytes a paste of `text` sends: its UTF-8 with every line break (CRLF, LF or CR)
@@ -703,34 +671,48 @@ mod tests {
     }
 
     #[test]
-    fn echo_follows_the_keys() {
+    fn keys_say_what_they_do_to_the_echo() {
         let encoder = KeyEncoder::default();
-        let mut line = EchoLine::default();
-        for source in ["a", "t", "left", "ctrl-c", "escape", "x", "backspace", "i"] {
-            let encoded = encoder.encode(&key(source)).unwrap();
-            assert_eq!(line.key(&encoded.echo), None);
-        }
-        assert_eq!(line.text(), "ati");
-        let alt = encoder.encode(&key("alt-b")).unwrap();
+        let echo = |source: &str| encoder.encode(&typed(source, source)).unwrap().echo;
+        assert_eq!(echo("a"), Echo::Text("a".into()));
         assert_eq!(
-            alt.echo,
+            encoder.encode(&key("space")).unwrap().echo,
+            Echo::Text(" ".into())
+        );
+        assert_eq!(
+            encoder.encode(&typed("shift-a", "A")).unwrap().echo,
+            Echo::Text("A".into())
+        );
+        assert_eq!(
+            encoder.encode(&key("backspace")).unwrap().echo,
+            Echo::Backspace
+        );
+        assert_eq!(encoder.encode(&key("enter")).unwrap().echo, Echo::Enter);
+        for control in ["left", "ctrl-c", "escape", "tab", "f5", "ctrl-backspace"] {
+            assert_eq!(
+                encoder.encode(&key(control)).unwrap().echo,
+                Echo::Nothing,
+                "{control}"
+            );
+        }
+        assert_eq!(
+            encoder.encode(&key("alt-b")).unwrap().echo,
             Echo::Nothing,
             "an alt chord is a control sequence"
         );
-        let enter = encoder.encode(&key("enter")).unwrap();
-        assert_eq!(line.key(&enter.echo), Some("ati".to_owned()));
-        assert!(line.is_empty());
     }
 
     #[test]
-    fn pasted_text_finishes_lines_at_every_break() {
-        let mut line = EchoLine::default();
-        line.key(&Echo::Text("> ".into()));
+    fn a_pastes_echo_ends_a_line_at_every_break() {
         assert_eq!(
-            line.paste("one\r\ntwo\nthree\rfo\tur"),
-            ["> one", "two", "three"]
+            paste_echo("one\r\ntwo\nthree\rfour"),
+            "one\ntwo\nthree\nfour"
         );
-        assert_eq!(line.text(), "four", "control characters echo as nothing");
+        assert_eq!(paste_echo("tail\n"), "tail\n");
+        assert_eq!(paste_echo("\r\n\r\n"), "\n\n");
+        assert_eq!(paste_echo("x\n\ry"), "x\n\ny", "LF then CR is two breaks");
+        assert_eq!(paste_echo("caf\u{e9}\t!"), "caf\u{e9}\t!");
+        assert_eq!(paste_echo(""), "");
     }
 
     #[test]

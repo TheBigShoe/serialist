@@ -102,8 +102,7 @@ pub struct TerminalView {
     search: SearchBar,
     /// Inline mode: the key context is `TerminalInline` and keys go to the port.
     inline: bool,
-    /// Typed in inline mode and not yet sent with Enter, shown at the foot.
-    pending_input: Option<SharedString>,
+
     /// Highlighted text lines, such as a saved command's matched response. Sorted by
     /// line, then start; drawn like search matches whether or not search is open.
     marks: Arc<Vec<SearchMatch>>,
@@ -174,7 +173,7 @@ impl TerminalView {
                 stale: false,
             },
             inline: false,
-            pending_input: None,
+
             marks: Arc::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![input_events, config_changes],
@@ -405,22 +404,6 @@ impl TerminalView {
     pub fn set_inline(&mut self, inline: bool, cx: &mut Context<Self>) {
         if self.inline != inline {
             self.inline = inline;
-            if !inline {
-                self.pending_input = None;
-            }
-            cx.notify();
-        }
-    }
-
-    /// What inline mode has typed since the last Enter.
-    pub fn pending_input(&self) -> Option<&SharedString> {
-        self.pending_input.as_ref()
-    }
-
-    pub fn set_pending_input(&mut self, text: Option<SharedString>, cx: &mut Context<Self>) {
-        let text = text.filter(|text| !text.is_empty());
-        if self.pending_input != text {
-            self.pending_input = text;
             cx.notify();
         }
     }
@@ -1059,32 +1042,6 @@ impl TerminalView {
             )
     }
 
-    /// The strip at the foot that shows what inline mode typed since the last Enter.
-    fn render_pending_input(
-        &self,
-        text: SharedString,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        div()
-            .id("terminal-pending-input")
-            .absolute()
-            .bottom_2()
-            .left_2()
-            .max_w(relative(0.8))
-            .px_2()
-            .py_0p5()
-            .rounded_sm()
-            .bg(self.palette.background)
-            .border_1()
-            .border_color(theme.border)
-            .font_family(self.font.font.family.clone())
-            .text_size(self.font.size)
-            .text_color(self.palette.tx)
-            .truncate()
-            .child(text)
-    }
-
     fn render_frame_stats(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let summary = self.frame_summary();
@@ -1132,11 +1089,6 @@ impl Render for TerminalView {
         let following = self.scroll.is_following();
         let search_bar = search_open.then(|| self.render_search_bar(cx));
         let frame_stats = self.show_frame_stats.then(|| self.render_frame_stats(cx));
-        let pending = self
-            .pending_input
-            .clone()
-            .filter(|_| self.inline)
-            .map(|text| self.render_pending_input(text, cx));
 
         v_flex()
             .id("terminal")
@@ -1171,7 +1123,6 @@ impl Render for TerminalView {
                     .child(element)
                     .child(Scrollbar::vertical(&self.scroll).id("terminal-scrollbar"))
                     .children(frame_stats)
-                    .children(pending)
                     .when(!following, |area| {
                         area.child(
                             div().absolute().bottom_3().right_6().child(
