@@ -16,18 +16,21 @@ There are three ways to write a codec, all behind one Rust trait, `serialist_cor
 `plugins/` is a folder in the config directory (`~/.config/serialist` on macOS and Linux,
 `%APPDATA%\Serialist` on Windows). Each plugin is a folder directly under it. A folder with
 a `plugin.lua` is a Lua plugin (even if it also has a `plugin.wasm`); otherwise a folder
-with a `plugin.wasm` is a WebAssembly plugin. A plugin registers under the name its
-`describe` returns, and replaces a built-in of the same name, so a plugin that describes
-itself as `airoha-race` replaces the built-in one.
+with a `plugin.wasm` is a WebAssembly plugin. The app registers a plugin under its
+folder's name, so `plugins/airoha-race/` replaces the built-in `airoha-race` codec and
+`plugins/airoha-race-lua/` is listed beside it. (The library function
+`serialist_plugins::load_plugins` registers under the name `describe` returns instead.)
+WebAssembly folders load only in a build with the `wasm` feature
+(`cargo build -p serialist --features wasm`); otherwise the folder is reported as needing it.
 
-> **Status.** The plugin machinery is in the tree and tested: the `Codec` trait, the frame
-> store and the ingest-thread sink in `serialist-core`; the Rust, Lua and WebAssembly
-> adapters, plugin folder discovery and codec-payload encoding in `serialist-plugins`; the
-> guest crate `serialist-plugin-sdk`. The app's own use of it, the Decoded panel, loading
-> the `plugins/` folder, a device profile's `plugin`, and codec payloads in saved commands,
-> is being finished separately. Sections headed "as designed" describe that from the plan
-> (`docs/plan.md`), not from code you can run yet. Where this page says what a crate does,
-> it is describing the code as of commit `68ede78`.
+> **Status.** The plugin machinery and the app's use of it are in the tree and tested: the
+> `Codec` trait, the frame store and the ingest-thread sink in `serialist-core`; the Rust,
+> Lua and WebAssembly adapters, plugin folder discovery and codec-payload encoding in
+> `serialist-plugins`; the guest crate `serialist-plugin-sdk`; and in `serialist-ui` the
+> `plugins/` folder (loaded at startup, reloaded on save), a device profile's `plugin`, the
+> session toolbar's codec picker, the Decoded panel, summaries and hidden frames in the
+> terminal, codec payloads and frame predicates in saved commands, and CSV and JSON export
+> of decoded frames. "Using plugins in the app" below describes that UI.
 
 ## What a codec does
 
@@ -154,9 +157,10 @@ return M
 - **Refused at load.** A `plugin.lua` that does not return a table with `describe`,
   `decode` and `encode` functions, or whose `describe` result is not valid.
 - **Reloading.** `LuaCodec::reload` loads the file again into a fresh VM and starts decoding
-  over; if the new file fails to load, the old one keeps running. Reloading a plugin when
-  its file is saved, as the plan describes, belongs to the app's plugin wiring (see the
-  status note above).
+  over; if the new file fails to load, the old one keeps running. The app reloads a plugin
+  when a file in `plugins/` is saved: a session decoding with it switches to the new
+  version at its next chunk, and a save that does not load is shown in the status line
+  while the last version that loaded keeps running.
 
 The reference is `crates/serialist-plugins/assets/plugins/airoha-race/plugin.lua`, a
 resynchronising framer for RACE with an encoder for two commands.
@@ -387,37 +391,47 @@ The built-in `text-lines` codec is the simplest: one `line` frame per received l
 command, `line`, which sends `text` and a line ending (`eol`: `crlf` by default, `lf`, `cr`
 or `none`).
 
-## Using plugins in the app (as designed)
+## Using plugins in the app
 
-This part is the plan's design; the UI for it is being finished, so treat the details as
-subject to change.
-
-- **Activating a codec.** A device profile in `settings.json` names one, so a board gets its
-  baud, plugin and line ending the moment it is plugged in:
+- **Activating a codec.** A device profile in `settings.json` names one, and a session on a
+  matching port decodes with it from its first byte:
   `{ "match": { "vid": "0x0e8d", "product": "Airoha" }, "baud": 921600, "plugin": "airoha-race", "eol": "crlf" }`.
-  The status line shows the active plugin. The plan does not say how to pick a plugin by
-  hand.
+  The Devices panel shows the profile's plugin as a badge on the port's row. The session
+  toolbar's Codec picker lists `none`, the built-ins and the loaded plugins; picking one
+  switches at the next received chunk, and the frames decoded so far stay. The status line
+  shows `Codec: <name>`.
 - **The Decoded panel** is a table in the right dock (above the Script console) of the
-  active plugin's frames: timestamp, direction, frame type, decoded fields and raw hex, with
-  a filter. A frame carries a timestamp, a direction, a kind, named fields, a severity and
-  a byte range into the scrollback rather than a copy of the bytes.
-- **In the terminal**, a frame's one-line summary can be shown in a plugin color, and framed
-  bytes can be hidden from the text view. These are the display settings
-  `display.decoded_inline` and `display.hide_framed_bytes`; they are not in this tree's
-  `default_settings.jsonc` yet.
-- **Export.** Decoded frames can be exported as CSV or JSON once a plugin is active, next to
-  the raw and text exports.
+  session's frames: time (stamped like the terminal's gutter), direction, kind, summary,
+  fields and raw hex. The kind filter lists the codec's kinds and shows the chosen kind's
+  declared fields as columns; the text filter matches summaries, kinds and field values.
+  Error frames (`codec_error`, `plugin_error`) show in the error color with their message.
+  Selecting a row marks the terminal lines that hold the frame's bytes and scrolls to them
+  (in hex view, to the frame's first byte). The table follows the newest frame until it
+  is scrolled away or a row is selected; Follow brings it back. A frame carries a
+  timestamp, a direction, a kind, named fields, a severity and a byte range into the
+  scrollback rather than a copy of the bytes.
+- **In the terminal**, `display.decoded_inline` (on by default) adds a one-line summary of
+  each decoded frame as a notice line in the plugin color (the theme's `syntax.keyword`);
+  text frames get none, since their text is on screen. `display.hide_framed_bytes` (off by
+  default) leaves out received lines whose bytes all belong to binary frames; lines with
+  any text stay. Both are also toggles in the session toolbar.
+- **Export.** "Export frames…" in the session toolbar (shown while a codec decodes) saves
+  every retained frame as `.csv` (time, direction, kind, summary, one column per field
+  name, raw hex) or `.json` (an array of frame objects with fields and the raw bytes as
+  hex), chosen by the file's extension.
 - **Codec payloads in saved commands.** A saved command can name a codec instead of giving
-  text or hex. The file form, which the command loader already parses, is
-  `{ "codec": "airoha-race", "fields": { "cmd_id": "0x0F15" } }`. A `command` key inside
-  `fields` picks one of the codec's commands (`{ "command": "race_version" }`); without it
-  the codec's first command is used. The plugin encodes the fields to bytes, and a codec
-  payload sends no line ending unless the command sets `eol`. Each encode uses a fresh codec
-  instance, so it never disturbs a session's decoding state. `serialist_plugins::encode_payload`
-  does this against a codec registry, and returns an error for an unknown codec, a codec
-  with no commands, or whatever the codec refuses. In this tree `Command::encode` in
-  `serialist-core` still returns `PayloadError::CodecUnavailable` for a codec payload; the
-  encoding lives in `serialist-plugins`, and connecting the two is the app's wiring.
-- **Frame predicates.** The plan lets a saved command's expected response be a frame
-  predicate (same command id, type response) instead of a regex. In this tree an `expect`
-  is a `pattern` and a `timeout_ms` only.
+  text or hex: `{ "codec": "airoha-race", "fields": { "cmd_id": "0x0F15" } }`. A `command`
+  key inside `fields` picks one of the codec's commands (`{ "command": "race_version" }`);
+  without it the codec's first command is used. `{{param}}` placeholders in string values
+  are filled first; a value that is one placeholder takes the parameter's type (an `int`
+  becomes a number, a `hex16` the text `0xNNNN`). The app encodes through
+  `serialist_plugins::encode_payload` (a fresh codec instance, so a session's decoding
+  state is never disturbed), sends no line ending unless the command sets `eol`, and
+  echoes the bytes as hex. `Command::encode` in `serialist-core` still returns
+  `PayloadError::CodecUnavailable` for a codec payload, since that crate knows no codecs.
+- **Frame predicates.** A saved command's `expect` can be
+  `{ "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 1000 }`. While a
+  codec decodes the session, sending waits for the first frame after the send whose kind
+  and listed fields equal the predicate (integers match JSON numbers or hex text, bytes
+  match hex text), with the same `OK in N ms` and timeout reporting as a `pattern`. The
+  bundled example collection has a RACE group with such commands for `virtual:race`.

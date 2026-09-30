@@ -97,6 +97,15 @@ pub struct DisplaySettings {
     pub show_control_chars: bool,
     #[serde(default = "d::display_wrap")]
     pub wrap: bool,
+    /// While a codec decodes a session, put a one-line summary of each decoded frame
+    /// (text frames aside, whose text is on screen already) into the scrollback.
+    #[serde(default = "d::display_decoded_inline")]
+    pub decoded_inline: bool,
+    /// While a codec decodes a session, leave out of the text view every received line
+    /// whose bytes all belong to decoded binary frames. Text frames are never hidden,
+    /// and the hex view and raw export still have every byte.
+    #[serde(default = "d::display_hide_framed_bytes")]
+    pub hide_framed_bytes: bool,
 }
 
 /// The `terminal` object. A key that is set replaces the matching `buffer_font_*` value

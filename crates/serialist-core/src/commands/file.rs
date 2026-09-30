@@ -85,7 +85,7 @@ const COMMAND_KEYS: &[&str] = &[
     "params",
 ];
 const PAYLOAD_KEYS: &[&str] = &["text", "hex", "codec", "fields", "script"];
-const EXPECT_KEYS: &[&str] = &["pattern", "timeout_ms"];
+const EXPECT_KEYS: &[&str] = &["pattern", "timeout_ms", "frame"];
 const PARAM_KEYS: &[&str] = &["name", "label", "default", "kind"];
 
 fn options() -> ParseOptions {

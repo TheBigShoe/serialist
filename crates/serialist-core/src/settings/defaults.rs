@@ -73,6 +73,8 @@ defaults! {
     display_hex_bytes_per_row: usize = "display"."hex_bytes_per_row";
     display_show_control_chars: bool = "display"."show_control_chars";
     display_wrap: bool = "display"."wrap";
+    display_decoded_inline: bool = "display"."decoded_inline";
+    display_hide_framed_bytes: bool = "display"."hide_framed_bytes";
     inline_backspace: BackspaceKey = "inline"."backspace";
     inline_escape_chord: String = "inline"."escape_chord";
     inline_paste_chunk_bytes: usize = "inline"."paste_chunk_bytes";
@@ -98,6 +100,8 @@ pub(super) fn display() -> DisplaySettings {
         hex_bytes_per_row: display_hex_bytes_per_row(),
         show_control_chars: display_show_control_chars(),
         wrap: display_wrap(),
+        decoded_inline: display_decoded_inline(),
+        hide_framed_bytes: display_hide_framed_bytes(),
     }
 }
 

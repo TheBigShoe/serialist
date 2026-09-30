@@ -118,10 +118,7 @@ impl Command {
     }
 
     pub fn with_expect(mut self, pattern: impl Into<String>, timeout_ms: u64) -> Self {
-        self.expect = Some(Expect {
-            pattern: pattern.into(),
-            timeout_ms,
-        });
+        self.expect = Some(Expect::new(pattern, timeout_ms));
         self
     }
 
@@ -151,10 +148,12 @@ pub enum Payload {
     /// `{ "hex": "05 5A 02 00 {{id}}" }`: bytes as hex digits, with spaces, commas,
     /// newlines and `0x` prefixes tolerated, and `{{param}}` placeholders.
     Hex(String),
-    /// `{ "codec": "airoha-race", "fields": { … } }`: a plugin encodes it. Parsed and
-    /// kept, but [`Command::encode`] fails with
-    /// [`PayloadError::CodecUnavailable`](super::PayloadError::CodecUnavailable) until
-    /// codecs land.
+    /// `{ "codec": "airoha-race", "fields": { … } }`: the codec it names encodes it. A
+    /// `command` key in `fields` picks the codec's command (else its first), and string
+    /// values may hold `{{param}}` placeholders. This crate knows no codecs, so
+    /// [`Command::encode`] fails with
+    /// [`PayloadError::CodecUnavailable`](super::PayloadError::CodecUnavailable); the app
+    /// fills the placeholders and hands the fields to the codec registry.
     Codec {
         codec: String,
         fields: Map<String, Value>,
@@ -267,16 +266,30 @@ impl From<Payload> for PayloadRepr {
     }
 }
 
-/// The reply a command waits for.
+/// The reply a command waits for: a line matching `pattern`, or, while a codec decodes
+/// the session, a decoded frame matching `frame`.
+///
+/// ```jsonc
+/// { "pattern": "^OK|^ERROR", "timeout_ms": 1000 }
+/// { "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 1000 }
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Expect {
     /// A regex over incoming lines. Smart case, as in search: all lowercase matches
-    /// either case.
+    /// either case. Empty (or left out) when the command waits for a frame only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pattern: String,
     /// How long to wait for a matching line, from the moment of sending. Defaults to
     /// [`DEFAULT_EXPECT_TIMEOUT_MS`] when the file leaves it out.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// A frame predicate: the reply is the first decoded frame whose `kind` (the `kind`
+    /// key) and fields equal every key given. Values compare loosely, the way a codec
+    /// reads its request fields: `"0x0F15"` or `3861` matches the integer field 0x0F15,
+    /// and hex text matches a bytes field. Used while a codec decodes the session; the
+    /// `pattern`, if any, is the fallback when none does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<Map<String, Value>>,
 }
 
 fn default_timeout_ms() -> u64 {
@@ -288,6 +301,16 @@ impl Expect {
         Self {
             pattern: pattern.into(),
             timeout_ms,
+            frame: None,
+        }
+    }
+
+    /// Wait for a decoded frame matching `predicate` (see [`Expect::frame`]).
+    pub fn frame(predicate: Map<String, Value>, timeout_ms: u64) -> Self {
+        Self {
+            pattern: String::new(),
+            timeout_ms,
+            frame: Some(predicate),
         }
     }
 

@@ -4,10 +4,11 @@
 //! # Data path
 //!
 //! Received bytes never reach this thread. Opening the view spawns the session's ingest
-//! thread ([`Ingest::spawn`]), which owns the page store: it appends every chunk, turns
-//! the session's connect, disconnect and write-failure events into notice lines, and
-//! hands every chunk to the [`RecordingSink`], which also flushes a recording when the
-//! stream goes quiet ([`ChunkSink::on_idle`]). The view holds a [`Snapshot`] of the
+//! thread ([`Ingest::spawn_with`]), which owns the page store: it appends every chunk,
+//! turns the session's connect, disconnect and write-failure events into notice lines,
+//! and hands every chunk to the [`RecordingSink`], which also flushes a recording when
+//! the stream goes quiet ([`ChunkSink::on_idle`]), and to the codec slot (see "Codecs and
+//! decoded frames" below). The view holds a [`Snapshot`] of the
 //! store (an `Arc`), and the terminal draws from it. Where the link stands, and what the
 //! transport calls it, come from [`IngestHandle::connection`].
 //!
@@ -18,9 +19,13 @@
 //! doorbell that is already ringing does nothing), so at most one wake is ever pending.
 //! A foreground task waits on the doorbell. Per ring the view:
 //!
-//! 1. calls [`IngestHandle::acknowledge`], so anything published from now on rings
-//!    again;
-//! 2. takes [`IngestHandle::snapshot`], which is therefore never older than the ring;
+//! 1. calls [`IngestHandle::acknowledge`] and the frame store's
+//!    [`acknowledge`](FrameStoreReader::acknowledge), so anything published from now on
+//!    rings again;
+//! 2. takes the frame store's snapshot, then [`IngestHandle::snapshot`], which are
+//!    therefore never older than the ring (frames first: a chunk is stored before it
+//!    is decoded, so the store snapshot holds every frame's bytes), and handles the new
+//!    frames (see "Codecs and decoded frames");
 //! 3. hands the terminal the snapshot's text and hex sources
 //!    ([`TerminalView::update_sources`]) and the changed lines
 //!    ([`TerminalView::lines_appended`]), which keeps scroll, selection and pause, and
@@ -75,26 +80,56 @@
 //! saved commands `commands.send` names. The status line says what runs and for how
 //! long. Disconnecting stops every run and lets the script thread go, off the main
 //! thread.
+//!
+//! # Codecs and decoded frames
+//!
+//! The ingest thread also runs the session's [`CodecSlotSink`], built on that thread
+//! ([`Ingest::spawn_with`]), which decodes with the codec the view selects (see
+//! [`codecs`](crate::codecs)): the device profile's `plugin` at opening, then the
+//! toolbar's picker. Decoded frames go to a [`FrameStore`](serialist_core::FrameStore)
+//! whose waker rings the same doorbell, so one wake acknowledges both stores, then takes
+//! both snapshots. Per wake, with the new frames, the view:
+//!
+//! - puts a one-line summary of each new decoded frame into the scrollback as one batch
+//!   of notice lines (`display.decoded_inline`), which the terminal draws in the plugin
+//!   color;
+//! - with `display.hide_framed_bytes`, hands the terminal a [`FilteredText`] in place of
+//!   the snapshot, which leaves out the lines of binary frames (see
+//!   [`framed`](crate::framed));
+//! - bumps [`decoded_generation`](SessionView::decoded_generation), which the Decoded
+//!   panel follows.
+//!
+//! A saved command whose payload names a codec is encoded by it, and one whose `expect`
+//! is a frame predicate waits for a matching frame: a task polls the frame store each
+//! frame from the id it had before the write, until a frame matches or the timeout,
+//! and reports as a line match does.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use serde_json::{Map, Value as JsonValue};
 use serialist_core::{
-    ChunkSink, Command, CommandRef, ConnectionInfo, Direction, ExpectResult, Expectation, Ingest,
-    IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId, LineSource, LinkState,
-    ParamValues, Payload, PortId, SearchMatch, SerialConfig, SessionStats, Snapshot, Store,
-    TextOptions, Timestamps,
+    ChunkSink, CodecFactory, CodecInfo, CodecRegistry, Command, CommandRef, ConnectionInfo,
+    Direction, ExpectResult, Expectation, FrameId, FrameSnapshot, FrameStore, FrameStoreReader,
+    Ingest, IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId, LineSource, LinkState,
+    ParamValues, Payload, PortId, SearchMatch, Searcher, SerialConfig, SessionStats, Snapshot,
+    Store, StyledLine, TextOptions, Timestamps,
 };
 use serialist_script::{ScriptOutcome, ScriptSource};
 
 use crate::actions::{self, context};
 use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
+use crate::codecs::{
+    CodecSelection, CodecSlotSink, FrameTime, NO_CODEC, encode_codec_command, fill_placeholders,
+    frame_matches, hides_bytes, inline_summary, is_text_frame,
+};
 use crate::compose::{ComposeBar, ComposeEvent};
 use crate::config::Config;
-use crate::export::{ExportFormat, ExportJob};
+use crate::export::{ExportFormat, ExportJob, FramesFormat, SharedSource};
+use crate::framed::{FilteredText, FramedFilter};
 use crate::history::PersistentHistory;
 use crate::inline::{
     Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
@@ -113,10 +148,103 @@ use crate::status::{
     ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusInputs, StatusLine,
     file_name, format_bytes,
 };
-use crate::terminal::{DisplayMode, TerminalView, TimestampMode};
+use crate::terminal::view::MAX_MARKS;
+use crate::terminal::{Clock, DisplayMode, TerminalView, TimestampMode};
 
 /// The shortest time between two snapshots: about a frame at 120 Hz.
 pub const FRAME: Duration = Duration::from_millis(8);
+
+/// Summary lines one wake puts into the scrollback at most; a flood of frames gets a
+/// count for the rest.
+pub const MAX_SUMMARIES_PER_WAKE: usize = 200;
+
+/// Text lines a selected frame marks at most.
+const MAX_FRAME_LINES: usize = 64;
+
+/// The codec a session decodes with.
+#[derive(Clone)]
+pub struct ActiveCodec {
+    /// Its name in the registry.
+    pub name: String,
+    pub info: CodecInfo,
+    pub factory: Arc<dyn CodecFactory>,
+}
+
+impl std::fmt::Debug for ActiveCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActiveCodec")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The codecs of the installed configuration, or the built-ins without one.
+fn codec_registry(cx: &App) -> Arc<CodecRegistry> {
+    cx.try_global::<Config>().map_or_else(
+        || Arc::new(serialist_plugins::builtin_registry()),
+        |config| config.codec_registry().clone(),
+    )
+}
+
+/// What the codec picker lists.
+fn codec_choices(cx: &App) -> Vec<String> {
+    cx.try_global::<Config>().map_or_else(
+        || crate::codecs::CodecSet::builtin().choices(),
+        |config| config.codecs().choices(),
+    )
+}
+
+/// The received and local lines of `snapshot` that hold stream bytes `raw`, oldest first,
+/// at most [`MAX_FRAME_LINES`]: the lines a frame is shown in. A frame with no bytes
+/// names the line holding its offset.
+fn lines_holding(snapshot: &Snapshot, raw: Range<u64>) -> Vec<StyledLine> {
+    let (first, end) = (snapshot.first_line().0, snapshot.end().0);
+    // The last line starting at or before the frame: line starts only grow.
+    let (mut lo, mut hi) = (first, end);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match snapshot.line(LineId(mid)) {
+            Some(line) if line.raw.start <= raw.start => lo = mid + 1,
+            _ => hi = mid,
+        }
+    }
+    let mut out = Vec::new();
+    let mut id = lo.saturating_sub(1).max(first);
+    while id < end && out.len() < MAX_FRAME_LINES {
+        let Some(line) = snapshot.line(LineId(id)) else {
+            break;
+        };
+        if line.raw.start > raw.end || (line.raw.start == raw.end && !raw.is_empty()) {
+            break;
+        }
+        let holds = if raw.is_empty() {
+            line.raw.start <= raw.start && raw.start <= line.raw.end
+        } else {
+            line.raw.start < raw.end && raw.start < line.raw.end
+        };
+        if line.direction == Direction::Rx && holds {
+            out.push(line);
+        }
+        id += 1;
+    }
+    out
+}
+
+/// How waiting for a decoded frame ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameReply {
+    Matched { id: FrameId, elapsed: Duration },
+    TimedOut,
+    Closed,
+}
+
+/// A mark over the whole of `line`, as a matched reply is marked.
+fn whole_line_mark(line: &StyledLine) -> SearchMatch {
+    SearchMatch {
+        line: line.id,
+        range: 0..line.text.len(),
+    }
+}
 
 /// How often the view reads counters that move without new lines (TX, a recording's
 /// bytes).
@@ -292,6 +420,33 @@ pub struct SessionView {
     /// The task polling the runs is alive.
     script_polling: bool,
     _script_poll: Option<Task<()>>,
+    /// The reader of the store the ingest thread's codec slot fills.
+    frames: FrameStoreReader,
+    /// The newest frames, taken on a wake.
+    frame_snapshot: FrameSnapshot,
+    /// Which codec the ingest thread runs; shared with its codec slot.
+    selection: Arc<CodecSelection>,
+    codec: Option<ActiveCodec>,
+    /// Bumped whenever the frames or the codec change, for the Decoded panel.
+    decoded_generation: u64,
+    /// `display.decoded_inline` for this session.
+    decoded_inline: bool,
+    /// The first frame whose summary has not gone into the scrollback.
+    inline_next: FrameId,
+    /// `display.hide_framed_bytes` for this session.
+    hide_framed: bool,
+    /// The view-id map while framed bytes are hidden (and a codec runs).
+    filter: Option<FramedFilter>,
+    /// The terminal's text source made from it on the last wake.
+    filtered: Option<FilteredText>,
+    /// Marked replies and the selected frame's lines, in store line ids; the terminal
+    /// gets them in the ids of the source it shows.
+    reply_marks: Vec<SearchMatch>,
+    frame_marks: Vec<SearchMatch>,
+    selected_frame: Option<FrameId>,
+    /// The toolbar's codec picker, and whether it must be told the codec changed.
+    codec_select: Entity<SelectState<Vec<String>>>,
+    codec_select_stale: bool,
     focus_handle: FocusHandle,
     _wake: Task<()>,
     _housekeeping: Task<()>,
@@ -384,10 +539,30 @@ impl SessionView {
             Box::new(script_link.sink()),
         ];
         sinks.extend(extra_sinks);
-        let ingest = Ingest::spawn(
+        // The codec slot is made on the ingest thread, where a codec (a Lua VM) must
+        // stay; its frames ring the same doorbell.
+        let frame_store = FrameStore::default();
+        let frames = frame_store.reader();
+        let selection = Arc::new(CodecSelection::default());
+        let slot_selection = selection.clone();
+        let frame_doorbell = doorbell.clone();
+        let ingest = Ingest::spawn_with(
             session.events(),
             Store::new(options.store.clone()),
-            sinks,
+            Box::new(move || {
+                let mut sinks: Vec<Box<dyn ChunkSink>> = sinks
+                    .into_iter()
+                    .map(|sink| -> Box<dyn ChunkSink> { sink })
+                    .collect();
+                sinks.push(Box::new(CodecSlotSink::new(
+                    slot_selection,
+                    frame_store,
+                    Box::new(move || {
+                        let _ = frame_doorbell.try_send(());
+                    }),
+                )));
+                sinks
+            }),
             Box::new(move || {
                 // Full means a wake is already pending: that one will see this too.
                 let _ = doorbell.try_send(());
@@ -438,7 +613,30 @@ impl SessionView {
         });
         tracing::info!(%port, serial = %serial.summary(), "session open");
 
-        Self {
+        let choices = codec_choices(cx);
+        let codec_select = cx.new(|cx| {
+            SelectState::new(choices, Some(IndexPath::new(0)), window, cx).searchable(false)
+        });
+        let codec_picked = cx.subscribe(
+            &codec_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                let SelectEvent::Confirm(Some(name)) = event else {
+                    return;
+                };
+                if this.codec_name().unwrap_or(NO_CODEC) != name {
+                    this.set_codec(Some(name.as_str()), cx);
+                }
+            },
+        );
+        // A plugin reload reaches the codec this session runs, and the picker's list.
+        let config_changes = cx.observe_global_in::<Config>(window, |this, window, cx| {
+            this.codecs_changed(window, cx);
+        });
+        let initial_codec = options.codec.clone();
+        let decoded_inline = options.display.decoded_inline;
+        let hide_framed = options.display.hide_framed_bytes;
+
+        let mut view = Self {
             port,
             serial,
             connection: ConnectionInfo::default(),
@@ -467,11 +665,37 @@ impl SessionView {
             script_prompt: None,
             script_polling: false,
             _script_poll: None,
+            frame_snapshot: frames.snapshot(),
+            frames,
+            selection,
+            codec: None,
+            decoded_generation: 0,
+            decoded_inline,
+            inline_next: FrameId::ZERO,
+            hide_framed,
+            filter: None,
+            filtered: None,
+            reply_marks: Vec::new(),
+            frame_marks: Vec::new(),
+            selected_frame: None,
+            codec_select,
+            codec_select_stale: false,
             focus_handle: cx.focus_handle(),
             _wake: wake,
             _housekeeping: housekeeping,
-            _subscriptions: vec![compose_events, release, interceptor],
+            _subscriptions: vec![
+                compose_events,
+                release,
+                interceptor,
+                codec_picked,
+                config_changes,
+            ],
+        };
+        // The device profile's codec, from the first chunk on.
+        if let Some(name) = initial_codec {
+            view.set_codec(Some(&name), cx);
         }
+        view
     }
 
     // --- Reading the view ------------------------------------------------------------
@@ -569,6 +793,7 @@ impl SessionView {
     /// The status line's text for this session.
     pub fn status_line(&self) -> StatusLine {
         let script = self.script_status();
+        let codec = self.codec_name();
         StatusLine::new(StatusInputs {
             state: &self.state,
             title: self.title(),
@@ -581,6 +806,7 @@ impl SessionView {
             mode: self.mode,
             paste: self.paste_progress(),
             script: script.as_ref(),
+            codec,
         })
     }
 
@@ -591,16 +817,77 @@ impl SessionView {
 
     // --- The data path ---------------------------------------------------------------
 
-    /// One ring of the doorbell: acknowledge, then snapshot, then show.
+    /// One ring of the doorbell: acknowledge both stores, then snapshot both, then show.
+    /// The frames are taken first: a chunk is stored before it is decoded, so the store
+    /// snapshot taken after holds the bytes of every frame in it.
     fn wake(&mut self, cx: &mut Context<Self>) {
         let Some(ingest) = &self.ingest else {
             return;
         };
         ingest.acknowledge();
+        self.frames.acknowledge();
+        let frames = self.frames.snapshot();
         let snapshot = ingest.snapshot();
-        let shown = self.show(snapshot, cx);
-        if self.poll_session(cx) || shown {
+        let decoded = self.take_frames(frames);
+        let shown = self.show(snapshot, decoded, cx);
+        if self.poll_session(cx) || shown || decoded {
             cx.notify();
+        }
+    }
+
+    /// Take a newer frame snapshot, and put the summaries of the new frames into the
+    /// scrollback as one batch. Returns whether the frames changed.
+    fn take_frames(&mut self, frames: FrameSnapshot) -> bool {
+        let (before, after) = (self.frame_snapshot.stats(), frames.stats());
+        if before == after {
+            return false;
+        }
+        self.frame_snapshot = frames;
+        self.decoded_generation += 1;
+        let new = self.inline_next.max(after.first)..after.end;
+        self.inline_next = after.end;
+        if let Some(last) = self.frame_snapshot.last() {
+            tracing::debug!(
+                port = %self.port,
+                codec = self.codec_name().unwrap_or(NO_CODEC),
+                new = new.end.0 - new.start.0,
+                total = after.end.0,
+                last = %last.summary,
+                "decoded frames"
+            );
+        }
+        if self.decoded_inline {
+            self.put_summaries(new);
+        }
+        true
+    }
+
+    /// One notice line per decoded frame in `ids` (text frames aside: their text is on
+    /// screen), appended in one batch.
+    fn put_summaries(&mut self, ids: Range<FrameId>) {
+        let (Some(ingest), Some(codec)) = (&self.ingest, &self.codec) else {
+            return;
+        };
+        let mut lines = Vec::new();
+        let mut more = 0;
+        for (_, frame) in self.frame_snapshot.iter(ids) {
+            if is_text_frame(frame, Some(&codec.info)) {
+                continue;
+            }
+            if lines.len() < MAX_SUMMARIES_PER_WAKE {
+                lines.push(inline_summary(frame));
+            } else {
+                more += 1;
+            }
+        }
+        if more > 0 {
+            lines.push(format!(
+                "{}\u{2026} and {more} more frames",
+                crate::codecs::DECODED_MARK
+            ));
+        }
+        if !lines.is_empty() {
+            let _ = ingest.append_local(lines.join("\n"), Direction::Notice);
         }
     }
 
@@ -639,11 +926,14 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Hand `snapshot` to the terminal if it holds anything new. Returns whether it did.
-    fn show(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) -> bool {
+    /// Hand `snapshot` to the terminal if it holds anything new, or, while framed bytes
+    /// are hidden, if the frames (`decoded`) changed what is hidden. Returns whether it
+    /// did.
+    fn show(&mut self, snapshot: Snapshot, decoded: bool, cx: &mut Context<Self>) -> bool {
         // A snapshot of what the view already has: a wake that found nothing new. (Not
         // the stats, which cannot see a line being typed change without changing size.)
-        if self.snapshot().is_same_publication(&snapshot) {
+        let same = self.snapshot().is_same_publication(&snapshot);
+        if same && !(decoded && self.filter.is_some()) {
             return false;
         }
         let after = snapshot.stats();
@@ -651,8 +941,49 @@ impl SessionView {
         // have changed, so they count as changed along with the new ones.
         let changed = self.snapshot().committed_end().max(after.first_line)..after.end_line;
         self.scrollback = Scrollback::with_hex_row(&snapshot, self.floors, self.hex_bytes_per_row);
+        self.refilter();
+        let changed = match &self.filtered {
+            Some(filtered) => filtered.view_at_or_after(changed.start)..filtered.end(),
+            None => changed,
+        };
         self.push_sources(cx, |terminal, cx| terminal.lines_appended(changed, cx));
+        if self.filtered.is_some() {
+            // What was marked may have moved in the view's ids.
+            self.sync_marks(cx);
+        }
         true
+    }
+
+    /// Bring the hidden-lines map up to the current snapshot and frames, if framed bytes
+    /// are hidden and a codec runs.
+    fn refilter(&mut self) {
+        self.filtered = match (self.filter.as_mut(), self.codec.as_ref()) {
+            (Some(filter), Some(codec)) => {
+                let info = &codec.info;
+                Some(
+                    filter.update(&self.scrollback.text, &self.frame_snapshot, &|frame| {
+                        hides_bytes(frame, Some(info))
+                    }),
+                )
+            }
+            _ => None,
+        };
+    }
+
+    /// What the terminal shows as text: the scrollback, with framed bytes left out while
+    /// they are hidden.
+    pub fn text_source(&self) -> Arc<dyn LineSource> {
+        match &self.filtered {
+            Some(filtered) => Arc::new(filtered.clone()),
+            None => self.scrollback.text_source(),
+        }
+    }
+
+    fn text_searcher(&self) -> Arc<dyn Searcher> {
+        match &self.filtered {
+            Some(filtered) => Arc::new(filtered.clone()),
+            None => self.scrollback.text_searcher(),
+        }
     }
 
     /// Give the terminal the current scrollback's sources, then run `then` on it.
@@ -662,16 +993,61 @@ impl SessionView {
         then: impl FnOnce(&mut TerminalView, &mut Context<TerminalView>),
     ) {
         let scrollback = self.scrollback.clone();
+        let (text, searcher) = (self.text_source(), self.text_searcher());
         self.terminal.update(cx, |terminal, cx| {
             terminal.update_sources(
-                scrollback.text_source(),
-                Some(scrollback.text_searcher()),
+                text,
+                Some(searcher),
                 Some(scrollback.hex_source()),
                 Some(scrollback.hex_searcher()),
                 cx,
             );
             then(terminal, cx);
         });
+    }
+
+    /// Give the terminal a text source whose ids mean something else (framed bytes
+    /// hidden or shown again): its scroll and selection start over, and the marks are
+    /// given again in the new ids.
+    fn replace_text_source(&mut self, cx: &mut Context<Self>) {
+        let (text, searcher) = (self.text_source(), self.text_searcher());
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_source(text, cx);
+            terminal.set_searcher(Some(searcher), cx);
+        });
+        self.sync_marks(cx);
+    }
+
+    /// Hand the terminal the marked replies and the selected frame's lines, in the ids of
+    /// the text source it shows. Lines that are hidden have no mark.
+    fn sync_marks(&mut self, cx: &mut Context<Self>) {
+        let marks: Vec<SearchMatch> = self
+            .reply_marks
+            .iter()
+            .chain(&self.frame_marks)
+            .filter_map(|mark| {
+                let line = match &self.filtered {
+                    Some(filtered) => filtered.view_of(mark.line)?,
+                    None => mark.line,
+                };
+                Some(SearchMatch {
+                    line,
+                    range: mark.range.clone(),
+                })
+            })
+            .collect();
+        self.terminal
+            .update(cx, |terminal, cx| terminal.set_marks(marks, cx));
+    }
+
+    /// Mark a reply (a matched line, a matched frame's lines), keeping the newest.
+    fn mark_reply(&mut self, marks: impl IntoIterator<Item = SearchMatch>, cx: &mut Context<Self>) {
+        self.reply_marks.extend(marks);
+        if self.reply_marks.len() > MAX_MARKS {
+            let excess = self.reply_marks.len() - MAX_MARKS;
+            self.reply_marks.drain(..excess);
+        }
+        self.sync_marks(cx);
     }
 
     /// Read the session's counters and the link state, and notice a lost device.
@@ -786,7 +1162,14 @@ impl SessionView {
             self.remembered.insert(reference.clone(), params.clone());
         }
         let session_eol = self.line_ending(cx);
-        let bytes = match command.encode(params, session_eol) {
+        // A codec payload is the codec's to encode; the rest the command's own.
+        let encoded = match &command.payload {
+            Payload::Codec { .. } => encode_codec_command(&codec_registry(cx), command, params),
+            _ => command
+                .encode(params, session_eol)
+                .map_err(|error| error.to_string()),
+        };
+        let bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.notice = Some(Notice::error(format!("{name}: {error}")));
@@ -794,6 +1177,30 @@ impl SessionView {
                 return;
             }
         };
+        // A frame predicate is waited for while a codec decodes the session; its strings
+        // take the parameters as the payload does.
+        let frame_expect = match command.expect.as_ref() {
+            Some(expect) if self.codec.is_some() => match &expect.frame {
+                Some(predicate) => match fill_placeholders(predicate, command, params) {
+                    Ok(predicate) => Some((predicate, expect.timeout_ms)),
+                    Err(error) => {
+                        self.notice =
+                            Some(Notice::error(format!("{name}: expected frame: {error}")));
+                        cx.notify();
+                        return;
+                    }
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        let line_expect = command
+            .expect
+            .as_ref()
+            .filter(|expect| frame_expect.is_none() && !expect.pattern.is_empty());
+        let needs_codec = frame_expect.is_none()
+            && line_expect.is_none()
+            && command.expect.as_ref().is_some_and(|e| e.frame.is_some());
         let Some((session, ingest)) = self.live() else {
             self.notice = Some(Notice::error(format!("Not connected; not sent: {name}")));
             cx.notify();
@@ -801,27 +1208,128 @@ impl SessionView {
         };
         // A saved command is always echoed: it is the record of what was sent.
         let _ = ingest.append_local(command_echo(command, &bytes, session_eol), Direction::Tx);
-        // Registered before the write, so the reply cannot arrive unwatched.
-        let expectation = command.expect.as_ref().map(|expect| {
+        // Registered before the write, so the reply cannot arrive unwatched: a line
+        // expectation with the matchers, a frame one as the frame store's end now.
+        let expectation = line_expect.map(|expect| {
             ingest
                 .matchers()
                 .expect(&expect.pattern, expect.timeout())
                 .map(|expectation| (expectation, expect.timeout_ms))
         });
+        let frames_from = self.frames.stats().end;
+        let sent_at = Instant::now();
         if session.write(bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
         }
         tracing::debug!(command = %reference, "sent saved command");
-        match expectation {
-            Some(Ok((expectation, timeout_ms))) => {
+        match (expectation, frame_expect) {
+            (Some(Ok((expectation, timeout_ms))), _) => {
                 self.await_reply(name, expectation, timeout_ms, cx);
             }
-            Some(Err(error)) => {
+            (Some(Err(error)), _) => {
                 self.notice = Some(Notice::error(format!(
                     "{name}: the expected reply is not a valid pattern: {error}"
                 )));
             }
-            None => self.notice = Some(Notice::info(format!("Sent {name}"))),
+            (None, Some((predicate, timeout_ms))) => {
+                self.await_frame(name, predicate, frames_from, sent_at, timeout_ms, cx);
+            }
+            (None, None) if needs_codec => {
+                self.notice = Some(Notice::error(format!(
+                    "Sent {name}; its reply is a decoded frame, and no codec is decoding"
+                )));
+            }
+            (None, None) => self.notice = Some(Notice::info(format!("Sent {name}"))),
+        }
+        cx.notify();
+    }
+
+    /// Wait for a decoded frame matching `predicate`, from frame `from` on, until
+    /// `timeout_ms` after `sent_at`: a task reads the frame store once a frame (it may,
+    /// from any thread) and reports as a line reply does.
+    fn await_frame(
+        &mut self,
+        name: String,
+        predicate: Map<String, JsonValue>,
+        from: FrameId,
+        sent_at: Instant,
+        timeout_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some(Notice::info(format!("{name}: waiting for a reply…")));
+        let reader = self.frames.clone();
+        let deadline = sent_at + Duration::from_millis(timeout_ms);
+        cx.spawn(async move |this, cx| {
+            let mut next = from;
+            loop {
+                let frames = reader.snapshot();
+                let found = frames
+                    .iter(next..frames.end())
+                    .find(|(_, frame)| frame_matches(&predicate, frame))
+                    .map(|(id, frame)| (id, frame.at.saturating_duration_since(sent_at)));
+                next = next.max(frames.end());
+                let outcome = match found {
+                    Some((id, elapsed)) => Some(FrameReply::Matched { id, elapsed }),
+                    None => {
+                        let ended = this
+                            .read_with(cx, |view, _| view.state.is_disconnected())
+                            .unwrap_or(true);
+                        if ended {
+                            Some(FrameReply::Closed)
+                        } else if Instant::now() >= deadline {
+                            Some(FrameReply::TimedOut)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    this.update(cx, |view, cx| {
+                        view.frame_reply(&name, timeout_ms, outcome, cx);
+                    })
+                    .ok();
+                    return;
+                }
+                cx.background_executor().timer(EXPECT_POLL).await;
+            }
+        })
+        .detach();
+    }
+
+    fn frame_reply(
+        &mut self,
+        name: &str,
+        timeout_ms: u64,
+        reply: FrameReply,
+        cx: &mut Context<Self>,
+    ) {
+        match reply {
+            FrameReply::Matched { id, elapsed } => {
+                // The frame may be newer than the view's snapshots; the store has its
+                // bytes, which were stored before they were decoded.
+                let frames = self.frames.snapshot();
+                let snapshot = self.ingest.as_ref().map(IngestHandle::snapshot);
+                if let (Some(frame), Some(snapshot)) = (frames.get(id), snapshot) {
+                    let lines = lines_holding(&snapshot, frame.raw.clone());
+                    self.mark_reply(lines.iter().map(whole_line_mark), cx);
+                }
+                self.notice = Some(Notice::info(format!(
+                    "{name}: OK in {} ms",
+                    elapsed.as_millis()
+                )));
+            }
+            FrameReply::TimedOut => {
+                let message = format!("{name}: no response within {timeout_ms} ms");
+                if let Some(ingest) = &self.ingest {
+                    let _ = ingest.append_local(message.clone(), Direction::Notice);
+                }
+                self.notice = Some(Notice::error(message));
+            }
+            FrameReply::Closed => {
+                self.notice = Some(Notice::info(format!(
+                    "{name}: the session ended before a reply"
+                )));
+            }
         }
         cx.notify();
     }
@@ -865,9 +1373,7 @@ impl SessionView {
                 ..
             } => {
                 let range = highlight_range(range, &text);
-                self.terminal.update(cx, |terminal, cx| {
-                    terminal.add_mark(SearchMatch { line, range }, cx);
-                });
+                self.mark_reply([SearchMatch { line, range }], cx);
                 self.notice = Some(Notice::info(format!(
                     "{name}: OK in {} ms",
                     elapsed.as_millis()
@@ -887,6 +1393,215 @@ impl SessionView {
             }
         }
         cx.notify();
+    }
+
+    // --- Codecs and decoded frames ----------------------------------------------------
+
+    /// The codec decoding the session, if any.
+    pub fn codec(&self) -> Option<&ActiveCodec> {
+        self.codec.as_ref()
+    }
+
+    /// The name of the codec decoding the session, if any.
+    pub fn codec_name(&self) -> Option<&str> {
+        self.codec.as_ref().map(|codec| codec.name.as_str())
+    }
+
+    /// Decode with the codec the registry calls `name` from the next chunk on, or with
+    /// none (`None` or [`NO_CODEC`]). The frames decoded so far stay. Returns whether the
+    /// codec is known; an unknown one leaves decoding as it was and says so.
+    pub fn set_codec(&mut self, name: Option<&str>, cx: &mut Context<Self>) -> bool {
+        let name = name.filter(|name| !name.is_empty() && *name != NO_CODEC);
+        match name {
+            None => {
+                self.selection.set(None);
+                if self.codec.take().is_some() {
+                    self.notice = Some(Notice::info("Decoding off"));
+                }
+            }
+            Some(name) => match codec_registry(cx).get(name) {
+                Some(factory) => {
+                    self.selection.set(Some(factory.clone()));
+                    self.codec = Some(ActiveCodec {
+                        name: name.to_owned(),
+                        info: factory.info(),
+                        factory,
+                    });
+                    self.notice = Some(Notice::info(format!("Decoding with {name}")));
+                }
+                None => {
+                    self.notice = Some(Notice::error(format!(
+                        "No codec named {name} is loaded; decoding is unchanged"
+                    )));
+                    cx.notify();
+                    return false;
+                }
+            },
+        }
+        tracing::info!(port = %self.port, codec = name.unwrap_or(NO_CODEC), "codec selected");
+        // Summaries start with the frames of this codec.
+        self.inline_next = self.frame_snapshot.end().max(self.frames.stats().end);
+        self.decoded_generation += 1;
+        self.codec_select_stale = true;
+        self.update_filter(cx);
+        cx.notify();
+        true
+    }
+
+    /// The configuration changed: list its codecs in the picker, and if the factory of
+    /// the codec this session runs was replaced (a plugin reloaded), decode with the new
+    /// one from the next chunk on.
+    fn codecs_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let choices = codec_choices(cx);
+        let registry = codec_registry(cx);
+        self.codec_select.update(cx, |select, cx| {
+            select.set_items(choices, window, cx);
+        });
+        self.codec_select_stale = true;
+        let Some(codec) = &self.codec else {
+            return;
+        };
+        let Some(factory) = registry.get(&codec.name) else {
+            // The plugin is gone; what runs keeps running until another is picked.
+            return;
+        };
+        if Arc::ptr_eq(&factory, &codec.factory) {
+            return;
+        }
+        let name = codec.name.clone();
+        tracing::info!(port = %self.port, codec = %name, "codec reloaded");
+        self.selection.set(Some(factory.clone()));
+        self.codec = Some(ActiveCodec {
+            name: name.clone(),
+            info: factory.info(),
+            factory,
+        });
+        self.decoded_generation += 1;
+        self.notice = Some(Notice::info(format!("Reloaded {name}")));
+        cx.notify();
+    }
+
+    /// The frames decoded so far, as of the last wake.
+    pub fn frames(&self) -> &FrameSnapshot {
+        &self.frame_snapshot
+    }
+
+    /// A reader of the session's frames, for looking without waiting for a wake.
+    pub fn frame_reader(&self) -> &FrameStoreReader {
+        &self.frames
+    }
+
+    /// Bumped whenever the frames or the codec change.
+    pub fn decoded_generation(&self) -> u64 {
+        self.decoded_generation
+    }
+
+    /// How frames are stamped: the terminal's timestamp mode and the configured format.
+    pub fn frame_time(&self, cx: &App) -> FrameTime {
+        FrameTime {
+            clock: Clock::local(self.snapshot().epoch()),
+            mode: self.terminal.read(cx).timestamps(),
+            format: cx
+                .try_global::<Config>()
+                .map(|config| config.timestamp_format().to_owned()),
+        }
+    }
+
+    pub fn decoded_inline(&self) -> bool {
+        self.decoded_inline
+    }
+
+    /// Put a summary of each frame decoded from now on into the scrollback, or stop.
+    pub fn set_decoded_inline(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.decoded_inline != on {
+            self.decoded_inline = on;
+            self.inline_next = self.frame_snapshot.end();
+            cx.notify();
+        }
+    }
+
+    pub fn hides_framed_bytes(&self) -> bool {
+        self.hide_framed
+    }
+
+    /// Leave the lines of binary frames out of the text view, or show them again.
+    pub fn set_hide_framed_bytes(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.hide_framed != on {
+            self.hide_framed = on;
+            self.update_filter(cx);
+            cx.notify();
+        }
+    }
+
+    /// Start or stop the hidden-lines map as the toggle and the codec say, and give the
+    /// terminal the matching source when that changes what it shows.
+    fn update_filter(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.hide_framed && self.codec.is_some();
+        let had = self.filtered.is_some();
+        if wanted && self.filter.is_none() {
+            self.filter = Some(FramedFilter::new(self.snapshot()));
+        } else if !wanted {
+            self.filter = None;
+        }
+        self.refilter();
+        if had || self.filtered.is_some() {
+            self.replace_text_source(cx);
+        }
+    }
+
+    /// The frame selected in the Decoded panel.
+    pub fn selected_frame(&self) -> Option<FrameId> {
+        self.selected_frame
+    }
+
+    /// The selected frame's lines as marked, in store ids.
+    pub fn frame_marks(&self) -> &[SearchMatch] {
+        &self.frame_marks
+    }
+
+    /// Show frame `id` in the terminal: mark the text lines that hold its bytes and
+    /// scroll to the first, or in hex view scroll to the row of its first byte.
+    pub fn select_frame(&mut self, id: FrameId, cx: &mut Context<Self>) {
+        let Some(frame) = self.frame_snapshot.get(id).cloned() else {
+            return;
+        };
+        self.selected_frame = Some(id);
+        let lines = lines_holding(self.snapshot(), frame.raw.clone());
+        self.frame_marks = lines.iter().map(whole_line_mark).collect();
+        self.sync_marks(cx);
+        let row = match self.terminal.read(cx).display_mode() {
+            DisplayMode::Hex => Some(LineId(
+                frame.raw.start / self.hex_bytes_per_row.max(1) as u64,
+            )),
+            DisplayMode::Text => {
+                let store = lines
+                    .first()
+                    .map_or_else(|| self.line_at_offset(frame.raw.start), |line| line.id);
+                Some(match &self.filtered {
+                    Some(filtered) => filtered.view_at_or_after(store),
+                    None => store,
+                })
+            }
+        };
+        if let Some(row) = row {
+            self.terminal
+                .update(cx, |terminal, cx| terminal.reveal(row, cx));
+        }
+        cx.notify();
+    }
+
+    /// The first line at or after stream offset `offset`.
+    fn line_at_offset(&self, offset: u64) -> LineId {
+        let snapshot = self.snapshot();
+        let (mut lo, mut hi) = (snapshot.first_line().0, snapshot.end().0);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match snapshot.line(LineId(mid)) {
+                Some(line) if line.raw.end <= offset => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        LineId(lo)
     }
 
     // --- Scripts ---------------------------------------------------------------------
@@ -1380,6 +2095,7 @@ impl SessionView {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.floors = Floors::above(self.snapshot());
         self.rebuild_scrollback();
+        self.refilter();
         self.push_sources(cx, |terminal, cx| {
             terminal.set_selection(None, cx);
             terminal.jump_to_bottom(cx);
@@ -1422,10 +2138,20 @@ impl SessionView {
                 }
             });
         }
+        if options.codec != old.codec {
+            self.set_codec(options.codec.as_deref(), cx);
+        }
         let (new, old) = (options.display, old.display);
+        if new.decoded_inline != old.decoded_inline {
+            self.set_decoded_inline(new.decoded_inline, cx);
+        }
+        if new.hide_framed_bytes != old.hide_framed_bytes {
+            self.set_hide_framed_bytes(new.hide_framed_bytes, cx);
+        }
         if new.hex_bytes_per_row != old.hex_bytes_per_row {
             self.hex_bytes_per_row = new.hex_bytes_per_row;
             self.rebuild_scrollback();
+            self.refilter();
             let scrollback = self.scrollback.clone();
             self.terminal.update(cx, |terminal, cx| {
                 terminal.set_hex_source(
@@ -1582,6 +2308,25 @@ impl SessionView {
             options = options.with_timestamp_format(config.timestamp_format());
         }
         match (format, terminal.display_mode()) {
+            // Decoded frames: all of them, whatever the view shows.
+            (ExportFormat::Csv | ExportFormat::Json, _) => ExportJob::Frames {
+                frames: self.frames.snapshot(),
+                raw: snapshot,
+                time: self.frame_time(cx),
+                format: if format == ExportFormat::Csv {
+                    FramesFormat::Csv
+                } else {
+                    FramesFormat::Json
+                },
+            },
+            // With framed bytes hidden the terminal's line ids are the filter's.
+            (ExportFormat::Text, DisplayMode::Text) if self.filtered.is_some() => {
+                ExportJob::Lines {
+                    source: SharedSource(self.text_source()),
+                    lines,
+                    options,
+                }
+            }
             (ExportFormat::Text, DisplayMode::Text) => ExportJob::Text {
                 snapshot,
                 lines,
@@ -1611,6 +2356,13 @@ impl SessionView {
         format: ExportFormat,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        if format.is_decoded() && self.codec.is_none() && self.frame_snapshot.is_empty() {
+            self.notice = Some(Notice::error(
+                "No codec decodes this session, so there are no frames to export",
+            ));
+            cx.notify();
+            return Task::ready(());
+        }
         let job = self.export_job(format, cx);
         cx.spawn(async move |this, cx| {
             let outcome = cx.background_spawn(async move { job.run(&path) }).await;
@@ -1748,11 +2500,25 @@ impl SessionView {
 
     // --- Rendering -------------------------------------------------------------------
 
+    /// Tell the codec picker which codec runs, after a change it did not make.
+    fn sync_codec_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.codec_select_stale) {
+            return;
+        }
+        let name = self.codec_name().unwrap_or(NO_CODEC).to_owned();
+        self.codec_select.update(cx, |select, cx| {
+            if select.selected_value() != Some(&name) {
+                select.set_selected_value(&name, window, cx);
+            }
+        });
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let paused = self.is_paused();
         let recording = self.recording_status.is_some();
         let inline = self.mode == Mode::Inline;
+        let decoding = self.codec.is_some();
         h_flex()
             .flex_none()
             .w_full()
@@ -1761,6 +2527,38 @@ impl SessionView {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .child(
+                div().id("codec-picker").flex_none().w(px(150.)).child(
+                    Select::new(&self.codec_select)
+                        .small()
+                        .title_prefix("Codec: ")
+                        .menu_width(px(220.)),
+                ),
+            )
+            .child(
+                Button::new("decoded-inline")
+                    .label("Summaries")
+                    .tooltip("Put a one-line summary of each decoded frame in the scrollback")
+                    .small()
+                    .ghost()
+                    .toggled(self.decoded_inline)
+                    .disabled(!decoding)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_decoded_inline(!this.decoded_inline, cx);
+                    })),
+            )
+            .child(
+                Button::new("hide-framed")
+                    .label("Hide frames")
+                    .tooltip("Leave out the lines of decoded binary frames (text stays)")
+                    .small()
+                    .ghost()
+                    .toggled(self.hide_framed)
+                    .disabled(!decoding)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_hide_framed_bytes(!this.hide_framed, cx);
+                    })),
+            )
             .child(
                 Button::new("inline-mode")
                     .label(if inline { "Inline" } else { "Command" })
@@ -1797,6 +2595,16 @@ impl SessionView {
                     .ghost()
                     .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Raw, cx))),
             )
+            .when(decoding, |bar| {
+                bar.child(
+                    Button::new("export-decoded")
+                        .label("Export frames…")
+                        .tooltip("Save the decoded frames as CSV (.csv) or JSON (.json)")
+                        .small()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Csv, cx))),
+                )
+            })
             .child(
                 Button::new("record")
                     .label(if recording {
@@ -1823,7 +2631,8 @@ impl SessionView {
 }
 
 impl Render for SessionView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_codec_select(window, cx);
         let toolbar = self.render_toolbar(cx);
         let theme = cx.theme();
         v_flex()

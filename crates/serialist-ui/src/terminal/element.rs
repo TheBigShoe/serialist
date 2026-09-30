@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serialist_core::{LineId, LineSource, SearchMatch, Style, StyledLine};
+use serialist_core::{Direction, LineId, LineSource, SearchMatch, Style, StyledLine};
 
 use crate::config::Config;
 use crate::prelude::*;
@@ -424,11 +424,22 @@ fn normalized_runs(line: &StyledLine) -> Vec<(Range<usize>, Style)> {
 
 /// A line's runs as byte ranges with the colors and decorations they are drawn in. The
 /// glyphs of a `CONTROL` run (the store's placeholders for control bytes, when
-/// `display.show_control_chars` is on) come out in the palette's dim color.
+/// `display.show_control_chars` is on) come out in the palette's dim color, and a decoded
+/// frame's summary line (a notice starting with
+/// [`DECODED_MARK`](crate::codecs::DECODED_MARK)) in the plugin color.
 fn resolved_runs(
     line: &StyledLine,
     palette: &TerminalPalette,
 ) -> Vec<(Range<usize>, ResolvedStyle)> {
+    let decoded =
+        line.direction == Direction::Notice && crate::codecs::is_decoded_summary(&line.text);
+    let resolve = |style: &Style| {
+        if decoded {
+            palette.resolve_decoded(style)
+        } else {
+            palette.resolve(style, line.direction)
+        }
+    };
     let mut resolved: Vec<(Style, ResolvedStyle)> = Vec::new();
     normalized_runs(line)
         .into_iter()
@@ -438,7 +449,7 @@ fn resolved_runs(
                 .find(|(s, _)| *s == run_style)
                 .map(|(_, r)| *r);
             let resolved_style = found.unwrap_or_else(|| {
-                let r = palette.resolve(&run_style, line.direction);
+                let r = resolve(&run_style);
                 resolved.push((run_style, r));
                 r
             });

@@ -29,6 +29,10 @@ pub struct DisplayDefaults {
     pub timestamps: TimestampMode,
     pub view: DisplayMode,
     pub hex_bytes_per_row: usize,
+    /// `display.decoded_inline`: a summary line per decoded frame in the scrollback.
+    pub decoded_inline: bool,
+    /// `display.hide_framed_bytes`: leave lines of binary frames out of the text view.
+    pub hide_framed_bytes: bool,
 }
 
 impl Default for DisplayDefaults {
@@ -38,6 +42,8 @@ impl Default for DisplayDefaults {
             timestamps: TimestampMode::Off,
             view: DisplayMode::Text,
             hex_bytes_per_row: HEX_BYTES_PER_ROW,
+            decoded_inline: true,
+            hide_framed_bytes: false,
         }
     }
 }
@@ -51,25 +57,29 @@ pub struct SessionOptions {
     /// Echo sent lines into the scrollback.
     pub local_echo: bool,
     pub display: DisplayDefaults,
+    /// The codec to decode with from the start: the matching device profile's `plugin`.
+    /// `None` decodes nothing until one is picked.
+    pub codec: Option<String>,
 }
 
 impl Default for SessionOptions {
-    /// A default store, CRLF, sent lines echoed, text view.
+    /// A default store, CRLF, sent lines echoed, text view, no codec.
     fn default() -> Self {
         Self {
             store: StoreConfig::default(),
             line_ending: LineEnding::default(),
             local_echo: true,
             display: DisplayDefaults::default(),
+            codec: None,
         }
     }
 }
 
 impl SessionOptions {
     /// The options for `port` under `settings`: the scrollback budget, `display.*`,
-    /// `local_echo`, and the line ending of the first matching device profile, else
-    /// `line_ending`. `display.show_control_chars` is the store's, so it is read here,
-    /// when the session opens.
+    /// `local_echo`, and the line ending and codec (`plugin`) of the first matching
+    /// device profile, else `line_ending` and no codec. `display.show_control_chars` is
+    /// the store's, so it is read here, when the session opens.
     pub fn from_settings(settings: &Settings, port: &PortInfo) -> Self {
         let display = &settings.display;
         Self {
@@ -84,7 +94,13 @@ impl SessionOptions {
                 timestamps: display.timestamps,
                 view: display.view.into(),
                 hex_bytes_per_row: display.hex_bytes_per_row,
+                decoded_inline: display.decoded_inline,
+                hide_framed_bytes: display.hide_framed_bytes,
             },
+            codec: settings
+                .profile_for(port)
+                .and_then(|profile| profile.plugin.clone())
+                .filter(|name| !name.trim().is_empty()),
         }
     }
 
@@ -122,8 +138,10 @@ mod tests {
                 "line_ending": "lf",
                 "local_echo": true,
                 "display": { "wrap": true, "timestamps": "delta", "view": "hex_ascii",
-                             "hex_bytes_per_row": 8 },
-                "devices": [ { "match": { "product": "Airoha" }, "eol": "cr" } ]
+                             "hex_bytes_per_row": 8, "decoded_inline": false,
+                             "hide_framed_bytes": true },
+                "devices": [ { "match": { "product": "Airoha" }, "eol": "cr",
+                               "plugin": "airoha-race" } ]
             }"#,
         )
         .unwrap();
@@ -138,10 +156,14 @@ mod tests {
                 timestamps: TimestampMode::Delta,
                 view: DisplayMode::Hex,
                 hex_bytes_per_row: 8,
+                decoded_inline: false,
+                hide_framed_bytes: true,
             }
         );
+        assert_eq!(airoha.codec.as_deref(), Some("airoha-race"));
         let other = SessionOptions::from_settings(&settings, &usb("Something else"));
         assert_eq!(other.line_ending, LineEnding::Lf);
+        assert_eq!(other.codec, None, "no profile, no codec");
     }
 
     #[test]
