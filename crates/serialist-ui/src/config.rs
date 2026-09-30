@@ -261,6 +261,19 @@ impl Config {
         &self.inline
     }
 
+    /// `display.timestamp_format`: the `strftime` string of absolute gutter stamps. The
+    /// terminal reads it every frame, so a saved change shows at once.
+    pub fn timestamp_format(&self) -> &str {
+        &self.settings.display.timestamp_format
+    }
+
+    /// `display.show_control_chars`: draw CR, LF, ESC and other control bytes as dim
+    /// glyphs. It sets how a session's store parses, so it applies to sessions opened
+    /// after the change, not to ones already open.
+    pub fn show_control_chars(&self) -> bool {
+        self.settings.display.show_control_chars
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
