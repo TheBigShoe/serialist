@@ -3,27 +3,38 @@
 //!
 //! Timing model. Each direction is a wire with a release schedule. Bytes offered to a
 //! paced wire queue behind whatever is still being transmitted and finish at exactly
-//! `serial.bytes_per_second()`. The wire groups them into packets holding at most one
-//! [`PACKET_INTERVAL`] of data (and never more than `max_chunk` bytes), like a USB
-//! adapter that flushes its FIFO once per poll. A packet becomes readable when its last
-//! byte has finished on the wire, plus `latency`, plus a seeded `jitter` sample. Release
-//! times never go backwards, so bytes stay in order however large the jitter. An unpaced
-//! wire skips the transmission time but keeps latency, jitter and chunking.
+//! `serial.bytes_per_second()`. The wire groups them into packets holding one
+//! [`PACKET_INTERVAL`] of data (rounded up to whole bytes, and never more than
+//! `max_chunk`), like a USB adapter that flushes its FIFO once per poll. A packet becomes
+//! readable when its last byte has finished on the wire, plus `latency`, plus a seeded
+//! `jitter` sample. Release times never go backwards, so bytes stay in order however
+//! large the jitter. An unpaced wire skips the transmission time but keeps latency,
+//! jitter and chunking.
+//!
+//! Finish times and packet boundaries are counted in bytes from the start of the current
+//! run (the wire has been busy without a break since then, at one rate), not from each
+//! batch of bytes offered to it. So on a wire that is kept busy, byte `n` of the run
+//! finishes at exactly `run_start + (n + 1) / rate`, and the host sees the same packets
+//! at the same times however the bytes were batched.
 //!
 //! Device output first lands in the device's transmit FIFO. The device thread moves it
-//! onto a paced wire only as far as [`PACED_LOOKAHEAD`] ahead of now (onto an unpaced
-//! wire, only while fewer than [`HOST_BACKLOG_LIMIT`] bytes wait unread), and the device
-//! is not ticked again until its FIFO is empty. So however much one callback sends, at
-//! most one look-ahead of it is committed to the wire: a baud change shows within one
-//! look-ahead, and pulling the cable loses what is in flight instead of delaying the
-//! disconnect until it drains.
+//! onto a paced wire only as far as [`PACED_LOOKAHEAD`] ahead of now, in whole packets
+//! (onto an unpaced wire, only while fewer than [`HOST_BACKLOG_LIMIT`] bytes wait
+//! unread), and the device is not ticked again until its FIFO is empty. So however much
+//! one callback sends, at most one look-ahead of it is committed to the wire: a baud
+//! change shows within one look-ahead, and pulling the cable loses what is in flight
+//! instead of delaying the disconnect until it drains.
+//!
+//! Time comes from the link's [`Clock`]: [`VirtualLink::connect`] uses real time, and
+//! [`VirtualLink::connect_with_clock`] takes any clock, such as a
+//! [`ManualClock`](crate::ManualClock) that a test moves by hand.
 //!
 //! Faults (drop, corrupt) are drawn per byte from a seeded generator that is separate
 //! from the jitter generator, so the fault pattern depends only on the byte sequence and
 //! the seed, never on how the bytes happened to be batched.
 //!
-//! Nothing here busy-waits: the host reader and the device thread sleep on condition
-//! variables until the next release time, the caller's deadline, or a state change.
+//! Nothing here busy-waits: the host reader and the device thread sleep through
+//! [`Clock::wait`] until the next release time, the caller's deadline, or a state change.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -31,14 +42,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Mutex, MutexGuard};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serialist_core::{
     ControlLine, SerialConfig, Transport, TransportError, TransportReader, TransportWriter,
 };
 
-use crate::{DeviceOutput, LinkConfig, LinkStats, SimDevice};
+use crate::{Clock, DeviceOutput, LinkConfig, LinkStats, SimDevice, SystemClock, Wakeup};
 
 /// How often a paced wire hands a packet to the reader, like a USB-serial adapter's
 /// poll interval. At 3 Mbaud that is about 300 bytes per packet.
@@ -89,6 +100,11 @@ struct Wire {
     queued: usize,
     /// When the wire finishes transmitting everything scheduled so far.
     wire_free_at: Instant,
+    /// The current run on a paced wire: busy without a break since `run_start`, at
+    /// `run_bps`, with `run_bytes` scheduled. Zero `run_bps` means no run.
+    run_start: Instant,
+    run_bytes: usize,
+    run_bps: f64,
     last_release: Instant,
     fault_rng: StdRng,
     jitter_rng: StdRng,
@@ -128,15 +144,41 @@ fn wire_time(bytes: usize, bps: f64) -> Duration {
     Duration::try_from_secs_f64(bytes as f64 / bps).unwrap_or(Duration::MAX)
 }
 
+/// Whole bytes that finish within `d` at `bps`. The slack (one nanosecond, and a
+/// millionth of a byte) keeps nanosecond and float rounding from losing a byte that
+/// finishes exactly at the end of `d`.
+fn bytes_in(d: Duration, bps: f64) -> usize {
+    ((d.as_secs_f64() + 1e-9) * bps + 1e-6) as usize
+}
+
+/// Bytes in one packet of a wire moving `bps` bytes per second.
+fn packet_len(bps: f64, max_chunk: usize) -> usize {
+    ((bps * PACKET_INTERVAL.as_secs_f64()).ceil() as usize).clamp(1, max_chunk.max(1))
+}
+
 impl Wire {
     fn new(now: Instant, seed: u64, stream: u64) -> Self {
         Self {
             packets: VecDeque::new(),
             queued: 0,
             wire_free_at: now,
+            run_start: now,
+            run_bytes: 0,
+            run_bps: 0.0,
             last_release: now,
             fault_rng: StdRng::seed_from_u64(mix_seed(seed, stream)),
             jitter_rng: StdRng::seed_from_u64(mix_seed(seed, stream + 1)),
+        }
+    }
+
+    /// Where bytes offered at `now` to a wire moving `bps` start: the start of the
+    /// current run and the bytes already scheduled in it, or a new run from when the wire
+    /// is free (now, if it is idle).
+    fn run_at(&self, now: Instant, bps: f64) -> (Instant, usize) {
+        if self.run_bps == bps && self.wire_free_at >= now {
+            (self.run_start, self.run_bytes)
+        } else {
+            (self.wire_free_at.max(now), 0)
         }
     }
 
@@ -146,39 +188,48 @@ impl Wire {
             return;
         }
         let max_chunk = cfg.max_chunk.max(1);
-        let rate = wire_rate(cfg);
-        let (start, piece_len) = match rate {
+        match wire_rate(cfg) {
             Some(bps) => {
-                let per_interval = (bps * PACKET_INTERVAL.as_secs_f64()).ceil() as usize;
-                (self.wire_free_at.max(now), per_interval.clamp(1, max_chunk))
+                let packet = packet_len(bps, max_chunk);
+                let (run_start, base) = self.run_at(now, bps);
+                let end = base + bytes.len();
+                let mut at = base;
+                while at < end {
+                    // Packets end on multiples of `packet` counted from the run's start.
+                    let next = (at / packet + 1).saturating_mul(packet).min(end);
+                    let done = later(run_start, wire_time(next, bps));
+                    self.schedule(&bytes[at - base..next - base], done, cfg, stats);
+                    at = next;
+                }
+                self.run_start = run_start;
+                self.run_bytes = end;
+                self.run_bps = bps;
+                self.wire_free_at = later(run_start, wire_time(end, bps));
             }
-            None => (now, max_chunk),
-        };
-        let delay = cfg.latency.min(MAX_WAIT);
-        let mut offset = 0usize;
-        for piece in bytes.chunks(piece_len) {
-            offset += piece.len();
-            let done = match rate {
-                Some(bps) => later(start, wire_time(offset, bps)),
-                None => now,
-            };
-            let jitter = self.jitter(cfg.jitter.min(MAX_WAIT));
-            let release = later(done, delay + jitter).max(self.last_release);
-            self.last_release = release;
-            let data = self.apply_faults(piece, cfg, stats);
-            if !data.is_empty() {
-                self.queued += data.len();
-                self.packets.push_back(Packet {
-                    data,
-                    pos: 0,
-                    release_at: release,
-                });
+            None => {
+                for piece in bytes.chunks(max_chunk) {
+                    self.schedule(piece, now, cfg, stats);
+                }
+                self.run_bps = 0.0;
+                self.wire_free_at = now;
             }
         }
-        self.wire_free_at = match rate {
-            Some(bps) => later(start, wire_time(bytes.len(), bps)),
-            None => now,
-        };
+    }
+
+    /// Queue one packet whose last byte finishes on the wire at `done`.
+    fn schedule(&mut self, piece: &[u8], done: Instant, cfg: &LinkConfig, stats: &mut LinkStats) {
+        let jitter = self.jitter(cfg.jitter.min(MAX_WAIT));
+        let release = later(done, cfg.latency.min(MAX_WAIT) + jitter).max(self.last_release);
+        self.last_release = release;
+        let data = self.apply_faults(piece, cfg, stats);
+        if !data.is_empty() {
+            self.queued += data.len();
+            self.packets.push_back(Packet {
+                data,
+                pos: 0,
+                release_at: release,
+            });
+        }
     }
 
     fn jitter(&mut self, max: Duration) -> Duration {
@@ -341,23 +392,28 @@ impl LinkState {
             return 0;
         }
         let backlog_room = HOST_BACKLOG_LIMIT.saturating_sub(self.to_host.queued);
-        let room = match wire_rate(&self.cfg) {
+        let n = match wire_rate(&self.cfg) {
             Some(bps) => {
                 let (lookahead, _) = paced_window(bps);
-                let start = self.to_host.wire_free_at.max(now);
+                let (run_start, base) = self.to_host.run_at(now, bps);
                 let horizon = later(now, lookahead);
-                if start >= horizon {
-                    0
-                } else {
-                    // The epsilon keeps float rounding from losing a whole byte.
-                    let fits = ((horizon - start).as_secs_f64() * bps + 1e-6) as usize;
-                    // An idle wire always takes at least one byte.
-                    fits.max(usize::from(start <= now))
+                let fits = bytes_in(horizon.saturating_duration_since(run_start), bps)
+                    .saturating_sub(base);
+                let mut n = pending.min(fits).min(backlog_room);
+                if n < pending {
+                    // Whole packets only (the FIFO's tail excepted), so a packet's
+                    // contents and release time do not depend on when this runs.
+                    let packet = packet_len(bps, self.cfg.max_chunk);
+                    n = ((base + n) / packet * packet).saturating_sub(base);
                 }
+                // An idle wire always takes at least one byte.
+                if n == 0 && base == 0 && run_start <= now && backlog_room > 0 {
+                    n = 1;
+                }
+                n
             }
-            None => usize::MAX,
+            None => pending.min(backlog_room),
         };
-        let n = pending.min(room).min(backlog_room);
         if n == 0 {
             return 0;
         }
@@ -420,20 +476,33 @@ impl LinkState {
 
 struct Shared {
     name: String,
+    clock: Arc<dyn Clock>,
     state: Mutex<LinkState>,
-    /// The host reader waits here.
-    host_cv: Condvar,
-    /// The device thread waits here.
-    device_cv: Condvar,
-    /// `LinkHandle::wait_for_device_exit` waits here.
-    exit_cv: Condvar,
+    /// Wakes the host reader.
+    host: Arc<Wakeup>,
+    /// Wakes the device thread.
+    device: Arc<Wakeup>,
+    /// Wakes `LinkHandle::wait_for_device_exit`.
+    exit: Arc<Wakeup>,
 }
 
 impl Shared {
     fn unplug(&self) {
-        self.state.lock().pull_cable(Instant::now());
-        self.host_cv.notify_all();
-        self.device_cv.notify_all();
+        self.state.lock().pull_cable(self.clock.now());
+        self.host.notify();
+        self.device.notify();
+    }
+
+    /// Sleep with the link unlocked until `wakeup` is notified or the clock reaches
+    /// `deadline`. Call it right after checking, under `st`, that there is nothing to do.
+    fn sleep(
+        &self,
+        st: &mut MutexGuard<'_, LinkState>,
+        wakeup: &Arc<Wakeup>,
+        deadline: Option<Instant>,
+    ) {
+        let seen = wakeup.epoch();
+        MutexGuard::unlocked(st, || self.clock.wait(wakeup, seen, deadline));
     }
 }
 
@@ -447,12 +516,25 @@ impl VirtualLink {
     /// The device thread exits when the link is unplugged (from the handle or by the
     /// device itself) or when the host drops both the reader and the writer.
     pub fn connect(device: Box<dyn SimDevice>, cfg: LinkConfig) -> (Transport, LinkHandle) {
-        let now = Instant::now();
+        Self::connect_with_clock(device, cfg, Arc::new(SystemClock))
+    }
+
+    /// [`VirtualLink::connect`] on `clock`: the release schedule, latency, jitter, read
+    /// timeouts, device ticks and unplug timing all run on its time. Pass a
+    /// [`ManualClock`](crate::ManualClock) to make a test's timing exact; the
+    /// [`Clock`] docs describe how to drive one.
+    pub fn connect_with_clock(
+        device: Box<dyn SimDevice>,
+        cfg: LinkConfig,
+        clock: Arc<dyn Clock>,
+    ) -> (Transport, LinkHandle) {
+        let now = clock.now();
         let name = device.name().to_owned();
         let description = format!("virtual:{name} @ {}", cfg.serial.summary());
         let seed = cfg.seed;
         let shared = Arc::new(Shared {
             name,
+            clock,
             state: Mutex::new(LinkState {
                 cfg,
                 to_host: Wire::new(now, seed, 0),
@@ -471,9 +553,9 @@ impl VirtualLink {
                 controls: VecDeque::new(),
                 stats: LinkStats::default(),
             }),
-            host_cv: Condvar::new(),
-            device_cv: Condvar::new(),
-            exit_cv: Condvar::new(),
+            host: Arc::new(Wakeup::new()),
+            device: Arc::new(Wakeup::new()),
+            exit: Arc::new(Wakeup::new()),
         });
 
         let thread_shared = Arc::clone(&shared);
@@ -483,7 +565,7 @@ impl VirtualLink {
         if let Err(err) = spawned {
             tracing::error!(%err, device = %shared.name, "could not start the simulated device thread");
             let mut st = shared.state.lock();
-            st.pull_cable(Instant::now());
+            st.pull_cable(shared.clock.now());
             st.device_running = false;
         }
 
@@ -536,8 +618,8 @@ impl LinkHandle {
     /// timing. `seed` only takes effect when a link is created.
     pub fn set_link_config(&self, cfg: LinkConfig) {
         self.shared.state.lock().cfg = cfg;
-        self.shared.host_cv.notify_all();
-        self.shared.device_cv.notify_all();
+        self.shared.host.notify();
+        self.shared.device.notify();
     }
 
     /// The level the host last set on `line`. Both start asserted.
@@ -561,21 +643,21 @@ impl LinkHandle {
         self.shared.state.lock().device_running
     }
 
-    /// Wait for the device thread to finish. Returns whether it did within `timeout`.
+    /// Wait for the device thread to finish. Returns whether it did within `timeout`,
+    /// which runs on the link's clock.
     pub fn wait_for_device_exit(&self, timeout: Duration) -> bool {
-        let deadline = later(Instant::now(), timeout.min(MAX_WAIT));
-        let mut st = self.shared.state.lock();
-        while st.device_running {
-            if self
-                .shared
-                .exit_cv
-                .wait_until(&mut st, deadline)
-                .timed_out()
-            {
-                return !st.device_running;
+        let shared = &*self.shared;
+        let deadline = later(shared.clock.now(), timeout.min(MAX_WAIT));
+        let mut st = shared.state.lock();
+        loop {
+            if !st.device_running {
+                return true;
             }
+            if shared.clock.now() >= deadline {
+                return false;
+            }
+            shared.sleep(&mut st, &shared.exit, Some(deadline));
         }
-        true
     }
 }
 
@@ -597,17 +679,17 @@ struct VirtualReader {
 impl TransportReader for VirtualReader {
     fn read(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, TransportError> {
         let shared = &*self.shared;
-        let deadline = later(Instant::now(), timeout.min(MAX_WAIT));
+        let deadline = later(shared.clock.now(), timeout.min(MAX_WAIT));
         let mut st = shared.state.lock();
         st.stats.host_read_calls += 1;
         loop {
-            let now = Instant::now();
+            let now = shared.clock.now();
             let limit = buf.len().min(st.cfg.max_chunk.max(1));
             let n = st.to_host.read_ready(now, &mut buf[..limit]);
             if n > 0 {
                 if st.device_waiting_for_drain && st.to_host.queued < RESUME_BACKLOG {
                     st.device_waiting_for_drain = false;
-                    shared.device_cv.notify_one();
+                    shared.device.notify();
                 }
                 return Ok(n);
             }
@@ -621,7 +703,7 @@ impl TransportReader for VirtualReader {
                 .to_host
                 .next_release()
                 .map_or(deadline, |t| t.min(deadline));
-            shared.host_cv.wait_until(&mut st, wake);
+            shared.sleep(&mut st, &shared.host, Some(wake));
         }
     }
 }
@@ -629,7 +711,7 @@ impl TransportReader for VirtualReader {
 impl Drop for VirtualReader {
     fn drop(&mut self) {
         self.shared.state.lock().reader_open = false;
-        self.shared.device_cv.notify_all();
+        self.shared.device.notify();
     }
 }
 
@@ -651,8 +733,8 @@ impl TransportWriter for VirtualWriter {
         let st = &mut *guard;
         st.stats.host_to_device_bytes += bytes.len() as u64;
         st.to_device
-            .push(bytes, Instant::now(), &st.cfg, &mut st.stats);
-        self.shared.device_cv.notify_one();
+            .push(bytes, self.shared.clock.now(), &st.cfg, &mut st.stats);
+        self.shared.device.notify();
         Ok(())
     }
 
@@ -666,7 +748,7 @@ impl TransportWriter for VirtualWriter {
             ControlLine::Rts => st.rts = asserted,
         }
         st.controls.push_back((line, asserted));
-        self.shared.device_cv.notify_one();
+        self.shared.device.notify();
         Ok(())
     }
 
@@ -683,7 +765,7 @@ impl TransportWriter for VirtualWriter {
             return Err(TransportError::Disconnected);
         }
         st.cfg.serial = config.clone();
-        self.shared.device_cv.notify_one();
+        self.shared.device.notify();
         Ok(())
     }
 }
@@ -691,7 +773,7 @@ impl TransportWriter for VirtualWriter {
 impl Drop for VirtualWriter {
     fn drop(&mut self) {
         self.shared.state.lock().writer_open = false;
-        self.shared.device_cv.notify_all();
+        self.shared.device.notify();
     }
 }
 
@@ -729,8 +811,8 @@ impl Outbox {
         if std::mem::take(&mut self.disconnect) {
             st.hanging_up = true;
         }
-        if st.pump(Instant::now()) > 0 {
-            shared.host_cv.notify_one();
+        if st.pump(shared.clock.now()) > 0 {
+            shared.host.notify();
         }
         true
     }
@@ -754,15 +836,15 @@ impl Drop for DeviceExit<'_> {
             st.device_running = false;
             // A finished hang-up keeps its in-flight bytes; any other exit pulls the cable.
             if !st.unplugged {
-                st.pull_cable(Instant::now());
+                st.pull_cable(shared.clock.now());
             }
         }
         if thread::panicking() {
             tracing::error!(device = %shared.name, "simulated device panicked; link unplugged");
         }
-        shared.host_cv.notify_all();
-        shared.device_cv.notify_all();
-        shared.exit_cv.notify_all();
+        shared.host.notify();
+        shared.device.notify();
+        shared.exit.notify();
     }
 }
 
@@ -773,7 +855,7 @@ fn run_device(shared: &Shared, mut device: Box<dyn SimDevice>) {
     if !out.flush(shared) {
         return;
     }
-    let mut next_tick = Some(Instant::now());
+    let mut next_tick = Some(shared.clock.now());
     while let Some(work) = wait_for_work(shared, next_tick) {
         for (line, asserted) in work.controls {
             device.on_control(line, asserted, &mut out);
@@ -782,10 +864,10 @@ fn run_device(shared: &Shared, mut device: Box<dyn SimDevice>) {
             device.on_receive(chunk, &mut out);
         }
         if work.tick.is_some() {
-            next_tick = device.on_tick(Instant::now(), &mut out);
+            next_tick = device.on_tick(shared.clock.now(), &mut out);
         } else if !work.incoming.is_empty() && next_tick.is_none() {
             // A sleeping device gets one tick after new data so it can schedule itself.
-            next_tick = Some(Instant::now());
+            next_tick = Some(shared.clock.now());
         }
         if !out.flush(shared) {
             return;
@@ -801,13 +883,13 @@ fn wait_for_work(shared: &Shared, next_tick: Option<Instant>) -> Option<Work> {
         if st.unplugged || st.host_gone() {
             return None;
         }
-        let now = Instant::now();
+        let now = shared.clock.now();
         if st.pump(now) > 0 {
-            shared.host_cv.notify_one();
+            shared.host.notify();
         }
         if st.hanging_up && st.tx_pending() == 0 {
             st.finish_hang_up();
-            shared.host_cv.notify_all();
+            shared.host.notify();
             return None;
         }
 
@@ -819,7 +901,7 @@ fn wait_for_work(shared: &Shared, next_tick: Option<Instant>) -> Option<Work> {
                 Output::Ready if st.tx_pending() == 0 => may_tick = true,
                 // The FIFO is non-empty although the wire has room: float rounding in
                 // `pump`. Retry shortly rather than spin.
-                Output::Ready => wake = earliest(wake, now + PACKET_INTERVAL),
+                Output::Ready => wake = earliest(wake, later(now, PACKET_INTERVAL)),
                 Output::Until(t) => wake = earliest(wake, t),
                 Output::UntilDrained => st.device_waiting_for_drain = true,
             }
@@ -847,12 +929,7 @@ fn wait_for_work(shared: &Shared, next_tick: Option<Instant>) -> Option<Work> {
             }
         }
 
-        match wake {
-            Some(t) => {
-                shared.device_cv.wait_until(&mut st, t);
-            }
-            None => shared.device_cv.wait(&mut st),
-        }
+        shared.sleep(&mut st, &shared.device, wake);
     }
 }
 
@@ -895,7 +972,7 @@ mod tests {
     fn paced_schedule_is_exact() {
         // 1 Mbaud 8N1 is 100_000 bytes/s: 100 bytes per 1 ms packet.
         let cfg = paced(1_000_000);
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut wire = Wire::new(t0, 0, 0);
         let mut stats = LinkStats::default();
         wire.push(&[0u8; 10_000], t0, &cfg, &mut stats);
@@ -918,10 +995,80 @@ mod tests {
         assert_eq!(last.release_at - t0, Duration::from_micros(100_500));
     }
 
+    /// Each packet's size and release time, for comparing schedules.
+    fn schedule(wire: &Wire) -> Vec<(usize, Instant)> {
+        wire.packets
+            .iter()
+            .map(|p| (p.data.len(), p.release_at))
+            .collect()
+    }
+
+    #[test]
+    fn packets_do_not_depend_on_how_bytes_were_batched() {
+        // 115_200 baud 8N1 is 11_520 bytes/s: 12-byte packets of 1.04 ms each.
+        let cfg = paced(115_200);
+        let t0 = SystemClock.now();
+        let run = |batches: &[usize]| {
+            let mut wire = Wire::new(t0, 0, 0);
+            let mut stats = LinkStats::default();
+            let mut now = t0;
+            for &n in batches {
+                wire.push(&vec![0u8; n], now, &cfg, &mut stats);
+                // Offered again while the wire is still busy.
+                now += Duration::from_millis(3);
+            }
+            wire
+        };
+        let whole = run(&[1_200]);
+        assert_eq!(whole.packets.len(), 100);
+        assert_eq!(schedule(&run(&[360, 96, 744])), schedule(&whole));
+        // A batch that ends mid-packet splits that one packet in two; every packet still
+        // ends where it would have.
+        let split = run(&[368, 88, 744]);
+        assert_eq!(split.packets.len(), 101);
+        let ends: Vec<_> = split.packets.iter().map(|p| p.release_at).collect();
+        assert!(whole.packets.iter().all(|p| ends.contains(&p.release_at)));
+        assert_eq!(split.wire_free_at, whole.wire_free_at);
+    }
+
+    #[test]
+    fn pumping_at_any_times_gives_the_same_packets() {
+        let t0 = SystemClock.now();
+        let pumped = |at_ms: &[u64]| {
+            let mut st = state(paced(115_200), t0);
+            st.enqueue(&mut vec![0u8; 16 * 1024]);
+            for &ms in at_ms {
+                st.pump(t0 + Duration::from_millis(ms));
+            }
+            st
+        };
+        let a = pumped(&[0, 8, 16, 24, 32, 40]);
+        let b = pumped(&[0, 1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 40]);
+        // Both refilled to the same horizon, in whole packets.
+        assert_eq!(a.stats.device_to_host_bytes, b.stats.device_to_host_bytes);
+        assert_eq!(a.stats.device_to_host_bytes % 12, 0);
+        assert_eq!(schedule(&a.to_host), schedule(&b.to_host));
+    }
+
+    #[test]
+    fn a_rate_change_starts_a_new_run_where_the_old_one_ends() {
+        let t0 = SystemClock.now();
+        let mut st = state(paced(1_000_000), t0);
+        st.enqueue(&mut vec![0u8; 50_000]);
+        assert_eq!(st.pump(t0), 3_200);
+        st.cfg.serial.baud = 500_000;
+        // The wire is full to the horizon; the new rate starts when it frees up.
+        assert_eq!(st.pump(t0), 0);
+        assert_eq!(st.pump(t0 + Duration::from_millis(4)), 200);
+        let last = st.to_host.packets.back().unwrap();
+        assert_eq!(last.data.len(), 50);
+        assert_eq!(last.release_at - t0, Duration::from_millis(36));
+    }
+
     #[test]
     fn pump_commits_at_most_one_lookahead() {
         // 1 Mbaud: 100 bytes/ms, so 32 ms of look-ahead is 3_200 bytes.
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut st = state(paced(1_000_000), t0);
         st.enqueue(&mut vec![7u8; 50_000]);
         assert_eq!(st.pump(t0), 3_200);
@@ -938,7 +1085,7 @@ mod tests {
     #[test]
     fn slow_links_still_commit_whole_bytes() {
         // 300 baud 8N1 is 30 bytes/s; four bytes take longer than the usual look-ahead.
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut st = state(paced(300), t0);
         st.enqueue(&mut vec![1u8; 100]);
         assert_eq!(st.pump(t0), 4);
@@ -952,7 +1099,7 @@ mod tests {
 
     #[test]
     fn pulling_the_cable_keeps_released_bytes_only() {
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut st = state(paced(1_000_000), t0);
         st.enqueue(&mut vec![0u8; 50_000]);
         st.pump(t0);
@@ -966,7 +1113,7 @@ mod tests {
 
     #[test]
     fn unpaced_pump_respects_the_backlog_limit() {
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut st = state(LinkConfig::unpaced(), t0);
         st.enqueue(&mut vec![0u8; HOST_BACKLOG_LIMIT + 5]);
         assert_eq!(st.pump(t0), HOST_BACKLOG_LIMIT);
@@ -976,7 +1123,7 @@ mod tests {
 
     #[test]
     fn absurd_durations_saturate() {
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         assert!(later(t0, Duration::MAX) > t0);
         let cfg = LinkConfig {
             latency: Duration::MAX,
@@ -993,7 +1140,7 @@ mod tests {
         let mut cfg = LinkConfig::unpaced();
         cfg.max_chunk = 7;
         cfg.latency = Duration::from_millis(3);
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut wire = Wire::new(t0, 0, 0);
         wire.push(&[1u8; 20], t0, &cfg, &mut LinkStats::default());
         let sizes: Vec<_> = wire.packets.iter().map(|p| p.data.len()).collect();
@@ -1010,7 +1157,7 @@ mod tests {
         let mut cfg = LinkConfig::unpaced();
         cfg.max_chunk = 1;
         cfg.jitter = Duration::from_millis(5);
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut wire = Wire::new(t0, 7, 0);
         let bytes: Vec<u8> = (0..=255).collect();
         wire.push(&bytes, t0, &cfg, &mut LinkStats::default());
@@ -1032,7 +1179,7 @@ mod tests {
         };
         // Batching differs between runs; the fault pattern must not.
         let run = |batch: usize| {
-            let t0 = Instant::now();
+            let t0 = SystemClock.now();
             let mut wire = Wire::new(t0, cfg.seed, 0);
             let mut stats = LinkStats::default();
             for chunk in [0u8; 10_000].chunks(batch) {

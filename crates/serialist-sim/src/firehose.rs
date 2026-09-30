@@ -645,6 +645,7 @@ impl FirehoseVerifier {
 mod tests {
     use super::*;
     use crate::CaptureOutput;
+    use crate::{Clock, SystemClock};
 
     const ALL: [FirehoseContent; 6] = [
         FirehoseContent::Text,
@@ -772,7 +773,7 @@ mod tests {
             ..cfg
         });
         let mut out = CaptureOutput::new();
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let next = dev.on_tick(t0, &mut out);
         assert_eq!(out.sent.len(), 0);
         assert_eq!(next, Some(t0 + Duration::from_millis(2)));
@@ -788,7 +789,7 @@ mod tests {
 
     #[test]
     fn tick_is_clamped_and_saturates() {
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         let mut zero = FirehoseDevice::new(FirehoseConfig {
             tick: Duration::ZERO,
             ..FirehoseConfig::new(FirehoseContent::Text).with_rate(1_000)
@@ -807,7 +808,7 @@ mod tests {
     fn unlimited_device_sends_full_batches() {
         let mut dev = FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Binary));
         let mut out = CaptureOutput::new();
-        let t0 = Instant::now();
+        let t0 = SystemClock.now();
         assert_eq!(dev.on_tick(t0, &mut out), Some(t0));
         assert_eq!(out.sent.len(), 16 * 1024);
         assert_eq!(dev.emitted(), 16 * 1024);
