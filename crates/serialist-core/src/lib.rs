@@ -29,7 +29,7 @@ pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,
-    TextOptions, Timestamps,
+    TextExportReport, TextOptions, Timestamps,
 };
 pub use text::{
     Color, Direction, Epoch, LineId, LineSource, SearchMatch, Searcher, Style, StyleFlags,

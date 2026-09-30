@@ -912,3 +912,184 @@ fn a_bounded_hex_search_renders_no_row_outside_its_range() {
         .unwrap();
     assert!(none.is_empty());
 }
+
+/// A store with one line per 16 bytes, so that each 16-byte hex row is one line.
+fn timed_rows() -> Store {
+    let mut store = Store::default();
+    let base = t0(&store);
+    store.append(b"0123456789abcde\n", base + Duration::from_millis(1000));
+    store.append(b"fghijklmnopqrst\n", base + Duration::from_millis(3000));
+    store.append(b"uvwxyz01234567\r\n", base + Duration::from_millis(3500));
+    store
+}
+
+fn to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("exports are UTF-8")
+}
+
+#[test]
+fn counted_text_export_reports_lines_and_bytes() {
+    let mut store = Store::default();
+    let base = t0(&store);
+    store.append_local_at("hello", Direction::Notice, base);
+    store.append(b"first\r\n", base + Duration::from_millis(1500));
+    store.append_local_at("sent", Direction::Tx, base + Duration::from_millis(1600));
+    store.append(
+        b"\x1b[32msecond \xc3\xa9\x1b[0m\n",
+        base + Duration::from_secs(2),
+    );
+    let snap = store.snapshot();
+    let all = snap.first_line()..snap.end();
+    for options in [
+        TextOptions::default(),
+        TextOptions::received_only(),
+        TextOptions::default().with_timestamps(Timestamps::Absolute),
+        TextOptions::default().with_timestamps(Timestamps::Relative),
+        TextOptions::received_only().with_timestamps(Timestamps::Delta),
+    ] {
+        let mut out = Vec::new();
+        let report = snap
+            .write_text_counted(all.clone(), options, &mut out)
+            .unwrap();
+        let text = to_string(out);
+        assert_eq!(
+            report.lines,
+            text.matches('\n').count(),
+            "{options:?}: {text}"
+        );
+        assert_eq!(report.bytes, text.len() as u64, "{options:?}");
+        assert_eq!(text, snap.text(all.clone(), options), "{options:?}");
+        // The plain writer is the counting one without the counts.
+        let mut plain = Vec::new();
+        snap.write_text(all.clone(), options, &mut plain).unwrap();
+        assert_eq!(to_string(plain), text);
+    }
+    let mut out = Vec::new();
+    let report = snap
+        .write_text_counted(all.clone(), TextOptions::received_only(), &mut out)
+        .unwrap();
+    assert_eq!(
+        report,
+        TextExportReport {
+            lines: 2,
+            bytes: "first\nsecond \u{e9}\n".len() as u64
+        }
+    );
+    // A range with nothing in it writes nothing.
+    let mut out = Vec::new();
+    let report = snap
+        .write_text_counted(LineId(40)..LineId(50), TextOptions::default(), &mut out)
+        .unwrap();
+    assert_eq!(report, TextExportReport::default());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn write_lines_stamps_hex_rows_like_text_lines() {
+    let store = timed_rows();
+    let snap = store.snapshot();
+    let hex = snap.hex_view(16);
+    assert_eq!(hex.line_count(), 3);
+    let rows: Vec<String> = (0..3).map(|i| hex.line(LineId(i)).unwrap().text).collect();
+    let all = hex.first_line()..hex.end();
+    let export = |timestamps| {
+        let mut out = Vec::new();
+        let options = TextOptions::default().with_timestamps(timestamps);
+        let report = write_lines(&hex, all.clone(), options, &mut out).unwrap();
+        (report, to_string(out))
+    };
+
+    let (report, plain) = export(Timestamps::None);
+    assert_eq!(plain, format!("{}\n{}\n{}\n", rows[0], rows[1], rows[2]));
+    assert_eq!(report.lines, 3);
+    assert_eq!(report.bytes, plain.len() as u64);
+
+    let (_, relative) = export(Timestamps::Relative);
+    assert_eq!(
+        relative,
+        format!(
+            "[+1.000000] {}\n[+3.000000] {}\n[+3.500000] {}\n",
+            rows[0], rows[1], rows[2]
+        )
+    );
+    let (_, delta) = export(Timestamps::Delta);
+    assert_eq!(
+        delta,
+        format!(
+            "[+0.000000] {}\n[+2.000000] {}\n[+0.500000] {}\n",
+            rows[0], rows[1], rows[2]
+        )
+    );
+    let (report, absolute) = export(Timestamps::Absolute);
+    let wall = |ms| format_utc(store.epoch().wall + Duration::from_millis(ms));
+    assert_eq!(
+        absolute,
+        format!(
+            "[{}] {}\n[{}] {}\n[{}] {}\n",
+            wall(1000),
+            rows[0],
+            wall(3000),
+            rows[1],
+            wall(3500),
+            rows[2]
+        )
+    );
+    assert_eq!(report.bytes, absolute.len() as u64);
+
+    // The row range clips, and the store's own lines go through the same function.
+    let mut out = Vec::new();
+    let options = TextOptions::default().with_timestamps(Timestamps::Delta);
+    write_lines(&hex, LineId(1)..LineId(99), options, &mut out).unwrap();
+    assert_eq!(
+        to_string(out),
+        format!("[+0.000000] {}\n[+0.500000] {}\n", rows[1], rows[2])
+    );
+    let mut from_snapshot = Vec::new();
+    let mut from_write_text = Vec::new();
+    let all = snap.first_line()..snap.end();
+    write_lines(&snap, all.clone(), options, &mut from_snapshot).unwrap();
+    snap.write_text(all, options, &mut from_write_text).unwrap();
+    assert_eq!(from_snapshot, from_write_text);
+}
+
+/// The writer may be a trait object, which is what a caller with a boxed sink has.
+#[test]
+fn write_lines_takes_a_dyn_writer_and_reports_io_errors() {
+    struct Full(usize);
+
+    impl std::io::Write for Full {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 < buf.len() {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.0 -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let store = timed_rows();
+    let snap = store.snapshot();
+    let mut sink: Box<dyn std::io::Write> = Box::new(Vec::new());
+    let report = write_lines(
+        &snap,
+        snap.first_line()..snap.end(),
+        TextOptions::default(),
+        &mut *sink,
+    )
+    .unwrap();
+    assert_eq!(report.lines, 3);
+
+    let mut full = Full(20);
+    let error = write_lines(
+        &snap,
+        snap.first_line()..snap.end(),
+        TextOptions::default(),
+        &mut full,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "disk full");
+}
