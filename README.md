@@ -6,7 +6,7 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 - Devices appear the moment they are plugged in.
 - Any baud rate, full framing and flow control settings, per-device profiles.
 - Two modes: inline interactive, and saved commands you can send with a click or a key.
-- Lua scripting and protocol plugins (Airoha RACE ships as the first one).
+- Lua scripting and protocol plugins you install (an Airoha RACE example ships with the app).
 - Fonts and themes configured the way Zed does it; Zed theme files load unchanged.
 - Fast: no dropped bytes at 3 Mbaud, frames under 8 ms at a million lines of scrollback.
 - Every test runs without hardware.
@@ -16,7 +16,7 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 Milestones 0 to 5 of `docs/plan.md` have landed: the session engine and GPUI shell, the
 terminal element over a page-store scrollback, Zed-format settings, themes and keymaps that
 apply live, inline interactive and saved-command modes, Lua scripting with a headless
-`--script` mode, and protocol plugins in Rust, Lua and WebAssembly. Milestone 6 has
+`--script` mode, and protocol plugins in Lua and WebAssembly. Milestone 6 has
 started: CI on macOS, Linux and Windows, release packaging, and tabs for several sessions
 (with a port settings popover and session restore) are in; full terminal emulation is
 pending (the terminal is monitor mode, an ANSI parser over the received text). The plan's "Status as built" section lists where the build
@@ -54,15 +54,17 @@ Logging follows `RUST_LOG`, for example `RUST_LOG=serialist=debug`.
 
 Devices and Commands sit in the left dock, the session in the center, the Decoded panel and
 the Script console in the right dock, and the status bar along the bottom. Each dock has a
-rail of icons that opens and closes its panels. The Decoded panel opens when a session
-decodes with a codec and the Script console when a script prints; drag a dock's edge to
+rail of icons that opens and closes its panels. The Decoded panel (whose icon shows once a
+codec plugin is installed) opens when a session decodes with a codec and the Script console
+when a script prints; drag a dock's edge to
 resize it (the widths are kept in `state.json`). Below 1100 px of window width the right dock
 folds to its rail, and below 900 px the left one does; a panel opened from the rail stays open.
 
 The session toolbar is one row of icons, each with its shortcut in its tooltip: the port and
 its settings, Connect or Disconnect, Command / Inline, Pause, Record and Clear, Search, Hex,
-Timestamps and Wrap, an Export menu (text, raw bytes, decoded frames), and the codec menu
-(which also turns summaries and hidden frames on and off). Whatever does not fit the width
+Timestamps and Wrap, an Export menu (text, raw bytes, decoded frames), and, once a codec
+plugin is installed, the codec menu (which also turns summaries and hidden frames on and
+off, installs the bundled examples and opens the plugins folder). Whatever does not fit the width
 goes to the `…` menu at its right end. The status bar shows the port and its settings (click
 for the settings), the newest notice, then the mode (click to switch), RX and TX with their
 rates, and chips for the codec, a pause, a recording and a running script.
@@ -105,7 +107,7 @@ The app watches it and applies changes as you save; there is no restart.
 | `themes/` | Zed theme files (schema v0.2.0), one `*.json` each. Serialist Dark and Serialist Light are built in. |
 | `commands/` | Saved-command collections, one `*.json` each. |
 | `scripts/` | Lua scripts, `*.lua` at any depth. The Scripts menu's Open Scripts Folder creates it with two example scripts if it holds none. |
-| `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. See [`docs/plugins.md`](docs/plugins.md). |
+| `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. None is installed at first; `plugins/examples/` holds copies of the bundled examples, which decode nothing until installed. See [Plugins](#plugins). |
 | `history.jsonl` | The compose bar's history, one JSON string per line. |
 | `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode), reopened at the next start. Written by the app. |
 
@@ -216,21 +218,42 @@ codes. Two example scripts ship in `crates/serialist-core/assets/scripts/`:
 ## Plugins
 
 A plugin is a codec: it frames the received bytes into structured frames, and encodes
-structured commands into bytes to send. There are three ways to write one, all behind one
-Rust trait (`serialist_core::Codec`):
+structured commands into bytes to send. Decoders are plugins you install and enable: the
+app has none built in and none is active in a fresh config directory, so until one is
+installed the toolbar shows no codec menu and the right dock no Decoded panel icon.
 
-| Tier | What it is | Where it lives |
+Plugins live in the config directory's `plugins/` folder
+(`~/.config/serialist/plugins` on macOS and Linux, `%APPDATA%\Serialist\plugins` on
+Windows), one folder each, and each registers under its folder's name. Copying a plugin's
+folder in enables it at once; deleting it removes it.
+
+| Kind | What it is | Where it lives |
 |---|---|---|
-| Built-in Rust | `text-lines` (one frame per line) and `airoha-race` | compiled into `serialist-plugins` |
 | Lua | A folder with `plugin.lua`, which returns `describe`, `decode` and `encode` | `plugins/<name>/plugin.lua` |
 | WebAssembly | A folder with `plugin.wasm` (a component) and `plugin.toml`, written against `serialist-plugin-sdk` or any language that can build the WIT world | `plugins/<name>/plugin.wasm` and `plugin.toml` |
 
-The WebAssembly tier sits behind the `wasm` Cargo feature of `serialist-plugins` (the app
+**The bundled example.** The app ships an Airoha RACE plugin (in Lua, and also as
+WebAssembly in a build with the `wasm` feature) but does not enable it. To install it, open
+the command palette (`cmd-shift-p`) and run "Install example plugin: Airoha RACE", or use
+"Install example plugin…" in the codec menu once another plugin is installed. That copies
+the example into `plugins/airoha-race/`, and the codec appears. Then try it:
+`serialist --virtual race`, pick `airoha-race` in the codec menu, and send "RACE version"
+from the Commands panel. "Open plugins folder" (palette, codec menu, or the Serialist menu)
+also writes read-only copies of the examples into `plugins/examples/`, which do not load.
+
+A device profile's `"plugin"` selects a codec only when that plugin is installed; otherwise
+the port connects without one, the status line names the missing plugin with an Install
+button, and the Devices row shows the plugin's name greyed. A saved command whose payload
+names a codec that is not installed is not sent ("Install the airoha-race plugin to send
+this command").
+
+The WebAssembly kind sits behind the `wasm` Cargo feature of `serialist-plugins` (the app
 forwards it: `cargo build -p serialist --features wasm`), which is
 off by default: wasmtime and Cranelift make up most of a clean build and add minutes to it.
 Without the feature, a `plugin.wasm` folder is found but reported as needing it. The Lua
-tier needs nothing extra. Airoha RACE exists in all three tiers, and the tests hold them to
-byte-identical output. How to write a Lua or WebAssembly plugin, and how the Decoded panel
+kind needs nothing extra. The Airoha RACE plugin exists in Lua and WebAssembly and as a Rust
+reference codec that the tests hold both to, byte for byte; the Rust one is never
+registered in the app. How to write a Lua or WebAssembly plugin, and how the Decoded panel
 and codec payloads in saved commands use plugins, is in [`docs/plugins.md`](docs/plugins.md).
 
 ## Installing a release
