@@ -133,6 +133,13 @@ impl ConfigPaths {
     /// So a new config directory gets the examples the first time the scripts folder is
     /// opened, and a folder with scripts of the user's own is never touched. A file
     /// that already exists is never overwritten.
+    ///
+    /// Safe to call while a [`ConfigWatcher`](crate::ConfigWatcher) runs: it creates
+    /// the folder at spawn too, `create_dir_all` accepts a folder another thread made
+    /// first, and a scripts folder made after its watch went away (deleted while the app
+    /// ran) is watched again and reported as changed, examples and all. The caller may
+    /// still list the folder itself right after, as the app's "Open scripts folder"
+    /// does, rather than wait for the watcher.
     pub fn ensure_example_scripts(&self) -> io::Result<Vec<PathBuf>> {
         let dir = self.scripts_dir();
         std::fs::create_dir_all(&dir)?;
