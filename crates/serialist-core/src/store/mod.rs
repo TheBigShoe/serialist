@@ -33,11 +33,22 @@
 //!
 //! A plain line (printable UTF-8 in the default style, ended by LF or CRLF, possibly
 //! preceded by CRs) stores no text at all: [`Snapshot`] reads it back from the raw page.
-//! On typical log text (the firehose's `Text` content, about 70 bytes a line) the index
-//! costs about 7% of the raw bytes, and even 30-byte lines stay near 17%. Lines with
-//! escape sequences cost roughly their decoded size again, about 1x raw on ANSI-heavy
-//! traffic; the budget still bounds the total, so such a stream simply retains fewer
-//! raw bytes.
+//! Lines with escape sequences, overwrites, tabs or invalid UTF-8 cost roughly their
+//! decoded size again. Measured overhead above the raw bytes, 32 MiB of each firehose
+//! content in 4 KiB chunks:
+//!
+//! | Content | Bytes per line | Overhead |
+//! |---------|----------------|----------|
+//! | `Text` (plain logs, CRLF) | 76 | 7.3% |
+//! | Short lines (the gate test) | 35 | 15% |
+//! | `LongLines` | 2322 | 0.9% |
+//! | `Mixed` | 710 | 12.8% |
+//! | `MixedEol` (bare CRs overwrite) | 100 | 31.7% |
+//! | `Ansi` (SGR on every word) | 155 | 98% |
+//! | `Binary` (invalid UTF-8 becomes 3-byte U+FFFD) | 264 | 122% |
+//!
+//! The budget bounds the total whatever the content: a heavier stream simply retains
+//! fewer raw bytes.
 //!
 //! When an append takes the total over budget, the oldest whole page is evicted with
 //! every line that starts in it, and blocks and text pages no longer referenced by a
@@ -157,7 +168,7 @@ pub struct StoreStats {
     pub pages: usize,
     pub blocks: usize,
     pub text_pages: usize,
-    /// Lines whose text is stored decoded (in retained text pages, approximately).
+    /// Bytes of retained decoded-text pages.
     pub text_bytes: usize,
     pub evicted_lines: u64,
 }
