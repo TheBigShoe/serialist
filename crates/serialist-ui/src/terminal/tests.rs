@@ -13,7 +13,9 @@ use crate::prelude::*;
 use crate::terminal::double::{HexLines, MemoryLines, SyntheticLines};
 use crate::terminal::element::{CellMetrics, PADDING_LEFT};
 use crate::terminal::layout::Viewport;
-use crate::terminal::{DisplayMode, FrameSample, TerminalView, TimestampMode};
+use crate::terminal::{
+    DisplayMode, FrameSample, Selection, SelectionPoint, TerminalView, TimestampMode,
+};
 use crate::test_support::open_test_window;
 
 /// gpui-kit's `Input` binds select-all to the platform primary modifier.
@@ -171,7 +173,9 @@ fn follows_the_tail_and_fetches_only_the_screen(cx: &mut TestAppContext) {
     for i in 1000..1010 {
         source.push(&format!("line {i}"));
     }
-    view.update(cx, |view, cx| view.lines_appended(cx));
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(1000)..LineId(1010), cx)
+    });
     draw(cx, window);
     assert_eq!(top_line(cx, &view), top.offset(10));
 
@@ -612,6 +616,127 @@ fn search_reveals_a_match_scrolled_out_of_view(cx: &mut TestAppContext) {
     let rows = Geometry::of(cx, &view).rows() as u64;
     assert!(top.0 <= 1234 && 1234 < top.0 + rows, "top {top:?}");
     assert!(!view.read_with(cx, |view, _| view.is_following_tail()));
+}
+
+fn match_lines(cx: &mut TestAppContext, view: &Entity<TerminalView>) -> Vec<u64> {
+    view.read_with(cx, |view, _| {
+        view.search_results()
+            .matches
+            .iter()
+            .map(|m| m.line.0)
+            .collect()
+    })
+}
+
+#[gpui_test]
+fn new_lines_extend_an_open_search_once_per_append(cx: &mut TestAppContext) {
+    let (window, view, searcher) = searchable(cx);
+    let source = searcher.inner.clone();
+    let calls = || searcher.calls.load(Ordering::SeqCst);
+    press(cx, window, keys::SEARCH);
+    cx.update_window(window, |_, window, cx| window.input("error", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(calls(), 1);
+    press(cx, window, "enter");
+    let active = |cx: &mut TestAppContext| {
+        view.read_with(cx, |view, _| view.search_results().active_match().cloned())
+    };
+    let before = active(cx).unwrap();
+    assert_eq!(before.line, LineId(13));
+    let top = top_line(cx, &view);
+
+    // One append, one search of the new lines; the active match and the view stay.
+    source.push("30 error: again");
+    source.push("31 ok");
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(30)..LineId(32), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(calls(), 2);
+    assert_eq!(match_lines(cx, &view), [3, 13, 23, 30]);
+    assert_eq!(active(cx), Some(before.clone()));
+    draw(cx, window);
+    assert_eq!(top_line(cx, &view), top);
+
+    // Two appends before the first search ran: the second waits for it, then runs.
+    source.push("32 error");
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(32)..LineId(33), cx)
+    });
+    source.push("33 error");
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(33)..LineId(34), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(calls(), 4);
+    assert_eq!(match_lines(cx, &view), [3, 13, 23, 30, 32, 33]);
+
+    // Paused, new lines are not on display, so nothing is searched until resume.
+    view.update(cx, |view, cx| assert!(view.pause(cx)));
+    source.push("34 error");
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(34)..LineId(35), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(calls(), 4);
+    assert_eq!(match_lines(cx, &view).len(), 6);
+    view.update(cx, |view, cx| assert!(view.resume(cx)));
+    cx.run_until_parked();
+    assert_eq!(calls(), 5);
+    assert_eq!(match_lines(cx, &view), [3, 13, 23, 30, 32, 33, 34]);
+
+    // Eviction takes the matches with the lines.
+    source.evict(20);
+    source.push("35 ok");
+    view.update(cx, |view, cx| {
+        view.lines_appended(LineId(35)..LineId(36), cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(match_lines(cx, &view), [23, 30, 32, 33, 34]);
+}
+
+#[gpui_test]
+fn a_newer_source_keeps_scroll_selection_and_pause(cx: &mut TestAppContext) {
+    let (window, view) = open(cx, numbered(1000));
+    let row = Geometry::of(cx, &view).metrics.row_height;
+    view.update(cx, |view, cx| view.scroll_by(row * 50.0, cx));
+    draw(cx, window);
+    let top = top_line(cx, &view);
+    let selection = Selection::new(
+        SelectionPoint::new(LineId(990), 0),
+        SelectionPoint::new(LineId(992), 2),
+    );
+    view.update(cx, |view, cx| view.set_selection(Some(selection), cx));
+
+    // The next snapshot of the same stream: the same lines and more, in a new source.
+    let next = numbered(1100);
+    view.update(cx, |view, cx| {
+        view.update_sources(next.clone(), None, None, None, cx);
+        view.lines_appended(LineId(1000)..LineId(1100), cx);
+    });
+    draw(cx, window);
+    assert_eq!(top_line(cx, &view), top);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.selection(), Some(selection));
+        assert!(!view.is_following_tail());
+        assert_eq!(
+            view.selection_text().as_deref(),
+            Some("line 990\nline 991\nli")
+        );
+    });
+
+    // A pause freezes the newer source's end, and the one after keeps it.
+    view.update(cx, |view, cx| assert!(view.pause(cx)));
+    let after = numbered(1200);
+    view.update(cx, |view, cx| {
+        view.update_sources(after.clone(), None, None, None, cx);
+        view.lines_appended(LineId(1100)..LineId(1200), cx);
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.frozen_end(), Some(LineId(1100)));
+        assert_eq!(view.lines_since_pause(), Some(100));
+    });
 }
 
 #[gpui_test]

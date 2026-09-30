@@ -11,8 +11,9 @@ Options:
   --baud <N>          Baud rate for --port and the Connect field, any positive
                       integer (default 115200)
   --virtual [NAME]    List the simulated devices next to the real ports; with a
-                      NAME, also select virtual:<NAME> (repeatable). Built-ins:
-                      echo, echo-lines, at, firehose, firehose-ansi
+                      NAME, also open virtual:<NAME> at startup (repeatable; the
+                      first is opened unless --port is given). Built-ins: echo,
+                      echo-lines, at, firehose, firehose-ansi
   --terminal-demo     Open only the milestone 1 terminal element, fed by an
                       in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help

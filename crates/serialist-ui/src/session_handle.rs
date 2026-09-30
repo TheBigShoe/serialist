@@ -1,7 +1,8 @@
 //! The slice of `serialist_core::Session` the views use, as a trait.
 //!
 //! Views hold a `Box<dyn SessionHandle>` instead of a `Session` so UI tests can feed a
-//! session view from a plain channel, with no transport and no threads behind it.
+//! session view from a plain channel, with no transport and no reader or writer thread
+//! behind it.
 
 use std::sync::Arc;
 
@@ -12,7 +13,8 @@ use serialist_core::{
 };
 
 pub trait SessionHandle: Send + 'static {
-    /// The event stream. The view is its only consumer.
+    /// The event stream. The session view hands it to its ingest thread, which is its
+    /// only consumer.
     fn events(&self) -> Receiver<SessionEvent>;
 
     /// Queue bytes for the writer thread; never blocks.

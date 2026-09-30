@@ -14,6 +14,9 @@ serialist-sim.workspace = true
 # so GPUI is not listed separately. Code reaches all of it through `prelude`.
 gpui-kit.workspace = true
 crossbeam-channel.workspace = true
+# Wakes the session view from the ingest thread: a bounded(1) channel is a coalescing
+# doorbell whose receiver a foreground task can await.
+async-channel.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
 chrono.workspace = true
