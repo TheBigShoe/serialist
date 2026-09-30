@@ -34,6 +34,23 @@ fn main() {
         )
         .init();
 
+    if args.terminal_demo {
+        application().run(|cx| {
+            serialist_ui::init(cx);
+            if let Err(error) = serialist_ui::terminal::open_terminal_demo(cx) {
+                tracing::error!("could not open the terminal demo: {error:#}");
+                cx.quit();
+            }
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+        });
+        return;
+    }
+
     let options = match wiring::app_options(&args) {
         Ok(options) => options,
         Err(error) => {

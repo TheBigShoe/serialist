@@ -15,6 +15,7 @@ pub mod line_buffer;
 pub mod session_handle;
 pub mod session_model;
 pub mod session_view;
+pub mod terminal;
 pub mod workspace;
 
 #[cfg(test)]
@@ -53,6 +54,10 @@ pub mod prelude {
     // which the dev-dependency turns on.
     #[cfg(test)]
     pub use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    // GPUI's input-event trait, for tests that dispatch raw mouse events. Imported
+    // anonymously: its name collides with gpui-kit's `InputEvent` below.
+    #[cfg(test)]
+    pub use gpui_kit::InputEvent as _;
 
     // GPUI exports its `test` attribute unconditionally, and a glob import outranks the
     // language prelude, so `use crate::prelude::*` would silently turn every `#[test]`
@@ -63,6 +68,7 @@ pub mod prelude {
 
     pub use gpui_kit::component::button::{Button, ButtonVariants};
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
+    pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
     pub use gpui_kit::component::{
         ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeMode, h_flex, h_resizable,
         resizable_panel, v_flex,

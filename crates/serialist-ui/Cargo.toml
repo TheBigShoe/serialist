@@ -15,8 +15,16 @@ serialist-sim.workspace = true
 gpui-kit.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
+regex.workspace = true
+chrono.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
+
+# Measures the terminal element with the platform's real text system, which on macOS
+# must be created on the main thread, so it runs as a plain binary.
+[[test]]
+name = "terminal_frame_cost"
+harness = false
