@@ -332,6 +332,31 @@ fn a_profile_naming_a_missing_plugin_connects_without_a_codec_and_offers_to_inst
         NoticeAction::OpenPluginsFolder
     );
 
+    // The Devices row still names the profile's plugin, greyed: it is not installed.
+    let devices = workspace.read_with(cx, |w, _| w.devices().clone());
+    let race_row = |cx: &mut TestAppContext| {
+        devices.read_with(cx, |devices, cx| {
+            let entries = devices.list().entries();
+            let ix = entries
+                .iter()
+                .position(|entry| entry.info.id == PortId::new("virtual:race"))
+                .expect("listed");
+            let plugin = devices.plugin_for(&entries[ix].info, cx);
+            let installed = devices.plugin_installed("airoha-race", cx);
+            (ix, plugin, installed)
+        })
+    };
+    let (ix, plugin, installed) = race_row(cx);
+    assert_eq!(plugin.as_deref(), Some("airoha-race"));
+    assert!(!installed, "shown greyed, with a tooltip");
+    draw(cx, window);
+    let chip = cx
+        .update_window(window, |_, window, _| {
+            window.try_find(("device-plugin", ix)).is_some()
+        })
+        .unwrap();
+    assert!(chip, "the plugin's badge is on the row");
+
     // The notice's Install button installs it; the watcher loads it, and the session
     // decodes with it from then on.
     assert!(drawn(cx, window, "status-notice-action"));
@@ -357,6 +382,7 @@ fn a_profile_naming_a_missing_plugin_connects_without_a_codec_and_offers_to_inst
         })
     });
     assert!(workspace.read_with(cx, |w, _| w.is_panel_shown(DockPanel::Decoded)));
+    assert!(race_row(cx).2, "the badge is no longer greyed");
 }
 
 #[gpui_test]

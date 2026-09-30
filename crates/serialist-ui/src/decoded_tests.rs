@@ -850,6 +850,11 @@ fn a_device_profile_selects_the_codec_on_connect_and_the_devices_panel_names_it(
         )
     });
     assert_eq!(plugin.as_deref(), Some("airoha-race"));
+    assert!(
+        devices.read_with(cx, |devices, cx| devices
+            .plugin_installed("airoha-race", cx)),
+        "installed, so not greyed"
+    );
     assert_eq!(name, "RACE board");
     // The badge is drawn on the port's row.
     let badge = cx
