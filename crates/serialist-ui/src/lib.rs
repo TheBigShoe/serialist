@@ -16,6 +16,7 @@ pub mod compose;
 pub mod config;
 pub mod decoded_panel;
 pub mod devices_panel;
+pub mod dialog_footer;
 pub mod export;
 pub mod fonts;
 pub mod framed;
@@ -61,6 +62,7 @@ pub use decoded_panel::{DecodedPanel, FrameTable};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
+pub use dialog_footer::DialogButtons;
 pub use export::{ExportFormat, ExportJob, FramesFormat};
 pub use fonts::{TerminalFont, UiFont};
 pub use framed::{FilteredText, FramedFilter};
@@ -110,7 +112,9 @@ pub mod prelude {
     pub use gpui_kit::test as gpui_test;
 
     pub use gpui_kit::component::button::{Button, ButtonVariants};
-    pub use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+    pub use gpui_kit::component::dialog::{
+        Cancel, Confirm, Dialog, DialogButtonProps, DialogFooter,
+    };
     pub use gpui_kit::component::tooltip::Tooltip;
     pub use gpui_kit::component::{WindowExt, v_resizable};
     // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait
