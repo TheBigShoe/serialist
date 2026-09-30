@@ -115,6 +115,15 @@ impl ConfigPaths {
         self.dir.join("scripts")
     }
 
+    /// `plugins/` in `dir`: codec plugins, one folder each (`plugins/<name>/plugin.lua`).
+    /// The app registers each under its folder's name, so `plugins/airoha-race/`
+    /// replaces the built-in `airoha-race` codec and `plugins/my-proto/` adds
+    /// `my-proto`. Saving a file in there reloads the plugins
+    /// ([`ConfigEvent::Plugins`](crate::ConfigEvent::Plugins)).
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.dir.join("plugins")
+    }
+
     /// The example scripts that ship with the app, as `(file name, source)`.
     pub const EXAMPLE_SCRIPTS: &'static [(&'static str, &'static str)] = &[
         (

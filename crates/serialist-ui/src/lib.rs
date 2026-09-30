@@ -3,18 +3,22 @@
 //!
 //! A workspace with the Devices and Commands panels on the left, a session view in the
 //! center (the terminal element over the session's page store, and a compose bar, or
-//! the terminal alone in inline mode), the Script console on the right, and a status
-//! line. Settings, themes, fonts and key bindings come from Zed-format files through
-//! [`config`], and apply to the running app as the files change.
+//! the terminal alone in inline mode), the Decoded panel and the Script console on the
+//! right, and a status line. Settings, themes, fonts, key bindings and codec plugins come
+//! from Zed-format files and plugin folders through [`config`], and apply to the running
+//! app as the files change.
 
 pub mod actions;
 pub mod capture;
+pub mod codecs;
 pub mod commands_panel;
 pub mod compose;
 pub mod config;
+pub mod decoded_panel;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
+pub mod framed;
 pub mod history;
 pub mod inline;
 pub mod keymap;
@@ -36,6 +40,8 @@ mod commands_tests;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
+mod decoded_tests;
+#[cfg(test)]
 mod gate;
 #[cfg(test)]
 mod inline_tests;
@@ -47,14 +53,17 @@ mod stream_tests;
 mod test_support;
 
 pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
+pub use codecs::{CodecSelection, CodecSet, CodecSlotSink, PluginCodec, PluginProblem};
 pub use commands_panel::{CommandEditor, CommandsPanel, CommandsPanelEvent, EditorSeed};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding, LineEndingExt};
 pub use config::{Config, ConfigPiece, ConfigProblem, Opener};
+pub use decoded_panel::{DecodedPanel, FrameTable};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
-pub use export::{ExportFormat, ExportJob};
+pub use export::{ExportFormat, ExportJob, FramesFormat};
 pub use fonts::{TerminalFont, UiFont};
+pub use framed::{FilteredText, FramedFilter};
 pub use history::PersistentHistory;
 pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
@@ -66,7 +75,7 @@ pub use session_handle::{
     CoreSessionOpener, SessionControl, SessionHandle, SessionOpener, SharedSession,
 };
 pub use session_options::{DisplayDefaults, SessionOptions};
-pub use session_view::{SessionView, SessionViewEvent};
+pub use session_view::{ActiveCodec, SessionView, SessionViewEvent};
 pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
@@ -103,9 +112,14 @@ pub mod prelude {
     pub use gpui_kit::component::{WindowExt, v_resizable};
     // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait
     // through its private re-export, and `#[schemars(crate = …)]` points the derive here.
+    pub use gpui_kit::component::IndexPath;
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
+    pub use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+    pub use gpui_kit::component::table::{
+        Column, DataTable, TableDelegate, TableEvent, TableState,
+    };
     pub use gpui_kit::component::{
         ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeConfig, ThemeConfigColors,
         ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,

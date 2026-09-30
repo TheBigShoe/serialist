@@ -579,6 +579,58 @@ fn defaults_for_omitted_keys() {
 }
 
 #[test]
+fn an_expect_can_be_a_frame_predicate() {
+    let loaded = parse(
+        r#"{ "groups": [ { "name": "G", "commands": [
+            { "name": "Version", "payload": { "codec": "airoha-race", "fields": { "command": "race_version" } },
+              "expect": { "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 500 } },
+            { "name": "Both", "payload": { "text": "x" },
+              "expect": { "pattern": "^OK", "frame": { "kind": "response" } } },
+            { "name": "Neither", "payload": { "text": "x" }, "expect": { "timeout_ms": 5 } },
+            { "name": "Empty", "payload": { "text": "x" }, "expect": { "frame": {} } } ] } ] }"#,
+    );
+    let commands = &loaded.collection.groups[0].commands;
+    let version = commands[0].expect.as_ref().unwrap();
+    assert_eq!(version.pattern, "");
+    assert_eq!(version.timeout_ms, 500);
+    let frame = version.frame.as_ref().unwrap();
+    assert_eq!(frame["kind"], json!("response"));
+    assert_eq!(frame["cmd_id"], json!("0x0F15"));
+    assert!(
+        commands[0].problems().is_empty(),
+        "{:?}",
+        commands[0].problems()
+    );
+    let both = commands[1].expect.as_ref().unwrap();
+    assert_eq!(both.pattern, "^OK");
+    assert!(both.frame.is_some());
+    assert_eq!(both.timeout_ms, DEFAULT_EXPECT_TIMEOUT_MS);
+    assert!(commands[1].problems().is_empty());
+    assert!(
+        commands[2]
+            .problems()
+            .contains(&"expect needs a pattern or a frame".to_owned())
+    );
+    assert!(
+        commands[3]
+            .problems()
+            .contains(&"expect frame names nothing to match".to_owned())
+    );
+
+    // A frame-only expect writes no empty pattern, and reads back the same.
+    let written = serde_json::to_value(version).unwrap();
+    assert_eq!(
+        written,
+        json!({ "timeout_ms": 500, "frame": { "kind": "response", "cmd_id": "0x0F15" } })
+    );
+    let read: Expect = serde_json::from_value(written).unwrap();
+    assert_eq!(&read, version);
+    let mut predicate = Map::new();
+    predicate.insert("kind".into(), json!("response"));
+    assert_eq!(Expect::frame(predicate.clone(), 500).frame, Some(predicate));
+}
+
+#[test]
 fn an_empty_or_comment_only_file_is_an_empty_collection() {
     for text in ["", "  \n", "// nothing yet\n"] {
         let loaded = parse(text);
@@ -829,6 +881,34 @@ fn the_bundled_examples_load_clean_and_encode() {
     for name in ["AT", "ATI", "AT+VER?", "Echo"] {
         assert!(examples.find(name).unwrap().1.expect.is_some(), "{name}");
     }
+    // The RACE group's commands are codec payloads that wait for a response frame.
+    let race = examples.group("RACE").expect("a RACE group");
+    assert_eq!(race.commands.len(), 2);
+    for command in &race.commands {
+        assert!(
+            matches!(&command.payload, Payload::Codec { codec, .. } if codec == "airoha-race"),
+            "{}",
+            command.name
+        );
+        let frame = command.expect.as_ref().and_then(|e| e.frame.as_ref());
+        assert_eq!(
+            frame.unwrap()["kind"],
+            json!("response"),
+            "{}",
+            command.name
+        );
+        assert!(command.problems().is_empty(), "{:?}", command.problems());
+    }
+    let (_, version) = examples.find("RACE version").unwrap();
+    assert_eq!(
+        version.encode(&ParamValues::new(), session),
+        Err(PayloadError::CodecUnavailable),
+        "the app encodes codec payloads"
+    );
+    assert_eq!(
+        examples.find("RACE command").unwrap().1.placeholders(),
+        ["id"]
+    );
     for (_, command) in examples.commands() {
         assert!(command.keybinding.is_none(), "examples must not grab keys");
     }

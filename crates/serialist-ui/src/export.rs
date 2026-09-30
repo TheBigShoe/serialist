@@ -13,17 +13,39 @@
 //! only once fully written and synced, so a failed export never leaves a partial file
 //! and never clobbers an existing one. The functions take a path; the save dialog is
 //! only ever their caller.
+//!
+//! # Decoded frames
+//!
+//! While a codec decodes the session, `.csv` and `.json` export the decoded frames: every
+//! frame the session's frame store retains, from a [`FrameSnapshot`] taken with the job,
+//! with the raw bytes of each read from the store [`Snapshot`] by its stream offsets.
+//!
+//! - **CSV**: a header row, then one row per frame: `time`, `direction`, `kind`,
+//!   `summary`, one column per field name of the kinds present (in the order the fields
+//!   first appear; a frame without that field leaves it empty), and `raw`, the frame's
+//!   bytes as hex. Cells with commas, quotes or line breaks are quoted.
+//! - **JSON**: an array of objects with `id`, `time`, `direction`, `kind`, `severity`,
+//!   `summary`, `fields` (numbers as numbers, bytes as hex), `raw_start`, `raw_end` and
+//!   `raw` (hex, or `null` once the store has evicted the bytes).
+//!
+//! Times are stamped as the Decoded panel stamps them ([`FrameTime`]).
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::{Map, Value as JsonValue, json};
+use serialist_core::codec::encode_hex;
 use serialist_core::store::write_lines;
-use serialist_core::{HexView, LineId, Snapshot, TextExportReport, TextOptions};
+use serialist_core::{
+    Frame, FrameSnapshot, HexView, LineId, LineSource, Snapshot, TextExportReport, TextOptions,
+};
 
+use crate::codecs::{FrameTime, direction_label, value_json};
 use crate::status::{file_name, format_bytes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,16 +54,23 @@ pub enum ExportFormat {
     Text,
     /// The raw bytes as received, byte for byte.
     Raw,
+    /// The decoded frames as CSV.
+    Csv,
+    /// The decoded frames as a JSON array.
+    Json,
 }
 
 impl ExportFormat {
     /// The format a file name asks for: `.bin` and `.raw` are raw, `.txt`, `.log` and
-    /// `.text` are text, anything else is up to the caller.
+    /// `.text` are text, `.csv` and `.json` are decoded frames, anything else is up to
+    /// the caller.
     pub fn from_path(path: &Path) -> Option<Self> {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         match extension.as_str() {
             "bin" | "raw" => Some(ExportFormat::Raw),
             "txt" | "log" | "text" => Some(ExportFormat::Text),
+            "csv" => Some(ExportFormat::Csv),
+            "json" => Some(ExportFormat::Json),
             _ => None,
         }
     }
@@ -50,8 +79,22 @@ impl ExportFormat {
         match self {
             ExportFormat::Text => "txt",
             ExportFormat::Raw => "bin",
+            ExportFormat::Csv => "csv",
+            ExportFormat::Json => "json",
         }
     }
+
+    /// Whether this format writes decoded frames, which needs a codec.
+    pub fn is_decoded(self) -> bool {
+        matches!(self, ExportFormat::Csv | ExportFormat::Json)
+    }
+}
+
+/// Which file a frames export writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramesFormat {
+    Csv,
+    Json,
 }
 
 /// What to export, taken on the main thread and written on a background thread.
@@ -75,6 +118,32 @@ pub enum ExportJob {
         snapshot: Snapshot,
         range: Range<u64>,
     },
+    /// Lines `lines` of any source as displayed, such as the text view with framed
+    /// bytes hidden, whose ids are its own.
+    Lines {
+        source: SharedSource,
+        lines: Range<LineId>,
+        options: TextOptions,
+    },
+    /// Every retained decoded frame, with its bytes from `raw`.
+    Frames {
+        frames: FrameSnapshot,
+        raw: Snapshot,
+        time: FrameTime,
+        format: FramesFormat,
+    },
+}
+
+/// A line source an export job holds.
+#[derive(Clone)]
+pub struct SharedSource(pub Arc<dyn LineSource>);
+
+impl std::fmt::Debug for SharedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedSource")
+            .field("lines", &(self.0.first_line()..self.0.end()))
+            .finish()
+    }
 }
 
 impl ExportJob {
@@ -94,6 +163,31 @@ impl ExportJob {
                 write_lines(hex, rows.clone(), options.clone(), out)
             })
             .map(|report| format!("Exported {} hex rows to {name}", report.lines)),
+            ExportJob::Lines {
+                source,
+                lines,
+                options,
+            } => write_report(path, |out| {
+                write_lines(source.0.as_ref(), lines.clone(), options.clone(), out)
+            })
+            .map(|report| format!("Exported {} lines to {name}", report.lines)),
+            ExportJob::Frames {
+                frames,
+                raw,
+                time,
+                format,
+            } => {
+                let mut count = 0;
+                write_atomically(path, |out| {
+                    let (written, frames) = match format {
+                        FramesFormat::Csv => write_frames_csv(frames, raw, time, out)?,
+                        FramesFormat::Json => write_frames_json(frames, raw, time, out)?,
+                    };
+                    count = frames;
+                    Ok(written)
+                })
+                .map(|_| format!("Exported {count} frames to {name}"))
+            }
             ExportJob::Raw { snapshot, range } => {
                 let evicted = evicted_bytes(snapshot, range);
                 export_raw(path, snapshot, range.clone()).map(|bytes| {
@@ -129,6 +223,140 @@ fn write_report(
         Ok(report.bytes)
     })?;
     Ok(report)
+}
+
+/// Counts the bytes that pass through, for the frame writers' reports.
+struct Counting<'a> {
+    out: &'a mut dyn Write,
+    bytes: u64,
+}
+
+impl Write for Counting<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The bytes of `frame` as spaced hex, or `None` if the store no longer has all of them.
+pub fn frame_raw_hex(raw: &Snapshot, frame: &Frame) -> Option<String> {
+    let kept = raw.raw_range();
+    if frame.raw.start < kept.start || frame.raw.end > kept.end {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(frame.raw_len() as usize);
+    for slice in raw.raw(frame.raw.clone()) {
+        bytes.extend_from_slice(slice);
+    }
+    Some(encode_hex(&bytes, " "))
+}
+
+/// Append `text` to a CSV row, quoted when it must be.
+fn csv_cell(row: &mut String, text: &str) {
+    if !row.is_empty() {
+        row.push(',');
+    }
+    if text.contains([',', '"', '\n', '\r']) {
+        row.push('"');
+        row.push_str(&text.replace('"', "\"\""));
+        row.push('"');
+    } else {
+        row.push_str(text);
+    }
+}
+
+/// The CSV form of a frames export; see the module docs. Returns the bytes and frames
+/// written.
+fn write_frames_csv(
+    frames: &FrameSnapshot,
+    raw: &Snapshot,
+    time: &FrameTime,
+    out: &mut dyn Write,
+) -> io::Result<(u64, usize)> {
+    let mut out = Counting { out, bytes: 0 };
+    // The field columns: every field name the frames carry, in order of first sight.
+    let mut fields: Vec<&str> = Vec::new();
+    for (_, frame) in frames.frames() {
+        for (name, _) in &frame.fields {
+            if !fields.contains(&name.as_str()) {
+                fields.push(name.as_str());
+            }
+        }
+    }
+    let mut row = String::new();
+    for header in ["time", "direction", "kind", "summary"]
+        .into_iter()
+        .chain(fields.iter().copied())
+        .chain(["raw"])
+    {
+        csv_cell(&mut row, header);
+    }
+    writeln!(out, "{row}")?;
+    let mut previous = None;
+    let mut count = 0;
+    for (_, frame) in frames.frames() {
+        row.clear();
+        csv_cell(&mut row, &time.stamp(frame.at, previous));
+        csv_cell(&mut row, direction_label(frame));
+        csv_cell(&mut row, &frame.kind);
+        csv_cell(&mut row, &frame.summary);
+        for name in &fields {
+            let value = frame
+                .field(name)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            csv_cell(&mut row, &value);
+        }
+        csv_cell(&mut row, &frame_raw_hex(raw, frame).unwrap_or_default());
+        writeln!(out, "{row}")?;
+        previous = Some(frame.at);
+        count += 1;
+    }
+    Ok((out.bytes, count))
+}
+
+/// The JSON form of a frames export; see the module docs. Returns the bytes and frames
+/// written.
+fn write_frames_json(
+    frames: &FrameSnapshot,
+    raw: &Snapshot,
+    time: &FrameTime,
+    out: &mut dyn Write,
+) -> io::Result<(u64, usize)> {
+    let mut out = Counting { out, bytes: 0 };
+    out.write_all(b"[")?;
+    let mut previous = None;
+    let mut count = 0;
+    for (id, frame) in frames.frames() {
+        let fields: Map<String, JsonValue> = frame
+            .fields
+            .iter()
+            .map(|(name, value)| (name.to_string(), value_json(value)))
+            .collect();
+        let object = json!({
+            "id": id.0,
+            "time": time.stamp(frame.at, previous),
+            "direction": direction_label(frame),
+            "kind": frame.kind.as_str(),
+            "severity": frame.severity.name(),
+            "summary": frame.summary,
+            "fields": fields,
+            "raw_start": frame.raw.start,
+            "raw_end": frame.raw.end,
+            "raw": frame_raw_hex(raw, frame),
+        });
+        out.write_all(if count == 0 { b"\n  " } else { b",\n  " })?;
+        serde_json::to_writer(&mut out, &object).map_err(io::Error::other)?;
+        previous = Some(frame.at);
+        count += 1;
+    }
+    out.write_all(if count == 0 { b"]\n" } else { b"\n]\n" })?;
+    Ok((out.bytes, count))
 }
 
 /// Write `path` through a temporary sibling file. `write` returns the bytes it wrote.
@@ -201,7 +429,7 @@ mod tests {
     use serialist_core::{Direction, Epoch, LineSource, Store, StoreConfig, Timestamps};
 
     use super::*;
-    use crate::test_support::TestDir;
+    use crate::test_support::{TestDir, parse_csv};
 
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
@@ -236,6 +464,89 @@ mod tests {
         assert_eq!(format("capture.raw"), Some(ExportFormat::Raw));
         assert_eq!(format("capture.dat"), None);
         assert_eq!(format("noextension"), None);
+        assert_eq!(format("frames.CSV"), Some(ExportFormat::Csv));
+        assert_eq!(format("frames.json"), Some(ExportFormat::Json));
+        assert!(ExportFormat::Csv.is_decoded() && ExportFormat::Json.is_decoded());
+        assert!(!ExportFormat::Text.is_decoded());
+    }
+
+    #[test]
+    fn decoded_frames_export_as_csv_and_json() {
+        use serialist_core::{Codec, FrameStore};
+        use serialist_plugins::AirohaRace;
+        use serialist_plugins::race::{RaceType, encode_frame};
+
+        use crate::terminal::{Clock, TimestampMode};
+
+        let dir = TestDir::new("export-frames");
+        let epoch = Epoch::now();
+        let mut store = Store::new(StoreConfig {
+            epoch: Some(epoch),
+            ..StoreConfig::default()
+        });
+        let mut frames = FrameStore::default();
+        let mut race = AirohaRace::new();
+        let mut stream = b"hello, \"world\"\r\n".to_vec();
+        stream.extend(encode_frame(RaceType::Log, 0x0F40, b"boot").unwrap());
+        stream.extend(encode_frame(RaceType::Response, 0x0F15, b"\x00V1").unwrap());
+        let at = epoch.instant + Duration::from_millis(1500);
+        store.append(&stream, at);
+        let mut out = Vec::new();
+        race.decode(&stream, at, 0, &mut out);
+        frames.extend(out);
+        let time = FrameTime {
+            clock: Clock::fixed(epoch, 0),
+            mode: TimestampMode::Relative,
+            format: None,
+        };
+        let job = |format| ExportJob::Frames {
+            frames: frames.snapshot(),
+            raw: store.snapshot(),
+            time: time.clone(),
+            format,
+        };
+
+        let csv = dir.join("frames.csv");
+        assert_eq!(
+            job(FramesFormat::Csv).run(&csv),
+            Ok("Exported 3 frames to frames.csv".into())
+        );
+        let rows = parse_csv(&fs::read_to_string(&csv).unwrap());
+        assert_eq!(rows.len(), 4, "a header and three frames");
+        assert_eq!(
+            rows[0][..5],
+            ["time", "direction", "kind", "summary", "text"]
+        );
+        let column = |name: &str| rows[0].iter().position(|h| h == name).unwrap();
+        assert_eq!(rows[1][column("kind")], "text");
+        assert_eq!(
+            rows[1][column("summary")],
+            "hello, \"world\"",
+            "quoted and back"
+        );
+        assert_eq!(rows[1][column("time")], "+00:00:01.500");
+        assert_eq!(rows[2][column("kind")], "log");
+        assert_eq!(rows[2][column("cmd_id")], "3904");
+        assert_eq!(rows[2][column("text")], "", "a log frame has no text");
+        assert_eq!(rows[3][column("cmd_id")], "3861");
+        assert_eq!(rows[3][column("raw")], "05 5B 05 00 15 0F 00 56 31");
+        assert!(rows.iter().all(|row| row.len() == rows[0].len()));
+
+        let json = dir.join("frames.json");
+        assert_eq!(
+            job(FramesFormat::Json).run(&json),
+            Ok("Exported 3 frames to frames.json".into())
+        );
+        let parsed: JsonValue = serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+        let array = parsed.as_array().unwrap();
+        assert_eq!(array.len(), 3);
+        assert_eq!(array[2]["kind"], "response");
+        assert_eq!(array[2]["fields"]["cmd_id"], 0x0F15);
+        assert_eq!(array[2]["fields"]["payload"], "005631");
+        assert_eq!(array[2]["raw"], "05 5B 05 00 15 0F 00 56 31");
+        assert_eq!(array[1]["severity"], "info");
+        assert_eq!(array[0]["raw_start"], 0);
+        assert_eq!(entries(dir.path()), ["frames.csv", "frames.json"]);
     }
 
     #[test]

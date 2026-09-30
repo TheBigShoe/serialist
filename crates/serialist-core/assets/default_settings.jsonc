@@ -69,7 +69,15 @@
     // Render CR, LF and ESC as dim glyphs.
     "show_control_chars": false,
     // Wrap long lines instead of scrolling sideways.
-    "wrap": false
+    "wrap": false,
+    // While a codec plugin decodes the session, add a one-line summary of each decoded
+    // frame to the scrollback, in the plugin color. Text frames are left out: their
+    // text is on screen already.
+    "decoded_inline": true,
+    // While a codec plugin decodes the session, leave out of the text view the received
+    // lines whose bytes all belong to decoded binary frames. Text is never hidden, and
+    // the hex view, the Decoded panel and raw export still have every byte.
+    "hide_framed_bytes": false
   },
 
   // ---- Sessions ----
