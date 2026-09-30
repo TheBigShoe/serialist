@@ -13,6 +13,7 @@ authors.workspace = true
 bench = false
 
 [dependencies]
+chrono.workspace = true
 crossbeam-channel.workspace = true
 futures-core = "0.3"
 jsonc-parser.workspace = true

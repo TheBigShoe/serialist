@@ -2,8 +2,10 @@
 //!
 //! An export is taken on the main thread as a store [`Snapshot`] plus a range (an `Arc`
 //! clone, no copying) and written on a background thread: text through
-//! [`Snapshot::write_text`], hex rows with the same stamp formats, raw bytes straight
-//! from the store's pages with [`Snapshot::raw`].
+//! [`Snapshot::write_text_counted`], hex rows through the store's [`write_lines`] (the
+//! same stamps, the same counts), raw bytes straight from the store's pages with
+//! [`Snapshot::raw`]. What a text export wrote, lines and bytes, comes back as the
+//! store's [`TextExportReport`].
 //!
 //! Every export goes to a temporary file next to the target and is renamed into place
 //! only once fully written and synced, so a failed export never leaves a partial file
@@ -16,10 +18,9 @@ use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-use serialist_core::store::format_utc;
-use serialist_core::{HexView, LineId, LineSource, Snapshot, TextOptions, Timestamps};
+use serialist_core::store::write_lines;
+use serialist_core::{HexView, LineId, Snapshot, TextExportReport, TextOptions, Timestamps};
 
 use crate::status::{file_name, format_bytes};
 
@@ -82,16 +83,19 @@ impl ExportJob {
                 snapshot,
                 lines,
                 options,
-            } => write_counted(path, |out| {
-                snapshot.write_text(lines.clone(), *options, out)
+            } => write_report(path, |mut out| {
+                snapshot.write_text_counted(lines.clone(), options.clone(), &mut out)
             })
-            .map(|(_, lines)| format!("Exported {lines} lines to {name}")),
+            .map(|report| format!("Exported {} lines to {name}", report.lines)),
             ExportJob::HexText {
                 hex,
                 rows,
                 timestamps,
-            } => write_counted(path, |out| write_rows(hex, rows.clone(), *timestamps, out))
-                .map(|(_, rows)| format!("Exported {rows} hex rows to {name}")),
+            } => {
+                let options = TextOptions::default().with_timestamps(*timestamps);
+                write_report(path, |out| write_lines(hex, rows.clone(), options, out))
+                    .map(|report| format!("Exported {} hex rows to {name}", report.lines))
+            }
             ExportJob::Raw { snapshot, range } => {
                 let evicted = evicted_bytes(snapshot, range);
                 export_raw(path, snapshot, range.clone()).map(|bytes| {
@@ -116,90 +120,17 @@ fn evicted_bytes(snapshot: &Snapshot, range: &Range<u64>) -> u64 {
     snapshot.raw_range().start.clamp(range.start, end) - range.start
 }
 
-/// Counts what goes through it: bytes, and line feeds (one per exported line).
-struct Counting<W> {
-    inner: W,
-    bytes: u64,
-    lines: u64,
-}
-
-impl<W: Write> Write for Counting<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.bytes += n as u64;
-        self.lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// [`write_atomically`], returning the bytes and lines written.
-fn write_counted(
+/// [`write_atomically`] for a text export: whatever `write` reports it wrote.
+fn write_report(
     path: &Path,
-    write: impl FnOnce(&mut Counting<&mut dyn Write>) -> io::Result<()>,
-) -> io::Result<(u64, u64)> {
-    let mut lines = 0;
-    let bytes = write_atomically(path, |out| {
-        let mut counting = Counting {
-            inner: out,
-            bytes: 0,
-            lines: 0,
-        };
-        write(&mut counting)?;
-        lines = counting.lines;
-        Ok(counting.bytes)
+    write: impl FnOnce(&mut dyn Write) -> io::Result<TextExportReport>,
+) -> io::Result<TextExportReport> {
+    let mut report = TextExportReport::default();
+    write_atomically(path, |out| {
+        report = write(out)?;
+        Ok(report.bytes)
     })?;
-    Ok((bytes, lines))
-}
-
-/// Rows of any source as text, one per line, stamped the way [`Snapshot::write_text`]
-/// stamps lines.
-pub fn write_rows(
-    source: &dyn LineSource,
-    range: Range<LineId>,
-    timestamps: Timestamps,
-    out: &mut dyn Write,
-) -> io::Result<()> {
-    let epoch = source.epoch();
-    let end = range.end.min(source.end());
-    let mut id = range.start.max(source.first_line());
-    let mut previous = None;
-    let mut rows = Vec::new();
-    while id < end {
-        let slab = id.offset(4096).min(end);
-        rows.clear();
-        source.lines(id..slab, &mut rows);
-        for row in &rows {
-            match timestamps {
-                Timestamps::None => {}
-                Timestamps::Absolute => {
-                    write!(out, "[{}] ", format_utc(epoch.wall_time(row.received_at)))?;
-                }
-                Timestamps::Relative => {
-                    let since = row.received_at.saturating_duration_since(epoch.instant);
-                    write!(out, "[+{}] ", format_secs(since))?;
-                }
-                Timestamps::Delta => {
-                    let since = previous.map_or(Duration::ZERO, |p| {
-                        row.received_at.saturating_duration_since(p)
-                    });
-                    write!(out, "[+{}] ", format_secs(since))?;
-                }
-            }
-            previous = Some(row.received_at);
-            out.write_all(row.text.as_bytes())?;
-            out.write_all(b"\n")?;
-        }
-        id = slab;
-    }
-    Ok(())
-}
-
-fn format_secs(d: Duration) -> String {
-    format!("{}.{:06}", d.as_secs(), d.subsec_micros())
+    Ok(report)
 }
 
 /// Write `path` through a temporary sibling file. `write` returns the bytes it wrote.
@@ -267,9 +198,9 @@ fn create_temp_sibling(path: &Path) -> io::Result<(PathBuf, File)> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use serialist_core::{Direction, Epoch, Store, StoreConfig};
+    use serialist_core::{Direction, Epoch, LineSource, Store, StoreConfig};
 
     use super::*;
     use crate::test_support::TestDir;
@@ -365,6 +296,59 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         assert!(expected.starts_with("00000000  1b 5b 33 31 6d 6f 6e 65"));
+    }
+
+    #[test]
+    fn hex_rows_are_stamped_the_way_text_lines_are() {
+        let dir = TestDir::new("export-hex-stamped");
+        let snapshot = sample(Epoch::now()).snapshot();
+        let hex = snapshot.hex_view(16);
+        let (first, second) = (
+            hex.line(LineId(0)).unwrap().text,
+            hex.line(LineId(1)).unwrap().text,
+        );
+        let path = dir.join("dump.txt");
+        let job = |timestamps| ExportJob::HexText {
+            hex: hex.clone(),
+            rows: LineId(0)..LineId(2),
+            timestamps,
+        };
+        // Row 0 starts in the line that arrived at 1.5 s, row 1 in the one at 2 s.
+        job(Timestamps::Relative).run(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("[+1.500000] {first}\n[+2.000000] {second}\n")
+        );
+        job(Timestamps::Delta).run(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("[+0.000000] {first}\n[+0.500000] {second}\n")
+        );
+    }
+
+    #[test]
+    fn a_text_export_reports_the_lines_and_bytes_it_wrote() {
+        let dir = TestDir::new("export-report");
+        let snapshot = sample(Epoch::now()).snapshot();
+        let path = dir.join("lines.txt");
+        let options = TextOptions::default().with_timestamps(Timestamps::Relative);
+        let report = write_report(&path, |mut out| {
+            snapshot.write_text_counted(LineId(0)..LineId(4), options.clone(), &mut out)
+        })
+        .unwrap();
+        assert_eq!(report.lines, 4);
+        assert_eq!(report.bytes, fs::metadata(&path).unwrap().len());
+        // A line the options drop is not counted: the sent line is not received.
+        let received = TextOptions::received_only();
+        let report = write_report(&path, |mut out| {
+            snapshot.write_text_counted(LineId(0)..LineId(4), received.clone(), &mut out)
+        })
+        .unwrap();
+        assert_eq!(report.lines, 3);
+        assert_eq!(report.bytes, fs::metadata(&path).unwrap().len());
+        // A failure is the error, with no report.
+        let missing = dir.path().join("nope").join("out.txt");
+        assert!(write_report(&missing, |_| Ok(TextExportReport::default())).is_err());
     }
 
     #[test]
