@@ -31,6 +31,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select, unbounded};
+use parking_lot::Mutex;
 
 use crate::session::SessionEvent;
 use crate::store::{Snapshot, Store, StoreReader, StoreStats};
@@ -49,6 +50,35 @@ pub trait ChunkSink: Send {
     fn on_chunk(&mut self, bytes: &[u8], at: Instant);
     /// The session disconnected. No more chunks will arrive from it.
     fn on_disconnect(&mut self);
+    /// The session connected; `description` is the transport's own name for the link (the
+    /// text after "Connected to " in the notice line). Called once, before the first
+    /// chunk, after [`IngestHandle::connection`] reports the link as connected and the
+    /// notice is stored. The default does nothing.
+    fn on_connect(&mut self, description: &str) {
+        let _ = description;
+    }
+}
+
+/// Where the link stands, as far as the ingest thread has seen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LinkState {
+    /// The thread has not handled the session's `Connected` yet.
+    #[default]
+    Connecting,
+    /// The session connected. `description` is the transport's own name for the link.
+    Connected { description: String },
+    /// The link is gone: the session's `Disconnected` was handled, or the thread ended
+    /// without one. `error` is the transport error's message, `None` for an orderly close.
+    Disconnected { error: Option<String> },
+}
+
+/// What [`IngestHandle::connection`] reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    pub state: LinkState,
+    /// The description of the most recent `Connected`, kept after a disconnect, so a link
+    /// that connects and drops between two looks can still be named.
+    pub description: Option<String>,
 }
 
 /// Returned when the ingest thread has already ended.
@@ -83,6 +113,7 @@ enum Command {
 
 #[derive(Default)]
 struct Shared {
+    connection: Mutex<ConnectionInfo>,
     dirty: AtomicBool,
     chunks: AtomicU64,
     bytes: AtomicU64,
@@ -162,6 +193,14 @@ impl IngestHandle {
         self.commands
             .send(Command::Local(text.into(), direction, Instant::now()))
             .map_err(|_| IngestStopped)
+    }
+
+    /// Where the link stands now. The ingest thread updates it before it stores the
+    /// notice line that announces the change, so a snapshot holding "Connected to …" or
+    /// "Disconnected…" is never newer than this. Costs one uncontended lock and a clone;
+    /// read it after [`acknowledge`](Self::acknowledge), like the snapshot.
+    pub fn connection(&self) -> ConnectionInfo {
+        self.shared.connection.lock().clone()
     }
 
     /// The UI has rendered (or is about to take its snapshot): the next publication may
@@ -268,6 +307,15 @@ impl Worker {
                 break;
             }
         }
+        // A thread that ends without the session's `Disconnected` (a stop, or an event
+        // channel dropped early) leaves nothing connected.
+        let ended = !matches!(
+            self.shared.connection.lock().state,
+            LinkState::Disconnected { .. }
+        );
+        if ended {
+            self.set_state(LinkState::Disconnected { error: None });
+        }
         self.close_sinks();
         self.store
     }
@@ -338,14 +386,22 @@ impl Worker {
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
             SessionEvent::Connected { description } => {
+                self.set_state(LinkState::Connected {
+                    description: description.clone(),
+                });
                 self.store
                     .append_local(&format!("Connected to {description}"), Direction::Notice);
+                for sink in &mut self.sinks {
+                    sink.on_connect(&description);
+                }
             }
             SessionEvent::Disconnected { error } => {
-                let text = match error {
+                let error = error.map(|error| error.to_string());
+                let text = match &error {
                     Some(error) => format!("Disconnected: {error}"),
                     None => "Disconnected".to_owned(),
                 };
+                self.set_state(LinkState::Disconnected { error });
                 self.store.append_local(&text, Direction::Notice);
                 self.close_sinks();
             }
@@ -354,6 +410,15 @@ impl Worker {
                     .append_local(&format!("Write failed: {error}"), Direction::Notice);
             }
         }
+    }
+
+    /// Publish a new link state. Called before the matching notice line is stored.
+    fn set_state(&self, state: LinkState) {
+        let mut info = self.shared.connection.lock();
+        if let LinkState::Connected { description } = &state {
+            info.description = Some(description.clone());
+        }
+        info.state = state;
     }
 
     /// Mark the store dirty and wake the UI unless a wake is already pending.
@@ -372,6 +437,7 @@ mod tests {
 
     use super::*;
     use crate::text::{LineId, LineSource};
+    use crate::transport::TransportError;
 
     /// Records chunks and counts `on_disconnect` calls.
     struct Recorder(Arc<Mutex<(Vec<u8>, usize)>>);
@@ -563,5 +629,153 @@ mod tests {
         );
         tx.send(data(b"boom\n")).unwrap();
         drop(handle);
+    }
+
+    /// Logs the link events a sink hears, in order.
+    struct LinkLog(Arc<Mutex<Vec<String>>>);
+
+    impl ChunkSink for LinkLog {
+        fn on_chunk(&mut self, bytes: &[u8], _at: Instant) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("chunk {}", bytes.len()));
+        }
+
+        fn on_connect(&mut self, description: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("connect {description}"));
+        }
+
+        fn on_disconnect(&mut self) {
+            self.0.lock().unwrap().push("disconnect".to_owned());
+        }
+    }
+
+    fn wait_for_lines(handle: &IngestHandle, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.snapshot().line_count() < count {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} lines"
+            );
+            thread::yield_now();
+        }
+    }
+
+    fn connected(description: &str) -> SessionEvent {
+        SessionEvent::Connected {
+            description: description.into(),
+        }
+    }
+
+    #[test]
+    fn connection_follows_the_session_and_sinks_hear_the_connect() {
+        let (tx, rx) = unbounded();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(LinkLog(Arc::clone(&log)))],
+            Box::new(|| {}),
+        );
+        assert_eq!(handle.connection(), ConnectionInfo::default());
+        assert_eq!(handle.connection().state, LinkState::Connecting);
+
+        tx.send(connected("virtual:x @ 115200 8N1")).unwrap();
+        wait_for_lines(&handle, 1);
+        let info = handle.connection();
+        assert_eq!(
+            info.state,
+            LinkState::Connected {
+                description: "virtual:x @ 115200 8N1".into()
+            }
+        );
+        assert_eq!(info.description.as_deref(), Some("virtual:x @ 115200 8N1"));
+
+        tx.send(data(b"hi\n")).unwrap();
+        tx.send(SessionEvent::Disconnected {
+            error: Some(TransportError::Disconnected),
+        })
+        .unwrap();
+        wait_for_lines(&handle, 3);
+        let info = handle.connection();
+        assert_eq!(
+            info.state,
+            LinkState::Disconnected {
+                error: Some("device disconnected".into())
+            }
+        );
+        assert_eq!(
+            info.description.as_deref(),
+            Some("virtual:x @ 115200 8N1"),
+            "the description outlives the connection"
+        );
+        drop(tx);
+        let store = handle.join().expect("the ingest thread ran cleanly");
+        let last = store.snapshot().line(LineId(2)).unwrap();
+        assert_eq!(last.text, "Disconnected: device disconnected");
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["connect virtual:x @ 115200 8N1", "chunk 3", "disconnect"]
+        );
+    }
+
+    /// The state is stored before the notice line is published, so a reader that sees
+    /// the line can never read an older state.
+    #[test]
+    fn the_state_leads_its_notice() {
+        for round in 0..200 {
+            let (tx, rx) = unbounded();
+            let handle = Ingest::spawn(rx, Store::default(), Vec::new(), Box::new(|| {}));
+            tx.send(connected("virtual:x")).unwrap();
+            while handle.snapshot().line_count() < 1 {
+                thread::yield_now();
+            }
+            assert!(
+                matches!(handle.connection().state, LinkState::Connected { .. }),
+                "round {round}: {:?}",
+                handle.connection()
+            );
+            tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+            while handle.snapshot().line_count() < 2 {
+                thread::yield_now();
+            }
+            assert_eq!(
+                handle.connection().state,
+                LinkState::Disconnected { error: None },
+                "round {round}"
+            );
+        }
+    }
+
+    /// A thread that ends without the session's `Disconnected` leaves nothing connected.
+    #[test]
+    fn a_thread_that_ends_early_reports_disconnected() {
+        for send_connected in [false, true] {
+            let (tx, rx) = unbounded::<SessionEvent>();
+            let (_cmd_tx, cmd_rx) = unbounded();
+            let shared = Arc::new(Shared::default());
+            let worker = Worker {
+                events: rx,
+                commands: cmd_rx,
+                store: Store::default(),
+                sinks: Vec::new(),
+                waker: Box::new(|| {}),
+                shared: Arc::clone(&shared),
+                sinks_closed: false,
+            };
+            if send_connected {
+                tx.send(connected("virtual:x")).unwrap();
+            }
+            // The event channel closes with no `Disconnected` in it.
+            drop(tx);
+            let _store = worker.run();
+            let info = shared.connection.lock().clone();
+            assert_eq!(info.state, LinkState::Disconnected { error: None });
+            assert_eq!(info.description.is_some(), send_connected);
+        }
     }
 }
