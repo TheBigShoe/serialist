@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use serialist_core::{
     ChunkSink, Direction, Ingest, IngestHandle, IngestPanicked, IngestStats, LineId, LineSource,
-    PortId, SerialConfig, SessionStats, Snapshot, Store, StoreConfig, TextOptions, Timestamps,
+    PortId, SerialConfig, SessionStats, Snapshot, Store, TextOptions, Timestamps,
 };
 
 use crate::actions::context;
@@ -58,6 +58,7 @@ use crate::export::{ExportFormat, ExportJob};
 use crate::prelude::*;
 use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
+use crate::session_options::SessionOptions;
 use crate::status::{
     ConnectionState, Notice, PauseMark, RecordingStatus, StatusInputs, StatusLine, file_name,
     format_bytes,
@@ -166,6 +167,11 @@ pub struct SessionView {
     /// Recorded bytes last shown, so idle housekeeping repaints only when it moves.
     last_recorded: Option<u64>,
     notice: Option<Notice>,
+    /// Bytes per hex row.
+    hex_bytes_per_row: usize,
+    /// The options last applied, so a settings reload changes only what it changed and
+    /// leaves the user's own toggles alone.
+    options: SessionOptions,
     terminal: Entity<TerminalView>,
     compose: Entity<ComposeBar>,
     focus_handle: FocusHandle,
@@ -181,16 +187,17 @@ impl Focusable for SessionView {
 }
 
 impl SessionView {
-    /// Show `session`, whose scrollback lives in a new store configured by `store`.
+    /// Show `session`, whose scrollback lives in a new store sized by `options`, which
+    /// also give the line ending, local echo and display defaults.
     pub fn new(
         port: PortId,
         serial: SerialConfig,
         session: Box<dyn SessionHandle>,
-        store: StoreConfig,
+        options: SessionOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::with_sinks(port, serial, session, store, Vec::new(), window, cx)
+        Self::with_sinks(port, serial, session, options, Vec::new(), window, cx)
     }
 
     /// [`Self::new`] with more sinks on the ingest thread, after the view's own.
@@ -198,12 +205,18 @@ impl SessionView {
         port: PortId,
         serial: SerialConfig,
         session: Box<dyn SessionHandle>,
-        store: StoreConfig,
+        options: SessionOptions,
         extra_sinks: Vec<Box<dyn ChunkSink>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let compose = cx.new(|cx| ComposeBar::new(window, cx));
+        let line_ending = options.line_ending;
+        let compose = cx.new(|cx| {
+            let mut compose = ComposeBar::new(window, cx);
+            compose.set_line_ending(line_ending, cx);
+            compose.set_local_echo(options.local_echo, cx);
+            compose
+        });
         let compose_events =
             cx.subscribe_in(&compose, window, |this, _, event, _, cx| match event {
                 ComposeEvent::Submit { text, bytes } => this.send(text, bytes.clone(), cx),
@@ -239,7 +252,7 @@ impl SessionView {
         sinks.extend(extra_sinks);
         let ingest = Ingest::spawn(
             session.events(),
-            Store::new(store),
+            Store::new(options.store.clone()),
             sinks,
             Box::new(move || {
                 // Full means a wake is already pending: that one will see this too.
@@ -267,7 +280,9 @@ impl SessionView {
         });
 
         let floors = Floors::default();
-        let scrollback = Scrollback::new(&ingest.snapshot(), floors);
+        let display = options.display;
+        let scrollback =
+            Scrollback::with_hex_row(&ingest.snapshot(), floors, display.hex_bytes_per_row);
         let terminal = cx.new(|cx| {
             let mut terminal = TerminalView::new(scrollback.text_source(), window, cx);
             terminal.set_searcher(Some(scrollback.text_searcher()), cx);
@@ -276,6 +291,9 @@ impl SessionView {
                 Some(scrollback.hex_searcher()),
                 cx,
             );
+            terminal.set_wrap(display.wrap, cx);
+            terminal.set_timestamps(display.timestamps, cx);
+            terminal.set_display_mode(display.view, cx);
             terminal
         });
         tracing::info!(%port, serial = %serial.summary(), "session open");
@@ -297,6 +315,8 @@ impl SessionView {
             next_recording_id: 0,
             last_recorded: None,
             notice: None,
+            hex_bytes_per_row: display.hex_bytes_per_row,
+            options,
             terminal,
             compose,
             focus_handle: cx.focus_handle(),
@@ -310,6 +330,11 @@ impl SessionView {
 
     pub fn port(&self) -> &PortId {
         &self.port
+    }
+
+    /// The line settings the port was opened with.
+    pub fn serial(&self) -> &SerialConfig {
+        &self.serial
     }
 
     pub fn state(&self) -> &ConnectionState {
@@ -464,7 +489,7 @@ impl SessionView {
         // The line that was still arriving may have grown, so it counts as changed.
         let changed =
             LineId(before.end_line.0.saturating_sub(1)).max(after.first_line)..after.end_line;
-        self.scrollback = Scrollback::new(&snapshot, self.floors);
+        self.scrollback = Scrollback::with_hex_row(&snapshot, self.floors, self.hex_bytes_per_row);
         self.push_sources(cx, |terminal, cx| terminal.lines_appended(changed, cx));
         true
     }
@@ -537,10 +562,12 @@ impl SessionView {
         }
     }
 
-    /// Write a submitted line and echo it into the scrollback. The echo is queued
-    /// before the write, and ingest applies local lines before the next session event,
-    /// so the echo always lands before the reply it causes.
+    /// Write a submitted line and, with local echo on in the compose bar, echo it into
+    /// the scrollback. The echo is queued before the write, and ingest applies local
+    /// lines before the next session event, so the echo always lands before the reply
+    /// it causes.
     pub fn send(&mut self, text: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let echo = self.compose.read(cx).local_echo();
         let session = self
             .session
             .as_ref()
@@ -550,7 +577,9 @@ impl SessionView {
             cx.notify();
             return;
         };
-        let _ = ingest.append_local(text, Direction::Tx);
+        if echo {
+            let _ = ingest.append_local(text, Direction::Tx);
+        }
         if session.write(bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
         }
@@ -561,11 +590,72 @@ impl SessionView {
     /// stream, not of the screen.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.floors = Floors::above(self.snapshot());
-        self.scrollback = Scrollback::new(&self.scrollback.snapshot().clone(), self.floors);
+        self.rebuild_scrollback();
         self.push_sources(cx, |terminal, cx| {
             terminal.set_selection(None, cx);
             terminal.jump_to_bottom(cx);
             terminal.refresh_search(None, cx);
+        });
+        cx.notify();
+    }
+
+    /// Rebuild the terminal's sources from the current snapshot, floors and hex width.
+    fn rebuild_scrollback(&mut self) {
+        self.scrollback = Scrollback::with_hex_row(
+            &self.scrollback.snapshot().clone(),
+            self.floors,
+            self.hex_bytes_per_row,
+        );
+    }
+
+    /// The options last applied: at opening, or by [`Self::apply_options`].
+    pub fn options(&self) -> &SessionOptions {
+        &self.options
+    }
+
+    pub fn hex_bytes_per_row(&self) -> usize {
+        self.hex_bytes_per_row
+    }
+
+    /// Take new defaults, as after a settings reload. Only what differs from the last
+    /// options applied changes, so a reload that is about something else keeps the
+    /// user's own toggles (wrap, timestamps, the view, the line ending). The store's
+    /// budget applies to sessions opened from now on.
+    pub fn apply_options(&mut self, options: SessionOptions, cx: &mut Context<Self>) {
+        let old = std::mem::replace(&mut self.options, options.clone());
+        if options.line_ending != old.line_ending || options.local_echo != old.local_echo {
+            self.compose.update(cx, |compose, cx| {
+                if options.line_ending != old.line_ending {
+                    compose.set_line_ending(options.line_ending, cx);
+                }
+                if options.local_echo != old.local_echo {
+                    compose.set_local_echo(options.local_echo, cx);
+                }
+            });
+        }
+        let (new, old) = (options.display, old.display);
+        if new.hex_bytes_per_row != old.hex_bytes_per_row {
+            self.hex_bytes_per_row = new.hex_bytes_per_row;
+            self.rebuild_scrollback();
+            let scrollback = self.scrollback.clone();
+            self.terminal.update(cx, |terminal, cx| {
+                terminal.set_hex_source(
+                    Some(scrollback.hex_source()),
+                    Some(scrollback.hex_searcher()),
+                    cx,
+                );
+            });
+        }
+        self.terminal.update(cx, |terminal, cx| {
+            if new.wrap != old.wrap {
+                terminal.set_wrap(new.wrap, cx);
+            }
+            if new.timestamps != old.timestamps {
+                terminal.set_timestamps(new.timestamps, cx);
+            }
+            if new.view != old.view {
+                terminal.set_display_mode(new.view, cx);
+            }
         });
         cx.notify();
     }
@@ -966,7 +1056,7 @@ mod tests {
                 PortId::new("virtual:echo"),
                 SerialConfig::default(),
                 session,
-                StoreConfig::default(),
+                SessionOptions::default(),
                 window,
                 cx,
             )
@@ -1180,7 +1270,7 @@ mod tests {
                 PortId::new("virtual:echo"),
                 SerialConfig::default(),
                 session,
-                StoreConfig::default(),
+                SessionOptions::default(),
                 vec![Box::new(Exploding)],
                 window,
                 cx,

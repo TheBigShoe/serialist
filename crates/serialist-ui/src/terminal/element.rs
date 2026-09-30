@@ -35,7 +35,7 @@ use crate::terminal::palette::{ResolvedStyle, TerminalPalette};
 use crate::terminal::scroll::TerminalScrollHandle;
 use crate::terminal::selection::{Selection, SelectionPoint, column_of_byte};
 use crate::terminal::stats::{FrameSample, FrameStats};
-use crate::terminal::timestamps::{Clock, TimestampMode};
+use crate::terminal::timestamps::{Clock, TimestampMode, TimestampModeExt};
 use crate::terminal::view::TerminalView;
 
 /// Space between the element's left edge and the gutter or the text.
@@ -43,8 +43,8 @@ pub const PADDING_LEFT: Pixels = px(8.);
 /// Room on the right for the scrollbar thumb, so it never covers text.
 pub const PADDING_RIGHT: Pixels = px(14.);
 /// Line height as a multiple of the font size, when the font's own ascent and descent
-/// are tighter. Zed calls 1.3 "standard".
-pub const LINE_HEIGHT: f32 = 1.3;
+/// are tighter. Zed calls 1.3 "standard"; settings choose another.
+pub const LINE_HEIGHT: f32 = crate::fonts::STANDARD_LINE_HEIGHT;
 
 /// Shaped lines kept across frames: about forty screens of text.
 const SHAPED_LINES: usize = 2048;
@@ -59,7 +59,9 @@ pub struct CellMetrics {
 }
 
 impl CellMetrics {
-    pub fn measure(font: &Font, font_size: Pixels, window: &Window) -> Self {
+    /// The grid for `font` at `font_size`, rows `line_height` times the size apart
+    /// unless the font's own ascent and descent need more.
+    pub fn measure(font: &Font, font_size: Pixels, line_height: f32, window: &Window) -> Self {
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(font);
         let cell_width = text_system
@@ -69,7 +71,7 @@ impl CellMetrics {
         let ascent = text_system.ascent(font_id, font_size);
         // GPUI reports the descent below the baseline as a negative number.
         let descent = text_system.descent(font_id, font_size).abs();
-        let row_height = (ascent + descent).max(font_size * LINE_HEIGHT).ceil();
+        let row_height = (ascent + descent).max(font_size * line_height).ceil();
         Self {
             cell_width,
             row_height,
@@ -121,7 +123,8 @@ struct ShapedEntry {
 /// element in prepaint.
 pub struct ShapeCache {
     generation: u64,
-    style: Option<(Font, Pixels)>,
+    /// The font, size and line height (as bits) the metrics and shaped lines are for.
+    style: Option<(Font, Pixels, u32)>,
     metrics: Option<CellMetrics>,
     lines: Lru<LineId, ShapedEntry>,
     wraps: Lru<LineId, u32>,
@@ -148,6 +151,7 @@ impl ShapeCache {
         generation: u64,
         font: &Font,
         font_size: Pixels,
+        line_height: f32,
         window: &Window,
     ) -> CellMetrics {
         if generation != self.generation {
@@ -155,9 +159,9 @@ impl ShapeCache {
             self.lines.clear();
             self.wraps.clear();
         }
-        let style = (font.clone(), font_size);
+        let style = (font.clone(), font_size, line_height.to_bits());
         if self.style.as_ref() != Some(&style) || self.metrics.is_none() {
-            self.metrics = Some(CellMetrics::measure(font, font_size, window));
+            self.metrics = Some(CellMetrics::measure(font, font_size, line_height, window));
             self.style = Some(style);
             self.lines.clear();
             self.wraps.clear();
@@ -347,6 +351,8 @@ pub struct TerminalInputs {
     pub generation: u64,
     pub font: Font,
     pub font_size: Pixels,
+    /// Row pitch as a multiple of `font_size`.
+    pub line_height: f32,
     pub wrap: bool,
     pub timestamps: TimestampMode,
     pub clock: Clock,
@@ -565,7 +571,13 @@ impl Element for TerminalElement {
         inputs.scroll.set_bounds(bounds);
 
         let mut cache = inputs.cache.borrow_mut();
-        let metrics = cache.prepare(inputs.generation, &inputs.font, inputs.font_size, window);
+        let metrics = cache.prepare(
+            inputs.generation,
+            &inputs.font,
+            inputs.font_size,
+            inputs.line_height,
+            window,
+        );
         let (cell_width, row_height) = (metrics.cell_width, metrics.row_height);
         let gutter_cells = inputs.timestamps.width();
         let gutter_width = if gutter_cells > 0 {

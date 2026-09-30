@@ -14,8 +14,8 @@ use serialist_sim::{
 use crate::prelude::*;
 use crate::status::format_bytes;
 use crate::test_support::{
-    displayed, has_rx_line, open_workspace, open_workspace_with, run_until, type_line,
-    wait_connected,
+    displayed, enable_local_echo, has_rx_line, open_workspace, open_workspace_with, run_until,
+    type_line, wait_connected,
 };
 
 #[gpui_test]
@@ -29,11 +29,15 @@ fn echo_round_trip_appears_in_the_elements_source(cx: &mut TestAppContext) {
         devices.read_with(cx, |d, _| d.list().get(&echo).is_some_and(|e| e.present))
     });
     // Select the echo device and press Enter in the (focused) Devices panel.
-    devices.update(cx, |d, cx| d.select_port(echo.clone(), cx));
-    cx.update_window(window, |_, window, cx| window.press("enter", cx))
-        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        devices.update(cx, |d, cx| d.select_port(echo.clone(), window, cx));
+        window.press("enter", cx);
+    })
+    .unwrap();
     let view = wait_connected(cx, &workspace);
 
+    // Local echo is off by default; this test is about the echo's order.
+    enable_local_echo(cx, &view);
     // Connecting focused the compose bar.
     type_line(cx, window, "hello");
     run_until(cx, "the echoed line", |cx| has_rx_line(cx, &view, "hello"));

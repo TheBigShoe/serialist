@@ -3,17 +3,21 @@
 
 use std::sync::Arc;
 
+use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    PortId, PortSource, SerialConfig, StoreConfig, TransportError, TransportFactory,
+    PortId, PortInfo, PortKind, PortSource, SerialConfig, StoreConfig, TransportError,
+    TransportFactory,
 };
 
-use crate::actions::{self, Clear, Disconnect, Export, Pause, Quit, ToggleRecord, context};
+use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleRecord, context};
+use crate::config::{self, Config};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::export::ExportFormat;
 use crate::prelude::*;
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
+use crate::session_options::SessionOptions;
 use crate::session_view::SessionView;
-use crate::status::{ConnectionState, StatusLine};
+use crate::status::{ConnectionState, Notice, StatusLine};
 
 const STATUS_LINE_HEIGHT: Pixels = px(26.);
 
@@ -21,24 +25,24 @@ const STATUS_LINE_HEIGHT: Pixels = px(26.);
 pub struct AppOptions {
     pub port_source: Arc<dyn PortSource>,
     pub transport_factory: Arc<dyn TransportFactory>,
-    /// Starting line settings; the baud field is prefilled from it.
-    pub serial: SerialConfig,
+    /// The `--baud` flag: every connect uses it, over device profiles and the
+    /// `default_baud` setting.
+    pub baud: Option<u32>,
     /// Port to select at startup, even before the source lists it.
     pub select_port: Option<PortId>,
     /// Open `select_port` right away (the `--port` flag).
     pub connect_on_start: bool,
-    /// How each session's scrollback store is sized.
-    pub store: StoreConfig,
+    /// Sizes each session's store in place of the `scrollback_budget_bytes` setting.
+    pub store: Option<StoreConfig>,
 }
 
-/// Global setup: gpui-kit's components and theme, the dark default, key bindings and
-/// the app-level actions. Call once, before opening a window.
+/// Global setup: gpui-kit's components, the bundled configuration (theme, fonts and
+/// key bindings; [`config::start`] replaces it with the user's), and the app-level
+/// actions and menu. Call once, before opening a window.
 pub fn init(cx: &mut App) {
     kit_init(cx);
-    Theme::change(ThemeMode::Dark, None, cx);
-    actions::bind_keys(cx);
-    cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.set_menus([Menu::new("Serialist").items([MenuItem::action("Quit Serialist", Quit)])]);
+    actions::init(cx);
+    config::install(Config::bundled(ConfigPaths::default_for_platform()), cx);
 }
 
 /// Open the main window titled "Serialist" with a [`Workspace`] as its root view.
@@ -72,8 +76,14 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
 pub struct Workspace {
     devices: Entity<DevicesPanel>,
     session: Option<Entity<SessionView>>,
+    /// The port the session is on, for its device profile when settings change.
+    session_port: Option<PortInfo>,
     opener: Arc<dyn SessionOpener>,
-    store: StoreConfig,
+    port_source: Arc<dyn PortSource>,
+    /// The `--baud` flag.
+    baud: Option<u32>,
+    /// Store sizing over the settings' budget.
+    store: Option<StoreConfig>,
     /// Port being opened on the background executor, for the placeholder and status line.
     connecting: Option<PortId>,
     focus_handle: FocusHandle,
@@ -91,40 +101,46 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn new(options: AppOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let opener = Arc::new(CoreSessionOpener::new(options.transport_factory));
-        let mut workspace = Self::with_opener(
-            options.port_source,
-            opener,
-            options.serial.clone(),
-            window,
-            cx,
-        );
+        let mut workspace =
+            Self::with_opener(options.port_source, opener, options.baud, window, cx);
         workspace.store = options.store;
         if let Some(port) = options.select_port {
-            workspace
-                .devices
-                .update(cx, |devices, cx| devices.select_port(port.clone(), cx));
+            workspace.devices.update(cx, |devices, cx| {
+                devices.select_port(port.clone(), window, cx)
+            });
             if options.connect_on_start {
-                workspace.connect(port, options.serial, window, cx);
+                let serial = workspace.serial_for(&port, cx);
+                workspace.connect(port, serial, window, cx);
             }
         }
         workspace
     }
 
     /// A workspace with a custom way of opening sessions; tests pass fakes here.
+    /// `baud`, when set, is used for every connect, as the `--baud` flag is.
     pub fn with_opener(
         port_source: Arc<dyn PortSource>,
         opener: Arc<dyn SessionOpener>,
-        serial: SerialConfig,
+        baud: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let devices = cx.new(|cx| DevicesPanel::new(port_source, serial, window, cx));
+        let devices = cx.new(|cx| DevicesPanel::new(port_source.clone(), baud, window, cx));
         let devices_events =
             cx.subscribe_in(&devices, window, |this, _, event, window, cx| match event {
                 DevicesPanelEvent::Connect { port, serial } => {
                     this.connect(port.clone(), serial.clone(), window, cx);
                 }
             });
+        // A reload reaches the session's display defaults and the status line.
+        let config_changes = cx.observe_global_in::<Config>(window, |this, _, cx| {
+            this.config_changed(cx);
+        });
+        // `"mode": "system"` themes follow the window's appearance.
+        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
+            config::set_appearance(window.appearance(), cx);
+        });
+        config::set_appearance(window.appearance(), cx);
         // Start with the port list focused so arrows and Enter work immediately.
         let devices_focus = devices.focus_handle(cx);
         window.focus(&devices_focus, cx);
@@ -132,14 +148,68 @@ impl Workspace {
         Self {
             devices,
             session: None,
+            session_port: None,
             opener,
-            store: StoreConfig::default(),
+            port_source,
+            baud,
+            store: None,
             connecting: None,
             focus_handle: cx.focus_handle(),
             _connect_task: None,
             _session_observer: None,
-            _subscriptions: vec![devices_events],
+            _subscriptions: vec![devices_events, config_changes, appearance],
         }
+    }
+
+    /// What the app knows about `port`: its entry in the Devices panel, else the port
+    /// source's current list, else just its id (enough for a path-matched profile).
+    pub fn port_info(&self, port: &PortId, cx: &App) -> PortInfo {
+        self.devices
+            .read(cx)
+            .list()
+            .get(port)
+            .map(|entry| entry.info.clone())
+            .or_else(|| {
+                self.port_source
+                    .snapshot()
+                    .into_iter()
+                    .find(|info| &info.id == port)
+            })
+            .unwrap_or_else(|| PortInfo {
+                id: port.clone(),
+                kind: PortKind::Unknown,
+                display_name: port.to_string(),
+            })
+    }
+
+    /// The line settings to open `port` with: its device profile over `default_baud`,
+    /// with `--baud` over both.
+    pub fn serial_for(&self, port: &PortId, cx: &App) -> SerialConfig {
+        let info = self.port_info(port, cx);
+        let mut serial = cx.global::<Config>().serial_config_for(&info);
+        if let Some(baud) = self.baud {
+            serial.baud = baud;
+        }
+        serial
+    }
+
+    /// What a session on `port` starts with, from the settings and its profile.
+    fn session_options_for(&self, port: &PortInfo, cx: &App) -> SessionOptions {
+        let options = SessionOptions::from_settings(cx.global::<Config>().settings(), port);
+        match &self.store {
+            Some(store) => options.with_store(store.clone()),
+            None => options,
+        }
+    }
+
+    /// The configuration changed: hand the session its new defaults and repaint the
+    /// status line.
+    fn config_changed(&mut self, cx: &mut Context<Self>) {
+        if let (Some(session), Some(port)) = (&self.session, &self.session_port) {
+            let options = self.session_options_for(port, cx);
+            session.update(cx, |view, cx| view.apply_options(options, cx));
+        }
+        cx.notify();
     }
 
     pub fn devices(&self) -> &Entity<DevicesPanel> {
@@ -194,9 +264,11 @@ impl Workspace {
                 if let Some(previous) = self.session.take() {
                     previous.update(cx, |view, cx| view.disconnect(cx));
                 }
-                let store = self.store.clone();
-                let view =
-                    cx.new(|cx| SessionView::new(port.clone(), serial, session, store, window, cx));
+                let info = self.port_info(&port, cx);
+                let options = self.session_options_for(&info, cx);
+                self.session_port = Some(info);
+                let view = cx
+                    .new(|cx| SessionView::new(port.clone(), serial, session, options, window, cx));
                 // The status line and the Devices panel's "open" dot follow the session.
                 self._session_observer = Some(cx.observe(&view, |this, view, cx| {
                     let open = view.read(cx).open_port().cloned();
@@ -355,13 +427,46 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    /// What the status line says about the configuration: a file that did not load, a
+    /// theme that was not found, an unknown key.
+    pub fn config_notice(&self, cx: &App) -> Option<Notice> {
+        cx.try_global::<Config>().and_then(Config::notice)
+    }
+
+    fn render_config_notice(&self, cx: &Context<Self>) -> Option<Div> {
+        let notice = self.config_notice(cx)?;
+        let theme = cx.theme();
+        let color = if notice.is_error {
+            theme.danger
+        } else {
+            theme.warning
+        };
+        Some(
+            div()
+                .ml_auto()
+                .min_w_0()
+                .truncate()
+                .text_color(color)
+                .child(SharedString::from(notice.text)),
+        )
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
+        // Panels, the status line and inputs inherit the UI font's weight and OpenType
+        // features from here; gpui-kit's theme carries its family and size.
+        let ui_font = cx
+            .try_global::<Config>()
+            .map(|config| config.ui_font().font.clone());
         let center = self.render_center(cx);
-        let status_line = self.render_status_line(cx);
+        let status_line = self
+            .render_status_line(cx)
+            .children(self.render_config_notice(cx));
 
         v_flex()
             .id("workspace")
@@ -373,6 +478,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::toggle_record))
             .size_full()
+            .when_some(ui_font, |this, font| this.font(font))
             .bg(background)
             .text_color(foreground)
             .child(
@@ -407,7 +513,7 @@ mod tests {
         let opener = Arc::new(FakeOpener::default());
         let for_window = opener.clone();
         let (window, workspace) = open_test_window(cx, move |window, cx| {
-            Workspace::with_opener(source, for_window, SerialConfig::default(), window, cx)
+            Workspace::with_opener(source, for_window, None, window, cx)
         });
         cx.run_until_parked();
         (window, workspace, opener)

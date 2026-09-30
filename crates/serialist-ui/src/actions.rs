@@ -1,9 +1,26 @@
-//! Actions and default key bindings. Names follow Zed's `namespace::Action` style so a
-//! Zed-format keymap file can rebind them once keymap loading lands.
+//! Actions, the app-level action handlers and the menu. Names follow Zed's
+//! `namespace::Action` style; every action here registers under that name, which is
+//! how a Zed-format keymap file names it (see [`keymap`](crate::keymap)). The default
+//! bindings are the bundled keymap in `serialist-core`; [`keys`] restates the chords
+//! tests press.
 
+use crate::config::{self, Config};
 use crate::prelude::*;
 
-actions!(serialist, [Quit]);
+actions!(
+    serialist,
+    [
+        Quit,
+        /// Open settings.json, writing the commented template first if there is none.
+        OpenSettings,
+        /// Open keymap.json, writing an empty one first if there is none.
+        OpenKeymap,
+        /// Open the themes folder, creating it first if needed.
+        OpenThemesFolder,
+        /// Read settings, keymap and themes from disk again.
+        ReloadConfig,
+    ]
+);
 actions!(terminal, [Clear, JumpToBottom, Pause, Export, ToggleRecord]);
 actions!(
     terminal,
@@ -33,7 +50,7 @@ actions!(serial, [Connect, Disconnect]);
 actions!(devices, [SelectNext, SelectPrevious]);
 actions!(compose, [HistoryPrevious, HistoryNext, CycleLineEnding]);
 
-/// Key contexts set by the views, referenced by the bindings below.
+/// Key contexts set by the views, referenced by the bundled keymap.
 pub mod context {
     pub const WORKSPACE: &str = "Workspace";
     pub const DEVICES_PANEL: &str = "DevicesPanel";
@@ -43,7 +60,9 @@ pub mod context {
     pub const TERMINAL_SEARCH: &str = "TerminalSearch";
 }
 
-#[cfg(target_os = "macos")]
+/// The default chords tests press. The bundled keymap in `serialist-core` is where they
+/// are bound; `test_chords_match_the_bundled_keymap` keeps the two in step.
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) mod keys {
     pub const QUIT: &str = "cmd-q";
     pub const CLEAR: &str = "cmd-k";
@@ -63,7 +82,7 @@ pub(crate) mod keys {
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
 // (ctrl-s is XOFF), so the other platforms take shifted chords. Pause is the exception
 // at plain ctrl-p; inline mode will need an escape for it.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(test, not(target_os = "macos")))]
 pub(crate) mod keys {
     pub const QUIT: &str = "ctrl-q";
     pub const CLEAR: &str = "ctrl-shift-k";
@@ -80,51 +99,137 @@ pub(crate) mod keys {
     pub const TOGGLE_FRAME_STATS: &str = "ctrl-alt-i";
 }
 
-pub fn bind_keys(cx: &mut App) {
-    // The compose bindings sit on the gpui-kit Input's own context, one level deeper
-    // than a plain "ComposeBar" binding could reach, and they are registered after
-    // gpui-kit's, so they win over the Input's own up/down handling.
-    let compose_input = format!("{} > Input", context::COMPOSE_BAR);
-    cx.bind_keys([
-        KeyBinding::new(keys::QUIT, Quit, None),
-        KeyBinding::new(keys::CLEAR, Clear, Some(context::WORKSPACE)),
-        KeyBinding::new(keys::DISCONNECT, Disconnect, Some(context::WORKSPACE)),
-        KeyBinding::new(keys::PAUSE, Pause, Some(context::WORKSPACE)),
-        KeyBinding::new(keys::EXPORT, Export, Some(context::WORKSPACE)),
-        KeyBinding::new(keys::TOGGLE_RECORD, ToggleRecord, Some(context::WORKSPACE)),
-        KeyBinding::new("down", SelectNext, Some(context::DEVICES_PANEL)),
-        KeyBinding::new("up", SelectPrevious, Some(context::DEVICES_PANEL)),
-        KeyBinding::new("enter", Connect, Some(context::DEVICES_PANEL)),
-        KeyBinding::new("up", HistoryPrevious, Some(&compose_input)),
-        KeyBinding::new("down", HistoryNext, Some(&compose_input)),
-        KeyBinding::new(
-            keys::CYCLE_LINE_ENDING,
-            CycleLineEnding,
-            Some(context::COMPOSE_BAR),
-        ),
-    ]);
-    bind_terminal_keys(cx);
+/// App-level setup: remember gpui-kit's own key bindings (so a keymap reload can put
+/// them back), register the handlers of the app-wide actions, and set the menu. Call
+/// right after `gpui_kit::init`, before anything else binds keys.
+pub fn init(cx: &mut App) {
+    crate::keymap::snapshot_kit_bindings(cx);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &OpenSettings, cx| open_settings(cx));
+    cx.on_action(|_: &OpenKeymap, cx| open_keymap(cx));
+    cx.on_action(|_: &OpenThemesFolder, cx| open_themes_folder(cx));
+    cx.on_action(|_: &ReloadConfig, cx| config::reload_all(cx));
+    cx.set_menus([Menu::new("Serialist").items([
+        MenuItem::action("Open Settings", OpenSettings),
+        MenuItem::action("Open Keymap", OpenKeymap),
+        MenuItem::action("Open Themes Folder", OpenThemesFolder),
+        MenuItem::action("Reload Configuration", ReloadConfig),
+        MenuItem::separator(),
+        MenuItem::action("Quit Serialist", Quit),
+    ])]);
 }
 
-/// The terminal's own bindings. They apply while the terminal view has focus; the
-/// search field sits inside it, and the field's own Input bindings win there. Escape
-/// reaches `DismissSearch` because the Input propagates an escape it has no use for.
-fn bind_terminal_keys(cx: &mut App) {
-    let terminal = Some(context::TERMINAL);
-    cx.bind_keys([
-        KeyBinding::new(keys::COPY, Copy, terminal),
-        KeyBinding::new(keys::SELECT_ALL, SelectAll, terminal),
-        KeyBinding::new(keys::SEARCH, Search, terminal),
-        KeyBinding::new("escape", DismissSearch, Some(context::TERMINAL_SEARCH)),
-        KeyBinding::new("alt-z", ToggleWrap, terminal),
-        KeyBinding::new("alt-t", CycleTimestamps, terminal),
-        KeyBinding::new("alt-h", ToggleHexView, terminal),
-        KeyBinding::new(keys::TOGGLE_FRAME_STATS, ToggleFrameStats, terminal),
-        KeyBinding::new("pageup", PageUp, terminal),
-        KeyBinding::new("pagedown", PageDown, terminal),
-        KeyBinding::new("home", ScrollToTop, terminal),
-        KeyBinding::new("end", JumpToBottom, terminal),
-        KeyBinding::new(keys::SCROLL_TO_TOP, ScrollToTop, terminal),
-        KeyBinding::new(keys::SCROLL_TO_BOTTOM, JumpToBottom, terminal),
-    ]);
+/// A keymap.json that binds nothing, for [`OpenKeymap`] to start from.
+pub const KEYMAP_TEMPLATE: &str = "\
+// Serialist key bindings, in Zed's keymap format. These are applied after the
+// bundled defaults, so they win. Bind a keystroke to null to unbind it.
+//
+// [
+//   {
+//     \"context\": \"Workspace\",
+//     \"bindings\": {
+//       \"cmd-k\": \"terminal::Clear\"
+//     }
+//   }
+// ]
+[]
+";
+
+fn paths(cx: &App) -> Option<serialist_core::settings::ConfigPaths> {
+    cx.try_global::<Config>()
+        .map(|config| config.paths().clone())
+}
+
+fn report(what: &str, error: std::io::Error) {
+    tracing::error!(%error, "could not prepare {what}");
+}
+
+/// Write the commented settings template if there is no settings file, then open it.
+pub fn open_settings(cx: &mut App) {
+    let Some(paths) = paths(cx) else { return };
+    match paths.ensure_settings_file() {
+        Ok(_) => config::open_path(&paths.settings, cx),
+        Err(error) => report("settings.json", error),
+    }
+}
+
+/// Write an empty keymap if there is none, then open it.
+pub fn open_keymap(cx: &mut App) {
+    let Some(paths) = paths(cx) else { return };
+    let prepared = std::fs::create_dir_all(&paths.dir).and_then(|()| {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&paths.keymap)
+        {
+            Ok(mut file) => std::io::Write::write_all(&mut file, KEYMAP_TEMPLATE.as_bytes()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    });
+    match prepared {
+        Ok(()) => config::open_path(&paths.keymap, cx),
+        Err(error) => report("keymap.json", error),
+    }
+}
+
+/// Create the themes folder if needed, then open it.
+pub fn open_themes_folder(cx: &mut App) {
+    let Some(paths) = paths(cx) else { return };
+    match std::fs::create_dir_all(&paths.themes) {
+        Ok(()) => config::open_path(&paths.themes, cx),
+        Err(error) => report("the themes folder", error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serialist_core::Keymap;
+
+    use super::*;
+
+    /// The chords tests press are the ones the bundled keymap binds.
+    #[test]
+    fn test_chords_match_the_bundled_keymap() {
+        let keymap = Keymap::bundled_default();
+        let bound = |context: Option<&str>, keystrokes: &str| {
+            keymap
+                .resolved()
+                .into_iter()
+                .find(|entry| entry.context.as_deref() == context && entry.keystrokes == keystrokes)
+                .and_then(|entry| entry.action.as_ref())
+                .map(|action| action.name.clone())
+                .unwrap_or_else(|| panic!("{keystrokes} is not bound in {context:?}"))
+        };
+        let workspace = Some(context::WORKSPACE);
+        let terminal = Some(context::TERMINAL);
+        assert_eq!(bound(None, keys::QUIT), "serialist::Quit");
+        assert_eq!(bound(workspace, keys::CLEAR), "terminal::Clear");
+        assert_eq!(bound(workspace, keys::DISCONNECT), "serial::Disconnect");
+        assert_eq!(bound(workspace, keys::PAUSE), "terminal::Pause");
+        assert_eq!(bound(workspace, keys::EXPORT), "terminal::Export");
+        assert_eq!(
+            bound(workspace, keys::TOGGLE_RECORD),
+            "terminal::ToggleRecord"
+        );
+        assert_eq!(
+            bound(Some(context::COMPOSE_BAR), keys::CYCLE_LINE_ENDING),
+            "compose::CycleLineEnding"
+        );
+        assert_eq!(bound(terminal, keys::COPY), "terminal::Copy");
+        assert_eq!(bound(terminal, keys::SELECT_ALL), "terminal::SelectAll");
+        assert_eq!(bound(terminal, keys::SEARCH), "terminal::Search");
+        assert_eq!(
+            bound(terminal, keys::SCROLL_TO_TOP),
+            "terminal::ScrollToTop"
+        );
+        assert_eq!(
+            bound(terminal, keys::SCROLL_TO_BOTTOM),
+            "terminal::JumpToBottom"
+        );
+        assert_eq!(
+            bound(terminal, keys::TOGGLE_FRAME_STATS),
+            "terminal::ToggleFrameStats"
+        );
+    }
 }

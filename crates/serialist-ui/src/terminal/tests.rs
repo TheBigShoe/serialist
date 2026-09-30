@@ -15,6 +15,7 @@ use crate::terminal::element::{CellMetrics, PADDING_LEFT};
 use crate::terminal::layout::Viewport;
 use crate::terminal::{
     DisplayMode, FrameSample, Selection, SelectionPoint, TerminalView, TimestampMode,
+    TimestampModeExt,
 };
 use crate::test_support::open_test_window;
 
