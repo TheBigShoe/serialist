@@ -439,3 +439,98 @@ fn debug_output_names_the_state() {
     assert_eq!(expectation.pattern(), "^OK");
     assert_eq!(expectation.timeout(), Duration::from_secs(60));
 }
+
+#[test]
+fn a_match_reports_where_it_sits_in_the_line() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect(r"(\w+)=(\d+)(x)?");
+    // The arrow is three bytes, so byte ranges and character counts differ.
+    rig.feed("\u{2192} temp=41 ok\r\n".as_bytes());
+    let Some(ExpectResult::Matched {
+        text,
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "\u{2192} temp=41 ok");
+    assert_eq!(range, 4..11);
+    assert_eq!(&text[range], "temp=41");
+    assert_eq!(
+        capture_ranges,
+        [Some(4..11), Some(4..8), Some(9..11), None],
+        "the whole match, each group, and the group that sat out"
+    );
+    for (captured, range) in captures.iter().zip(&capture_ranges) {
+        assert_eq!(
+            captured.as_deref(),
+            range.clone().map(|range| &text[range]),
+            "each range slices out its capture"
+        );
+    }
+}
+
+#[test]
+fn the_first_match_in_the_line_is_the_one_reported() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect(r"\d+");
+    rig.feed(b"a 12 b 345\r\n");
+    let Some(ExpectResult::Matched {
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(range, 2..4);
+    assert_eq!(captures, [Some("12".to_owned())]);
+    assert_eq!(capture_ranges, [Some(2..4)]);
+}
+
+#[test]
+fn a_pattern_that_matches_nothing_in_particular_has_an_empty_range() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect("^");
+    rig.feed(b"anything\r\n");
+    let Some(ExpectResult::Matched {
+        text,
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "anything");
+    assert_eq!(range, 0..0);
+    assert_eq!(captures, [Some(String::new())]);
+    assert_eq!(capture_ranges, [Some(0..0)]);
+}
+
+#[test]
+fn ranges_follow_the_smart_case_regex_and_the_decoded_text() {
+    let mut rig = Rig::new();
+    // No capital in the pattern, so it ignores case; the line's text is what the parser
+    // made of it, with the escape sequences gone, not the raw bytes.
+    let expectation = rig.expect("ready");
+    rig.feed(b"\x1b[32mSystem READY\x1b[0m\r\n");
+    let Some(ExpectResult::Matched {
+        text,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "System READY");
+    assert_eq!(range, 7..12);
+    assert_eq!(&text[range.clone()], "READY");
+    assert_eq!(capture_ranges, [Some(range)]);
+}

@@ -39,6 +39,11 @@
 //!   line), and a line can satisfy any number of expectations at once.
 //! - **Captures**: [`ExpectResult::Matched::captures`] is the regex's capture list, group
 //!   0 (the whole match) first, `None` for a group that did not take part.
+//! - **Where it matched**: [`ExpectResult::Matched::range`] is the byte range of the
+//!   whole match within [`text`](ExpectResult::Matched::text), and
+//!   [`capture_ranges`](ExpectResult::Matched::capture_ranges) the range of every group
+//!   in the same order as `captures`, so a highlight needs no second pass with the
+//!   pattern. The first match in the line is the one reported.
 //!
 //! # Timing
 //!
@@ -64,6 +69,7 @@
 //! needs an option to test the line in progress; it is not here yet.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -92,6 +98,12 @@ pub enum ExpectResult {
         text: String,
         /// The regex's captures, whole match first.
         captures: Vec<Option<String>>,
+        /// Where the whole match sits in `text`, in bytes. Empty for a pattern that
+        /// matched nothing in particular, such as `^` (then `text[range]` is `""`).
+        range: Range<usize>,
+        /// Where each capture sits in `text`, in the order of `captures` (the whole
+        /// match first, `None` for a group that did not take part).
+        capture_ranges: Vec<Option<Range<usize>>>,
         /// From registering the expectation to the chunk holding the line arriving.
         elapsed: Duration,
     },
@@ -270,22 +282,25 @@ impl MatcherHandle {
                         // Too late to count. Reported as a timeout at the next expiry.
                         return true;
                     }
-                    if !entry.regex.is_match(&line.text) {
+                    let Some(caps) = entry.regex.captures(&line.text) else {
                         return true;
-                    }
-                    let captures = entry
-                        .regex
-                        .captures(&line.text)
-                        .map(|caps| {
-                            caps.iter()
-                                .map(|group| group.map(|m| m.as_str().to_owned()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    };
+                    let captures = caps
+                        .iter()
+                        .map(|group| group.map(|m| m.as_str().to_owned()))
+                        .collect();
+                    let capture_ranges: Vec<Option<Range<usize>>> =
+                        caps.iter().map(|group| group.map(|m| m.range())).collect();
                     slot.resolve(ExpectResult::Matched {
                         line: line.id,
                         text: line.text.clone(),
                         captures,
+                        range: capture_ranges
+                            .first()
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_default(),
+                        capture_ranges,
                         elapsed: at.saturating_duration_since(entry.registered),
                     });
                     false
