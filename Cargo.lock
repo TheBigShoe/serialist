@@ -6496,10 +6496,12 @@ dependencies = [
 name = "serialist-ui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossbeam-channel",
  "gpui-kit",
  "parking_lot",
  "proptest",
+ "regex",
  "serialist-core",
  "serialist-sim",
  "tracing",
