@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Serialist icon candidate 4: Glass chevron. Original artwork, MIT OR Apache-2.0.
+
+  The prompt chevron, big, built from two translucent slabs: mint in front, cyan
+  behind. Each slab's inner end is cut along the other's outer edge, so the
+  silhouette stays one clean chevron while the overlap at the point shows as a
+  brighter pane where light passes through both. A square wave is cut clean
+  through the glass (stroked with the tile's own gradient, so the cut shows the
+  tile), and the glass throws a faint coloured glow onto a dark tile with a
+  fading grid. Built from paths, gradients and group opacity only.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Serialist: Glass chevron</title>
+  <defs>
+    <linearGradient id="tile" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="1024">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="1" stop-color="#0a0f19"/>
+    </linearGradient>
+    <radialGradient id="grid" gradientUnits="userSpaceOnUse" cx="512" cy="512" r="500">
+      <stop offset="0" stop-color="#9fc2ff" stop-opacity="0.13"/>
+      <stop offset="0.65" stop-color="#9fc2ff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#9fc2ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glow" gradientUnits="userSpaceOnUse" x1="0" y1="192" x2="0" y2="832">
+      <stop offset="0" stop-color="#5df0c6"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+    <linearGradient id="mint" gradientUnits="userSpaceOnUse" x1="300" y1="200" x2="660" y2="600">
+      <stop offset="0" stop-color="#a6fbe3"/>
+      <stop offset="0.5" stop-color="#5df0c6"/>
+      <stop offset="1" stop-color="#26c79c"/>
+    </linearGradient>
+    <linearGradient id="cyan" gradientUnits="userSpaceOnUse" x1="660" y1="420" x2="260" y2="820">
+      <stop offset="0" stop-color="#9be6fb"/>
+      <stop offset="0.5" stop-color="#4cc9f0"/>
+      <stop offset="1" stop-color="#2394c9"/>
+    </linearGradient>
+    <!-- Specular sheen across each slab, top edge to bottom edge. -->
+    <linearGradient id="specU" gradientUnits="userSpaceOnUse" x1="535" y1="352" x2="443" y2="470">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.42"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0a0f19" stop-opacity="0.12"/>
+    </linearGradient>
+    <linearGradient id="specL" gradientUnits="userSpaceOnUse" x1="428" y1="566" x2="520" y2="684">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.32"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0a0f19" stop-opacity="0.16"/>
+    </linearGradient>
+    <path id="outline" d="M330 192L740 512L330 832L238 714L496 512L238 310Z"/>
+    <path id="upper" d="M330 192L740 512L618 607L238 310Z"/>
+    <path id="lower" d="M330 832L740 512L618 417L238 714Z"/>
+    <path id="wave" d="M372 572H474V452H604V572H790"/>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+
+  <!-- Grid, 64 px, fading out well before the rim. -->
+  <path fill="none" stroke="url(#grid)" stroke-width="2" d="M128 32V992M192 32V992M256 32V992M320 32V992M384 32V992M448 32V992M512 32V992M576 32V992M640 32V992M704 32V992M768 32V992M832 32V992M896 32V992M32 128H992M32 192H992M32 256H992M32 320H992M32 384H992M32 448H992M32 512H992M32 576H992M32 640H992M32 704H992M32 768H992M32 832H992M32 896H992"/>
+
+  <g transform="translate(16 0)">
+    <!-- Slabs: rounded by a same-colour stroke, then made translucent as a group. -->
+    <g opacity="0.84" stroke-linejoin="round" stroke-width="20">
+      <use xlink:href="#lower" fill="url(#cyan)" stroke="url(#cyan)"/>
+    </g>
+    <use xlink:href="#lower" fill="url(#specL)"/>
+    <g opacity="0.84" stroke-linejoin="round" stroke-width="20">
+      <use xlink:href="#upper" fill="url(#mint)" stroke="url(#mint)"/>
+    </g>
+    <use xlink:href="#upper" fill="url(#specU)"/>
+    <!-- Where the panes overlap, more light gets through. -->
+    <path d="M740 512L618 607L496 512L618 417Z" fill="#ffffff" fill-opacity="0.30" stroke="#ffffff" stroke-opacity="0.30" stroke-width="20" stroke-linejoin="round"/>
+
+    <!-- Highlight edges, lit from above. -->
+    <g fill="none" stroke-linecap="round">
+      <path d="M338 186L736 497" stroke="#ffffff" stroke-opacity="0.85" stroke-width="8"/>
+      <path d="M326 190L234 308" stroke="#ffffff" stroke-opacity="0.45" stroke-width="6"/>
+      <path d="M244 704L500 504" stroke="#ffffff" stroke-opacity="0.55" stroke-width="6"/>
+    </g>
+
+    <!-- The signal, cut through the glass (stroked in the tile's own gradient). -->
+    <use xlink:href="#wave" fill="none" stroke="url(#tile)" stroke-width="24" stroke-linejoin="miter" stroke-linecap="butt"/>
+
+    <!-- Light thrown by the glass. Drawn after the cut, so wherever the cut runs
+         past the glass it picks up the same glow as its surroundings and vanishes. -->
+    <g fill="none" stroke="url(#glow)" stroke-linejoin="round">
+      <use xlink:href="#outline" stroke-width="250" stroke-opacity="0.018"/>
+      <use xlink:href="#outline" stroke-width="210" stroke-opacity="0.022"/>
+      <use xlink:href="#outline" stroke-width="172" stroke-opacity="0.03"/>
+      <use xlink:href="#outline" stroke-width="138" stroke-opacity="0.04"/>
+      <use xlink:href="#outline" stroke-width="108" stroke-opacity="0.05"/>
+      <use xlink:href="#outline" stroke-width="80" stroke-opacity="0.065"/>
+      <use xlink:href="#outline" stroke-width="56" stroke-opacity="0.08"/>
+    </g>
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+</svg>
