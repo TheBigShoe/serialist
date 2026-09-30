@@ -441,7 +441,7 @@ impl Stage {
             transport_factory: world.transport_factory(),
             baud: None,
             select_port: shot.connect.map(PortId::new),
-            connect_on_start: shot.connect.is_some(),
+            open_ports: shot.connect.map(PortId::new).into_iter().collect(),
             store: None,
         };
         let (width, height) = shot.size;
