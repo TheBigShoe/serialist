@@ -1,12 +1,13 @@
-//! Raw capture: the received bytes exactly as the transport delivered them, for raw
-//! export and recording.
+//! Raw recording: every received chunk appended to a file, exactly as the transport
+//! delivered it.
 //!
-//! A stand-in for the milestone 1 page store, which will own raw retention. Until then
-//! [`RawRing`] keeps the transport's own `Arc<[u8]>` chunks (no copy) under a byte cap,
-//! and [`Recorder`] appends chunks to a file from the drain worker, so file I/O never
-//! runs on the main thread.
+//! The store owns raw retention (raw export reads its pages); recording is the one
+//! consumer that must see every byte forever, so it runs on the ingest thread as a
+//! [`ChunkSink`]. [`RecordingSink`] is installed when the session's ingest thread is
+//! spawned and looks up the active [`Recorder`] in a [`RecordingSlot`] per chunk, so a
+//! recording starts and stops mid-session without respawning anything, and file I/O
+//! never runs on the main thread.
 
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -15,91 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-
-/// Raw bytes kept per session before the oldest chunks are dropped.
-pub const DEFAULT_RAW_CAPACITY: usize = 64 * 1024 * 1024;
+use serialist_core::ChunkSink;
 
 /// A recording reaches the disk at least this often while data flows.
 pub const RECORD_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
-
-/// The newest received chunks, up to a byte cap.
-///
-/// Eviction is by whole chunks, oldest first. The newest chunk is always kept, so a
-/// single chunk larger than the cap (not possible with the session's 64 KiB reads)
-/// cannot empty the ring.
-#[derive(Clone, Debug)]
-pub struct RawRing {
-    chunks: VecDeque<Arc<[u8]>>,
-    capacity: usize,
-    retained: usize,
-    /// Stream offset of the first retained byte, which is also the bytes evicted so far.
-    oldest_offset: u64,
-}
-
-impl Default for RawRing {
-    fn default() -> Self {
-        Self::new(DEFAULT_RAW_CAPACITY)
-    }
-}
-
-impl RawRing {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            chunks: VecDeque::new(),
-            capacity,
-            retained: 0,
-            oldest_offset: 0,
-        }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    pub fn push(&mut self, chunk: Arc<[u8]>) {
-        if chunk.is_empty() {
-            return;
-        }
-        self.retained += chunk.len();
-        self.chunks.push_back(chunk);
-        while self.retained > self.capacity && self.chunks.len() > 1 {
-            if let Some(oldest) = self.chunks.pop_front() {
-                self.retained -= oldest.len();
-                self.oldest_offset += oldest.len() as u64;
-            }
-        }
-    }
-
-    /// Bytes currently held.
-    pub fn retained_bytes(&self) -> usize {
-        self.retained
-    }
-
-    /// Stream offset of the oldest byte still held.
-    pub fn oldest_offset(&self) -> u64 {
-        self.oldest_offset
-    }
-
-    /// Bytes dropped from the front to honour the cap.
-    pub fn evicted_bytes(&self) -> u64 {
-        self.oldest_offset
-    }
-
-    /// Stream offset just past the newest byte: every byte ever pushed.
-    pub fn end_offset(&self) -> u64 {
-        self.oldest_offset + self.retained as u64
-    }
-
-    pub fn chunks(&self) -> impl Iterator<Item = &Arc<[u8]>> + '_ {
-        self.chunks.iter()
-    }
-
-    /// The retained chunks, sharing their storage: cheap enough to take on the main
-    /// thread and hand to a background export.
-    pub fn snapshot(&self) -> Vec<Arc<[u8]>> {
-        self.chunks.iter().cloned().collect()
-    }
-}
 
 /// Counters a recording shares with the UI, readable without touching the file.
 #[derive(Debug, Default)]
@@ -174,6 +94,17 @@ impl Recorder {
         }
     }
 
+    /// Flush now, whatever the interval.
+    pub fn flush(&mut self) {
+        if self.failed {
+            return;
+        }
+        self.last_flush = Instant::now();
+        if let Err(error) = self.file.flush() {
+            self.fail(&error);
+        }
+    }
+
     /// Final flush and sync. Returns the bytes recorded, or the first error.
     pub fn finish(mut self) -> Result<u64, String> {
         if !self.failed {
@@ -201,11 +132,11 @@ impl Recorder {
     }
 }
 
-/// Where the drain worker finds the active recorder, if any.
+/// Where the recording sink finds the active recorder, if any.
 ///
-/// Only background threads lock it (the drain worker per batch, and start and stop
-/// tasks), so the main thread never waits on a file write. Each recording carries an
-/// id so a stop can only ever take the recording it was meant for.
+/// Only background threads lock it (the ingest thread per chunk, and the start, stop
+/// and idle-flush tasks), so the main thread never waits on a file write. Each
+/// recording carries an id so a stop can only ever take the recording it was meant for.
 #[derive(Clone, Default)]
 pub struct RecordingSlot {
     active: Arc<Mutex<Option<(u64, Recorder)>>>,
@@ -233,8 +164,7 @@ impl RecordingSlot {
         self.active.lock().is_some()
     }
 
-    /// The drain path: append every chunk in order, then flush if one is due. Called on
-    /// every wake, including idle ones, so the flush cadence holds when data stops.
+    /// Append every chunk in order, then flush if one is due.
     pub fn record<'a>(&self, chunks: impl IntoIterator<Item = &'a [u8]>, now: Instant) {
         let mut active = self.active.lock();
         if let Some((_, recorder)) = active.as_mut() {
@@ -244,60 +174,53 @@ impl RecordingSlot {
             recorder.tick(now);
         }
     }
+
+    /// Flush if one is due. The session view calls this from the background executor on
+    /// a timer, so the flush cadence holds when data stops and no chunk calls the sink.
+    pub fn tick(&self, now: Instant) {
+        self.record(std::iter::empty(), now);
+    }
+
+    /// Flush now.
+    pub fn flush(&self) {
+        if let Some((_, recorder)) = self.active.lock().as_mut() {
+            recorder.flush();
+        }
+    }
+}
+
+/// The [`ChunkSink`] a session's ingest thread writes recordings through: whatever
+/// recorder the slot holds gets every chunk, unchanged and in order; with none
+/// installed a chunk costs one uncontended lock.
+#[derive(Clone, Default)]
+pub struct RecordingSink {
+    slot: RecordingSlot,
+}
+
+impl RecordingSink {
+    pub fn new(slot: RecordingSlot) -> Self {
+        Self { slot }
+    }
+}
+
+impl ChunkSink for RecordingSink {
+    fn on_chunk(&mut self, bytes: &[u8], _at: Instant) {
+        self.slot.record([bytes], Instant::now());
+    }
+
+    /// Nothing more will arrive: get what is buffered onto the disk. The session view
+    /// then stops the recording with a final flush and sync.
+    fn on_disconnect(&mut self) {
+        self.slot.flush();
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::test_support::TestDir;
-
-    fn ring_bytes(ring: &RawRing) -> Vec<u8> {
-        ring.chunks().flat_map(|c| c.iter().copied()).collect()
-    }
-
-    #[test]
-    fn ring_evicts_the_oldest_chunks_and_counts_them() {
-        let mut ring = RawRing::new(10);
-        for chunk in [&b"abcd"[..], b"efgh", b"ijkl", b"mn"] {
-            ring.push(Arc::from(chunk));
-        }
-        // 14 bytes pushed; dropping "abcd" leaves exactly 10.
-        assert_eq!(ring_bytes(&ring), b"efghijklmn");
-        assert_eq!(ring.retained_bytes(), 10);
-        assert_eq!(ring.evicted_bytes(), 4);
-        assert_eq!(ring.oldest_offset(), 4);
-        assert_eq!(ring.end_offset(), 14);
-
-        ring.push(Arc::from(&b"o"[..]));
-        assert_eq!(ring_bytes(&ring), b"ijklmno");
-        assert_eq!(ring.evicted_bytes(), 8);
-        assert_eq!(ring.end_offset(), 15);
-    }
-
-    #[test]
-    fn ring_keeps_the_newest_bytes_of_a_long_stream() {
-        let mut ring = RawRing::new(1000);
-        let stream: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-        for chunk in stream.chunks(37) {
-            ring.push(Arc::from(chunk));
-        }
-        let kept = ring_bytes(&ring);
-        assert!(kept.len() <= 1000 && kept.len() > 1000 - 37);
-        assert_eq!(kept, stream[stream.len() - kept.len()..]);
-        assert_eq!(ring.evicted_bytes() as usize, stream.len() - kept.len());
-    }
-
-    #[test]
-    fn ring_never_drops_the_newest_chunk_and_ignores_empty_ones() {
-        let mut ring = RawRing::new(4);
-        ring.push(Arc::from(&b""[..]));
-        assert_eq!(ring.chunks().count(), 0);
-        ring.push(Arc::from(&b"123456"[..]));
-        assert_eq!(ring_bytes(&ring), b"123456");
-        ring.push(Arc::from(&b"78"[..]));
-        assert_eq!(ring_bytes(&ring), b"78");
-        assert_eq!(ring.evicted_bytes(), 6);
-    }
 
     #[test]
     fn recorder_flushes_on_its_interval_and_on_finish() {
@@ -341,5 +264,45 @@ mod tests {
 
         // With nothing installed, recording is a no-op.
         slot.record([&b"lost"[..]], Instant::now());
+    }
+
+    #[test]
+    fn the_sink_records_through_whatever_the_slot_holds() {
+        let dir = TestDir::new("recorder-sink");
+        let slot = RecordingSlot::default();
+        let mut sink = RecordingSink::new(slot.clone());
+        let now = Instant::now();
+        sink.on_chunk(b"before ", now);
+
+        let path = dir.path().join("mid.bin");
+        slot.install(7, Recorder::create(&path).unwrap());
+        sink.on_chunk(b"\x00during\r\n", now);
+        sink.on_chunk(b"\xff", now);
+        assert_eq!(fs::read(&path).unwrap(), b"", "buffered");
+        sink.on_disconnect();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"\x00during\r\n\xff",
+            "disconnect flushes, byte for byte"
+        );
+
+        let recorder = slot.take(7).unwrap();
+        sink.on_chunk(b"after", now);
+        assert_eq!(recorder.finish(), Ok(10));
+        assert_eq!(fs::read(&path).unwrap(), b"\x00during\r\n\xff");
+    }
+
+    #[test]
+    fn an_idle_tick_flushes_once_the_interval_passed() {
+        let dir = TestDir::new("recorder-tick");
+        let slot = RecordingSlot::default();
+        let path = dir.path().join("idle.bin");
+        slot.install(1, Recorder::create(&path).unwrap());
+        let start = Instant::now();
+        slot.record([&b"quiet"[..]], start);
+        slot.tick(start);
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        slot.tick(start + RECORD_FLUSH_INTERVAL + Duration::from_millis(1));
+        assert_eq!(fs::read(&path).unwrap(), b"quiet");
     }
 }

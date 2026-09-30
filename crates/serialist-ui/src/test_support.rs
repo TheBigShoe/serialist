@@ -10,17 +10,14 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use serialist_core::{
-    PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig, SessionClosed, SessionEvent,
-    SessionStats, TransportError, UsbInfo,
+    Direction, LineSource, PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig,
+    SessionClosed, SessionEvent, SessionStats, StoreConfig, StyledLine, TransportError, UsbInfo,
 };
 use serialist_sim::SimWorld;
 
-use crate::drain::FRAME;
-use crate::line_buffer::LineKind;
 use crate::prelude::*;
 use crate::session_handle::{SessionHandle, SessionOpener};
-use crate::session_model::ConnectionState;
-use crate::session_view::SessionView;
+use crate::session_view::{FRAME, SessionView};
 use crate::workspace::{AppOptions, Workspace};
 
 pub(crate) fn port(id: &str) -> PortInfo {
@@ -104,6 +101,8 @@ struct FakeSessionShared {
     written: Mutex<Vec<Vec<u8>>>,
     stats: Mutex<SessionStats>,
     closed: AtomicBool,
+    /// A `Disconnected` went out; like `Session`, nothing is emitted after it.
+    ended: AtomicBool,
 }
 
 /// The session half handed to the view.
@@ -150,8 +149,12 @@ impl FakeFeed {
         });
     }
 
+    /// The link reports its end. As with `Session`, the session reads as disconnected
+    /// before the event is visible, and a later `close` emits nothing more.
     pub fn disconnected(&self, error: Option<TransportError>) {
-        self.send(SessionEvent::Disconnected { error });
+        if !self.shared.ended.swap(true, Ordering::SeqCst) {
+            self.send(SessionEvent::Disconnected { error });
+        }
     }
 
     pub fn send(&self, event: SessionEvent) {
@@ -186,15 +189,18 @@ impl SessionHandle for FakeSession {
     }
 
     fn is_connected(&self) -> bool {
-        !self.shared.closed.load(Ordering::SeqCst)
+        !self.shared.closed.load(Ordering::SeqCst) && !self.shared.ended.load(Ordering::SeqCst)
     }
 
     fn close(self: Box<Self>) {
-        // Same contract as `Session::close`: an orderly close reports itself.
+        // Same contract as `Session::close`: an orderly close reports itself, unless the
+        // link already reported its own end.
         self.shared.closed.store(true, Ordering::SeqCst);
-        self.feed
-            .send(SessionEvent::Disconnected { error: None })
-            .ok();
+        if !self.shared.ended.swap(true, Ordering::SeqCst) {
+            self.feed
+                .send(SessionEvent::Disconnected { error: None })
+                .ok();
+        }
     }
 }
 
@@ -285,14 +291,21 @@ impl Drop for TestDir {
     }
 }
 
-// Driving the real engine (Session threads over SimWorld links) from a headless
-// workspace. The engine runs on real threads, so waits are bounded in real time. Each
-// step advances the test clock by one frame, which fires the drain loop's pacing timer;
-// the drain worker then blocks for at most its idle wait and returns the moment data
-// arrives, so nothing sleeps longer than the engine takes.
+// Driving the real engine (Session and ingest threads over SimWorld links) from a
+// headless workspace. The engine runs on real threads, so waits are bounded in real
+// time. Each step runs whatever the ingest thread's doorbell woke, then advances the
+// test clock by one frame, which fires the session view's pacing timer so the next
+// ring is answered; nothing sleeps longer than the engine takes.
 
 /// Generous failure bound for engine-driven waits; tests finish far sooner.
 pub(crate) const ENGINE_WAIT: Duration = Duration::from_secs(10);
+
+/// Let real threads wake the test's tasks. A session view's ingest thread rings the
+/// view's doorbell from its own thread, which GPUI's test scheduler otherwise records
+/// as nondeterminism and fails the test for. Call it before opening a session view.
+pub(crate) fn allow_engine_threads(cx: &mut TestAppContext) {
+    cx.executor().allow_parking();
+}
 
 pub(crate) fn run_until(
     cx: &mut TestAppContext,
@@ -313,18 +326,38 @@ pub(crate) fn run_until(
     }
 }
 
+/// Advance `frames` frames, running whatever they wake.
+pub(crate) fn step(cx: &mut TestAppContext, frames: usize) {
+    for _ in 0..frames {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+}
+
 /// A workspace over `world`, optionally opening `connect_to` at startup as `--port` does.
 pub(crate) fn open_workspace(
     cx: &mut TestAppContext,
     world: &SimWorld,
     connect_to: Option<&str>,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_workspace_with(cx, world, connect_to, StoreConfig::default())
+}
+
+/// [`open_workspace`] with sessions stored as `store` says.
+pub(crate) fn open_workspace_with(
+    cx: &mut TestAppContext,
+    world: &SimWorld,
+    connect_to: Option<&str>,
+    store: StoreConfig,
+) -> (AnyWindowHandle, Entity<Workspace>) {
+    allow_engine_threads(cx);
     let options = AppOptions {
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         serial: SerialConfig::default(),
         select_port: connect_to.map(PortId::new),
         connect_on_start: connect_to.is_some(),
+        store,
     };
     open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))
 }
@@ -336,23 +369,46 @@ pub(crate) fn session_of(
     workspace.read_with(cx, |w, _| w.session().cloned())
 }
 
+/// Wait for the workspace's session view to show ingest's `Connected to …` notice.
 pub(crate) fn wait_connected(
     cx: &mut TestAppContext,
     workspace: &Entity<Workspace>,
 ) -> Entity<SessionView> {
     run_until(cx, "the session to connect", |cx| {
-        session_of(cx, workspace)
-            .is_some_and(|s| s.read_with(cx, |v, _| v.model().state == ConnectionState::Connected))
+        session_of(cx, workspace).is_some_and(|view| {
+            view.read_with(cx, |v, _| {
+                v.snapshot()
+                    .line(serialist_core::LineId::ZERO)
+                    .is_some_and(|line| line.text.starts_with("Connected to "))
+            })
+        })
     });
     session_of(cx, workspace).expect("session view")
 }
 
+/// The lines the session's terminal displays now, read from the element's source.
+pub(crate) fn displayed(cx: &mut TestAppContext, view: &Entity<SessionView>) -> Vec<StyledLine> {
+    view.read_with(cx, |v, cx| {
+        let terminal = v.terminal().read(cx);
+        let mut out = Vec::new();
+        terminal
+            .source()
+            .lines(terminal.displayed_span().range(), &mut out);
+        out
+    })
+}
+
+/// A received line with exactly this text among the newest 1000 displayed.
 pub(crate) fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, text: &str) -> bool {
-    view.read_with(cx, |v, _| {
-        v.model()
-            .buffer
-            .rows()
-            .any(|r| r.kind == LineKind::Rx && r.text == text)
+    view.read_with(cx, |v, cx| {
+        let terminal = v.terminal().read(cx);
+        let span = terminal.displayed_span();
+        let from = serialist_core::LineId(span.end.0.saturating_sub(1000)).max(span.first);
+        let mut lines = Vec::new();
+        terminal.source().lines(from..span.end, &mut lines);
+        lines
+            .iter()
+            .any(|line| line.direction == Direction::Rx && line.text == text)
     })
 }
 
