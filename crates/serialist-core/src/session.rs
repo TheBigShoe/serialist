@@ -878,10 +878,13 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         let reads = probe.reads.load(Ordering::Relaxed) - before;
         let per_second = reads as f64 / started.elapsed().as_secs_f64();
-        // A 10 ms timeout is about 100 reads/s; 64/s on Windows' 15.6 ms timer tick.
+        // A 10 ms timeout is about 100 reads/s, 64/s on Windows' 15.6 ms timer tick, and a
+        // loaded CI runner has been seen at 16/s. The point of the test is the upper bound
+        // (no spinning); the lower bound only proves the loop is alive.
+        assert!(reads >= 2, "reader made only {reads} reads in 300 ms");
         assert!(
-            (20.0..200.0).contains(&per_second),
-            "{per_second:.0} reads/s"
+            per_second < 200.0,
+            "{per_second:.0} reads/s looks like a spin"
         );
         drop(session);
     }
