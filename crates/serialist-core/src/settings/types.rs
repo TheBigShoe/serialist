@@ -12,6 +12,7 @@ use crate::port::PortInfo;
 use super::de::{baud_rate, font_size, font_weight, opt_font_size, opt_font_weight, row_bytes};
 use super::defaults as d;
 use super::font::{FontFeatures, FontSpec, LineHeight};
+use super::inline::InlineSettings;
 use super::load::SettingsWarning;
 use super::profile::DeviceProfile;
 
@@ -266,6 +267,10 @@ pub struct Settings {
     pub line_ending: LineEnding,
     #[serde(default = "d::local_echo")]
     pub local_echo: bool,
+
+    /// Inline interactive mode: the Backspace byte, the escape chord and paste pacing.
+    #[serde(default = "d::inline")]
+    pub inline: InlineSettings,
 
     /// Per-device profiles; the first one whose `match` fits a port applies.
     #[serde(default = "d::devices")]

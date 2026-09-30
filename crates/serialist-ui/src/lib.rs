@@ -50,7 +50,7 @@ pub use devices_panel::{
 pub use export::{ExportFormat, ExportJob};
 pub use fonts::{TerminalFont, UiFont};
 pub use history::PersistentHistory;
-pub use inline::{InlineSettings, KeyEncoder, Mode, encode_key};
+pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
 pub use scrollback::{Floored, Floors, Scrollback};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};

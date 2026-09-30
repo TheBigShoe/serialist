@@ -16,16 +16,22 @@
 mod de;
 mod defaults;
 mod font;
+mod inline;
 mod load;
 mod paths;
 mod profile;
 mod types;
 
 #[cfg(test)]
+mod inline_tests;
+#[cfg(test)]
 mod tests;
 
 pub use defaults::DEFAULT_SETTINGS_JSONC;
 pub use font::{FontFeatures, FontSpec, LineHeight};
+pub use inline::{
+    BackspaceKey, InlineSettings, MAX_PASTE_CHUNK_BYTES, MAX_PASTE_CHUNK_DELAY_MS, validate_chord,
+};
 pub use load::{
     SettingsError, SettingsLayer, SettingsWarning, load_settings, load_settings_from_layers,
 };
