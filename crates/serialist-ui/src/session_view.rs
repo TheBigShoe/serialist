@@ -126,13 +126,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Receiver;
 use serde_json::{Map, Value as JsonValue};
 use serialist_core::{
     ChunkSink, CodecFactory, CodecInfo, CodecRegistry, Command, CommandRef, ConnectionInfo,
-    Direction, ExpectResult, Expectation, FrameId, FrameSnapshot, FrameStore, FrameStoreReader,
-    Ingest, IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId, LineSource, LinkState,
-    ParamValues, Payload, PortId, SearchMatch, Searcher, SerialConfig, SessionStats, Snapshot,
-    Store, StyledLine, TextOptions, Timestamps,
+    ControlLine, Direction, ExpectResult, Expectation, FrameId, FrameSnapshot, FrameStore,
+    FrameStoreReader, Ingest, IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId,
+    LineSource, LinkState, ParamValues, Payload, PortId, SearchMatch, Searcher, SerialConfig,
+    SessionEvent, SessionStats, Snapshot, Store, StyledLine, TextOptions, Timestamps,
 };
 use serialist_script::{ScriptOutcome, ScriptSource};
 
@@ -151,6 +152,7 @@ use crate::inline::{
     Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
     paste_bytes, paste_echo,
 };
+use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
 use crate::prelude::*;
 use crate::script_bridge::{
     ConsoleKind, ConsoleLine, GuiScriptSession, ScriptEffect, ScriptEnv, ScriptLinkParts,
@@ -278,6 +280,39 @@ pub enum SessionViewEvent {
     /// Lines for the Script console: what the session's scripts printed, logged and
     /// asked, and how their runs went.
     Script(Vec<ConsoleLine>),
+    /// The toolbar's Connect, on a closed session: open the port again, with the view's
+    /// settings, into this view (see [`SessionView::reconnect`]).
+    Reconnect,
+}
+
+/// How long Send break holds the line.
+pub const BREAK_DURATION: Duration = Duration::from_millis(250);
+
+/// How long a reconfigure may take to be confirmed before the form says so.
+const PORT_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long after a control-line change or a break (past its duration) a refusal is
+/// still waited for.
+const PORT_CHANGE_SETTLE: Duration = Duration::from_millis(150);
+
+/// A change sent to the port whose outcome the port settings form waits for.
+#[derive(Clone, Debug)]
+enum PortChangeKind {
+    Serial {
+        from: SerialConfig,
+        to: SerialConfig,
+    },
+    Control(ControlLine, bool),
+    Break,
+}
+
+#[derive(Clone, Debug)]
+struct PortChange {
+    kind: PortChangeKind,
+    /// The store's end when it was sent: a `Write failed` notice after it is the
+    /// writer thread's refusal.
+    mark: LineId,
+    sent_at: Instant,
 }
 
 /// What a sent command's echo line says: text payloads as sent without the line ending,
@@ -342,6 +377,82 @@ fn echo_key(ingest: &IngestHandle, echo: &Echo) {
     };
 }
 
+/// An ingest thread started for a view, and the task answering its doorbell.
+struct IngestStart {
+    ingest: IngestHandle,
+    frames: FrameStoreReader,
+    wake: Task<()>,
+}
+
+/// Start an ingest thread taking `events` into `store`, through the view's recording
+/// and script-link sinks, then `extra_sinks`, then a codec slot decoding with
+/// `selection` into a new frame store (from the store's current end, so frames name
+/// its stream offsets), and a task answering its doorbell.
+fn start_ingest(
+    events: Receiver<SessionEvent>,
+    store: Store,
+    recording: &RecordingSlot,
+    script_link: &ScriptLinkParts,
+    selection: &Arc<CodecSelection>,
+    extra_sinks: Vec<Box<dyn ChunkSink + Send>>,
+    cx: &mut Context<SessionView>,
+) -> IngestStart {
+    let (doorbell, rings) = async_channel::bounded::<()>(1);
+    let mut sinks: Vec<Box<dyn ChunkSink + Send>> = vec![
+        Box::new(RecordingSink::new(recording.clone())),
+        Box::new(script_link.sink()),
+    ];
+    sinks.extend(extra_sinks);
+    // The codec slot is made on the ingest thread, where a codec (a Lua VM) must
+    // stay; its frames ring the same doorbell.
+    let frame_store = FrameStore::default();
+    let frames = frame_store.reader();
+    let slot_selection = selection.clone();
+    let frame_doorbell = doorbell.clone();
+    let offset = store.stats().raw_len;
+    let ingest = Ingest::spawn_with(
+        events,
+        store,
+        Box::new(move || {
+            let mut sinks: Vec<Box<dyn ChunkSink>> = sinks
+                .into_iter()
+                .map(|sink| -> Box<dyn ChunkSink> { sink })
+                .collect();
+            sinks.push(Box::new(
+                CodecSlotSink::new(
+                    slot_selection,
+                    frame_store,
+                    Box::new(move || {
+                        let _ = frame_doorbell.try_send(());
+                    }),
+                )
+                .starting_at(offset),
+            ));
+            sinks
+        }),
+        Box::new(move || {
+            // Full means a wake is already pending: that one will see this too.
+            let _ = doorbell.try_send(());
+        }),
+    );
+    let wake = cx.spawn(async move |this, cx| {
+        while rings.recv().await.is_ok() {
+            if this.update(cx, |view, cx| view.wake(cx)).is_err() {
+                return;
+            }
+            cx.background_executor().timer(FRAME).await;
+        }
+        // The doorbell's only sender lives in the ingest thread's waker, so a closed
+        // doorbell means that thread has ended, cleanly or not.
+        this.update(cx, |view, cx| view.ingest_ended(cx)).ok();
+    });
+    IngestStart {
+        ingest,
+        frames,
+        wake,
+    }
+}
+
 /// A paste going out in chunks.
 struct PasteJob {
     id: u64,
@@ -394,7 +505,11 @@ fn raw_under(source: &dyn LineSource, lines: Range<LineId>) -> Range<u64> {
 
 pub struct SessionView {
     port: PortId,
+    /// The line settings in force: those the port was opened with, then whatever the
+    /// port settings changed them to. Connecting again in this view uses them.
     serial: SerialConfig,
+    /// The settings the port was opened with, which the transport's description names.
+    opened_serial: SerialConfig,
     /// Where the link stands and the transport's own name for it, as ingest last
     /// reported.
     connection: ConnectionInfo,
@@ -473,6 +588,23 @@ pub struct SessionView {
     /// RX bytes counted when the view was hidden, for what its tab label says arrived
     /// since.
     rx_seen: u64,
+    /// The store the last ingest thread handed back when it ended: connecting again
+    /// goes on filling it, so the scrollback stays.
+    retired_store: Option<Store>,
+    /// The last ingest thread has ended and been joined.
+    ingest_joined: bool,
+    /// What `attach_scripts` was given, to attach scripts again after a reconnect.
+    script_env: Option<ScriptEnv>,
+    /// A disconnect confirmation is open.
+    pending_disconnect: bool,
+    /// DTR and RTS as last set from here; opening a port asserts both.
+    dtr: bool,
+    rts: bool,
+    /// The port settings popover's form.
+    port_form: Entity<PortSettingsForm>,
+    /// A change sent to the port, waiting for the writer thread's verdict.
+    port_change: Option<PortChange>,
+    _port_watch: Option<Task<()>>,
     _wake: Task<()>,
     _housekeeping: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -558,52 +690,20 @@ impl SessionView {
 
         let recording = RecordingSlot::default();
         let script_link = ScriptLinkParts::default();
-        let (doorbell, rings) = async_channel::bounded::<()>(1);
-        let mut sinks: Vec<Box<dyn ChunkSink + Send>> = vec![
-            Box::new(RecordingSink::new(recording.clone())),
-            Box::new(script_link.sink()),
-        ];
-        sinks.extend(extra_sinks);
-        // The codec slot is made on the ingest thread, where a codec (a Lua VM) must
-        // stay; its frames ring the same doorbell.
-        let frame_store = FrameStore::default();
-        let frames = frame_store.reader();
         let selection = Arc::new(CodecSelection::default());
-        let slot_selection = selection.clone();
-        let frame_doorbell = doorbell.clone();
-        let ingest = Ingest::spawn_with(
+        let IngestStart {
+            ingest,
+            frames,
+            wake,
+        } = start_ingest(
             session.events(),
             Store::new(options.store.clone()),
-            Box::new(move || {
-                let mut sinks: Vec<Box<dyn ChunkSink>> = sinks
-                    .into_iter()
-                    .map(|sink| -> Box<dyn ChunkSink> { sink })
-                    .collect();
-                sinks.push(Box::new(CodecSlotSink::new(
-                    slot_selection,
-                    frame_store,
-                    Box::new(move || {
-                        let _ = frame_doorbell.try_send(());
-                    }),
-                )));
-                sinks
-            }),
-            Box::new(move || {
-                // Full means a wake is already pending: that one will see this too.
-                let _ = doorbell.try_send(());
-            }),
+            &recording,
+            &script_link,
+            &selection,
+            extra_sinks,
+            cx,
         );
-        let wake = cx.spawn(async move |this, cx| {
-            while rings.recv().await.is_ok() {
-                if this.update(cx, |view, cx| view.wake(cx)).is_err() {
-                    return;
-                }
-                cx.background_executor().timer(FRAME).await;
-            }
-            // The doorbell's only sender lives in the ingest thread's waker, so a closed
-            // doorbell means that thread has ended, cleanly or not.
-            this.update(cx, |view, cx| view.ingest_ended(cx)).ok();
-        });
         let housekeeping = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(HOUSEKEEPING).await;
@@ -660,9 +760,25 @@ impl SessionView {
         let initial_codec = options.codec.clone();
         let decoded_inline = options.display.decoded_inline;
         let hide_framed = options.display.hide_framed_bytes;
+        let port_form = cx.new(|cx| {
+            PortSettingsForm::new(
+                PortSettings::new(serial.clone(), options.line_ending, options.local_echo),
+                true,
+                window,
+                cx,
+            )
+        });
+        let port_settings_events = cx.subscribe_in(
+            &port_form,
+            window,
+            |this, _, event: &PortSettingsEvent, window, cx| {
+                this.port_settings_changed(event, window, cx);
+            },
+        );
 
         let mut view = Self {
             port,
+            opened_serial: serial.clone(),
             serial,
             connection: ConnectionInfo::default(),
             state: ConnectionState::Connected,
@@ -709,6 +825,15 @@ impl SessionView {
             visible: true,
             missed_wake: false,
             rx_seen: 0,
+            retired_store: None,
+            ingest_joined: false,
+            script_env: None,
+            pending_disconnect: false,
+            dtr: true,
+            rts: true,
+            port_form,
+            port_change: None,
+            _port_watch: None,
             _wake: wake,
             _housekeeping: housekeeping,
             _subscriptions: vec![
@@ -717,6 +842,7 @@ impl SessionView {
                 interceptor,
                 codec_picked,
                 config_changes,
+                port_settings_events,
             ],
         };
         // The device profile's codec, from the first chunk on.
@@ -732,7 +858,8 @@ impl SessionView {
         &self.port
     }
 
-    /// The line settings the port was opened with.
+    /// The line settings in force (those the port was opened with, then whatever the
+    /// port settings changed them to), which connecting again in this view uses.
     pub fn serial(&self) -> &SerialConfig {
         &self.serial
     }
@@ -797,11 +924,20 @@ impl SessionView {
     /// What the status line names the session by: the transport's description once
     /// ingest has seen the link connect, else the port and its settings (which is what
     /// every transport describes itself as today).
+    ///
+    /// A description that ends with the settings the port was opened with names the
+    /// settings in force instead, once the port settings changed them.
     pub fn title(&self) -> String {
-        self.connection
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("{} @ {}", self.port, self.serial.summary()))
+        match &self.connection.description {
+            Some(description) if self.serial != self.opened_serial => description
+                .strip_suffix(&self.opened_serial.summary())
+                .map_or_else(
+                    || description.clone(),
+                    |prefix| format!("{prefix}{}", self.serial.summary()),
+                ),
+            Some(description) => description.clone(),
+            None => format!("{} @ {}", self.port, self.serial.summary()),
+        }
     }
 
     /// Where the link stands, as ingest last reported it.
@@ -1008,18 +1144,23 @@ impl SessionView {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let joined = cx
-                .background_spawn(async move { ingest.join().map(drop) })
-                .await;
+            let joined = cx.background_spawn(async move { ingest.join() }).await;
             this.update(cx, |view, cx| view.ingest_joined(joined, cx))
                 .ok();
         })
         .detach();
     }
 
-    fn ingest_joined(&mut self, joined: Result<(), IngestPanicked>, cx: &mut Context<Self>) {
-        let Err(error) = joined else {
-            return;
+    /// The ingest thread was joined: keep the store it hands back for a reconnect, or
+    /// end the session if it panicked.
+    fn ingest_joined(&mut self, joined: Result<Store, IngestPanicked>, cx: &mut Context<Self>) {
+        self.ingest_joined = true;
+        let error = match joined {
+            Ok(store) => {
+                self.retired_store = Some(store);
+                return;
+            }
+            Err(error) => error,
         };
         // Nothing reaches the scrollback any more, so the session is as good as lost.
         tracing::error!(port = %self.port, %error, "the scrollback stopped");
@@ -1750,6 +1891,7 @@ impl SessionView {
             reader: ingest.reader(),
             link: self.script_link.clone(),
         };
+        self.script_env = Some(env.clone());
         self.scripts = Some(SessionScripts::new(Arc::new(session), env));
     }
 
@@ -2316,10 +2458,454 @@ impl SessionView {
     fn close_session(&mut self, cx: &mut Context<Self>) {
         self.stop_recording(cx);
         self.detach_scripts(cx);
+        self.port_change = None;
+        self._port_watch = None;
         if let Some(session) = self.session.take() {
             self.stats = session.stats();
             cx.background_spawn(async move { session.close() }).detach();
         }
+        self.port_form
+            .update(cx, |form, cx| form.set_live(false, cx));
+    }
+
+    /// Disconnect, as the toolbar's Disconnect and `serial::Disconnect` do: at once,
+    /// unless a recording or a script is running, which a dialog asks about first.
+    pub fn request_disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.is_disconnected() {
+            return;
+        }
+        let recording = self.recording_status.is_some();
+        let script = self.script_status().map(|status| status.name);
+        let running = match (recording, &script) {
+            (false, None) => {
+                self.disconnect(cx);
+                return;
+            }
+            (true, Some(script)) => format!("A recording and {script} are running."),
+            (true, None) => "A recording is running.".to_owned(),
+            (false, Some(script)) => format!("{script} is running."),
+        };
+        let message = SharedString::from(format!(
+            "{running} Disconnecting stops the script and finishes the recording; the \
+             scrollback stays."
+        ));
+        let title = SharedString::from(format!("Disconnect {}?", self.port));
+        self.pending_disconnect = true;
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm = view.clone();
+            let closed = view.clone();
+            dialog
+                .title(title.clone())
+                .w(px(420.))
+                .child(div().text_sm().child(message.clone()))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Disconnect")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    confirm
+                        .update(cx, |view, cx| view.confirm_disconnect(window, cx))
+                        .ok();
+                    false
+                })
+                .on_close(move |_, _, cx| {
+                    closed
+                        .update(cx, |view, _| view.pending_disconnect = false)
+                        .ok();
+                })
+        });
+        cx.notify();
+    }
+
+    /// Whether a disconnect confirmation is open.
+    pub fn pending_disconnect(&self) -> bool {
+        self.pending_disconnect
+    }
+
+    /// Disconnect as the confirmation's button does, closing the dialog first.
+    pub fn confirm_disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.pending_disconnect) {
+            window.close_dialog(cx);
+            self.disconnect(cx);
+        }
+    }
+
+    // --- Connecting again ------------------------------------------------------------
+
+    /// Whether [`Self::reconnect`] can take a session now: this one is closed and its
+    /// ingest thread has handed its store back.
+    pub fn can_reconnect(&self) -> bool {
+        self.session.is_none() && self.ingest.is_none() && self.ingest_joined
+    }
+
+    /// Stop the ingest thread of a closed session that is still draining it, and take
+    /// its store back off the main thread. The thread ends by itself once the closed
+    /// session's events run out; this is for when they have not a while after.
+    pub fn retire_ingest(&mut self, cx: &mut Context<Self>) {
+        if self.session.is_some() {
+            return;
+        }
+        self.refresh(cx);
+        let Some(ingest) = self.ingest.take() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let joined = cx.background_spawn(async move { ingest.stop() }).await;
+            this.update(cx, |view, cx| view.ingest_joined(joined, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Carry on with `session`, opened on the same port with `serial`: a new ingest
+    /// thread goes on filling the same store, so the scrollback, pause, marks and
+    /// display stay, and the line ending, echo and control levels set here apply again.
+    /// The frames decoded start over with this connection. Scripts attach again.
+    /// Call when [`Self::can_reconnect`].
+    pub fn reconnect(
+        &mut self,
+        session: Box<dyn SessionHandle>,
+        serial: SerialConfig,
+        cx: &mut Context<Self>,
+    ) {
+        debug_assert!(self.can_reconnect(), "the last session is still open");
+        let store = self
+            .retired_store
+            .take()
+            .unwrap_or_else(|| Store::new(self.options.store.clone()));
+        // A closed bell stays closed: scripts get a new one.
+        self.script_link = ScriptLinkParts::default();
+        let IngestStart {
+            ingest,
+            frames,
+            wake,
+        } = start_ingest(
+            session.events(),
+            store,
+            &self.recording,
+            &self.script_link,
+            &self.selection,
+            Vec::new(),
+            cx,
+        );
+        self.ingest = Some(ingest);
+        self._wake = wake;
+        self.ingest_joined = false;
+        self.missed_wake = false;
+        self.frame_snapshot = frames.snapshot();
+        self.frames = frames;
+        self.inline_next = FrameId::ZERO;
+        self.frame_marks.clear();
+        self.selected_frame = None;
+        self.decoded_generation += 1;
+        if self.filter.take().is_some() {
+            self.update_filter(cx);
+        }
+        self.opened_serial = serial.clone();
+        self.serial = serial;
+        self.connection = ConnectionInfo::default();
+        self.state = ConnectionState::Connected;
+        self.stats = session.stats();
+        self.rx_seen = 0;
+        self.session = Some(session);
+        self.notice = None;
+        self.scripts = None;
+        if let Some(env) = self.script_env.clone() {
+            self.attach_scripts(env);
+        }
+        self.apply_control_levels();
+        self.port_form
+            .update(cx, |form, cx| form.set_live(true, cx));
+        tracing::info!(port = %self.port, serial = %self.serial.summary(), "session open again");
+        cx.notify();
+    }
+
+    // --- Port settings -----------------------------------------------------------------
+
+    /// The port settings popover's form.
+    pub fn port_form(&self) -> &Entity<PortSettingsForm> {
+        &self.port_form
+    }
+
+    /// The port settings in force here: the line settings, the compose bar's line
+    /// ending and echo, and the control levels.
+    pub fn port_settings(&self, cx: &App) -> PortSettings {
+        let compose = self.compose.read(cx);
+        PortSettings {
+            serial: self.serial.clone(),
+            line_ending: compose.line_ending(),
+            local_echo: compose.local_echo(),
+            dtr: self.dtr,
+            rts: self.rts,
+        }
+    }
+
+    /// Show the settings in force in the form, as it opens.
+    pub fn sync_port_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.port_settings(cx);
+        let live = self.control().is_some();
+        self.port_form.update(cx, |form, cx| {
+            form.set_settings(settings, window, cx);
+            form.set_live(live, cx);
+        });
+    }
+
+    /// Take `settings` (set on a Devices row for this port) as a new session's: the
+    /// line ending, echo and control levels. The line settings are what it opened with.
+    pub fn apply_port_settings(&mut self, settings: &PortSettings, cx: &mut Context<Self>) {
+        let (ending, echo) = (settings.line_ending, settings.local_echo);
+        self.compose.update(cx, |compose, cx| {
+            compose.set_line_ending(ending, cx);
+            compose.set_local_echo(echo, cx);
+        });
+        self.dtr = settings.dtr;
+        self.rts = settings.rts;
+        self.apply_control_levels();
+        cx.notify();
+    }
+
+    /// Set the control lines the opener asserted to the levels set here.
+    fn apply_control_levels(&self) {
+        let Some(control) = self.control() else {
+            return;
+        };
+        for (line, level) in [(ControlLine::Dtr, self.dtr), (ControlLine::Rts, self.rts)] {
+            if !level {
+                let _ = control.set_control(line, false);
+            }
+        }
+    }
+
+    /// The live session's control handle.
+    fn control(&self) -> Option<Arc<dyn crate::session_handle::SessionControl>> {
+        self.live().and_then(|(session, _)| session.control())
+    }
+
+    /// DTR and RTS as last set from here.
+    pub fn control_levels(&self) -> (bool, bool) {
+        (self.dtr, self.rts)
+    }
+
+    fn port_settings_changed(
+        &mut self,
+        event: &PortSettingsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            PortSettingsEvent::Serial(serial) => self.reconfigure(serial.clone(), window, cx),
+            PortSettingsEvent::LineEnding(ending) => {
+                let ending = *ending;
+                self.compose
+                    .update(cx, |compose, cx| compose.set_line_ending(ending, cx));
+            }
+            PortSettingsEvent::LocalEcho(on) => {
+                let on = *on;
+                self.compose
+                    .update(cx, |compose, cx| compose.set_local_echo(on, cx));
+            }
+            PortSettingsEvent::Control(line, on) => {
+                self.set_control_line(*line, *on, window, cx);
+            }
+            PortSettingsEvent::SendBreak => self.send_break(window, cx),
+        }
+    }
+
+    /// Change the line settings: on the open port through its writer thread (the
+    /// form hears whether the transport took them), or, while closed, for the next
+    /// connect in this view.
+    pub fn reconfigure(
+        &mut self,
+        serial: SerialConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(control) = self.control() else {
+            self.serial = serial;
+            self.port_form.update(cx, |form, cx| {
+                form.set_status(Some("Used when the port is connected again".into()), cx);
+            });
+            cx.notify();
+            return;
+        };
+        if control.reconfigure(serial.clone()).is_err() {
+            self.port_change_failed(None, "the session closed".into(), window, cx);
+            return;
+        }
+        tracing::debug!(port = %self.port, serial = %serial.summary(), "reconfiguring");
+        self.watch_port_change(
+            PortChangeKind::Serial {
+                from: self.serial.clone(),
+                to: serial,
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Assert or release DTR or RTS on the open port, or set its level for the next
+    /// connect in this view.
+    pub fn set_control_line(
+        &mut self,
+        line: ControlLine,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(control) = self.control() else {
+            self.set_level(line, on);
+            cx.notify();
+            return;
+        };
+        if control.set_control(line, on).is_err() {
+            self.port_change_failed(None, "Not connected".into(), window, cx);
+            return;
+        }
+        self.set_level(line, on);
+        self.watch_port_change(PortChangeKind::Control(line, on), window, cx);
+    }
+
+    fn set_level(&mut self, line: ControlLine, on: bool) {
+        match line {
+            ControlLine::Dtr => self.dtr = on,
+            ControlLine::Rts => self.rts = on,
+        }
+    }
+
+    /// Hold the open port's line in break for [`BREAK_DURATION`].
+    pub fn send_break(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sent = self
+            .control()
+            .is_some_and(|control| control.send_break(BREAK_DURATION).is_ok());
+        if !sent {
+            self.port_form.update(cx, |form, cx| {
+                form.set_error(Some("Not connected; no break sent".into()), cx);
+            });
+            return;
+        }
+        self.watch_port_change(PortChangeKind::Break, window, cx);
+    }
+
+    /// Wait a frame at a time for the writer thread's verdict on `kind`.
+    fn watch_port_change(
+        &mut self,
+        kind: PortChangeKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mark = self
+            .latest_snapshot()
+            .map_or(LineId::ZERO, |snapshot| snapshot.end());
+        self.port_change = Some(PortChange {
+            kind,
+            mark,
+            sent_at: cx.background_executor().now(),
+        });
+        self._port_watch = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(EXPECT_POLL).await;
+                let decided = this
+                    .update_in(cx, |view, window, cx| view.poll_port_change(window, cx))
+                    .unwrap_or(true);
+                if decided {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// The writer thread's refusal stored since `mark`: a `Write failed` notice.
+    fn write_failure_since(&self, mark: LineId) -> Option<String> {
+        let snapshot = self.latest_snapshot()?;
+        let mut lines = Vec::new();
+        snapshot.lines(mark.max(snapshot.first_line())..snapshot.end(), &mut lines);
+        lines.into_iter().find_map(|line| {
+            (line.direction == Direction::Notice)
+                .then(|| line.text.strip_prefix("Write failed: ").map(str::to_owned))
+                .flatten()
+        })
+    }
+
+    /// Look at the change in flight. Returns whether it is decided.
+    fn poll_port_change(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(change) = self.port_change.clone() else {
+            return true;
+        };
+        let now = cx.background_executor().now();
+        let elapsed = now.saturating_duration_since(change.sent_at);
+        if let Some(error) = self.write_failure_since(change.mark) {
+            self.port_change = None;
+            self.port_change_failed(Some(change.kind), error, window, cx);
+            return true;
+        }
+        let status = match &change.kind {
+            PortChangeKind::Serial { to, .. } => {
+                let applied = self
+                    .control()
+                    .and_then(|control| control.serial_config())
+                    .is_some_and(|serial| &serial == to);
+                if applied {
+                    self.serial = to.clone();
+                    Some(format!("{} applied", to.summary()))
+                } else if elapsed >= PORT_CHANGE_TIMEOUT {
+                    self.port_change = None;
+                    let error = "the port did not confirm the change".to_owned();
+                    self.port_change_failed(Some(change.kind), error, window, cx);
+                    return true;
+                } else {
+                    None
+                }
+            }
+            PortChangeKind::Control(line, on) => (elapsed >= PORT_CHANGE_SETTLE).then(|| {
+                let name = match line {
+                    ControlLine::Dtr => "DTR",
+                    ControlLine::Rts => "RTS",
+                };
+                format!("{name} {}", if *on { "asserted" } else { "released" })
+            }),
+            PortChangeKind::Break => {
+                (elapsed >= BREAK_DURATION + PORT_CHANGE_SETTLE).then(|| "Break sent".to_owned())
+            }
+        };
+        let Some(status) = status else {
+            return false;
+        };
+        self.port_change = None;
+        self.port_form
+            .update(cx, |form, cx| form.set_status(Some(status), cx));
+        cx.notify();
+        true
+    }
+
+    /// The port refused a change (or closed first): say why in the form and put its
+    /// controls back to what is in force.
+    fn port_change_failed(
+        &mut self,
+        kind: Option<PortChangeKind>,
+        error: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            Some(PortChangeKind::Serial { from, to }) => {
+                tracing::warn!(port = %self.port, serial = %to.summary(), %error, "reconfigure refused");
+                // What the port is on now: what it was on, unless it says otherwise.
+                self.serial = self
+                    .control()
+                    .and_then(|control| control.serial_config())
+                    .unwrap_or(from);
+            }
+            Some(PortChangeKind::Control(line, on)) => self.set_level(line, !on),
+            Some(PortChangeKind::Break) | None => {}
+        }
+        let settings = self.port_settings(cx);
+        self.port_form.update(cx, |form, cx| {
+            form.set_settings(settings, window, cx);
+            form.set_error(Some(error), cx);
+        });
+        cx.notify();
     }
 
     // --- Pause -----------------------------------------------------------------------
@@ -2647,6 +3233,37 @@ impl SessionView {
         let recording = self.recording_status.is_some();
         let inline = self.mode == Mode::Inline;
         let decoding = self.codec.is_some();
+        let open = !self.state.is_disconnected();
+        let form = self.port_form.clone();
+        let port_settings = Popover::new("port-settings-popover")
+            .trigger(
+                Button::new("port-settings")
+                    .label(SharedString::from(self.serial.summary()))
+                    .tooltip("Port settings: baud, framing, flow control, DTR and RTS")
+                    .small()
+                    .ghost(),
+            )
+            .content(move |_, _, _| form.clone())
+            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                if *open {
+                    this.sync_port_form(window, cx);
+                }
+            }));
+        let connection = if open {
+            Button::new("session-disconnect")
+                .label("Disconnect")
+                .tooltip("Close the port; the scrollback stays")
+                .small()
+                .ghost()
+                .on_click(cx.listener(|this, _, window, cx| this.request_disconnect(window, cx)))
+        } else {
+            Button::new("session-connect")
+                .label("Connect")
+                .tooltip("Open the port again with these settings")
+                .small()
+                .primary()
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(SessionViewEvent::Reconnect)))
+        };
         h_flex()
             .flex_none()
             .w_full()
@@ -2655,6 +3272,8 @@ impl SessionView {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .child(port_settings)
+            .child(connection)
             .child(
                 div().id("codec-picker").flex_none().w(px(150.)).child(
                     Select::new(&self.codec_select)

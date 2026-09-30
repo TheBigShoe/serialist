@@ -24,6 +24,7 @@ pub mod history;
 pub mod inline;
 pub mod keymap;
 pub mod param_prompt;
+pub mod port_settings;
 pub mod script_bridge;
 pub mod script_console;
 pub mod script_files;
@@ -49,6 +50,8 @@ mod gate;
 #[cfg(test)]
 mod inline_tests;
 #[cfg(test)]
+mod port_tests;
+#[cfg(test)]
 mod script_tests;
 #[cfg(test)]
 mod stream_tests;
@@ -72,6 +75,7 @@ pub use framed::{FilteredText, FramedFilter};
 pub use history::PersistentHistory;
 pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
+pub use port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm, STANDARD_BAUDS};
 pub use script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, SessionScripts};
 pub use script_console::{ScriptConsole, ScriptConsoleEvent, ScriptPrompt};
 pub use script_files::{ScriptEntry, list_scripts, resolve_script};
@@ -122,8 +126,10 @@ pub mod prelude {
     pub use gpui_kit::component::IndexPath;
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
+    pub use gpui_kit::component::popover::Popover;
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
     pub use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+    pub use gpui_kit::component::switch::Switch;
     pub use gpui_kit::component::tab::{Tab, TabBar};
     pub use gpui_kit::component::table::{
         Column, DataTable, TableDelegate, TableEvent, TableState,

@@ -11,6 +11,7 @@
 //! [`SharedSession`] for that.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use parking_lot::{Mutex, RwLock};
@@ -31,6 +32,13 @@ pub trait SessionControl: Send + Sync {
 
     /// The line settings in effect, while the session is open.
     fn serial_config(&self) -> Option<SerialConfig>;
+
+    /// Hold the line in the break condition for `duration`. A session that cannot
+    /// says it is closed.
+    fn send_break(&self, duration: Duration) -> Result<(), SessionClosed> {
+        let _ = duration;
+        Err(SessionClosed)
+    }
 }
 
 pub trait SessionHandle: Send + 'static {
@@ -131,6 +139,10 @@ impl SessionControl for SessionCell {
 
     fn serial_config(&self) -> Option<SerialConfig> {
         self.with(|session| Ok(session.serial_config())).ok()
+    }
+
+    fn send_break(&self, duration: Duration) -> Result<(), SessionClosed> {
+        self.with(|session| session.send_break(duration))
     }
 }
 
