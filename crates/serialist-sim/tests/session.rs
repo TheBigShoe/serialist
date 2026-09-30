@@ -139,13 +139,14 @@ fn firehose_at_3_mbaud_is_complete_and_on_rate() {
     clock.settle(2);
     let t0 = clock.now();
 
-    // Two seconds in 100 ms windows. 3 Mbaud 8N1 is 300 000 bytes/s in 300-byte packets:
-    // 30 000 bytes a window, less one packet for the 1 ms latency in the first.
+    // Two seconds in 100 ms windows, in 20 ms steps. 3 Mbaud 8N1 is 300 000 bytes/s in
+    // 300-byte packets: 30 000 bytes a window, less one packet for the 1 ms latency in
+    // the first.
     let mut verifier = FirehoseVerifier::new(FirehoseContent::Mixed);
     let mut received = 0;
     for window in 1..=20u32 {
         let elapsed = 100 * MS * window;
-        advance_to(&clock, t0 + elapsed, 4 * MS, 2);
+        advance_to(&clock, t0 + elapsed, 20 * MS, 2);
         let data = take_data(&events);
         verifier.feed(&data);
         received += data.len();
@@ -310,9 +311,10 @@ fn idle_session_reader_reads_once_per_timeout() {
     clock.settle(2);
     let before = link.stats().host_read_calls;
 
-    // One second in 1 ms steps: the reader's read times out every 10 ms and it reads
-    // again at once. A reader that spun, or woke early, would show more calls.
-    advance_to(&clock, clock.now() + Duration::from_secs(1), MS, 2);
+    // One second in 5 ms steps: the reader's read times out every 10 ms and it reads
+    // again at once. Every step wakes the reader, so one that spun, or returned before
+    // its timeout, would show 200 calls or more.
+    advance_to(&clock, clock.now() + Duration::from_secs(1), 5 * MS, 2);
     assert_eq!(link.stats().host_read_calls - before, 100);
     assert_eq!(session.stats().rx_chunks, 0);
 
