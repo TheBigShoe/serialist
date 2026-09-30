@@ -18,6 +18,7 @@ use crate::session_view::FRAME;
 use crate::status::Notice;
 use crate::terminal::TerminalView;
 use crate::terminal::double::MemoryLines;
+use crate::terminal::palette::ensure_contrast;
 use crate::test_support::{
     FakeOpener, FakePortSource, TestDir, allow_engine_threads, displayed, open_test_window,
     open_workspace, port, run_until, wait_connected,
@@ -393,9 +394,15 @@ fn a_zed_theme_colors_the_terminal_and_the_chrome(cx: &mut TestAppContext) {
         fixture(seed, "terminal.foreground"),
         "terminal fg",
     );
+    // The theme's dim color, lifted if the fixture's (arbitrary) value would not read on
+    // its terminal background: the gutter draws it there as it is.
     assert_color(
         palette.dim_foreground,
-        fixture(seed, "terminal.dim_foreground"),
+        ensure_contrast(
+            fixture(seed, "terminal.dim_foreground"),
+            palette.background,
+            palette.faint_contrast,
+        ),
         "dim",
     );
     assert_color(

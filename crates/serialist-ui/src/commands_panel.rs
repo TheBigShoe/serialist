@@ -27,6 +27,7 @@ use crate::actions::commands::{
 };
 use crate::actions::context;
 use crate::config::Config;
+use crate::dialog_footer::DialogButtons;
 use crate::prelude::*;
 use crate::status::Notice;
 
@@ -410,11 +411,8 @@ impl CommandsPanel {
                 .title(title.clone())
                 .w(px(560.))
                 .child(editor.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Save")
-                        .show_cancel(true),
-                )
+                .footer(DialogButtons::new("Save"))
+                // Enter and the Save button; a bad value keeps the dialog open.
                 .on_ok(move |_, _, cx| save.update(cx, |editor, cx| editor.save(cx)))
                 .on_close(move |_, _, cx| {
                     closed
@@ -484,11 +482,7 @@ impl CommandsPanel {
                 .title("New collection")
                 .w(px(360.))
                 .child(Input::new(&input).id("new-collection-name"))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Create")
-                        .show_cancel(true),
-                )
+                .footer(DialogButtons::new("Create"))
                 .on_ok(move |_, _, cx| {
                     create
                         .update(cx, |panel, cx| panel.confirm_new_collection(cx))

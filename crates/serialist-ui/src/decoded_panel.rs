@@ -23,6 +23,16 @@
 //! Selecting a row asks the session view to show the frame in the terminal
 //! ([`SessionView::select_frame`]). Like the terminal, the table follows the newest frame
 //! until it is scrolled away from the bottom or a row is selected; Follow brings it back.
+//!
+//! # Layout
+//!
+//! gpui-kit's table has fixed pixel column widths, so the panel works them out: the Time
+//! column is as wide as the stamp of the session's timestamp mode and format (as the
+//! terminal's gutter is, in cells of the table's monospace font), Summary takes what is
+//! left of the panel's width after Time, Dir and Kind, and the columns after it (the
+//! fields, the raw bytes) are reached by scrolling sideways. The raw column is off until
+//! the "Hex" toggle turns it on; a hex preview of the selected frame's bytes opens under
+//! the table while a row is selected and closes with the selection.
 
 use std::collections::VecDeque;
 
@@ -38,8 +48,23 @@ pub const ALL_KINDS: &str = "All kinds";
 /// Bytes of a frame the raw column shows.
 const RAW_PREVIEW: usize = 24;
 
+/// Bytes of the selected frame the hex preview shows.
+const SELECTION_PREVIEW: usize = 64;
+
 /// Characters of one value in the fields column.
 const VALUE_PREVIEW: usize = 32;
+
+/// The table's cell padding on each side (gpui-kit's small table: 6 px), and a little
+/// slack so a stamp that fills its column is not cut by rounding.
+const CELL_PADDING: f32 = 6.;
+const SLACK: f32 = 2.;
+/// What the table's vertical scrollbar covers of the width the panel is given.
+const SCROLLBAR: f32 = 12.;
+
+const DIRECTION_WIDTH: f32 = 40.;
+const KIND_WIDTH: f32 = 88.;
+/// Summary keeps this much however narrow the panel gets.
+const SUMMARY_MIN_WIDTH: f32 = 160.;
 
 /// A column of the table.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,21 +81,40 @@ enum Col {
 }
 
 impl Col {
-    fn column(&self) -> Column {
-        let (key, name, width) = match self {
-            Col::Time => ("time", "Time", 104.),
-            Col::Direction => ("dir", "Dir", 40.),
-            Col::Kind => ("kind", "Kind", 88.),
-            Col::Summary => ("summary", "Summary", 260.),
+    /// The key and header of the column.
+    fn key_and_name(&self) -> (SharedString, SharedString) {
+        let (key, name) = match self {
+            Col::Time => ("time", "Time"),
+            Col::Direction => ("dir", "Dir"),
+            Col::Kind => ("kind", "Kind"),
+            Col::Summary => ("summary", "Summary"),
             Col::Field(field) => {
-                return Column::new(SharedString::from(field.clone()), field.clone())
-                    .width(px(96.));
+                return (
+                    SharedString::from(field.clone()),
+                    SharedString::from(field.clone()),
+                );
             }
-            Col::Fields => ("fields", "Fields", 280.),
-            Col::Raw => ("raw", "Raw", 240.),
+            Col::Fields => ("fields", "Fields"),
+            Col::Raw => ("raw", "Raw"),
         };
-        Column::new(key, name).width(px(width))
+        (key.into(), name.into())
     }
+
+    /// Whether the cells are drawn in the monospace font.
+    fn is_mono(&self) -> bool {
+        matches!(self, Col::Raw | Col::Time | Col::Fields | Col::Field(_))
+    }
+}
+
+/// The advance of one character of the table's monospace font at the cells' size
+/// (`text_sm`, which the small table uses).
+pub(crate) fn cell_advance(window: &Window, cx: &App) -> Pixels {
+    let size = rems(0.875).to_pixels(window.rem_size());
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&font(cx.theme().mono_font_family.clone()));
+    text_system
+        .advance(font_id, size, '0')
+        .map_or(size * 0.6, |advance| advance.width)
 }
 
 /// `value` for a cell: its display form, cut short.
@@ -84,14 +128,15 @@ fn preview(value: &Value) -> String {
     }
 }
 
-/// The first bytes of `frame` as hex, from the store; `None` once they were evicted.
-fn raw_preview(raw: &Snapshot, frame: &Frame) -> Option<String> {
+/// The first `limit` bytes of `frame` as hex, from the store; `None` once they were
+/// evicted.
+fn raw_preview(raw: &Snapshot, frame: &Frame, limit: usize) -> Option<String> {
     let kept = raw.raw_range();
     if frame.raw.start < kept.start || frame.raw.end > kept.end {
         return None;
     }
-    let end = frame.raw.end.min(frame.raw.start + RAW_PREVIEW as u64);
-    let mut bytes = Vec::with_capacity(RAW_PREVIEW);
+    let end = frame.raw.end.min(frame.raw.start + limit as u64);
+    let mut bytes = Vec::with_capacity(limit);
     for slice in raw.raw(frame.raw.start..end) {
         bytes.extend_from_slice(slice);
     }
@@ -117,11 +162,17 @@ pub struct FrameTable {
     /// The text filter, lower case; empty for none.
     query: String,
     columns: Vec<Col>,
+    /// Whether the raw bytes get a column of their own.
+    show_raw: bool,
+    /// The advance of one character of the cells' monospace font, and the width the
+    /// table has been given; both measured when the panel paints, zero before.
+    advance: Pixels,
+    viewport: Pixels,
 }
 
 impl FrameTable {
     fn new() -> Self {
-        Self {
+        let mut table = Self {
             frames: None,
             raw: None,
             info: None,
@@ -130,8 +181,67 @@ impl FrameTable {
             scanned: FrameId::ZERO,
             kind: None,
             query: String::new(),
-            columns: Self::columns_for(None, None),
+            columns: Vec::new(),
+            show_raw: false,
+            advance: Pixels::ZERO,
+            viewport: Pixels::ZERO,
+        };
+        table.reset_columns();
+        table
+    }
+
+    /// The columns for the current kind filter and codec, without the raw one unless it
+    /// is turned on.
+    fn reset_columns(&mut self) {
+        let mut columns = Self::columns_for(self.kind.as_deref(), self.info.as_ref());
+        if !self.show_raw {
+            columns.retain(|col| *col != Col::Raw);
         }
+        self.columns = columns;
+    }
+
+    /// Width of the stamps in cells: the session's mode and format, absolute while the
+    /// gutter is off, and the default format's until the session is known.
+    fn time_cells(&self) -> usize {
+        self.time.as_ref().map_or(12, FrameTime::width)
+    }
+
+    /// The width of the Time column: the stamp in cells of the monospace font, inside the
+    /// cell's padding.
+    fn time_width(&self) -> Pixels {
+        let advance = if self.advance > Pixels::ZERO {
+            self.advance
+        } else {
+            // Not measured yet: a monospace face is about 0.6 em wide, at the 14 px
+            // `text_sm` most themes land on.
+            px(8.4)
+        };
+        advance * self.time_cells() as f32 + px(2. * CELL_PADDING + SLACK)
+    }
+
+    /// What Summary gets: the rest of the panel's width after Time, Dir and Kind, never
+    /// less than [`SUMMARY_MIN_WIDTH`].
+    fn summary_width(&self) -> Pixels {
+        let rest = self.viewport
+            - px(SCROLLBAR)
+            - self.time_width()
+            - px(DIRECTION_WIDTH)
+            - px(KIND_WIDTH);
+        rest.max(px(SUMMARY_MIN_WIDTH))
+    }
+
+    fn column_of(&self, col: &Col) -> Column {
+        let (key, name) = col.key_and_name();
+        let width = match col {
+            Col::Time => self.time_width(),
+            Col::Direction => px(DIRECTION_WIDTH),
+            Col::Kind => px(KIND_WIDTH),
+            Col::Summary => self.summary_width(),
+            Col::Field(_) => px(96.),
+            Col::Fields => px(280.),
+            Col::Raw => px(240.),
+        };
+        Column::new(key, name).width(width)
     }
 
     fn columns_for(kind: Option<&str>, info: Option<&CodecInfo>) -> Vec<Col> {
@@ -237,7 +347,7 @@ impl FrameTable {
             Col::Raw => self
                 .raw
                 .as_ref()
-                .and_then(|raw| raw_preview(raw, frame))
+                .and_then(|raw| raw_preview(raw, frame, RAW_PREVIEW))
                 .unwrap_or_else(|| "(evicted)".to_owned()),
         }
     }
@@ -255,7 +365,7 @@ impl TableDelegate for FrameTable {
     fn column(&self, col_ix: usize, _: &App) -> Column {
         self.columns
             .get(col_ix)
-            .map_or_else(|| Column::new("", ""), Col::column)
+            .map_or_else(|| Column::new("", ""), |col| self.column_of(col))
     }
 
     fn render_tr(
@@ -286,7 +396,7 @@ impl TableDelegate for FrameTable {
         let text = SharedString::from(self.text(row_ix, &col));
         let severity = self.frame(row_ix).map(|(_, frame)| frame.severity);
         let theme = cx.theme();
-        let mono = matches!(col, Col::Raw | Col::Time | Col::Fields | Col::Field(_));
+        let mono = col.is_mono();
         div()
             .w_full()
             .truncate()
@@ -353,6 +463,8 @@ pub struct DecodedPanel {
     seen: Option<u64>,
     focus_handle: FocusHandle,
     _session_observer: Option<Subscription>,
+    /// The session's terminal, whose timestamp mode the time column follows.
+    _terminal_observer: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -407,6 +519,7 @@ impl DecodedPanel {
             seen: None,
             focus_handle: cx.focus_handle(),
             _session_observer: None,
+            _terminal_observer: None,
             _subscriptions: vec![row_events, kind_events, filter_events],
         }
     }
@@ -443,7 +556,7 @@ impl DecodedPanel {
         let headers = delegate
             .columns
             .iter()
-            .map(|col| col.column().name.to_string())
+            .map(|col| col.key_and_name().1.to_string())
             .collect();
         let rows = (0..delegate.rows.len())
             .map(|row| {
@@ -484,6 +597,13 @@ impl DecodedPanel {
                 this.session_changed(window, cx);
             })
         });
+        // The terminal's timestamp mode changes without the session view noticing.
+        self._terminal_observer = session.as_ref().map(|session| {
+            let terminal = session.read(cx).terminal().clone();
+            cx.observe_in(&terminal, window, |this, _, window, cx| {
+                this.session_changed(window, cx);
+            })
+        });
         self.session = session.as_ref().map(Entity::downgrade);
         self.seen = None;
         self.follow = true;
@@ -520,6 +640,8 @@ impl DecodedPanel {
                     .is_none_or(|old| old.mode != time.mode || old.format != time.format);
                 if changed {
                     delegate.time = Some(time);
+                    // A stamp of another width: the Time column is sized to it.
+                    table.refresh(cx);
                     cx.notify();
                 }
             });
@@ -556,18 +678,26 @@ impl DecodedPanel {
             let delegate = table.delegate_mut();
             delegate.frames = Some(frames);
             delegate.raw = Some(raw);
+            let time_changed = delegate
+                .time
+                .as_ref()
+                .is_none_or(|old| old.mode != time.mode || old.format != time.format);
             delegate.time = Some(time);
             if codec_changed {
                 delegate.info = codec.map(|(_, info)| info);
                 // The kinds of another codec mean nothing to this one.
                 delegate.kind = None;
-                delegate.columns = FrameTable::columns_for(None, delegate.info.as_ref());
+                delegate.reset_columns();
                 delegate.rebuild();
                 table.refresh(cx);
                 table.clear_selection(cx);
             } else if delegate.catch_up() > 0 {
                 // Rows went from the front: the selected index names another frame.
                 table.clear_selection(cx);
+            }
+            if time_changed && !codec_changed {
+                // A stamp of another width: the Time column is sized to it.
+                table.refresh(cx);
             }
             if follow {
                 table.vertical_scroll_handle.scroll_to_bottom();
@@ -600,8 +730,8 @@ impl DecodedPanel {
             if delegate.kind == kind {
                 return;
             }
-            delegate.columns = FrameTable::columns_for(kind.as_deref(), delegate.info.as_ref());
             delegate.kind = kind;
+            delegate.reset_columns();
             delegate.rebuild();
             table.refresh(cx);
             table.clear_selection(cx);
@@ -624,6 +754,78 @@ impl DecodedPanel {
             cx.notify();
         });
         cx.notify();
+    }
+
+    /// Whether the raw bytes have a column of their own (off until turned on).
+    pub fn raw_column(&self, cx: &App) -> bool {
+        self.table.read(cx).delegate().show_raw
+    }
+
+    /// Turn the raw bytes' column on or off, scrolling it into view when it comes on.
+    pub fn set_raw_column(&mut self, show: bool, cx: &mut Context<Self>) {
+        self.table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            if delegate.show_raw == show {
+                return;
+            }
+            delegate.show_raw = show;
+            delegate.reset_columns();
+            table.refresh(cx);
+            if show {
+                let last = table.delegate().columns.len().saturating_sub(1);
+                table.scroll_to_col(last, cx);
+            }
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// The columns as laid out: header and width in pixels.
+    pub fn column_widths(&self, cx: &App) -> Vec<(String, f32)> {
+        let delegate = self.table.read(cx).delegate();
+        delegate
+            .columns
+            .iter()
+            .map(|col| {
+                let column = delegate.column_of(col);
+                (column.name.to_string(), f32::from(column.width))
+            })
+            .collect()
+    }
+
+    /// The width the table has been given, as measured when the panel last painted.
+    pub fn viewport_width(&self, cx: &App) -> f32 {
+        f32::from(self.table.read(cx).delegate().viewport)
+    }
+
+    /// The hex the preview under the table shows, while a row is selected.
+    pub fn selection_preview(&self, cx: &App) -> Option<String> {
+        let table = self.table.read(cx);
+        let delegate = table.delegate();
+        let (_, frame) = delegate.frame(table.selected_row()?)?;
+        let raw = delegate.raw.as_ref()?;
+        raw_preview(raw, frame, SELECTION_PREVIEW)
+    }
+
+    /// Called as the panel paints with the width the table has and the monospace font's
+    /// advance at the cells' size: the Time column follows the advance and Summary the
+    /// width.
+    fn measured(&mut self, viewport: Pixels, advance: Pixels, cx: &mut Context<Self>) {
+        let changed = self.table.update(cx, |table, cx| {
+            let delegate = table.delegate_mut();
+            let moved = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs() >= 0.5;
+            if !moved(delegate.viewport, viewport) && !moved(delegate.advance, advance) {
+                return false;
+            }
+            delegate.viewport = viewport;
+            delegate.advance = advance;
+            table.refresh(cx);
+            cx.notify();
+            true
+        });
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Keep the newest frame in view again.
@@ -699,9 +901,60 @@ impl DecodedPanel {
     }
 }
 
+impl DecodedPanel {
+    /// The bytes of the selected frame in hex, under the table; nothing while no row is
+    /// selected.
+    fn render_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let table = self.table.read(cx);
+        let delegate = table.delegate();
+        let (_, frame) = delegate.frame(table.selected_row()?)?;
+        let hex = delegate
+            .raw
+            .as_ref()
+            .and_then(|raw| raw_preview(raw, frame, SELECTION_PREVIEW))
+            .unwrap_or_else(|| "(evicted)".to_owned());
+        let title = format!(
+            "{} {} \u{b7} {} bytes",
+            direction_label(frame),
+            frame.kind,
+            frame.raw.end - frame.raw.start
+        );
+        let theme = cx.theme();
+        Some(
+            v_flex()
+                .id("decoded-preview")
+                // Observable in UI tests: the preview is there only with a selection.
+                .test_support()
+                .flex_none()
+                .gap_0p5()
+                .px_3()
+                .py_1p5()
+                .max_h(px(112.))
+                .overflow_hidden()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(SharedString::from(title)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .child(SharedString::from(hex)),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for DecodedPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
+        let preview = self.render_preview(cx);
+        let panel = cx.entity().downgrade();
         // Frames decoded before the codec was turned off still show.
         let has_frames = self
             .table
@@ -745,14 +998,47 @@ impl Render for DecodedPanel {
                             div()
                                 .flex_1()
                                 .child(Input::new(&self.filter).small().id("decoded-filter")),
+                        )
+                        .child(
+                            Button::new("decoded-raw")
+                                .label("Hex")
+                                .tooltip("Show each frame's raw bytes as a column")
+                                .small()
+                                .ghost()
+                                .toggled(self.table.read(cx).delegate().show_raw)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let show = !this.raw_column(cx);
+                                    this.set_raw_column(show, cx);
+                                })),
                         ),
                 )
                 .child(
                     div()
                         .flex_1()
                         .min_h_0()
+                        .relative()
+                        // Measures what the table has to lay its columns out in, and how
+                        // wide a character of the cells' monospace font is. Nothing is
+                        // drawn: the answer goes back to the panel, which resizes the
+                        // Time and Summary columns when it changed.
+                        .child(
+                            canvas(
+                                move |bounds, window, cx| {
+                                    let advance = cell_advance(window, cx);
+                                    panel
+                                        .update(cx, |this, cx| {
+                                            this.measured(bounds.size.width, advance, cx)
+                                        })
+                                        .ok();
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
                         .child(DataTable::new(&self.table).small().bordered(false)),
                 )
+                .children(preview)
                 .into_any_element()
         };
         v_flex()

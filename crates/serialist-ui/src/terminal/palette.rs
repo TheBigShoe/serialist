@@ -2,8 +2,15 @@
 //! store's [`Color`] and [`Style`] to GPUI colors.
 //!
 //! [`TerminalPalette::from_lookup`] fills a palette from a Zed theme's `terminal.*`,
-//! `players[0]` and `search.*` keys; [`TerminalPalette::default`] is a One Dark-like set
-//! and the fallback for every key a theme leaves out.
+//! `players[0]` and `search.*` keys. A key a theme leaves out falls back to
+//! [`TerminalPalette::dark`] (a One Dark-like set, also the [`Default`]) or, for a theme
+//! whose terminal background is light, to [`TerminalPalette::light`], so a light theme
+//! that sets only a few keys does not get dark-theme colors on its pale background.
+//!
+//! What is drawn is always checked against what is behind it: the default and faint
+//! foregrounds against the theme's terminal background when the palette is built, and
+//! every run against its own cell's background (the terminal's, or the ANSI, indexed or
+//! RGB color the application set) when it is resolved.
 
 use serialist_core::{Color, Direction, Style, StyleFlags};
 
@@ -35,12 +42,29 @@ pub struct TerminalPalette {
     pub bold_is_bright: bool,
     /// Minimum WCAG contrast ratio between a glyph and what is behind it; 1.0 turns the
     /// guard off. Text an application colors unreadably (dark blue on the dark
-    /// background) is lightened or darkened until it reaches this.
+    /// background, pale text on a pale chip) is lightened or darkened until it reaches
+    /// this. The default is WCAG's AA level for body text.
     pub minimum_contrast: f32,
+    /// The same for text that is faint on purpose (SGR 2, the placeholders for control
+    /// characters): lower, so dim text stays dim. Never more than
+    /// [`Self::minimum_contrast`].
+    pub faint_contrast: f32,
 }
+
+/// WCAG AA for body text.
+pub const MINIMUM_CONTRAST: f32 = 4.5;
+/// WCAG's level for large text, the floor for text that is meant to be faint.
+pub const FAINT_CONTRAST: f32 = 3.0;
 
 impl Default for TerminalPalette {
     fn default() -> Self {
+        Self::dark()
+    }
+}
+
+impl TerminalPalette {
+    /// The colors a dark theme falls back to: One Dark-like.
+    pub fn dark() -> Self {
         let hex = |value: u32| Hsla::from(rgb(value));
         Self {
             foreground: hex(0xdcdfe4),
@@ -49,7 +73,7 @@ impl Default for TerminalPalette {
             bright_foreground: hex(0xffffff),
             ansi: [
                 hex(0x3f4451),
-                hex(0xe05561),
+                hex(0xe45b67),
                 hex(0x8cc265),
                 hex(0xd18f52),
                 hex(0x4aa5f0),
@@ -73,10 +97,56 @@ impl Default for TerminalPalette {
             notice: hex(0xa9afbc),
             decoded: hex(0xc162de),
             bold_is_bright: true,
-            minimum_contrast: 3.0,
+            minimum_contrast: MINIMUM_CONTRAST,
+            faint_contrast: FAINT_CONTRAST,
+        }
+    }
+
+    /// The colors a light theme falls back to: the bundled Serialist Light theme's. The
+    /// ANSI colors are the deep ones that read on a pale background (and as chips behind
+    /// dark text), with the bright variants only a step lighter, so a bold color is not
+    /// picked over the normal one when it would be harder to read (see
+    /// [`Self::foreground_of`]).
+    pub fn light() -> Self {
+        let hex = |value: u32| Hsla::from(rgb(value));
+        Self {
+            foreground: hex(0x23272e),
+            background: hex(0xfbfbfc),
+            dim_foreground: hex(0x6a7381),
+            bright_foreground: hex(0x0d0f12),
+            ansi: [
+                hex(0x3b4048),
+                hex(0xc2303c),
+                hex(0x2a8a3f),
+                hex(0x9a6a06),
+                hex(0x1f63c6),
+                hex(0x8b3dc4),
+                hex(0x0b7a8a),
+                hex(0x8e97a5),
+                hex(0x6a7280),
+                hex(0xde505a),
+                hex(0x3ea256),
+                hex(0xb8820f),
+                hex(0x3a7fe0),
+                hex(0xa55bdc),
+                hex(0x1c95a8),
+                hex(0xb9c0cb),
+            ],
+            selection: Hsla::from(rgba(0x1f63c633)),
+            cursor: hex(0x1f63c6),
+            search_match: Hsla::from(rgba(0xf0c04a59)),
+            active_match: Hsla::from(rgba(0xf0a020b3)),
+            tx: hex(0x1f63c6),
+            notice: hex(0x5b6472),
+            decoded: hex(0x8b3dc4),
+            ..Self::dark()
         }
     }
 }
+
+/// Terminal backgrounds brighter than this (relative luminance) are light: the point where
+/// black text has more contrast than white.
+const LIGHT_BACKGROUND: f32 = 0.18;
 
 /// The Zed theme keys of the sixteen ANSI colors, in [`TerminalPalette::ansi`] order.
 pub const ANSI_KEYS: [&str; 16] = [
@@ -110,6 +180,9 @@ impl TerminalPalette {
     /// | bright foreground | `terminal.bright_foreground`, then the foreground |
     /// | dim foreground | `terminal.dim_foreground`, `text.muted` |
     /// | ANSI 0 to 15 | `terminal.ansi.black` … `terminal.ansi.bright_white` |
+    ///
+    /// The bright and dim foregrounds are lightened or darkened, if they need it, to reach
+    /// [`Self::minimum_contrast`] and [`Self::faint_contrast`] against the background.
     /// | cursor | `players[0].cursor`, `text.accent` |
     /// | selection | `players[0].selection`, `element.selected` |
     /// | search match | `search.match_background` |
@@ -118,8 +191,14 @@ impl TerminalPalette {
     /// | notices | `text.muted`, `hint` |
     /// | decoded frame summaries | `syntax.keyword`, `terminal.ansi.magenta` |
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<Hsla>) -> Self {
-        let defaults = Self::default();
         let first = |keys: &[&str]| keys.iter().find_map(|key| lookup(key));
+        let themed_background = first(&["terminal.background", "editor.background", "background"]);
+        // What a key the theme leaves out falls back to follows the theme's appearance.
+        let defaults = match themed_background {
+            Some(background) if relative_luminance(background) > LIGHT_BACKGROUND => Self::light(),
+            _ => Self::dark(),
+        };
+        let background = themed_background.unwrap_or(defaults.background);
         let foreground = first(&["terminal.foreground", "editor.foreground", "text"])
             .unwrap_or(defaults.foreground);
         let search_match = first(&["search.match_background"]).unwrap_or(defaults.search_match);
@@ -129,18 +208,26 @@ impl TerminalPalette {
                 *slot = color;
             }
         }
+        // The default and faint foregrounds are drawn straight onto the terminal's
+        // background (the gutter and control placeholders are not resolved run by run),
+        // so a theme's values are held to the guard against it here.
+        let dim_foreground =
+            first(&["terminal.dim_foreground", "text.muted"]).unwrap_or(defaults.dim_foreground);
+        let bright_foreground = first(&["terminal.bright_foreground"]).unwrap_or(
+            if lookup("terminal.foreground").is_some() {
+                foreground
+            } else {
+                defaults.bright_foreground
+            },
+        );
         Self {
             foreground,
-            background: first(&["terminal.background", "editor.background", "background"])
-                .unwrap_or(defaults.background),
-            dim_foreground: first(&["terminal.dim_foreground", "text.muted"])
-                .unwrap_or(defaults.dim_foreground),
-            bright_foreground: first(&["terminal.bright_foreground"]).unwrap_or(
-                if lookup("terminal.foreground").is_some() {
-                    foreground
-                } else {
-                    defaults.bright_foreground
-                },
+            background,
+            dim_foreground: ensure_contrast(dim_foreground, background, defaults.faint_contrast),
+            bright_foreground: ensure_contrast(
+                bright_foreground,
+                background,
+                defaults.minimum_contrast,
             ),
             ansi,
             selection: first(&["players[0].selection", "element.selected"])
@@ -198,6 +285,18 @@ impl TerminalPalette {
         }
     }
 
+    /// What bold draws `normal` as: its `bright` variant, unless that reads worse against
+    /// the terminal's background. A dark theme's bright colors are lighter and stand out
+    /// more; a light theme's, lighter still, fade into the page, and bold then keeps the
+    /// normal color and leaves the emphasis to the heavier weight.
+    fn brighter(&self, normal: Hsla, bright: Hsla) -> Hsla {
+        if contrast_ratio(bright, self.background) >= contrast_ratio(normal, self.background) {
+            bright
+        } else {
+            normal
+        }
+    }
+
     /// A foreground color; `Default` takes the line's own default so sent lines and
     /// notices stand apart from received text.
     pub fn foreground_of(&self, color: Color, bold: bool, direction: Direction) -> Hsla {
@@ -205,11 +304,13 @@ impl TerminalPalette {
             Color::Default => match direction {
                 Direction::Tx => self.tx,
                 Direction::Notice => self.notice,
-                Direction::Rx if bold && self.bold_is_bright => self.bright_foreground,
+                Direction::Rx if bold && self.bold_is_bright => {
+                    self.brighter(self.foreground, self.bright_foreground)
+                }
                 Direction::Rx => self.foreground,
             },
             Color::Ansi(n) | Color::Indexed(n) if n < 8 && bold && self.bold_is_bright => {
-                self.ansi[n as usize + 8]
+                self.brighter(self.ansi[n as usize], self.ansi[n as usize + 8])
             }
             Color::Ansi(n) | Color::Indexed(n) => self.indexed(n),
             Color::Rgb(r, g, b) => from_bytes(r, g, b),
@@ -269,10 +370,17 @@ impl TerminalPalette {
             foreground = self.dim_foreground;
         }
         let behind = background.unwrap_or(self.background);
+        // Faint text is held to the lower floor, so dimming it does not undo itself.
+        let faint = flags.contains(StyleFlags::DIM) || flags.contains(StyleFlags::CONTROL);
+        let minimum = if faint {
+            self.faint_contrast.min(self.minimum_contrast)
+        } else {
+            self.minimum_contrast
+        };
         foreground = if flags.contains(StyleFlags::HIDDEN) {
             behind
         } else {
-            ensure_contrast(foreground, behind, self.minimum_contrast)
+            ensure_contrast(foreground, behind, minimum)
         };
         ResolvedStyle {
             foreground,
@@ -455,6 +563,155 @@ mod tests {
         let keyword =
             TerminalPalette::from_lookup(|key| (key == "syntax.keyword").then(|| hex(0xc678dd)));
         assert_eq!(keyword.decoded, hex(0xc678dd), "the plugin color");
+    }
+
+    /// A bundled theme's palette, as the app builds it.
+    fn bundled(name: &str) -> TerminalPalette {
+        let theme = serialist_core::theme::ThemeRegistry::bundled()
+            .get(name)
+            .unwrap_or_else(|| panic!("no bundled theme {name}"))
+            .clone();
+        TerminalPalette::from_lookup(|key| theme.color(key).map(crate::config::hsla))
+    }
+
+    fn style(fg: Color, bg: Color, flags: StyleFlags) -> Style {
+        Style { fg, bg, flags }
+    }
+
+    #[test]
+    fn a_light_theme_that_sets_few_keys_falls_back_to_the_light_palette() {
+        let hex = |value: u32| Hsla::from(rgb(value));
+        // Only a pale background: the colors the theme leaves out are the light set's,
+        // not the dark set's pastels and white.
+        let palette = TerminalPalette::from_lookup(|key| {
+            (key == "terminal.background").then(|| hex(0xfdf6e3))
+        });
+        let light = TerminalPalette::light();
+        assert_eq!(palette.background, hex(0xfdf6e3));
+        assert_eq!(palette.foreground, light.foreground);
+        assert_eq!(palette.ansi, light.ansi);
+        assert_eq!(palette.notice, light.notice);
+        assert_eq!(palette.bright_foreground, light.bright_foreground);
+        // Bold default text is the dark ink, not the dark theme's white.
+        let bold = palette.foreground_of(Color::Default, true, Direction::Rx);
+        assert!(contrast_ratio(bold, palette.background) >= MINIMUM_CONTRAST);
+        // A dark background (or none) is the dark set.
+        let dark = TerminalPalette::from_lookup(|key| {
+            (key == "terminal.background").then(|| hex(0x101010))
+        });
+        assert_eq!(dark.ansi, TerminalPalette::dark().ansi);
+    }
+
+    #[test]
+    fn the_themes_faint_and_bright_foregrounds_are_held_to_the_guard_against_its_background() {
+        let hex = |value: u32| Hsla::from(rgb(value));
+        let keys = std::collections::HashMap::from([
+            ("terminal.background", hex(0xfbfbfc)),
+            ("terminal.foreground", hex(0x23272e)),
+            // Far too pale to read on that background.
+            ("terminal.dim_foreground", hex(0xdde0e5)),
+            ("terminal.bright_foreground", hex(0xc8ccd2)),
+        ]);
+        let palette = TerminalPalette::from_lookup(|key| keys.get(key).copied());
+        assert!(
+            contrast_ratio(palette.dim_foreground, palette.background) >= FAINT_CONTRAST,
+            "dim"
+        );
+        assert!(
+            contrast_ratio(palette.bright_foreground, palette.background) >= MINIMUM_CONTRAST,
+            "bright"
+        );
+        // Darkened, not replaced: still the theme's hue and still the lighter of the two.
+        assert!(palette.dim_foreground.l < keys["terminal.dim_foreground"].l);
+        assert!(palette.dim_foreground.l > palette.bright_foreground.l);
+    }
+
+    #[test]
+    fn bold_is_bright_only_when_it_reads_at_least_as_well() {
+        // Dark: the bright variants are lighter and stand out more.
+        let dark = bundled("Serialist Dark");
+        let pick = |palette: &TerminalPalette, n: u8| {
+            palette.foreground_of(Color::Ansi(n), true, Direction::Rx)
+        };
+        for n in 1..7 {
+            assert_eq!(pick(&dark, n), dark.ansi[n as usize + 8], "dark {n}");
+        }
+        // Light: lighter means fainter, so bold keeps the normal color wherever the
+        // bright one has less contrast against the page.
+        let light = bundled("Serialist Light");
+        for n in 0..8u8 {
+            let (normal, bright) = (light.ansi[n as usize], light.ansi[n as usize + 8]);
+            let chosen = pick(&light, n);
+            let ratio = |color| contrast_ratio(color, light.background);
+            assert!(
+                ratio(chosen) >= ratio(normal).min(ratio(bright)),
+                "light {n}"
+            );
+            assert!(
+                ratio(chosen) >= ratio(normal),
+                "bold never fades, light {n}"
+            );
+        }
+        assert_eq!(
+            pick(&light, 2),
+            light.ansi[2],
+            "green: the bright one is paler"
+        );
+        assert_eq!(
+            light.foreground_of(Color::Default, true, Direction::Rx),
+            light.bright_foreground,
+            "bold default text is the darker ink"
+        );
+    }
+
+    #[test]
+    fn every_bundled_theme_combination_is_readable_after_the_guard() {
+        for name in ["Serialist Dark", "Serialist Light"] {
+            let palette = bundled(name);
+            assert_eq!(palette.minimum_contrast, MINIMUM_CONTRAST);
+            let colors: Vec<Color> = std::iter::once(Color::Default)
+                .chain((0..16).map(Color::Ansi))
+                .chain([
+                    Color::Indexed(21),
+                    Color::Indexed(244),
+                    Color::Rgb(120, 60, 200),
+                ])
+                .collect();
+            for flags in [StyleFlags::NONE, StyleFlags::BOLD, StyleFlags::DIM] {
+                let floor = if flags == StyleFlags::DIM {
+                    palette.faint_contrast
+                } else {
+                    palette.minimum_contrast
+                };
+                for fg in &colors {
+                    for bg in &colors {
+                        let resolved = palette.resolve(&style(*fg, *bg, flags), Direction::Rx);
+                        let behind = resolved.background.unwrap_or(palette.background);
+                        let ratio = contrast_ratio(resolved.foreground, behind);
+                        assert!(
+                            ratio >= floor - 0.01,
+                            "{name}: {fg:?} on {bg:?} ({flags:?}) reads at {ratio:.2}, below {floor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dim_colored_text_is_held_to_the_faint_floor_not_the_body_one() {
+        let palette = bundled("Serialist Light");
+        let dim = palette.resolve(
+            &style(Color::Ansi(2), Color::Default, StyleFlags::DIM),
+            Direction::Rx,
+        );
+        let body = palette.resolve(
+            &style(Color::Ansi(2), Color::Default, StyleFlags::NONE),
+            Direction::Rx,
+        );
+        let ratio = |r: ResolvedStyle| contrast_ratio(r.foreground, palette.background);
+        assert!(ratio(dim) < ratio(body), "dim stays fainter than body text");
+        assert!(ratio(dim) >= palette.faint_contrast - 0.01);
     }
 
     #[test]

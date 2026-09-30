@@ -16,10 +16,11 @@ use serialist_sim::SimWorld;
 
 use crate::codecs::{DECODED_MARK, hides_bytes};
 use crate::config::{self, Config, ConfigPiece};
-use crate::decoded_panel::DecodedPanel;
+use crate::decoded_panel::{DecodedPanel, cell_advance};
 use crate::export::{ExportFormat, ExportJob};
 use crate::prelude::*;
 use crate::session_view::SessionView;
+use crate::terminal::TimestampMode;
 use crate::test_support::{
     TestDir, allow_engine_threads, displayed, open_test_window, parse_csv, run_until,
     wait_connected,
@@ -162,8 +163,13 @@ fn race_frames_fill_the_panel_and_a_frame_reply_resolves_the_send(cx: &mut TestA
         "{}",
         log.summary
     );
-    // The panel draws it: a time, the direction, the kind and its hex bytes.
-    let (headers, rows) = panel(cx, &workspace).read_with(cx, |panel, cx| panel.dump(cx));
+    // The panel draws it: a time, the direction, the kind and, once the raw column is
+    // turned on (it is off by default), its hex bytes.
+    let decoded = panel(cx, &workspace);
+    let (headers, _) = decoded.read_with(cx, |panel, cx| panel.dump(cx));
+    assert_eq!(headers, ["Time", "Dir", "Kind", "Summary", "Fields"]);
+    decoded.update(cx, |panel, cx| panel.set_raw_column(true, cx));
+    let (headers, rows) = decoded.read_with(cx, |panel, cx| panel.dump(cx));
     assert_eq!(headers, ["Time", "Dir", "Kind", "Summary", "Fields", "Raw"]);
     let row = rows.iter().find(|row| row[2] == "log").unwrap();
     assert_eq!(row[1], "RX");
@@ -551,6 +557,176 @@ fn selecting_a_decoded_row_marks_its_bytes_in_the_terminal(cx: &mut TestAppConte
     // Follow brings the table back to the newest frame.
     panel.update(cx, |panel, cx| panel.follow(cx));
     assert!(panel.read_with(cx, |p, _| p.is_following()));
+}
+
+/// The width of the column headed `name`.
+fn width_of(columns: &[(String, f32)], name: &str) -> f32 {
+    columns
+        .iter()
+        .find(|(header, _)| header == name)
+        .unwrap_or_else(|| panic!("no {name} column in {columns:?}"))
+        .1
+}
+
+#[gpui_test]
+fn the_time_column_fits_its_stamp_and_summary_takes_the_rest(cx: &mut TestAppContext) {
+    let dir = config_dir("decoded-widths", &race_profile("airoha-race"));
+    let Opened {
+        window,
+        workspace,
+        view,
+        _world,
+    } = open(cx, &dir, false);
+    wait_frames(cx, &workspace, "the banner and two logs", |frames| {
+        frames.iter().filter(|frame| is_log(frame)).count() >= 2
+    });
+    let decoded = panel(cx, &workspace);
+    let draw = |cx: &mut TestAppContext| {
+        // One frame to measure the table, one to lay it out with the answer.
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let advance = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| f32::from(cell_advance(window, cx)))
+            .unwrap()
+    };
+    draw(cx);
+
+    // The column holds the longest stamp shown, in cells of the monospace font.
+    let (_, rows) = decoded.read_with(cx, |panel, cx| panel.dump(cx));
+    let longest = rows.iter().map(|row| row[0].chars().count()).max().unwrap();
+    assert_eq!(longest, 12, "HH:MM:SS.mmm");
+    let columns = decoded.read_with(cx, |panel, cx| panel.column_widths(cx));
+    let time = width_of(&columns, "Time");
+    assert!(
+        time >= advance(cx) * longest as f32,
+        "{time} px holds {longest} cells of {}",
+        advance(cx)
+    );
+    assert!(time <= advance(cx) * longest as f32 + 20.);
+
+    // Summary is the rest of what the table has, after Time, Dir and Kind.
+    let viewport = decoded.read_with(cx, |panel, cx| panel.viewport_width(cx));
+    assert!(viewport > 0., "the table was measured");
+    let (dir, kind, summary) = (
+        width_of(&columns, "Dir"),
+        width_of(&columns, "Kind"),
+        width_of(&columns, "Summary"),
+    );
+    let expected = (viewport - 12. - time - dir - kind).max(160.);
+    assert!(
+        (summary - expected).abs() < 1.,
+        "Summary {summary} px, {expected} px left of {viewport}"
+    );
+
+    // Another stamp mode, another width: a relative stamp is one character longer.
+    view.update(cx, |view, cx| {
+        view.terminal().update(cx, |terminal, cx| {
+            terminal.set_timestamps(TimestampMode::Relative, cx)
+        });
+    });
+    draw(cx);
+    let (_, rows) = decoded.read_with(cx, |panel, cx| panel.dump(cx));
+    let longest = rows.iter().map(|row| row[0].chars().count()).max().unwrap();
+    assert_eq!(longest, 13, "+HH:MM:SS.mmm");
+    let relative = width_of(
+        &decoded.read_with(cx, |panel, cx| panel.column_widths(cx)),
+        "Time",
+    );
+    assert!(
+        (relative - time - advance(cx)).abs() < 1.,
+        "{relative} px against {time} px and a cell of {}",
+        advance(cx)
+    );
+}
+
+#[gpui_test]
+fn the_raw_column_is_off_until_the_toggle_turns_it_on(cx: &mut TestAppContext) {
+    let dir = config_dir("decoded-raw-toggle", &race_profile("airoha-race"));
+    let Opened {
+        window,
+        workspace,
+        _world,
+        ..
+    } = open(cx, &dir, false);
+    wait_frames(cx, &workspace, "the banner and two logs", |frames| {
+        frames.iter().filter(|frame| is_log(frame)).count() >= 2
+    });
+    let decoded = panel(cx, &workspace);
+    let headers = |cx: &mut TestAppContext| decoded.read_with(cx, |p, cx| p.dump(cx).0);
+    assert!(!decoded.read_with(cx, |p, cx| p.raw_column(cx)));
+    assert!(!headers(cx).contains(&"Raw".to_owned()));
+
+    // The Hex toggle, clicked as a user would.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("decoded-raw", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(decoded.read_with(cx, |p, cx| p.raw_column(cx)));
+    assert_eq!(headers(cx).last().map(String::as_str), Some("Raw"));
+
+    // It survives a kind filter (whose columns are the kind's fields) and goes again.
+    decoded.update(cx, |p, cx| p.set_kind(Some("log".into()), cx));
+    assert_eq!(headers(cx).last().map(String::as_str), Some("Raw"));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("decoded-raw", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(!headers(cx).contains(&"Raw".to_owned()));
+}
+
+#[gpui_test]
+fn the_hex_preview_opens_on_a_selection_and_closes_with_it(cx: &mut TestAppContext) {
+    let dir = config_dir("decoded-preview", &race_profile("airoha-race"));
+    let Opened {
+        window,
+        workspace,
+        view,
+        _world,
+    } = open(cx, &dir, false);
+    let frames = wait_frames(cx, &workspace, "the banner and two logs", |frames| {
+        frames.iter().filter(|frame| is_log(frame)).count() >= 2
+    });
+    let decoded = panel(cx, &workspace);
+    let previewed = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("decoded-preview").is_some()
+        })
+        .unwrap()
+    };
+
+    // Nothing is selected: no preview, and no raw column either.
+    assert_eq!(decoded.read_with(cx, |p, cx| p.selection_preview(cx)), None);
+    assert!(!previewed(cx));
+
+    let ix = frames.iter().position(is_log).unwrap();
+    decoded.update(cx, |p, cx| p.select_row(ix, cx));
+    cx.run_until_parked();
+    let snapshot = view.read_with(cx, |v, _| v.snapshot().clone());
+    let bytes = raw_bytes(&snapshot, &frames[ix]);
+    let hex = decoded
+        .read_with(cx, |p, cx| p.selection_preview(cx))
+        .expect("the selected frame's bytes");
+    assert!(
+        hex.starts_with(&serialist_core::codec::encode_hex(&bytes[..8], " ")),
+        "{hex}"
+    );
+    assert!(previewed(cx));
+
+    // A filter rebuilds the rows and drops the selection, and the preview with it.
+    decoded.update(cx, |p, cx| p.set_query("heartbeat", cx));
+    cx.run_until_parked();
+    assert_eq!(decoded.read_with(cx, |p, cx| p.selection_preview(cx)), None);
+    assert!(!previewed(cx));
 }
 
 #[gpui_test]
