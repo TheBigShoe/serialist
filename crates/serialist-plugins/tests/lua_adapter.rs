@@ -374,12 +374,15 @@ fn plugins_are_found_by_folder_and_webassembly_is_recognised() {
     assert!(find_plugins(&dir.path().join("missing")).is_empty());
 }
 
+/// A Lua codec never crosses threads: its factory does, and the codec is made on the
+/// thread that runs it.
 #[test]
-fn a_lua_codec_moves_to_the_ingest_thread() {
+fn a_lua_codec_is_made_on_the_thread_that_runs_it() {
     let mut registry = CodecRegistry::new();
     registry.register(Arc::new(bundled_race_lua(LuaLimits::default()).unwrap()));
-    let mut codec = registry.create("airoha-race").unwrap();
+    let factory = registry.get("airoha-race").unwrap();
     let frames = std::thread::spawn(move || {
+        let mut codec = factory.create().unwrap();
         let mut out = Vec::new();
         codec.decode(b"hello\n", Instant::now(), 0, &mut out);
         out

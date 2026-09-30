@@ -1,10 +1,14 @@
 //! Codec plugins for Serialist: built-in Rust codecs, the Lua adapter (tier 1), and the
 //! Airoha RACE reference plugin in both.
 //!
-//! Every codec implements [`serialist_core::Codec`]; the app keeps them in a
+//! Every codec implements [`serialist_core::Codec`]; the app keeps their factories in a
 //! [`CodecRegistry`] and runs the active one on the ingest thread through a
 //! [`CodecSink`](serialist_core::CodecSink), which fills a
-//! [`FrameStore`](serialist_core::FrameStore) the UI reads.
+//! [`FrameStore`](serialist_core::FrameStore) the UI reads. Codecs are not `Send` (a Lua
+//! codec's VM stays on one thread): the factory crosses to the ingest thread and the
+//! codec is made there, with
+//! [`CodecSink::from_factory`](serialist_core::CodecSink::from_factory) inside
+//! [`Ingest::spawn_with`](serialist_core::Ingest::spawn_with).
 //!
 //! | Item | What it is |
 //! |---|---|
