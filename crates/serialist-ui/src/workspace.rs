@@ -1,22 +1,32 @@
-//! The window's root view: Devices panel on the left, the session in the center, the
-//! status line along the bottom. The workspace owns sessions; panels only ask for them.
+//! The window's root view: the Devices and Commands panels on the left, the session in
+//! the center, the status line along the bottom. The workspace owns sessions; panels
+//! only ask for them.
+//!
+//! Saved commands reach the session through here: the Commands panel's
+//! [`CommandsPanelEvent::Send`] and every [`commands::Send`](crate::actions::commands::Send)
+//! keybinding call [`Workspace::send_command`], which asks for the command's parameters
+//! in a dialog when it has any, then hands it to the session view. The workspace also
+//! owns the persisted compose history, which every session's compose bar shares.
 
 use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    PortId, PortInfo, PortKind, PortSource, SerialConfig, StoreConfig, TransportError,
-    TransportFactory,
+    CommandRef, ParamValues, PortId, PortInfo, PortKind, PortSource, SerialConfig, StoreConfig,
+    TransportError, TransportFactory,
 };
 
 use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
+use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
 use crate::config::{self, Config};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::export::ExportFormat;
+use crate::history::PersistentHistory;
+use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
 use crate::prelude::*;
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 use crate::session_options::SessionOptions;
-use crate::session_view::SessionView;
+use crate::session_view::{SessionView, SessionViewEvent};
 use crate::status::{ConnectionState, Notice, StatusLine};
 
 const STATUS_LINE_HEIGHT: Pixels = px(26.);
@@ -75,6 +85,11 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
 
 pub struct Workspace {
     devices: Entity<DevicesPanel>,
+    commands: Entity<CommandsPanel>,
+    /// The compose history every session shares, kept in `history.jsonl`.
+    history: Entity<PersistentHistory>,
+    /// The parameter dialog, while it is open.
+    param_prompt: Option<Entity<ParamPrompt>>,
     session: Option<Entity<SessionView>>,
     /// The port the session is on, for its device profile when settings change.
     session_port: Option<PortInfo>,
@@ -89,6 +104,8 @@ pub struct Workspace {
     focus_handle: FocusHandle,
     _connect_task: Option<Task<()>>,
     _session_observer: Option<Subscription>,
+    _session_events: Option<Subscription>,
+    _param_prompt_events: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -132,6 +149,27 @@ impl Workspace {
                     this.connect(port.clone(), serial.clone(), window, cx);
                 }
             });
+        let commands = cx.new(|cx| CommandsPanel::new(window, cx));
+        let commands_events =
+            cx.subscribe_in(
+                &commands,
+                window,
+                |this, _, event, window, cx| match event {
+                    CommandsPanelEvent::Send(reference) => {
+                        this.send_command(reference.clone(), window, cx);
+                    }
+                },
+            );
+        // The history file is only read and written for a configuration loaded from its
+        // directory; the bundled defaults keep it in memory.
+        let history_path = cx
+            .try_global::<Config>()
+            .filter(|config| config.is_loaded())
+            .map(|config| config.paths().history_path());
+        let history = cx.new(|_| PersistentHistory::load(history_path));
+        let flush_history = cx.on_release(|this, cx| {
+            this.history.update(cx, |history, cx| history.flush(cx));
+        });
         // A reload reaches the session's display defaults and the status line.
         let config_changes = cx.observe_global_in::<Config>(window, |this, _, cx| {
             this.config_changed(cx);
@@ -147,6 +185,9 @@ impl Workspace {
 
         Self {
             devices,
+            commands,
+            history,
+            param_prompt: None,
             session: None,
             session_port: None,
             opener,
@@ -157,7 +198,15 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             _connect_task: None,
             _session_observer: None,
-            _subscriptions: vec![devices_events, config_changes, appearance],
+            _session_events: None,
+            _param_prompt_events: None,
+            _subscriptions: vec![
+                devices_events,
+                commands_events,
+                flush_history,
+                config_changes,
+                appearance,
+            ],
         }
     }
 
@@ -220,6 +269,125 @@ impl Workspace {
         self.session.as_ref()
     }
 
+    pub fn commands(&self) -> &Entity<CommandsPanel> {
+        &self.commands
+    }
+
+    pub fn history(&self) -> &Entity<PersistentHistory> {
+        &self.history
+    }
+
+    /// The parameter dialog's form, while it is open.
+    pub fn param_prompt(&self) -> Option<&Entity<ParamPrompt>> {
+        self.param_prompt.as_ref()
+    }
+
+    /// Send the saved command `reference` names on the session. A command with
+    /// parameters first asks for them in a dialog, prefilled with the values sent last
+    /// in this session or the defaults.
+    pub fn send_command(
+        &mut self,
+        reference: CommandRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command = cx
+            .try_global::<Config>()
+            .and_then(|config| config.commands().get(&reference).cloned());
+        let Some(command) = command else {
+            self.commands.update(cx, |panel, cx| {
+                panel.set_notice(Some(Notice::error(format!("No command {reference}"))), cx);
+            });
+            return;
+        };
+        let Some(session) = self.session.clone() else {
+            self.commands.update(cx, |panel, cx| {
+                panel.set_notice(
+                    Some(Notice::error(format!(
+                        "Not connected; connect a port to send {}",
+                        command.name
+                    ))),
+                    cx,
+                );
+            });
+            return;
+        };
+        if command.params.is_empty() {
+            session.update(cx, |view, cx| {
+                view.send_command(&reference, &command, &ParamValues::new(), cx);
+            });
+            return;
+        }
+        let values = session
+            .read(cx)
+            .remembered_params(&reference)
+            .cloned()
+            .unwrap_or_else(|| command.defaults());
+        let params = command.params.clone();
+        let prompt = cx.new(|cx| ParamPrompt::new(reference.clone(), params, &values, window, cx));
+        self._param_prompt_events =
+            Some(
+                cx.subscribe_in(&prompt, window, |this, _, event, window, cx| match event {
+                    ParamPromptEvent::Confirmed { reference, values } => {
+                        this.send_with_params(reference, values, cx);
+                        this.param_prompt = None;
+                        window.close_dialog(cx);
+                    }
+                }),
+            );
+        self.param_prompt = Some(prompt.clone());
+        let title = SharedString::from(format!("Send {}", command.name));
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm = prompt.clone();
+            let closed = this.clone();
+            dialog
+                .title(title.clone())
+                .w(px(420.))
+                .child(prompt.clone())
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Send")
+                        .show_cancel(true),
+                )
+                // Confirming emits the values; the subscription sends and closes.
+                .on_ok(move |_, _, cx| {
+                    confirm.update(cx, |prompt, cx| prompt.confirm(cx));
+                    false
+                })
+                .on_close(move |_, _, cx| {
+                    closed
+                        .update(cx, |workspace, _| workspace.param_prompt = None)
+                        .ok();
+                })
+        });
+    }
+
+    fn send_with_params(
+        &mut self,
+        reference: &CommandRef,
+        values: &ParamValues,
+        cx: &mut Context<Self>,
+    ) {
+        let command = cx
+            .try_global::<Config>()
+            .and_then(|config| config.commands().get(reference).cloned());
+        if let (Some(command), Some(session)) = (command, &self.session) {
+            session.update(cx, |view, cx| {
+                view.send_command(reference, &command, values, cx)
+            });
+        }
+    }
+
+    fn send_command_action(
+        &mut self,
+        action: &crate::actions::commands::Send,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_command(action.reference(), window, cx);
+    }
+
     pub fn connecting(&self) -> Option<&PortId> {
         self.connecting.as_ref()
     }
@@ -276,7 +444,22 @@ impl Workspace {
                         .update(cx, |devices, cx| devices.set_connected(open, cx));
                     cx.notify();
                 }));
-                view.update(cx, |view, cx| view.focus_compose(window, cx));
+                self._session_events = Some(cx.subscribe_in(
+                    &view,
+                    window,
+                    |this, _, event, window, cx| match event {
+                        SessionViewEvent::SaveAsCommand { text } => {
+                            this.commands.update(cx, |panel, cx| {
+                                panel.save_text_as_command(text, window, cx);
+                            });
+                        }
+                    },
+                ));
+                let history = self.history.clone();
+                view.update(cx, |view, cx| {
+                    view.set_history(history, cx);
+                    view.focus_compose(window, cx);
+                });
                 self.devices
                     .update(cx, |devices, cx| devices.set_connected(Some(port), cx));
                 self.session = Some(view);
@@ -507,6 +690,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::toggle_record))
             .on_action(cx.listener(Self::toggle_inline))
+            .on_action(cx.listener(Self::send_command_action))
             .size_full()
             .when_some(ui_font, |this, font| this.font(font))
             .bg(background)
@@ -518,7 +702,16 @@ impl Render for Workspace {
                             resizable_panel()
                                 .size(px(280.))
                                 .size_range(px(200.)..px(520.))
-                                .child(self.devices.clone()),
+                                .child(
+                                    v_resizable("left-dock")
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(300.))
+                                                .size_range(px(120.)..px(900.))
+                                                .child(self.devices.clone()),
+                                        )
+                                        .child(resizable_panel().child(self.commands.clone())),
+                                ),
                         )
                         .child(resizable_panel().child(center)),
                 ),
