@@ -13,6 +13,7 @@
 //! | [`AIROHA_RACE_LUA`], [`bundled_race_lua`] | The reference RACE plugin in Lua, bundled |
 //! | [`find_plugins`], [`load_plugins`] | Plugin folders on disk, and the WebAssembly seam ([`dir`]) |
 //! | [`encode_payload`], [`PayloadEncoder`] | A saved command's `{ "codec": …, "fields": … }` payload to bytes |
+//! | [`corpus`] | Deterministic RACE captures for conformance tests and benchmarks |
 //!
 //! The Rust and Lua RACE codecs must agree byte for byte: the same description, the same
 //! frames for every way a capture is cut into chunks, and the same bytes (or the same
@@ -33,6 +34,7 @@
 //! assert_eq!(frames[0].raw, 0..6);
 //! ```
 
+pub mod corpus;
 pub mod dir;
 pub mod lua;
 mod payload;
