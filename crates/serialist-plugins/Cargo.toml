@@ -1,11 +1,17 @@
 [package]
 name = "serialist-plugins"
-description = "Codec plugins for Serialist: built-in Rust codecs, the Lua adapter, and the Airoha RACE reference plugin."
+description = "Codec plugins for Serialist: built-in Rust codecs, the Lua adapter, the WebAssembly adapter, and the Airoha RACE reference plugin."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+
+[features]
+default = []
+# Tier 2 plugins: plugin.wasm components run by wasmtime. Off by default because wasmtime
+# and Cranelift add minutes to a clean build; the Lua tier needs nothing extra.
+wasm = ["dep:wasmtime", "dep:toml", "dep:serde"]
 
 [dependencies]
 serialist-core.workspace = true
@@ -14,9 +20,13 @@ mlua.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+wasmtime = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 serialist-sim.workspace = true
 crossbeam-channel.workspace = true
 insta.workspace = true
 proptest.workspace = true
+wat.workspace = true

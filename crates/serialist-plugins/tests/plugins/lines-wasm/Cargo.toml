@@ -1,0 +1,19 @@
+[package]
+name = "lines-wasm"
+description = "A line framer that misbehaves on request: the WebAssembly adapter's test plugin."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Built by serialist-plugins' tests/wasm_plugin.rs into tests/fixtures/wasm/lines-wasm.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serialist-plugin-sdk.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serialist-plugin-sdk = { workspace = true, features = ["rt"] }

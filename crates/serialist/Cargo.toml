@@ -11,6 +11,49 @@ authors.workspace = true
 name = "serialist"
 path = "src/main.rs"
 
+# Release packaging. `packaging/package.sh` drives both of these tables; see
+# docs/releasing.md. Paths in `assets` are relative to this crate, except
+# `target/release/...`, which cargo-deb maps to the real target directory.
+[package.metadata.deb]
+name = "serialist"
+maintainer = "John Gunn <gunn.johnj@gmail.com>"
+copyright = "2026, John Gunn <gunn.johnj@gmail.com>"
+section = "utils"
+priority = "optional"
+# $auto adds the libraries the binary links against (fontconfig, xkbcommon, udev, ...).
+# The Vulkan loader is opened at run time, so dpkg-shlibdeps cannot see it.
+depends = "$auto, libvulkan1"
+recommends = "mesa-vulkan-drivers"
+extended-description = """\
+Serialist is a native, GPU-rendered serial terminal. Devices appear the moment \
+they are plugged in, any baud rate and framing works, and Lua scripts and protocol \
+plugins automate a session."""
+assets = [
+    ["target/release/serialist", "usr/bin/", "755"],
+    ["../../packaging/linux/serialist.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/serialist.svg", "usr/share/icons/hicolor/scalable/apps/serialist.svg", "644"],
+    ["../../packaging/icons/png/serialist-16.png", "usr/share/icons/hicolor/16x16/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-24.png", "usr/share/icons/hicolor/24x24/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-32.png", "usr/share/icons/hicolor/32x32/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-48.png", "usr/share/icons/hicolor/48x48/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-64.png", "usr/share/icons/hicolor/64x64/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-128.png", "usr/share/icons/hicolor/128x128/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-256.png", "usr/share/icons/hicolor/256x256/apps/serialist.png", "644"],
+    ["../../packaging/icons/png/serialist-512.png", "usr/share/icons/hicolor/512x512/apps/serialist.png", "644"],
+    ["../../LICENSE-MIT", "usr/share/doc/serialist/", "644"],
+    ["../../LICENSE-APACHE", "usr/share/doc/serialist/", "644"],
+    ["../../README.md", "usr/share/doc/serialist/", "644"],
+]
+
+# The WiX source lives in packaging/windows/. `include` is relative to where `cargo wix`
+# runs, the repository root. The GUIDs must never change once a release is out.
+[package.metadata.wix]
+upgrade-guid = "C6DA1F40-676A-4BD0-9D96-A6786DD5E5F5"
+path-guid = "EDB2349B-73DF-4778-967C-07874C730A98"
+license = false
+eula = false
+include = ["packaging/windows/main.wxs"]
+
 # GPUI and its platform layer arrive through `serialist-ui` (gpui-kit depends on
 # `gpui-pre-platform` with `font-kit`), and the binary reaches them through
 # `serialist_ui::prelude`, so neither is listed here.
