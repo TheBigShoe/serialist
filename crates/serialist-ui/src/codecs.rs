@@ -530,6 +530,16 @@ pub struct FrameTime {
 }
 
 impl FrameTime {
+    /// Width of a stamp in characters, as the terminal's gutter counts it (absolute
+    /// while the gutter is off).
+    pub fn width(&self) -> usize {
+        let mode = match self.mode {
+            TimestampMode::Off => TimestampMode::Absolute,
+            mode => mode,
+        };
+        self.clock.width(mode, self.format.as_deref())
+    }
+
     /// The stamp of a frame completed `at`, whose predecessor (for delta stamps) was
     /// completed at `previous`.
     pub fn stamp(&self, at: Instant, previous: Option<Instant>) -> String {
