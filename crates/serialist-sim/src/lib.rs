@@ -13,11 +13,15 @@
 //! - [`SimWorld`]: a source and a factory wired together, with the built-in devices plugged in.
 //! - Built-in devices: [`EchoDevice`], [`AtDevice`], [`FirehoseDevice`] (configurable rate
 //!   and content, verified end to end by [`FirehoseVerifier`]).
+//! - [`Clock`]: where a link gets its time. [`SystemClock`] is real time; a
+//!   [`ManualClock`] moves only when a test moves it, so timing assertions are exact.
+//!   [`VirtualLink::connect_with_clock`] and [`SimWorld::with_clock`] take one.
 
 use std::time::{Duration, Instant};
 
 use serialist_core::{ControlLine, SerialConfig};
 
+mod clock;
 mod crc;
 mod devices;
 mod factory;
@@ -26,6 +30,7 @@ mod link;
 mod source;
 mod world;
 
+pub use clock::{Clock, ManualClock, SystemClock, Wakeup};
 pub use crc::crc32;
 pub use devices::{AtDevice, CaptureOutput, EchoDevice};
 pub use factory::{DeviceConstructor, SimTransportFactory};
@@ -64,6 +69,9 @@ pub trait SimDevice: Send + 'static {
     /// Called at the deadline previously returned, and once after `on_connect`.
     /// Return the next time this device wants to run, or `None` to sleep until data arrives;
     /// a sleeping device is ticked once more after its next `on_receive`.
+    ///
+    /// `now` and the deadline are on the link's [`Clock`], so a device on a
+    /// [`ManualClock`] runs on manual time.
     ///
     /// A device that returns `Some(now)` runs as fast as the link accepts. Output goes
     /// into the device's transmit FIFO, and the link does not tick the device again until

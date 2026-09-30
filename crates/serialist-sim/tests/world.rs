@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serialist_core::{
@@ -9,11 +10,11 @@ use serialist_core::{
     TransportFactory, UsbInfo,
 };
 use serialist_sim::{
-    EchoDevice, LinkConfig, SimPortSource, SimTransportFactory, SimWorld, virtual_port,
-    virtual_port_id,
+    EchoDevice, LinkConfig, ManualClock, SimPortSource, SimTransportFactory, SimWorld,
+    virtual_port, virtual_port_id,
 };
 
-use common::{read_exactly, read_to_disconnect};
+use common::{MS, advance_to, drain, read_exactly, read_to_disconnect};
 
 fn recv(rx: &crossbeam_channel::Receiver<PortEvent>) -> PortEvent {
     rx.recv_timeout(Duration::from_secs(1))
@@ -239,4 +240,33 @@ fn world_can_impersonate_a_usb_adapter() {
         read_exactly(&mut *t.reader, 3, 4096, Duration::from_secs(2)),
         b"usb"
     );
+}
+
+#[test]
+fn a_world_on_a_manual_clock_runs_its_links_on_it() {
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::with_clock(clock.clone());
+    let factory = SimTransportFactory::with_clock(clock.clone());
+    let id = factory.register(
+        "echo",
+        LinkConfig::default(),
+        || Box::new(EchoDevice::new()),
+    );
+    for factory in [world.factory(), &factory] {
+        // 115 200 baud 8N1 with 1 ms of latency.
+        let mut t = factory.open(&id, &SerialConfig::default()).unwrap();
+        clock.settle(1);
+        let t0 = clock.now();
+        t.writer.write_all(b"ping").unwrap();
+        clock.settle(1);
+        // Nothing moves until the clock does.
+        assert_eq!(drain(&mut *t.reader), (Vec::new(), false));
+        // "ping" takes 347 us on the wire and is released to the device at 1.35 ms; in
+        // 1 ms steps the device sees it at 2 ms and echoes it at once, and the echo is
+        // released to the host at 3.35 ms.
+        advance_to(&clock, t0 + 3 * MS, MS, 1);
+        assert_eq!(drain(&mut *t.reader).0, b"");
+        advance_to(&clock, t0 + 4 * MS, MS, 1);
+        assert_eq!(drain(&mut *t.reader).0, b"ping");
+    }
 }
