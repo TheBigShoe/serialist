@@ -17,9 +17,13 @@
 //!       "codec": null, "mode": "command" },
 //!     { "port": "/dev/cu.usbserial-1420",
 //!       "serial": { "baud": 921600, ... }, "codec": "airoha-race", "mode": "inline" }
-//!   ]
+//!   ],
+//!   "docks": { "left_width": 280.0, "right_width": 400.0, "devices": true, "commands": true }
 //! }
 //! ```
+//!
+//! `docks` is the dock widths and which left panels are open (see
+//! [`docks`](crate::docks)); a file without it leaves the docks at their defaults.
 //!
 //! A file that does not parse, or of another version, is ignored (and logged): the app
 //! starts with no tabs, as it would without one.
@@ -31,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{PortId, SerialConfig};
 
+use crate::docks::SavedDocks;
 use crate::inline::Mode;
 
 /// The version this build writes and reads.
@@ -84,8 +89,8 @@ pub struct SavedTab {
     pub mode: SavedMode,
 }
 
-/// The tabs, in order, and which was active.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The tabs, in order, which was active, and the docks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionState {
     pub version: u32,
     /// Index into `tabs`.
@@ -93,6 +98,9 @@ pub struct SessionState {
     pub active: usize,
     #[serde(default)]
     pub tabs: Vec<SavedTab>,
+    /// The dock widths and the left panels open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docks: Option<SavedDocks>,
 }
 
 impl Default for SessionState {
@@ -101,6 +109,7 @@ impl Default for SessionState {
             version: STATE_VERSION,
             active: 0,
             tabs: Vec::new(),
+            docks: None,
         }
     }
 }
@@ -179,12 +188,19 @@ mod tests {
                     mode: SavedMode::Inline,
                 },
             ],
+            docks: Some(SavedDocks {
+                left_width: 312.,
+                right_width: 450.,
+                devices: true,
+                commands: false,
+            }),
         };
         state.save(&path).unwrap();
         assert_eq!(SessionState::load(&path), Some(state.clone()));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(r#""port": "virtual:at""#), "{text}");
         assert!(text.contains(r#""mode": "inline""#), "{text}");
+        assert!(text.contains(r#""left_width": 312.0"#), "{text}");
         assert!(!dir.join("state.json.tmp").exists());
     }
 
@@ -209,6 +225,7 @@ mod tests {
         assert_eq!(state.tabs[0].mode, SavedMode::Command);
         assert_eq!(state.tabs[0].codec, None);
         assert_eq!(state.tabs[0].serial.baud, 9600);
+        assert_eq!(state.docks, None);
     }
 
     #[test]

@@ -1,5 +1,12 @@
 //! The Devices panel: the live port list, the baud field and the Connect button.
 //!
+//! Each port is one 28 px row: a dot (green while a tab has it open, a ring otherwise),
+//! its name, its port id and USB `VID:PID` in muted text, and a chip for its device
+//! profile or codec. The selected row adds the line settings the next connect uses;
+//! hovering a row brings up its gear (those settings) and Connect. Simulated ports
+//! (`--virtual`) sit under a "Simulated" header that folds, open while nothing else is
+//! listed. The list scrolls; the baud field and Connect stay below it.
+//!
 //! The list is a plain model ([`DeviceList`]) fed from a [`PortSource`] subscription;
 //! the panel only renders it and turns a connect request into a
 //! [`DevicesPanelEvent::Connect`] for the workspace, which owns sessions.
@@ -19,11 +26,10 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serialist_core::{LineEnding, PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig};
 
 use crate::actions::{Connect, SelectNext, SelectPrevious, context};
+use crate::chrome;
 use crate::config::Config;
 use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
 use crate::prelude::*;
-
-const ROW_HEIGHT: Pixels = px(44.);
 
 /// Longest the port-event worker blocks waiting for an event, so it notices a dropped
 /// panel.
@@ -270,6 +276,9 @@ pub struct DevicesPanel {
     /// The form the rows' gear opens, and the port it is open for.
     port_form: Entity<PortSettingsForm>,
     editing: Option<PortId>,
+    /// Whether the user unfolded (or folded) the simulated devices; `None` follows the
+    /// default (open while nothing else is listed, or a simulated port is selected).
+    simulated_open: Option<bool>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     /// Held for the panel's lifetime: a source may stop reporting once dropped
@@ -356,6 +365,7 @@ impl DevicesPanel {
             port_settings: HashMap::new(),
             port_form,
             editing: None,
+            simulated_open: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             _source: source,
@@ -456,6 +466,7 @@ impl DevicesPanel {
 
     pub fn select_port(&mut self, id: PortId, window: &mut Window, cx: &mut Context<Self>) {
         self.list.select(id);
+        self.reveal_selection();
         self.scroll_to_selection();
         self.prefill_baud(window, cx);
         cx.notify();
@@ -583,21 +594,105 @@ impl DevicesPanel {
         true
     }
 
-    fn scroll_to_selection(&self) {
-        if let Some(ix) = self.list.selected_index() {
-            self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+    /// Whether the simulated devices' group is unfolded.
+    pub fn simulated_is_open(&self) -> bool {
+        self.simulated_open.unwrap_or_else(|| {
+            self.list
+                .entries()
+                .iter()
+                .all(|entry| is_simulated(&entry.info))
+                || self
+                    .list
+                    .selected()
+                    .is_some_and(|entry| is_simulated(&entry.info))
+        })
+    }
+
+    /// Fold or unfold the simulated devices.
+    pub fn set_simulated_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.simulated_open = Some(open);
+        cx.notify();
+    }
+
+    /// The rows the list shows: the other ports, then the simulated ones under their
+    /// header (unless folded), each part in the list's order.
+    pub fn rows(&self) -> Vec<DeviceRow> {
+        let entries = self.list.entries();
+        let (simulated, others): (Vec<usize>, Vec<usize>) =
+            (0..entries.len()).partition(|ix| is_simulated(&entries[*ix].info));
+        let mut rows: Vec<DeviceRow> = others.into_iter().map(DeviceRow::Entry).collect();
+        if !simulated.is_empty() {
+            let open = self.simulated_is_open();
+            rows.push(DeviceRow::Simulated {
+                count: simulated.len(),
+                open,
+            });
+            if open {
+                rows.extend(simulated.into_iter().map(DeviceRow::Entry));
+            }
+        }
+        rows
+    }
+
+    /// Unfold the simulated devices if the selection is one of them.
+    fn reveal_selection(&mut self) {
+        if self
+            .list
+            .selected()
+            .is_some_and(|entry| is_simulated(&entry.info))
+            && self.simulated_open == Some(false)
+        {
+            self.simulated_open = Some(true);
         }
     }
 
+    fn scroll_to_selection(&self) {
+        let Some(selected) = self.list.selected_index() else {
+            return;
+        };
+        if let Some(row) = self
+            .rows()
+            .iter()
+            .position(|row| *row == DeviceRow::Entry(selected))
+        {
+            self.scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+    }
+
+    /// Move the selection to the next (or previous) row on screen, stopping at the ends.
+    fn step_selection(&mut self, forward: bool) {
+        let visible: Vec<usize> = self
+            .rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                DeviceRow::Entry(ix) => Some(ix),
+                DeviceRow::Simulated { .. } => None,
+            })
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        let at = self
+            .list
+            .selected_index()
+            .and_then(|selected| visible.iter().position(|ix| *ix == selected));
+        let next = match at {
+            None => 0,
+            Some(at) if forward => (at + 1).min(visible.len() - 1),
+            Some(at) => at.saturating_sub(1),
+        };
+        self.list.select_index(visible[next]);
+    }
+
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
-        self.list.select_next();
+        self.step_selection(true);
         self.scroll_to_selection();
         self.prefill_baud(window, cx);
         cx.notify();
     }
 
     fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        self.list.select_previous();
+        self.step_selection(false);
         self.scroll_to_selection();
         self.prefill_baud(window, cx);
         cx.notify();
@@ -614,16 +709,13 @@ impl DevicesPanel {
         let set = self.port_settings.contains_key(&port);
         Popover::new(("device-settings", ix))
             .trigger(
-                Button::new(("device-gear", ix))
-                    .label("\u{2699}")
+                chrome::toggle_button(("device-gear", ix), IconName::Settings2, set, cx)
+                    .xsmall()
                     .tooltip(if set {
                         "Port settings (set for the next connect)"
                     } else {
                         "Port settings for the next connect"
-                    })
-                    .xsmall()
-                    .ghost()
-                    .selected(set),
+                    }),
             )
             .content(move |_, _, _| form.clone())
             .on_open_change(cx.listener(move |this, open: &bool, window, cx| {
@@ -633,39 +725,100 @@ impl DevicesPanel {
             }))
     }
 
-    fn render_row(&self, ix: usize, entry: &DeviceEntry, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme();
+    /// The line settings the next connect to `info` uses, with the rate in the baud field.
+    fn next_settings(&self, info: &PortInfo, cx: &App) -> SerialConfig {
+        let base = self
+            .port_settings
+            .get(&info.id)
+            .map_or_else(|| self.serial_for(info, cx), |s| s.serial.clone());
+        match parse_baud(&self.baud_text(cx)) {
+            Ok(baud) => SerialConfig { baud, ..base },
+            Err(_) => base,
+        }
+    }
+
+    /// Entry `ix` of the list (its index in [`DeviceList::entries`]) as a row.
+    fn render_row(&self, ix: usize, entry: &DeviceEntry, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.list.selected_index() == Some(ix);
         let connected = self.connected.contains(&entry.info.id);
+        let can_connect = entry.present;
+        let group = SharedString::from(format!("device-row-{ix}"));
+        let row_background = chrome::overlay_background(selected, cx);
+        // Hovering a row brings up its actions, over its right end (and the selected
+        // row's settings).
+        let actions = h_flex()
+            .id(("device-actions", ix))
+            .absolute()
+            .top_0()
+            .right_0()
+            .h_full()
+            .pl_4()
+            .pr_1()
+            .gap_0p5()
+            .items_center()
+            .bg(row_background)
+            .opacity(0.)
+            .group_hover(group.clone(), |style| style.opacity(1.))
+            .child(self.render_gear(ix, entry, cx))
+            .child(
+                chrome::icon_button(("device-connect", ix), IconName::Plug, cx)
+                    .xsmall()
+                    .disabled(!can_connect)
+                    .tooltip_with_action(
+                        if connected {
+                            "Go to its tab"
+                        } else {
+                            "Connect"
+                        },
+                        &Connect,
+                        Some(context::DEVICES_PANEL),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.focus_handle, cx);
+                        this.list.select_index(ix);
+                        this.prefill_baud(window, cx);
+                        this.connect_selected(cx);
+                    })),
+            );
+
+        let theme = cx.theme();
+        let simulated = is_simulated(&entry.info);
         let mono = theme.mono_font_family.clone();
         let (name_color, detail_color) = if entry.present {
             (theme.foreground, theme.muted_foreground)
         } else {
             (theme.muted_foreground, theme.muted_foreground.opacity(0.7))
         };
-
-        let mut details = h_flex().gap_2().text_xs().text_color(detail_color).child(
-            div()
-                .font_family(mono)
-                .truncate()
-                .child(SharedString::from(entry.info.id.to_string())),
-        );
-        if let Some(ids) = entry.usb_ids() {
-            details = details.child(div().flex_none().child(SharedString::from(ids)));
-        }
-        if !entry.present {
-            details = details.child(div().flex_none().italic().child("unplugged"));
-        }
+        let (dot_color, hollow) = if connected {
+            (theme.success, false)
+        } else if entry.present {
+            (theme.muted_foreground, true)
+        } else {
+            (theme.muted_foreground.opacity(0.5), true)
+        };
         let name = SharedString::from(self.display_name(&entry.info, cx));
         let profiled = self.has_profile(&entry.info, cx);
         let plugin = self.plugin_for(&entry.info, cx);
+        let summary = selected.then(|| self.next_settings(&entry.info, cx).summary());
+        let port = entry.info.id.to_string();
+        let tooltip = SharedString::from(match entry.usb_ids() {
+            Some(ids) => format!("{port} \u{00b7} USB {ids}"),
+            None => port.clone(),
+        });
 
-        v_flex()
+        h_flex()
             .id(("device-row", ix))
+            .test_support()
+            .group(group)
+            .relative()
             .w_full()
-            .h(ROW_HEIGHT)
-            .px_3()
-            .justify_center()
+            .h(chrome::ROW_HEIGHT)
+            .pl(if simulated { px(20.) } else { px(12.) })
+            .pr_2()
+            .gap_2()
+            .items_center()
+            .overflow_hidden()
             .border_l_2()
             .map(|row| {
                 if selected {
@@ -676,56 +829,58 @@ impl DevicesPanel {
                         .hover(|style| style.bg(theme.list_hover))
                 }
             })
+            .child(chrome::state_dot(dot_color, hollow))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .truncate()
-                            .text_color(name_color)
-                            .child(name),
-                    )
-                    .when(profiled, |this| {
-                        this.child(
-                            div()
-                                .id(("device-profile", ix))
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(theme.border)
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("profile"),
-                        )
-                    })
-                    .when_some(plugin, |this, plugin| {
-                        this.child(
-                            div()
-                                .id(("device-plugin", ix))
-                                .test_support()
-                                .flex_none()
-                                .px_1()
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(theme.info)
-                                .text_xs()
-                                .text_color(theme.info)
-                                .child(SharedString::from(plugin)),
-                        )
-                    })
-                    .when(connected, |this| {
-                        this.child(div().flex_none().size_2().rounded_full().bg(theme.success))
-                    })
-                    .child(
-                        div()
-                            .ml_auto()
-                            .flex_none()
-                            .child(self.render_gear(ix, entry, cx)),
-                    ),
+                div()
+                    .flex_shrink_1()
+                    .min_w(px(40.))
+                    .truncate()
+                    .text_sm()
+                    .text_color(name_color)
+                    .when(!entry.present, |name| name.italic())
+                    .child(name),
             )
-            .child(details)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_xs()
+                    .text_color(detail_color)
+                    .child(SharedString::from(port)),
+            )
+            .children(entry.usb_ids().map(|ids| {
+                div()
+                    .flex_none()
+                    .font_family(mono.clone())
+                    .text_xs()
+                    .text_color(detail_color)
+                    .child(SharedString::from(ids))
+            }))
+            .when(profiled && plugin.is_none(), |row| {
+                row.child(chrome::quiet_chip("profile", cx))
+            })
+            .when_some(plugin, |row, plugin| {
+                row.child(
+                    chrome::chip(cx.theme().info)
+                        .id(("device-plugin", ix))
+                        .test_support()
+                        .child(SharedString::from(plugin)),
+                )
+            })
+            .when_some(summary, |row, summary| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .font_family(mono)
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(SharedString::from(summary)),
+                )
+            })
+            .child(actions)
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
                 this.list.select_index(ix);
@@ -735,73 +890,138 @@ impl DevicesPanel {
                 }
                 cx.notify();
             }))
+            .into_any_element()
+    }
+
+    /// The header of the simulated devices' group, which folds it.
+    fn render_group(&self, count: usize, open: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme();
+        h_flex()
+            .id("device-group-simulated")
+            .w_full()
+            .h(chrome::ROW_HEIGHT)
+            .pl_3()
+            .pr_3()
+            .gap_1()
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.list_hover))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size_3()
+                .text_color(theme.muted_foreground),
+            )
+            .child(chrome::section_label("Simulated", cx))
+            .child(
+                div()
+                    .ml_auto()
+                    .text_size(chrome::LABEL_SIZE)
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(count.to_string())),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.simulated_open = Some(!open);
+                cx.notify();
+            }))
     }
 }
 
 impl Render for DevicesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows();
         let theme = cx.theme();
         let present = self.list.entries().iter().filter(|e| e.present).count();
         let can_connect = self.list.selected().is_some_and(|e| e.present);
+        let muted = theme.muted_foreground;
 
-        let header = h_flex()
-            .justify_between()
-            .px_3()
-            .h(px(32.))
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child("DEVICES")
-            .child(SharedString::from(format!("{present} available")));
+        let header = chrome::panel_header("Devices", cx).child(
+            div()
+                .ml_auto()
+                .pr_2()
+                .text_size(chrome::LABEL_SIZE)
+                .text_color(muted)
+                .child(SharedString::from(format!("{present} available"))),
+        );
 
         let body =
             if self.list.is_empty() {
                 v_flex()
                     .flex_1()
-                    .p_3()
+                    .px_3()
+                    .py_2()
                     .gap_1()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(muted)
                     .child("No serial ports found.")
                     .child(div().text_xs().child(
                         "Plug in a device, or start with --virtual <name> or --port <path>.",
                     ))
                     .into_any_element()
             } else {
-                uniform_list(
-                    "device-list",
-                    self.list.len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                        let entries: Vec<DeviceEntry> = this.list.entries()[range.clone()].to_vec();
-                        range
-                            .zip(entries.iter())
-                            .map(|(ix, entry)| this.render_row(ix, entry, cx))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&self.scroll)
-                .flex_1()
-                .into_any_element()
+                let count = rows.len();
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        uniform_list(
+                            "device-list",
+                            count,
+                            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                                let rows = this.rows();
+                                range
+                                    .filter_map(|ix| rows.get(ix).cloned())
+                                    .map(|row| match row {
+                                        DeviceRow::Entry(ix) => {
+                                            let entry = this.list.entries()[ix].clone();
+                                            this.render_row(ix, &entry, cx)
+                                        }
+                                        DeviceRow::Simulated { count, open } => {
+                                            this.render_group(count, open, cx).into_any_element()
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .track_scroll(&self.scroll)
+                        .size_full(),
+                    )
+                    .into_any_element()
             };
 
         let footer = v_flex()
+            .id("devices-footer")
+            .flex_none()
             .gap_1()
-            .p_2()
+            .px_2()
+            .py_1p5()
             .border_t_1()
             .border_color(theme.border)
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
+                    .items_center()
                     .child(
                         div()
-                            .w(px(120.))
+                            .flex_1()
+                            .min_w_0()
                             .child(Input::new(&self.baud).id("baud-input").small()),
                     )
                     .child(
                         Button::new("connect")
+                            .icon(IconName::Plug)
                             .label("Connect")
                             .small()
                             .primary()
                             .disabled(!can_connect)
+                            .tooltip_with_action(
+                                "Open the selected port at this rate",
+                                &Connect,
+                                Some(context::DEVICES_PANEL),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.connect_selected(cx);
                             })),
@@ -809,10 +1029,12 @@ impl Render for DevicesPanel {
             )
             .when_some(self.notice.clone(), |this, notice| {
                 this.child(div().text_xs().text_color(theme.danger).child(notice))
-            });
+            })
+            .test_support();
 
         v_flex()
             .id("devices-panel")
+            .test_support()
             .key_context(context::DEVICES_PANEL)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next))
@@ -825,6 +1047,20 @@ impl Render for DevicesPanel {
             .child(body)
             .child(footer)
     }
+}
+
+/// A simulated port (`--virtual`), listed in the "Simulated" group.
+pub fn is_simulated(info: &PortInfo) -> bool {
+    matches!(info.kind, PortKind::Virtual) || info.id.as_str().starts_with("virtual:")
+}
+
+/// A row of the Devices list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRow {
+    /// The entry at this index of [`DeviceList::entries`].
+    Entry(usize),
+    /// The header of the simulated devices, which fold.
+    Simulated { count: usize, open: bool },
 }
 
 #[cfg(test)]

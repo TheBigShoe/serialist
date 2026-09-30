@@ -17,6 +17,7 @@ use serialist_sim::{AtDevice, DeviceOutput, LinkConfig, SimDevice, SimWorld};
 use crate::actions::keys;
 use crate::actions::scripts::OpenScriptsFolder;
 use crate::config::{self, Config, Opener};
+use crate::docks::DockPanel;
 use crate::prelude::*;
 use crate::script_bridge::{ConsoleKind, ConsoleLine};
 use crate::script_console::ScriptConsole;
@@ -168,8 +169,18 @@ fn version_probe_runs_from_the_console_against_the_at_modem(cx: &mut TestAppCont
     assert_eq!(listed, ["firehose_stats.lua", "version_probe.lua"]);
     assert_eq!(script_status(cx, &workspace), None, "idle");
 
-    // The list's second Run button.
+    // The Script console is closed until a script runs or the user opens it: open it
+    // from its rail, then the list's second Run button.
+    assert!(!workspace.read_with(cx, |w, _| w.is_panel_shown(DockPanel::Scripts)));
     cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(DockPanel::Scripts.rail_id(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(workspace.read_with(cx, |w, _| w.is_panel_shown(DockPanel::Scripts)));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
         window.click(("run-script", 1usize), cx)
     })
     .unwrap();
@@ -549,6 +560,9 @@ fn the_repl_runs_a_line_and_equals_prints_it(cx: &mut TestAppContext) {
     let dir = config_dir("script-repl", &[]);
     let (world, _) = world();
     let (window, workspace, _view) = open(cx, &world, &dir, "virtual:at", false);
+    // The console is on screen once opened from its rail.
+    workspace.update(cx, |w, cx| w.set_panel_open(DockPanel::Scripts, true, cx));
+    crate::test_support::draw(cx, window);
     let console = console(cx, &workspace);
     let input = console.read_with(cx, |c, _| c.input().clone());
     cx.update_window(window, |_, window, cx| {

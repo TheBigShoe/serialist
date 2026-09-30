@@ -15,6 +15,7 @@
   {
     "context": "Workspace",
     "bindings": {
+      "cmd-shift-p": "command_palette::Toggle",
       "cmd-k": "terminal::Clear",
       "cmd-w": "tabs::CloseTab",
       "cmd-shift-w": "serial::Disconnect",
@@ -57,6 +58,13 @@
     "bindings": {
       "up": "commands::SelectPrevious",
       "down": "commands::SelectNext"
+    }
+  },
+  {
+    "context": "CommandPalette > Input",
+    "bindings": {
+      "up": "command_palette::SelectPrevious",
+      "down": "command_palette::SelectNext"
     }
   },
   {
