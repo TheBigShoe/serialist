@@ -19,10 +19,11 @@
 //! of the key bindings: every install that changes the keymap or the commands rebinds,
 //! with the commands' bindings layered after the keymap's (see [`keymap::apply`]).
 //!
-//! So do the codecs ([`CodecSet`]): the built-ins and the plugin folders under
-//! `plugins/`, reloaded on [`ConfigEvent::Plugins`]. A session view that observes the
-//! global notices when the factory of the codec it runs changed (see
-//! [`codecs`](crate::codecs)) and switches to the new one at the next chunk.
+//! So do the codecs ([`CodecSet`]): the plugin folders under `plugins/`, and nothing
+//! else (the app ships with no decoder active), reloaded on [`ConfigEvent::Plugins`]. A
+//! session view that observes the global notices when the factory of the codec it runs
+//! changed (see [`codecs`](crate::codecs)) and switches to the new one at the next
+//! chunk, and when a plugin its device profile named has been installed.
 //!
 //! # Failures
 //!
@@ -160,8 +161,8 @@ pub struct Config {
     /// The `*.lua` files in the scripts folder, for the Script console and the menu.
     /// Empty for the bundled defaults, which read nothing from disk.
     scripts: Arc<Vec<ScriptEntry>>,
-    /// The codecs: the built-ins, and the plugins in `plugins/` for a configuration read
-    /// from its directory.
+    /// The codecs: the plugins in `plugins/` for a configuration read from its
+    /// directory; none for the bundled defaults.
     codecs: CodecSet,
     /// Read from `paths` (not just the bundled defaults), so files there may be written:
     /// the compose history, a saved command.
@@ -204,7 +205,7 @@ impl Config {
             keymap: Arc::new(Keymap::bundled_default()),
             commands: Arc::new(bundled_commands()),
             scripts: Arc::new(Vec::new()),
-            codecs: CodecSet::builtin(),
+            codecs: CodecSet::default(),
             loaded: false,
             themes,
             system_dark: true,
@@ -257,7 +258,7 @@ impl Config {
         &self.scripts
     }
 
-    /// The codecs: the built-ins and the plugins.
+    /// The codecs: the plugins installed in `plugins/`.
     pub fn codecs(&self) -> &CodecSet {
         &self.codecs
     }

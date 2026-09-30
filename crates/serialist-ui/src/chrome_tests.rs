@@ -15,7 +15,7 @@ use crate::session_state::{SessionState, state_path};
 use crate::session_view::SessionView;
 use crate::test_support::{
     TestDir, allow_engine_threads, displayed, draw, has_rx_line, open_test_window_sized,
-    resize_window, run_until, type_line, wait_connected,
+    race_config_dir, resize_window, run_until, type_line, wait_connected,
 };
 use crate::toolbar::{ToolbarItem, ToolbarLayout};
 use crate::workspace::{AppOptions, Workspace};
@@ -117,7 +117,8 @@ fn assert_toolbar_fits(cx: &mut TestAppContext, window: AnyWindowHandle, layout:
 #[gpui_test]
 fn the_toolbar_moves_what_does_not_fit_into_its_overflow_menu(cx: &mut TestAppContext) {
     let world = SimWorld::new();
-    let (window, workspace) = open(cx, &world, None, &["virtual:at"], WIDE);
+    let dir = race_config_dir("chrome-overflow");
+    let (window, workspace) = open(cx, &world, Some(&dir), &["virtual:at"], WIDE);
     let view = wait_connected(cx, &workspace);
     // Decoding, as a device profile's plugin would: the codec menu names its codec.
     view.update(cx, |v, cx| assert!(v.set_codec(Some("airoha-race"), cx)));
@@ -129,7 +130,7 @@ fn the_toolbar_moves_what_does_not_fit_into_its_overflow_menu(cx: &mut TestAppCo
     );
     assert!(
         wide.shows(ToolbarItem::Codec),
-        "the built-in codec is there to pick"
+        "the installed plugin is there to pick"
     );
     assert_toolbar_fits(cx, window, &wide);
 
@@ -261,7 +262,8 @@ fn docks_collapse_below_their_breakpoints_and_keep_their_widths(cx: &mut TestApp
 #[gpui_test]
 fn the_decoded_panel_opens_with_a_codec_and_closes_without_one(cx: &mut TestAppContext) {
     let world = SimWorld::new();
-    let (window, workspace) = open(cx, &world, None, &["virtual:at"], WIDE);
+    let dir = race_config_dir("chrome-decoded");
+    let (window, workspace) = open(cx, &world, Some(&dir), &["virtual:at"], WIDE);
     let view = wait_connected(cx, &workspace);
     assert!(!shown(cx, &workspace, DockPanel::Decoded));
 

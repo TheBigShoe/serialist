@@ -2,9 +2,10 @@
 //! produces, and the registry the app keeps codecs in.
 //!
 //! A [`Codec`] turns the received byte stream into structured [`Frame`]s and turns
-//! structured commands ([`EncodeRequest`]) into bytes to send. Built-in codecs implement
-//! it in Rust; the plugin crate adapts Lua (and later WebAssembly) plugins to the same
-//! trait, so the rest of the app never knows which kind it is talking to.
+//! structured commands ([`EncodeRequest`]) into bytes to send. The app's codecs are
+//! plugins the user installs: the plugin crate adapts Lua and WebAssembly plugins to this
+//! trait (and keeps Rust reference codecs for its tests), so the rest of the app never
+//! knows which kind it is talking to.
 //!
 //! # Decoding
 //!
@@ -134,8 +135,7 @@ impl CodecRegistry {
     }
 
     /// Register `factory` under the name its [`CodecInfo`] gives, replacing (and
-    /// returning) any factory already registered under that name. A user's plugin can
-    /// so override a built-in of the same name.
+    /// returning) any factory already registered under that name.
     pub fn register(&mut self, factory: Arc<dyn CodecFactory>) -> Option<Arc<dyn CodecFactory>> {
         let name = factory.info().name;
         self.factories.insert(name, factory)

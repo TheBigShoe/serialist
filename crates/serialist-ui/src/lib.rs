@@ -29,6 +29,7 @@ pub mod inline;
 pub mod keymap;
 pub mod palette;
 pub mod param_prompt;
+pub mod plugin_files;
 pub mod port_settings;
 pub mod script_bridge;
 pub mod script_console;
@@ -57,6 +58,8 @@ mod decoded_tests;
 mod gate;
 #[cfg(test)]
 mod inline_tests;
+#[cfg(test)]
+mod plugin_tests;
 #[cfg(test)]
 mod port_tests;
 #[cfg(test)]
@@ -95,7 +98,9 @@ pub use session_handle::{
 pub use session_options::{DisplayDefaults, SessionOptions};
 pub use session_state::{SavedMode, SavedTab, SessionState};
 pub use session_view::{ActiveCodec, SessionView, SessionViewEvent};
-pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusLine};
+pub use status::{
+    ConnectionState, Notice, NoticeAction, PauseMark, RecordingStatus, ScriptStatus, StatusLine,
+};
 pub use tabs::{TabId, TabLabel, TabState, TabStatus};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 

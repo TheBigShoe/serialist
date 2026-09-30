@@ -81,7 +81,8 @@ pub fn find_plugins(root: &Path) -> Vec<PluginDir> {
 }
 
 /// Load every plugin under `root` into `registry`, each under the name it describes
-/// (replacing a built-in of the same name). Returns what could not be loaded.
+/// (replacing a codec already registered by that name). Returns what could not be
+/// loaded.
 pub fn load_plugins(
     root: &Path,
     registry: &mut CodecRegistry,

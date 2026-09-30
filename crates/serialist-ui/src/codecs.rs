@@ -4,14 +4,18 @@
 //!
 //! # The registry and reloading
 //!
-//! [`CodecSet`] lives in [`Config`](crate::config::Config): the built-in codecs from
-//! [`serialist_plugins::builtin_registry`], made once, plus one codec per plugin folder
+//! [`CodecSet`] lives in [`Config`](crate::config::Config): one codec per plugin folder
 //! under the config directory's `plugins/` (`plugins/<name>/plugin.lua`, or
 //! `plugin.wasm` and `plugin.toml` with the `wasm` feature), registered under the
-//! folder's name. A folder named like a built-in (`plugins/airoha-race/`) replaces it;
-//! `plugins/airoha-race-lua/` sits beside it. (`serialist_plugins::load_plugins` registers
-//! under the name a plugin describes; the app keys by folder so two versions of one
-//! protocol can be compared, and loads each folder itself for that.)
+//! folder's name, and nothing else. Decoders are plugins the user installs; the app
+//! ships with none active, so a fresh configuration has no codec at all, and the session
+//! toolbar shows no codec menu until a plugin is installed. The bundled examples
+//! ([`serialist_plugins::EXAMPLE_PLUGINS`]) install from the codec menu or the command
+//! palette (see [`plugin_files`](crate::plugin_files)), which copies the example's folder
+//! into `plugins/`; the watcher then loads it like any other.
+//! (`serialist_plugins::load_plugins` registers under the name a plugin describes; the
+//! app keys by folder so two versions of one protocol, `plugins/airoha-race/` and
+//! `plugins/airoha-race-wasm/`, can be compared, and loads each folder itself for that.)
 //!
 //! A plugin is loaded from what its files held when read: a [`LuaCodecFactory`] is made
 //! from the source text, and a WebAssembly factory keeps the component it compiled, so
@@ -19,8 +23,7 @@
 //! (a syntax error, a `describe` that fails) is reported as a problem and the last good
 //! version stays registered and keeps running, however many codecs it still has to make.
 //! A reload keeps the factory (the same `Arc`) of every plugin whose files hash the same,
-//! and of every built-in, so a session can tell by pointer whether a reload concerns the
-//! codec it runs.
+//! so a session can tell by pointer whether a reload concerns the codec it runs.
 //!
 //! # Running a session's codec
 //!
@@ -52,7 +55,10 @@ use serialist_core::{
     ChunkSink, Codec, CodecError, CodecFactory, CodecInfo, CodecRegistry, CodecSink, Command,
     EncodeRequest, FieldType, Frame, FrameStore, ParamKind, ParamValues, Payload, Severity, Value,
 };
-use serialist_plugins::{LuaCodecFactory, LuaLimits, PLUGIN_ERROR_KIND, PluginKind, find_plugins};
+use serialist_plugins::{
+    EXAMPLE_PLUGINS, ExamplePlugin, LuaCodecFactory, LuaLimits, PLUGIN_ERROR_KIND, PluginKind,
+    find_plugins,
+};
 
 use crate::terminal::{Clock, TimestampMode};
 
@@ -172,18 +178,14 @@ impl std::fmt::Display for PluginProblem {
     }
 }
 
-/// The codecs the app knows: the built-ins and the plugins. Cheap to clone.
-#[derive(Clone)]
+/// The codecs the app knows: the plugins in `plugins/`, and no others. Empty until a
+/// plugin is installed. Cheap to clone.
+#[derive(Clone, Default)]
 pub struct CodecSet {
-    builtins: CodecRegistry,
     plugins: Vec<PluginCodec>,
+    /// Every plugin folder found by the last reload, loaded or not, by name.
+    folders: Vec<String>,
     registry: Arc<CodecRegistry>,
-}
-
-impl Default for CodecSet {
-    fn default() -> Self {
-        Self::builtin()
-    }
 }
 
 impl std::fmt::Debug for CodecSet {
@@ -191,24 +193,20 @@ impl std::fmt::Debug for CodecSet {
         f.debug_struct("CodecSet")
             .field("registry", &self.registry)
             .field("plugins", &self.plugins)
+            .field("folders", &self.folders)
             .finish()
     }
 }
 
 impl CodecSet {
-    /// The built-in codecs alone.
-    pub fn builtin() -> Self {
-        let builtins = serialist_plugins::builtin_registry();
-        Self {
-            registry: Arc::new(builtins.clone()),
-            builtins,
-            plugins: Vec::new(),
-        }
-    }
-
-    /// Every codec by name: the built-ins, with the plugins over them.
+    /// Every codec by name: one per plugin that loaded.
     pub fn registry(&self) -> &Arc<CodecRegistry> {
         &self.registry
+    }
+
+    /// Whether there is no codec to decode with: no plugin is installed, or none loaded.
+    pub fn is_empty(&self) -> bool {
+        self.registry.is_empty()
     }
 
     /// The plugins loaded, sorted by name.
@@ -218,6 +216,19 @@ impl CodecSet {
 
     pub fn is_plugin(&self, name: &str) -> bool {
         self.plugins.iter().any(|plugin| plugin.name == name)
+    }
+
+    /// Whether `plugins/<name>/` holds a plugin, whether or not it loaded.
+    pub fn is_installed(&self, name: &str) -> bool {
+        self.folders.iter().any(|folder| folder == name)
+    }
+
+    /// The bundled example plugins that are not installed, in the order menus list them.
+    pub fn examples_to_install(&self) -> Vec<&'static ExamplePlugin> {
+        EXAMPLE_PLUGINS
+            .iter()
+            .filter(|example| !self.is_installed(example.name))
+            .collect()
     }
 
     /// What the codec picker lists: [`NO_CODEC`], then every codec, sorted.
@@ -232,6 +243,7 @@ impl CodecSet {
     /// Never fails: what went wrong comes back as problems.
     pub fn reload_plugins(&mut self, root: &Path, limits: LuaLimits) -> Vec<PluginProblem> {
         let mut plugins = Vec::new();
+        let mut folders = Vec::new();
         let mut problems = Vec::new();
         for dir in find_plugins(root) {
             let name = dir
@@ -239,6 +251,7 @@ impl CodecSet {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            folders.push(name.clone());
             let previous = self.plugins.iter().find(|plugin| plugin.name == name);
             let loaded = match load_plugin(&dir, previous.map(|p| p.fingerprint), limits) {
                 Ok(None) => previous.cloned(),
@@ -267,11 +280,12 @@ impl CodecSet {
             };
             plugins.extend(loaded);
         }
-        let mut registry = self.builtins.clone();
+        let mut registry = CodecRegistry::new();
         for plugin in &plugins {
             registry.register(plugin.factory.clone());
         }
         self.plugins = plugins;
+        self.folders = folders;
         self.registry = Arc::new(registry);
         problems
     }
@@ -630,10 +644,17 @@ pub fn loose_eq(expected: &JsonValue, actual: &Value) -> bool {
 
 // --- Saved commands ----------------------------------------------------------------------
 
+/// What the status line says about a saved command whose payload names `codec` while no
+/// plugin by that name is loaded.
+pub fn codec_not_installed(codec: &str) -> String {
+    format!("Install the {codec} plugin to send this command")
+}
+
 /// The bytes for a saved command's `{ "codec": …, "fields": … }` payload: placeholders
 /// filled from `params` (see [`fill_placeholders`]), then encoded by the codec it names
 /// in `registry`, then the command's own `eol` if it has one (a codec payload has no line
-/// ending otherwise). The error is a message for the status line.
+/// ending otherwise). The error is a message for the status line; a codec that is not in
+/// `registry` is [`codec_not_installed`].
 pub fn encode_codec_command(
     registry: &CodecRegistry,
     command: &Command,
@@ -642,6 +663,9 @@ pub fn encode_codec_command(
     let Payload::Codec { codec, fields } = &command.payload else {
         return Err("not a codec payload".to_owned());
     };
+    if !registry.contains(codec) {
+        return Err(codec_not_installed(codec));
+    }
     let fields = fill_placeholders(fields, command, params)?;
     let mut bytes = serialist_plugins::encode_payload(registry, codec, &fields)
         .map_err(|error| error.to_string())?;
@@ -779,7 +803,9 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use serialist_core::settings::ConfigPaths;
     use serialist_core::{FrameStore, Param};
+    use serialist_plugins::{AIROHA_RACE_LUA, AirohaRace, TextLines, example_plugin};
 
     use super::*;
 
@@ -800,9 +826,17 @@ mod tests {
         )
     }
 
+    /// The Rust reference codecs, registered by hand: the app registers none.
+    fn reference_registry() -> CodecRegistry {
+        let mut registry = CodecRegistry::new();
+        registry.register(AirohaRace::factory());
+        registry.register(TextLines::factory());
+        registry
+    }
+
     #[test]
     fn codec_payloads_encode_with_their_placeholders_filled() {
-        let registry = serialist_plugins::builtin_registry();
+        let registry = reference_registry();
         let version = codec_command(json!({ "command": "race_version" }));
         assert_eq!(
             encode_codec_command(&registry, &version, &ParamValues::new()),
@@ -858,7 +892,12 @@ mod tests {
         );
         assert_eq!(
             encode_codec_command(&registry, &unknown, &ParamValues::new()),
-            Err("no codec named `nope` is loaded".to_owned())
+            Err("Install the nope plugin to send this command".to_owned())
+        );
+        // With no plugin installed, the bundled RACE commands say what they need.
+        assert_eq!(
+            encode_codec_command(&CodecRegistry::new(), &version, &ParamValues::new()),
+            Err("Install the airoha-race plugin to send this command".to_owned())
         );
     }
 
@@ -892,7 +931,7 @@ mod tests {
         assert!(hides_bytes(&log, Some(&info)));
         assert!(!hides_bytes(&text, Some(&info)));
         assert!(!hides_bytes(&failed, Some(&info)));
-        let lines = serialist_plugins::TextLines::info();
+        let lines = TextLines::info();
         assert!(is_text_frame(&Frame::new("line", 0..3, at), Some(&lines)));
         assert_eq!(inline_summary(&log), "\u{25B8} log 0x0F40 len 9");
         assert!(is_decoded_summary(&inline_summary(&Frame::new(
@@ -934,7 +973,7 @@ mod tests {
         slot.on_chunk(&log, at);
         assert!(reader.snapshot().is_empty());
 
-        let registry = serialist_plugins::builtin_registry();
+        let registry = reference_registry();
         selection.set(registry.get("airoha-race"));
         slot.on_chunk(&log, at + Duration::from_millis(1));
         let snap = reader.snapshot();
@@ -994,7 +1033,7 @@ mod tests {
         assert_eq!(frame.kind, CODEC_ERROR_KIND);
         assert_eq!(frame.severity, Severity::Error);
         assert!(frame.summary.contains("broken could not be made"));
-        selection.set(serialist_plugins::builtin_registry().get("text-lines"));
+        selection.set(Some(TextLines::factory()));
         slot.on_chunk(b"ok\n", Instant::now());
         assert_eq!(reader.snapshot().last().unwrap().kind, "line");
     }
@@ -1014,8 +1053,12 @@ mod tests {
         for file in ["plugin.wasm", "plugin.toml"] {
             fs::copy(format!("{RACE_WASM}/{file}"), folder.join(file)).unwrap();
         }
-        let mut set = CodecSet::builtin();
+        let mut set = CodecSet::default();
         let problems = set.reload_plugins(&root, LuaLimits::default());
+        assert!(
+            set.is_installed("race-wasm"),
+            "found, whether or not it loads"
+        );
         if cfg!(feature = "wasm") {
             assert!(problems.is_empty(), "{problems:?}");
             let factory = set
@@ -1048,20 +1091,35 @@ mod tests {
     #[test]
     fn plugins_load_by_folder_keep_their_last_good_version_and_their_factory() {
         let dir = crate::test_support::TestDir::new("codec-set");
-        let root = dir.join("plugins");
+        let paths = ConfigPaths::new(dir.path());
+        let root = paths.plugins_dir();
+        // Nothing is built in: with no plugin folder there is no codec at all.
+        let mut set = CodecSet::default();
+        assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
+        assert!(set.is_empty());
+        assert_eq!(set.choices(), ["none"]);
+        assert_eq!(set.examples_to_install()[0].name, "airoha-race");
+
+        // The RACE example, installed, and a copy of it under another folder's name.
+        paths
+            .install_example_plugin(example_plugin("airoha-race").unwrap())
+            .unwrap();
         let lua = root.join("race-lua");
         fs::create_dir_all(&lua).unwrap();
-        fs::write(lua.join("plugin.lua"), serialist_plugins::AIROHA_RACE_LUA).unwrap();
-        let mut set = CodecSet::builtin();
-        let builtin = set.registry().get("airoha-race").unwrap();
+        fs::write(lua.join("plugin.lua"), AIROHA_RACE_LUA).unwrap();
         assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
-        assert_eq!(
-            set.choices(),
-            ["none", "airoha-race", "race-lua", "text-lines"]
+        assert_eq!(set.choices(), ["none", "airoha-race", "race-lua"]);
+        assert!(set.is_installed("airoha-race"));
+        assert!(
+            set.examples_to_install()
+                .iter()
+                .all(|example| example.name != "airoha-race"),
+            "an installed example is not offered again"
         );
+        let example = set.registry().get("airoha-race").unwrap();
         let plugin = set.registry().get("race-lua").unwrap();
         assert_eq!(plugin.info().name, "race-lua", "registered by folder");
-        assert_eq!(set.plugins()[0].described, "airoha-race");
+        assert_eq!(set.plugins()[1].described, "airoha-race");
         assert!(set.is_plugin("race-lua"));
 
         // A reload that changed nothing keeps every factory.
@@ -1071,7 +1129,7 @@ mod tests {
             &set.registry().get("race-lua").unwrap()
         ));
         assert!(Arc::ptr_eq(
-            &builtin,
+            &example,
             &set.registry().get("airoha-race").unwrap()
         ));
 
@@ -1090,41 +1148,44 @@ mod tests {
         assert!(kept.create().is_ok(), "made from the text it loaded");
 
         // Going back to the text that loaded changes nothing.
-        fs::write(lua.join("plugin.lua"), serialist_plugins::AIROHA_RACE_LUA).unwrap();
+        fs::write(lua.join("plugin.lua"), AIROHA_RACE_LUA).unwrap();
         assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
         assert!(Arc::ptr_eq(
             &plugin,
             &set.registry().get("race-lua").unwrap()
         ));
 
-        // A good edit replaces it; a folder named like a built-in replaces the built-in.
-        let edited = serialist_plugins::AIROHA_RACE_LUA.replace("-- describe", "-- edited");
-        assert_ne!(edited, serialist_plugins::AIROHA_RACE_LUA);
+        // A good edit replaces it; the example's factory is untouched.
+        let edited = AIROHA_RACE_LUA.replace("-- describe", "-- edited");
+        assert_ne!(edited, AIROHA_RACE_LUA);
         fs::write(lua.join("plugin.lua"), edited).unwrap();
-        let shadow = root.join("text-lines");
-        fs::create_dir_all(&shadow).unwrap();
-        fs::write(
-            shadow.join("plugin.lua"),
-            serialist_plugins::AIROHA_RACE_LUA,
-        )
-        .unwrap();
         assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
         assert!(!Arc::ptr_eq(
             &plugin,
             &set.registry().get("race-lua").unwrap()
         ));
-        assert_eq!(
-            set.registry().get("text-lines").unwrap().info().kinds.len(),
-            6
-        );
+        assert!(Arc::ptr_eq(
+            &example,
+            &set.registry().get("airoha-race").unwrap()
+        ));
 
-        // A folder that goes takes its codec with it.
-        fs::remove_dir_all(&shadow).unwrap();
-        set.reload_plugins(&root, LuaLimits::default());
-        assert_eq!(
-            set.registry().get("text-lines").unwrap().info().kinds.len(),
-            1,
-            "the built-in is back"
-        );
+        // A folder that never loaded is installed but is no codec.
+        let broken = root.join("broken");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("plugin.lua"), "return {").unwrap();
+        let problems = set.reload_plugins(&root, LuaLimits::default());
+        assert_eq!(problems.len(), 1);
+        assert!(!problems[0].kept_previous);
+        assert!(set.is_installed("broken"));
+        assert!(!set.registry().contains("broken"));
+
+        // A folder that goes takes its codec with it; the examples folder is no plugin.
+        fs::remove_dir_all(&lua).unwrap();
+        fs::remove_dir_all(&broken).unwrap();
+        paths.ensure_example_plugins(EXAMPLE_PLUGINS).unwrap();
+        assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
+        assert_eq!(set.choices(), ["none", "airoha-race"]);
+        assert!(!set.is_installed("race-lua"));
+        assert!(!set.is_installed("examples"));
     }
 }

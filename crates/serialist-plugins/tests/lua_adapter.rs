@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::json;
+use serialist_core::settings::ConfigPaths;
 use serialist_core::{Codec, CodecError, CodecRegistry, EncodeRequest, Frame, Severity, Value};
+use serialist_plugins::race::race_info;
 use serialist_plugins::{
-    LuaCodec, LuaLimits, PLUGIN_ERROR_KIND, PluginKind, bundled_race_lua, find_plugins,
-    load_plugins,
+    EXAMPLE_PLUGINS, LuaCodec, LuaLimits, PLUGIN_ERROR_KIND, PluginKind, bundled_race_lua,
+    example_plugin, find_plugins, load_plugins,
 };
 
 use common::{TempDir, decode_chunks};
@@ -353,7 +355,7 @@ fn plugins_are_found_by_folder_and_webassembly_is_recognised() {
     let kinds: Vec<_> = found.iter().map(|p| p.kind).collect();
     assert_eq!(kinds, [PluginKind::Lua, PluginKind::Lua, PluginKind::Wasm]);
 
-    let mut registry = serialist_plugins::builtin_registry();
+    let mut registry = CodecRegistry::new();
     let warnings = load_plugins(dir.path(), &mut registry, LuaLimits::default());
     let warned: Vec<_> = warnings
         .iter()
@@ -361,7 +363,8 @@ fn plugins_are_found_by_folder_and_webassembly_is_recognised() {
         .collect();
     assert_eq!(warned, ["broken", "compiled"]);
     assert!(warnings[1].message.contains("WebAssembly"));
-    // The Lua plugin replaced the built-in of the same name and decodes the same.
+    // The Lua plugin is the only codec, registered under the name it describes.
+    assert_eq!(registry.names().collect::<Vec<_>>(), ["airoha-race"]);
     let mut codec = registry.create("airoha-race").unwrap();
     let mut out = Vec::new();
     codec.decode(
@@ -372,6 +375,60 @@ fn plugins_are_found_by_folder_and_webassembly_is_recognised() {
     );
     assert_eq!(out[0].kind, "response");
     assert!(find_plugins(&dir.path().join("missing")).is_empty());
+}
+
+/// The bundled examples decode nothing until installed; installed, they load from
+/// `plugins/` like any plugin, and the RACE one describes itself as the reference does.
+#[test]
+fn the_example_plugins_load_once_installed() {
+    let dir = TempDir::new("examples");
+    let paths = ConfigPaths::new(dir.path());
+    let plugins = paths.plugins_dir();
+    let loaded = |registry: &mut CodecRegistry| {
+        let warnings = load_plugins(&plugins, registry, LuaLimits::default());
+        assert!(warnings.is_empty(), "{warnings:?}");
+    };
+    let mut registry = CodecRegistry::new();
+    paths.ensure_example_plugins(EXAMPLE_PLUGINS).unwrap();
+    loaded(&mut registry);
+    assert_eq!(
+        registry.names().count(),
+        0,
+        "shipped, not installed: plugins/examples/ is not a plugin"
+    );
+
+    for example in EXAMPLE_PLUGINS {
+        paths.install_example_plugin(example).unwrap();
+    }
+    let folders: Vec<String> = find_plugins(&plugins)
+        .iter()
+        .map(|plugin| {
+            plugin
+                .dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let names: Vec<&str> = EXAMPLE_PLUGINS.iter().map(|example| example.name).collect();
+    assert_eq!(folders, names);
+    assert_eq!(names[0], "airoha-race");
+    assert_eq!(
+        example_plugin("airoha-race").map(|e| e.title),
+        Some("Airoha RACE")
+    );
+    loaded(&mut registry);
+    let factory = registry.get("airoha-race").expect("the RACE example");
+    assert_eq!(factory.info(), race_info());
+    let mut out = Vec::new();
+    factory.create().unwrap().decode(
+        &[0x05, 0x5B, 0x02, 0x00, 0x15, 0x0F],
+        Instant::now(),
+        0,
+        &mut out,
+    );
+    assert_eq!(out[0].kind, "response");
 }
 
 /// A Lua codec never crosses threads: its factory does, and the codec is made on the
