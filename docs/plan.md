@@ -1,0 +1,338 @@
+<!-- Exported from the Serialist build plan (Claude Doc): https://claude.ai/code/artifact/f55267fe-2a58-4d25-b911-8e852f14d82e -->
+
+# GPUI Serial Terminal Build Plan
+
+Sep 29, 2026 · @John
+
+## Goals and requirements
+
+The app is a native, GPU-rendered serial terminal that stays responsive at multi-megabaud rates while staying scriptable and themeable to the degree Zed is. Each of your seven requirements becomes a measurable target below; the last three rows are implied requirements that the plan also covers.
+
+| # | Requirement | Testable target |
+| --- | --- | --- |
+| 1 | Auto-detect devices | A newly plugged device appears in the port list within 250 ms with no user action. Unplugging marks the session disconnected and offers one-key reconnect when a device with the same USB serial or path returns. |
+| 2 | Full port configuration | Baud from a standard list or any integer typed in (custom rates work on macOS, Linux and Windows). Data bits 5 to 8, parity none/odd/even/mark/space, stop bits 1/2, flow control none/RTS-CTS/XON-XOFF, DTR and RTS toggles, send line ending none/CR/LF/CRLF, local echo. Settings persist per device identity. |
+| 3 | Scripting | A user script can open a port, send bytes or text, wait for a regex or byte pattern with a timeout, loop, sleep, log and prompt. Scripts run off the UI thread and can be bound to keys or saved-command buttons. |
+| 4 | Custom plugins | A plugin registers a protocol codec that frames incoming bytes, decodes them into structured rows and encodes outgoing commands. The Airoha RACE format (0x05 header, type, length, RACE id, payload) is the first shipped example. |
+| 5 | Performance | No dropped bytes at 3 Mbaud sustained (about 300 KB/s). Render under 8 ms per frame while receiving. Append to scrollback is O(1) and scrolling a 1-million-line buffer costs the same as a 100-line one. Cold start under 300 ms. |
+| 6 | Fonts and formats | JSON-with-comments settings file, hot-reloaded on save, with Zed's font keys (family, size, weight, features, line height, fallbacks) for both the terminal and the UI. Themes load from Zed's theme JSON format so your Fadetouched Blur file works unchanged. Display formats: text with ANSI colors, hex, hex plus ASCII, per-line timestamps, and plugin-decoded views. |
+| 7 | Two modes | Inline interactive: keystrokes go straight to the port, like picocom. Saved-command mode: named commands with parameters, grouped into collections on disk, sent by click or keybinding, with history. Both modes share one session and one scrollback. |
+| 8 | Cross-platform | macOS first, Linux and Windows from the same codebase with no per-OS UI code. |
+| 9 | Logging and search | Raw and decoded logs to file, and regex search over scrollback that stays fast at the buffer sizes above. |
+| 10 | Multiple sessions | Several ports open at once in tabs, each with its own settings, script and plugin state. |
+| 11 | Hardware-free testing | Every unit test, property test, benchmark and stress run works with no serial device attached, on all three OSes in CI. Hardware tests exist only as an opt-in tier that is never required to merge. |
+
+## GPUI research findings
+
+GPUI is ready for this app, but not from a clean crates.io release. The last official release, [gpui 0.2.2](https://crates.io/crates/gpui) from October 2025, predates a crate split on Zed's main branch, so the practical route is a pinned community snapshot plus the gpui-kit widget library, with raw GPUI custom elements for the terminal itself.
+
+| Route | What you get | Cost |
+| --- | --- | --- |
+| gpui 0.2.2 on crates.io, Apache-2.0 | Stable and documented on docs.rs | Pre-split API, the retired blade renderer on Linux, no fixes since October 2025. Current examples do not compile against it. |
+| Git dependency on [zed-industries/zed](https://github.com/zed-industries/zed) main | The real current API: `gpui` plus `gpui_platform`, wgpu on Linux since [February 2026](https://github.com/zed-industries/zed/pull/46758) | Pulls Zed's workspace lock, weekly churn, first build over ten minutes. |
+| [gpui-pre 0.3.7](https://crates.io/crates/gpui-pre), a weekly snapshot (2026-09-28) pinned by [gpui-kit 0.7.0](https://gpui-kit.com/docs/) | The current API frozen at one commit, plus 75 widgets: Input, Textarea, Table, VirtualList, Dock with draggable tabs and splits, Tabs, Menu, Popover, Resizable, 30 themes, AccessKit | Not endorsed by Zed. Needs a rename line in Cargo.toml. Migrate when Zed publishes 0.3. |
+
+The third row is the recommendation. The dependency line is `gpui = { package = "gpui-pre", version = "=0.3.7" }`, and the app imports GPUI only through its own prelude module so the swap stays in one file. Zed main pins stable Rust 1.98.1 with edition 2024; this Mac has 1.95, so a toolchain update comes first. macOS needs full Xcode for Metal, Linux needs xkbcommon, Wayland dev libraries and a Vulkan driver, and Windows needs nothing extra.
+
+**Concepts the app leans on**, all verified against current source:
+
+- `App` owns state, `Context<T>` is what a view gets, `Window` is not a context. `cx.new(|cx| T)` returns `Entity<T>`, and an entity that implements `Render` is a view. The old `View`, `ViewContext` and `WindowContext` types are gone.
+- Every panel is an entity. The session entity implements `EventEmitter`, the terminal view subscribes to it, and `cx.notify()` schedules a repaint.
+- `cx.background_spawn` runs `Send` futures on a pool and `cx.spawn` runs on the main thread. The serial reader is a plain OS thread; a foreground task drains its channel, the same way Zed's terminal drains Alacritty events.
+- The `Element` trait (request\_layout, prepaint, paint) is how the terminal is drawn. `window.text_system().shape_line(text, size, runs, force_width)` returns a `ShapedLine` whose `paint` places glyphs; `TextRun` carries per-span font, color, background, underline. `shape_line` panics on a newline, so lines are stored stripped.
+- `uniform_list` gives virtualized fixed-height lists for the device and command panels. gpui-kit's Table gives the virtualized decoded-frame view.
+- `actions!` declares actions, `div().key_context("Terminal").on_action(cx.listener(..))` scopes them, and `cx.bind_keys` loads bindings from a keymap JSON in Zed's own format.
+- `Font { family, features, fallbacks, weight, style }` maps one to one onto Zed's settings keys, and `FontFeatures` deserializes the `{"calt": false}` form. `cx.text_system().add_fonts` loads bundled fonts at startup.
+- `impl Global` plus `cx.observe_global` is how settings and theme changes fan out to every view.
+- Raw GPUI has no text input widget. The official example is 784 lines. gpui-kit's Input is the compose bar and every form field.
+
+**How Zed's terminal renders** is the pattern to copy. [TerminalElement](https://github.com/zed-industries/zed/blob/main/crates/terminal_view/src/terminal_element.rs) is a bespoke element, not a canvas and not a list. In prepaint it resolves the terminal font from settings, syncs a snapshot of the grid, merges horizontally adjacent cells with the same style into batched runs, and collects background rectangles. In paint it clips to its bounds, registers mouse and input handlers, paints backgrounds, then shapes and paints each run with the cell width forced so the grid stays monospace. ANSI colors map through the theme's `terminal.ansi.*` keys with a minimum-contrast guard. Monitor mode in this app does the same per visible line instead of per cell.
+
+**Caveats** worth knowing before the first commit:
+
+- Documentation is thin. The README points at the Zed source and Discord; the community [gpui-book](https://matinaniss.github.io/gpui-book/) covers the basics but its Element, List and Canvas chapters are stubs. Reading Zed source is part of the job.
+- Zed's `terminal`, `settings`, `theme` and `ui` crates are GPL-3.0 and unpublished. Patterns can be copied; code cannot unless this app is GPL too.
+- OpenType font features are documented for macOS and Windows only.
+- A GPUI serial terminal already exists: [Baudrun](https://github.com/packetThrower/Baudrun), GPL, 29 stars, bridging Alacritty's parser to a custom grid element. It is worth reading for its bridge code even though it has no device list, scripting or plugins.
+
+## Crate and technology choices
+
+Every choice favors the boring, maintained option: a blocking thread per port, Lua as the one language for scripts and first-tier plugins, and Zed's own parser and terminal crates where they fit. Versions are from crates.io as of 2026-09-29.
+
+| Concern | Choice | Why | Rejected |
+| --- | --- | --- | --- |
+| Serial I/O | [serialport 4.10.1](https://github.com/serialport/serialport-rs) | Custom baud on all three OSes: the IOSSIOSPEED ioctl on macOS, termios2 on Linux, any DCB rate on Windows ([platform notes](https://docs.rs/crate/serialport/latest/source/doc/platforms.md)). Enumeration returns VID, PID, serial number, manufacturer, product and USB location. Reads block in poll() with a timeout, so an idle port costs no CPU. | tokio-serial 5.5: an [August 2026 report](https://github.com/berkowski/tokio-serial/issues/29) shows reads never resolving on a Windows 11 USB-CDC port. serial2 0.2: no USB metadata. |
+| Hotplug | [nusb 0.2.7](https://docs.rs/nusb/latest/nusb/hotplug/index.html) `watch_devices()`, a 150 ms debounce, then re-enumerate and diff by port name | One crate wraps IOKit, udev and Windows device notifications. The tty node can appear a moment after the USB event, hence the debounce. | Hand-written IOKit, udev and WM\_DEVICECHANGE code: three unsafe-heavy implementations. Plain polling: 2 s latency. A 3 s poll stays as the fallback for Bluetooth and PCI ports. |
+| Scripting | [mlua 0.12](https://github.com/mlua-rs/mlua) with Lua 5.4 and the async feature | Lua is what [tio](https://github.com/tio/tio), scope-rs, Wireshark and Neovim use, so embedded engineers already know it. Async functions registered from Rust let `serial.expect()` suspend the coroutine rather than a thread. Lua 5.4 has 64-bit integers and string.pack for binary protocols. A memory limit and an instruction hook give cancellation. | Rhai 1.26: [no async](https://rhai.rs/book/patterns/multi-threading.html) and 2 to 3 times slower than Python by its own benchmarks. Rune 0.14: pre-1.0 churn. rquickjs 0.14: fine engine, but JavaScript is a poor fit for byte work. deno\_core: archived into the Deno monorepo and 30 MB of V8. Luau is the swap if untrusted scripts ever need a hardened sandbox, at the cost of integer types. |
+| Plugins, tier 1 | Lua modules in the same VM | No extra machinery, hot reload from the file watcher, and the same API users learn for scripts. |  |
+| Plugins, tier 2 | [wasmtime 49](https://github.com/bytecodealliance/wasmtime) component model with wit-bindgen 0.62, in [Zed's extension layout](https://zed.dev/blog/zed-decoded-extensions) | Sandboxed, compiled, distributable, any source language. A host-to-guest call costs about 1.4 µs, so per-chunk calls stay negligible. | extism 1.30: simpler ABI but pinned six wasmtime majors back. Dynamic libraries via libloading: a plugin crash kills the app, no safe unload, and abi\_stable has been unmaintained since 2023. |
+| ANSI and terminal | [vte 0.15](https://docs.rs/vte) with a custom Perform for monitor mode; [alacritty\_terminal 0.26](https://docs.rs/alacritty_terminal/latest/alacritty_terminal/term/struct.Term.html) for full terminal mode | vte is Alacritty's parser and handles UTF-8 and every escape class. alacritty\_terminal runs without a PTY: feed bytes through its Processor and get a grid, selection and damage tracking. Zed already pairs it with GPUI. | vt100 0.16: simpler but no damage tracking. termwiz: 35 dependencies and no emulation. |
+| Settings files | [jsonc-parser 0.34](https://crates.io/crates/jsonc-parser) into serde types | Comments and trailing commas, and it is the parser Zed's settings editor depends on. | toml: better for round-trip edits but not what Zed users paste. |
+| File watching | notify 8.2 with notify-debouncer-full 0.7 | FSEvents, inotify and ReadDirectoryChangesW behind one API. |  |
+| Threads and buffers | crossbeam-channel 0.5 for handoff; a VecDeque of 64 KB pages for scrollback | Chunked messages keep channel cost per chunk, not per byte. | ringbuf: per-byte rings are the wrong granularity. flume: casual maintenance mode. |
+| Search, time, logging | regex 1.13 in bytes mode, memchr for line splitting, std Instant for chunk timestamps, tracing 0.1 | All standard. | quanta: unnecessary at chunk granularity. |
+| Testing | proptest for parser and store invariants, criterion for benches, cargo-fuzz for the parser and codecs, insta for decoded-frame snapshots, cargo-llvm-cov for coverage, GPUI's test app context for headless UI tests | All hardware-free. proptest finds chunk-boundary bugs that hand-written cases miss, and GPUI's test context runs views with no window. | Hardware-in-the-loop as a required tier: not reproducible in CI. |
+
+**Pitfalls the research turned up**, each with its answer in the design:
+
+- macOS enumeration returns both a cu and a tty entry per device. The device list dedupes and opens the cu path, because the tty path blocks waiting for carrier detect.
+- serialport applies its custom-baud ioctl unconditionally on macOS, so a socat PTY pair fails to open. Loopback tests use the in-process virtual transport, never a PTY, so they run anywhere.
+- A zero read timeout makes reads return immediately and spin a core. The read loop uses 10 to 50 ms.
+- FTDI adapters buffer for 16 ms by default and the crate cannot change it. On Linux the app can write the sysfs latency timer; on macOS there is no knob, so the status line shows the adapter chipset as a hint.
+- serialport-rs is [seeking maintainers](https://github.com/serialport/serialport-rs), especially for Windows. The serial layer sits behind a Transport trait, as your Bose Audio Workbench transport crate already does, so a swap stays local.
+- Two Rust projects are close cousins worth reading: [scope-rs](https://github.com/matheuswhite/scope-rs) (TUI, Lua plugins, timestamps, tags) and [serial-monitor-rust](https://github.com/hacknus/serial-monitor-rust) (egui, plotting). Neither is GPU-rendered or has a native device list.
+
+## Architecture
+
+Four kinds of threads and one rule: bytes never touch the main thread, and the main thread never blocks on I/O. GPUI owns the window; everything below the session entity is plain Rust with no GPUI dependency, so the core builds and tests headless.
+
+&#91;embedded content: thread and data-flow architecture · 4 thread groups, 12 components\]
+
+Data flows down from the port to the screen at most once per frame, while the script and watcher threads talk to the session entity rather than to the port. Each session gets its own reader, writer and ingest threads.
+
+**Workspace layout.** The project is named Serialist and every crate carries that prefix:
+
+- `crates/serialist-core`: the Transport trait with serial, raw TCP, file-replay and in-process virtual implementations, and a PortSource trait with real and fake device sources; the session state machine; the page store and line index; the ANSI parser; the Codec trait with the text and hex codecs; settings, theme and keymap types with the JSONC loader. No GPUI.
+- `crates/serialist-sim`: the virtual port pair, the fake port source, simulated devices in Rust, and capture recording and replay. A dev-dependency of every other crate and a normal dependency of the app for developer mode.
+- `crates/serialist-script`: the mlua host, the Lua API surface, the script runner thread, the matcher bridge, and the Lua adapter for scripted simulated devices.
+- `crates/serialist-plugins`: the Lua and WebAssembly codec adapters, the Airoha RACE reference plugin, and the conformance tests that run both against recorded captures.
+- `crates/serialist-ui`: the GPUI app. A prelude module that re-exports GPUI and gpui-kit, the workspace view, panels, the terminal element, the bridge from a Zed theme to gpui-kit's theme, and keymap loading.
+- `crates/serialist`: the binary. Wiring, flags such as `--port`, `--baud`, `--script` and `--virtual`, and bundled assets (fonts, default themes, the RACE plugin).
+
+Only the last two crates depend on GPUI. Dependencies point one way: app to ui to script and plugins to core.
+
+**Ownership and handoff.** The session entity holds the port configuration, the connection state, an `Arc` to the store, the channel senders for the reader, writer and ingest threads, the decoded frames, and byte counters. Pages in the store are immutable once sealed, so the terminal element reads them without a lock. Only the line index sits behind a read-write lock, and the element takes a read lock just long enough to copy the visible slice. Ingest holds the write lock once per chunk to push index entries. Session events (connected, disconnected, data arrived, frame decoded, script finished) fan out through GPUI's event emitter to whichever panels subscribe.
+
+## Configuration, fonts and theming
+
+The app reads Zed's settings vocabulary and Zed's theme file format, so the block you already have in your Zed settings, and the Fadetouched theme file in your themes folder, work as they are. Your current Zed config sets UI font size 16, buffer font size 15, and a dark/light theme pair with Fadetouched Blur as the dark choice. Those three keys are the first ones the app honors.
+
+**Settings** live in a JSON-with-comments file (comments and trailing commas allowed, as in Zed) at the user config directory, with defaults bundled in the binary and an optional project-local file that overrides both. A file watcher hot-reloads on save and the change lands on the next frame. Keys follow Zed's names exactly:
+
+- `buffer_font_family`, `buffer_font_size`, `buffer_font_weight`, `buffer_font_features` (OpenType features such as `calt` and `ss01`), `buffer_line_height` (`comfortable`, `standard`, or a number) and `buffer_font_fallbacks` drive the terminal.
+- `ui_font_family`, `ui_font_size`, `ui_font_weight`, `ui_font_features` and `ui_font_fallbacks` drive panels, tabs and the status line.
+- `terminal.font_family` and siblings override the buffer values for the terminal only, as they do in Zed.
+- `theme` takes a string or the `{ mode, light, dark }` object, and `mode: "system"` follows macOS appearance.
+
+**Themes** are Zed theme JSON files (schema v0.2.0) dropped into a themes folder. Your Fadetouched file defines 134 style keys per variant; the app maps the ones it needs and ignores the rest without error:
+
+| Theme keys | Used for |
+| --- | --- |
+| `terminal.background`, `terminal.foreground`, `terminal.bright_foreground`, `terminal.dim_foreground`, the 16 `terminal.ansi.*` colors | Scrollback text and ANSI rendering |
+| `players[0].cursor`, `players[0].selection` | Cursor and selection in the terminal and inputs |
+| `background`, `surface.background`, `elevated_surface.background`, `panel.background`, `title_bar.*`, `status_bar.background`, `tab_bar.background`, `tab.*`, `toolbar.background` | Window chrome, docks, tabs |
+| `element.*`, `ghost_element.*`, `border.*`, `text.*`, `icon.*`, `scrollbar.*` | Buttons, lists, inputs, focus rings |
+| `search.match_background`, `search.active_match_background` | Scrollback search |
+| `success`, `warning`, `error`, `info`, `hint` and their `.background` variants | Connection state, TX/RX/decoded row accents, script results |
+| `syntax.number`, `syntax.string`, `syntax.keyword`, `syntax.comment` | Decoded frame fields and the script console |
+
+One Dark and One Light ship as bundled defaults so the app looks right before any file exists.
+
+**Display formats** are settings too, with per-session overrides from the status line:
+
+```jsonc
+{
+  "buffer_font_family": "Berkeley Mono",
+  "buffer_font_features": { "calt": false },
+  "buffer_font_size": 15,
+  "ui_font_size": 16,
+  "theme": { "mode": "dark", "light": "One Light", "dark": "Fadetouched Blur" },
+  "display": {
+    "timestamps": "delta",          // off | absolute | relative | delta
+    "timestamp_format": "%H:%M:%S%.3f",
+    "view": "text",                 // text | hex | hex_ascii
+    "hex_bytes_per_row": 16,
+    "show_control_chars": true,     // render CR/LF/ESC as dim glyphs
+    "wrap": true
+  },
+  "devices": [
+    { "match": { "vid": "0x0e8d", "product": "Airoha" },
+      "baud": 921600, "plugin": "airoha-race", "eol": "crlf" }
+  ]
+}
+```
+
+The `devices` list keys per-device profiles by USB identity, so a board gets its baud, plugin and line ending the moment it is plugged in. Keybindings use the same layered files in Zed's keymap format.
+
+## UI design: two modes, one session
+
+One window, Zed-style: a tab per open port, collapsible docks on either side, the terminal in the center, and a command palette for every action. Both modes act on the same session and the same scrollback, so switching modes never loses context.
+
+| Panel | Purpose | Default dock |
+| --- | --- | --- |
+| Devices | Live port list with USB product, VID:PID, serial number, connection state. Connect with Enter or click. Recently seen but unplugged devices stay listed, greyed, so a reconnect is one key. | Left |
+| Commands | Saved-command collections with fuzzy filter, groups, keybinding badges, and an edit form. | Left, below Devices |
+| Terminal | Scrollback with ANSI color, selection, search bar, follow-tail pill, and a status line (port, baud and framing, RX/TX bytes and rate, EOL, mode, active plugin). | Center |
+| Compose bar | Input with history, text/hex toggle, EOL picker, send button, "save as command". Shown in saved-command mode, hidden in inline mode. | Bottom of terminal |
+| Decoded | Plugin output as a structured table (timestamp, direction, frame type, decoded fields, raw hex) with filter. | Right |
+| Script console | Script output, running scripts, run/stop, and a small REPL. | Right, below Decoded |
+
+**Inline interactive mode** behaves like picocom or a real terminal:
+
+- Every keystroke goes to the port immediately. Enter sends the configured EOL, Backspace sends 0x08 or 0x7f (configurable), arrow and function keys send ANSI sequences.
+- Local echo is optional per session. Paste can be chunked with a delay for bootloaders that drop bytes.
+- The terminal owns all keys, including Ctrl-C, so leaving the mode uses an escape chord (default Ctrl-\]) or the mode toggle from the palette.
+
+**Saved-command mode** is for repeatable work:
+
+- Commands live as JSON with comments in a user directory and optionally in a project-local file, so a collection can be checked into a firmware repo.
+- A command has a name, a group, a payload (text, hex, or a plugin-encoded form such as a RACE id plus fields), an EOL override, parameters written as placeholders that prompt at send time, an optional expected-response regex with a timeout, and an optional keybinding.
+- Sending a command echoes it into the scrollback in a distinct TX color. A matched response is highlighted; a timeout shows inline.
+- The compose bar keeps history across sessions, and any history entry can be promoted to a saved command.
+
+Keybindings use Zed's keymap format: a JSON array of contexts and binding maps, with actions named like `serial::Connect` and `terminal::Clear`, so your muscle memory and editing habits carry over.
+
+## Scripting and plugins
+
+One Rust trait defines what a protocol plugin is, Lua and WebAssembly are two ways to implement it, and scripts drive the same session API the UI uses. That keeps three features (scripts, plugins, saved commands) on one code path.
+
+**Scripts** are Lua files run on a script thread with its own executor. Every call that waits for the device is an async Rust function, so a waiting script suspends its coroutine and costs nothing:
+
+```lua
+-- scripts/version_probe.lua
+local port = serial.current()               -- or serial.open{ match = { product = "Airoha" }, baud = 921600 }
+port:write("AT\r\n")
+local ok = port:expect("OK", { timeout_ms = 1000 })
+for i = 1, 10 do
+  port:write(string.format("AT+READ=%d\r\n", i))
+  local m = port:expect("^VAL=(%d+)", { timeout_ms = 500 })
+  log.info("value", i, m and m[1] or "timeout")
+  sleep(100)
+end
+```
+
+- Port API: `serial.ports()`, `serial.open`, `serial.current`, `port:write`, `port:write_hex`, `port:read`, `port:read_line`, `port:expect` with regex captures, `port:on_line` and `port:on_frame` callbacks, `port:set{dtr, rts, baud}`, `port:close`.
+- App API: `sleep`, `log`, `ui.prompt`, `ui.notify`, `commands.send(name, params)`, timers, and any loaded codec as `codecs.<name>.encode`.
+- Triggers: the script console, the command palette, a keybinding, a saved command whose payload is a script, a per-device `on_connect` hook in the profile, and a `--script` flag for headless runs.
+- Limits: a 64 MB VM memory cap, an instruction-count hook so Stop works inside a tight loop, and no `os` or `io` libraries beyond an allow-listed scripts directory.
+
+**Plugins** implement one trait. Built-in codecs (plain text, hex) implement it in Rust, and two adapters implement it for Lua and WebAssembly:
+
+```rust
+pub trait Codec: Send {
+    fn describe(&self) -> CodecInfo;                          // name, version, field schema
+    fn decode(&mut self, chunk: &[u8], out: &mut Vec<Frame>); // stateful framer, called once per chunk
+    fn encode(&mut self, cmd: &CommandPayload) -> Result<Vec<u8>>;
+    fn reset(&mut self);
+}
+```
+
+A decoded frame carries a timestamp, direction, a kind, named fields, severity, and a byte range into the scrollback pages rather than a copy. The Decoded panel renders the fields as a table, the terminal can show a one-line summary in a plugin color, and framed bytes can be hidden from the text view.
+
+- Tier 1, Lua: a folder with `plugin.lua` returning `describe`, `decode(bytes, state)` and `encode(cmd)`. Chunks arrive as Lua strings and `string.unpack` reads headers. Saving the file reloads the plugin and resets its state.
+- Tier 2, WebAssembly: a WIT world with the same three functions over `list<u8>`, built with cargo-component, with a manifest that pins the API version. The host wraps the instance in the same trait. This tier is for sharing compiled, sandboxed plugins across machines and languages.
+- Saved commands can name a codec: a payload like `{ "codec": "airoha-race", "cmd_id": "0x0F15" }` is encoded by the plugin, and the command's expected response can be a frame predicate (same command id, type response) instead of a regex.
+
+**The Airoha RACE example** is the first shipped plugin. The frame layout is small enough to be the reference implementation in both tiers, compared byte for byte in tests:
+
+| Field | Size | Value |
+| --- | --- | --- |
+| Sync | 1 byte | 0x05 |
+| Type | 1 byte | 0x5A command, 0x5B response, 0x5C indication, 0x5D log |
+| Length | u16 little-endian | payload length plus 2 |
+| Command id | u16 little-endian | for example 0x0F15 query version and build time |
+| Payload | length minus 2 bytes | command-specific |
+
+Your Bose Audio Workbench crate already has a framer and an encoder with exactly this shape. It is under a proprietary license, so the plugin is reimplemented from the layout above rather than depending on that crate, but its tests are a ready-made conformance suite.
+
+## Performance strategy
+
+Speed comes from keeping every hot path off the UI thread and making per-frame cost independent of scrollback size. The rule is: the port is never blocked, the UI never parses bytes, and the renderer never touches more than the visible rows.
+
+| Hot path | Budget | Technique |
+| --- | --- | --- |
+| Serial read | Zero dropped bytes at 300 KB/s | One dedicated OS thread per port doing blocking reads with a 10 ms timeout into a 64 KB buffer. No async runtime in the read loop. Chunks go into an unbounded channel so a slow UI backs up memory, never the port. |
+| Ingest and parse | Under 10% of one core at 300 KB/s | A second thread owns the scrollback store. It appends chunks to 64 KB pages, runs the ANSI state machine once per chunk, and records line starts and timestamps in an index. Append is O(1). Plugins receive the same chunk, never single bytes. |
+| UI wake-up | At most one wake per frame | The ingest thread sets a dirty flag and pokes the GPUI foreground executor. Render coalesces everything that arrived since the last frame. No per-chunk notify. |
+| Layout and paint | Under 8 ms per frame at any buffer size | A custom element computes the visible line range from the scroll offset, shapes only those lines, and paints glyph runs directly. Row height is uniform. Wrap counts per line for the current width are cached, so scroll position maps to lines in O(log n). |
+| Shaped-line cache | Under 1 ms for a scroll step | An LRU keyed by line id, font and width holds shaped lines. A font or width change clears it. Scrolling through already-seen text costs no shaping. |
+| Memory | Bounded, default 256 MB per session | Pages live in a ring. When the cap is hit, the oldest page and its index entries drop. Retained bytes times about 1.3 is the whole footprint including the index. |
+| Search | First match under 50 ms on 1 M lines | Regex in bytes mode over the pages on a background thread, streaming matches to the UI as found. |
+| Scripts and matchers | No polling | A script waiting for a pattern registers a matcher with the ingest thread and sleeps until it fires. |
+
+**Measuring it** is part of the plan, not an afterthought:
+
+- A virtual port pair inside the process replaces socat and com0com. It paces bytes at a configured baud, chunks like a real driver, and can drop or corrupt bytes on demand, so no hardware or PTY is involved.
+- A firehose simulated device feeds the store at several MB/s to profile ingest and render, from the test suite or from the app's developer mode.
+- Criterion benchmarks cover the store, the ANSI parser and the line index, and fail CI on regression. Frame times show in a debug overlay.
+- Startup is measured cold with the settings file present. The target of 300 ms rules out loading themes, fonts and plugins eagerly; they load on demand and in parallel.
+
+## Testing strategy
+
+Every test, benchmark and stress run works with no serial hardware attached. The seam is the Transport trait: the same session, ingest, scripting and UI code runs against an in-process virtual port pair, so CI on all three OSes exercises everything a real board would except the OS driver itself.
+
+**Test doubles** live in a small crate used by tests, benches and the app's developer mode:
+
+- Virtual transport: an in-memory pair of endpoints that models a real link. It paces bytes at a configured baud, chunks like a real driver, adds latency and jitter, can drop or corrupt bytes on demand, tracks DTR and RTS, and can unplug and replug itself. Defaults come from recorded captures of real adapters so the timing is representative.
+- Fake port source: a controllable device list. A test plugs and unplugs devices with USB metadata and checks the Devices panel and the reconnect logic against the 250 ms budget.
+- Simulated devices: what sits on the far end of the virtual pair, behind a small trait. Built-ins in Rust cover an echo device, an AT-command device, a RACE device that answers version and log-filter queries, a U-Boot style menu, and a firehose that streams ANSI-heavy, long-line, binary or mixed CR/LF traffic at any rate. A Lua adapter in the script crate lets you write new devices as scripts with the same engine users script the app with.
+- Recorded captures: byte files with timing sidecars from real sessions, replayed through the file-replay transport at 1x or faster. Captures are the fixtures for codec conformance and for every bug first seen on hardware.
+
+**Test tiers**, all run by `cargo test` and in CI:
+
+| Tier | What it covers | Tooling |
+| --- | --- | --- |
+| Unit and property | Page store, line index, ANSI parser, codecs. The key property: splitting one byte stream at random chunk boundaries yields an identical line index and identical frames. | proptest, plain tests |
+| Fuzz | The parser and every codec against arbitrary bytes: no panics, bounded memory. | cargo-fuzz, nightly in CI |
+| Snapshot | Decoded frames for each capture fixture. The Lua and WebAssembly RACE plugins must match byte for byte. | insta |
+| Integration | A session against a simulated device: connect, send a saved command, expect a response, lose the device, reconnect, script timeouts. | virtual transport, fake port source |
+| UI | Panels, keybindings, mode switching and the terminal element's visible-range math, with GPUI's test app context and no window. | gpui test-support |
+| Stress and bench | Firehose at 1 to 10 MB/s for 60 s: zero dropped bytes, memory under the cap, ingest under 10% of a core. Criterion benches for append, parse and search, failing CI past a regression threshold. | criterion, the firehose device |
+| Hardware, optional | Custom baud on real adapters and driver quirks. Marked ignored; runs only when a board is attached. | serialport |
+
+**Rules that keep it honest:**
+
+- No merge without green CI on macOS, Linux and Windows, and CI has no serial devices.
+- Every bug found on hardware gets a capture and a regression test that reproduces it without hardware.
+- The app's developer mode lists the simulated devices in the Devices panel, so stress testing the real UI is a click, not a lab setup.
+- Coverage is measured with cargo-llvm-cov, with a proposed floor of 90% for the core crate.
+
+## Milestones
+
+Seven milestones, each demoable on real hardware, with the performance gate second so that every later feature is built on a store and renderer already proven at 3 Mbaud. No dates are set; each milestone is sized to one or two focused weekends.
+
+&#91;embedded content: delivery roadmap · 7 milestones, each with a gate\]
+
+Each diamond is a gate that must pass before the next milestone starts; the highlighted milestone is where the speed requirement is settled.
+
+- Milestone 0 exists to de-risk the toolchain: the gpui-pre snapshot, gpui-kit, Xcode, and a first custom element. It ends with a simulated device's output on screen, even if ugly. A real board is a bonus, never a gate.
+- Milestone 1 is the biggest and is where the firehose harness, the criterion benches and the frame-time overlay are built. Features that follow use them.
+- Milestones 2 and 3 make the app pleasant daily: your Zed theme and fonts, then both interaction modes.
+- Milestones 4 and 5 add the automation layer in the order users adopt it: scripts first, then codecs that scripts and saved commands can call.
+- Milestone 6 is when the second and third operating systems get CI builds, when full terminal emulation lands for U-Boot and Linux consoles, and when tabs for multiple sessions ship.
+
+## Risks and open questions
+
+The two risks that could change the plan are GPUI's publishing state and serialport-rs's Windows maintenance; both are contained by pinning and by a trait boundary. Everything else is ordinary engineering.
+
+| Risk | Effect if it lands | Answer in the plan |
+| --- | --- | --- |
+| GPUI API churn; gpui-pre is a community snapshot, not a Zed release | A snapshot bump breaks the build | Pin exact versions, import GPUI only through the prelude module, and bump on purpose once per milestone. Migrate to the official 0.3 when it ships. |
+| gpui-kit lock-in for widgets and its own theme model | A widget behaves differently from Zed, or its theme keys drift from Zed's | Keep the terminal element, the hot path, in raw GPUI. Bridge Zed theme keys to gpui-kit's theme in one file. |
+| serialport-rs loses its Windows maintainer | Windows port bugs stay open | Transport trait with serial2 as a drop-in candidate; Windows lands last, at milestone 6. |
+| Custom baud on macOS is driver-dependent and cannot be read back | A rate silently differs from the requested one | Status line shows the requested rate and adapter chipset; an optional hardware test tier, ignored by default, covers FTDI, CP210x, CH34x and native CDC adapters when a board is present. |
+| The tty node appears after the USB hotplug event | A new device is missed | 150 ms debounce, re-enumerate on every event, and a 3 s poll as backstop. |
+| mlua async plumbing | Deadlocks or `Send` errors between the VM and the executor | One script thread owns the VM; no Lua values cross threads; the session talks to it over channels only. |
+| GPL code nearby: Zed's terminal, settings and theme crates, and Baudrun | Copying code forces a GPL license on the app | Copy patterns, not code. The license is MIT OR Apache-2.0, decided 2026-09-29, so nothing GPL can be vendored. |
+| Build time and binary size from wasmtime | Compile times of several minutes | Feature-gate the WebAssembly tier; the Lua tier is the default build. |
+| OpenType font features are macOS and Windows only in GPUI | Ligature settings are ignored on Linux | Document it; it does not affect correctness. |
+| Raw GPUI text input and IME edge cases | Composition bugs in inputs | gpui-kit Input for every field; inline mode uses the low-level input handler only for IME composition. |
+| The virtual transport behaves differently from a real driver (chunk sizes, pacing, custom baud) | A bug shows only with a board attached | Virtual transport defaults come from recorded captures of real adapters, every hardware bug gets a capture and a hardware-free regression test, and the ignored hardware tier covers the rest. |
+
+**Open questions**, yours to answer before milestone 0:
+
+- [x] Name and license for the app: Serialist, MIT OR Apache-2.0, decided 2026-09-29.
+- [ ] gpui-kit for the chrome widgets, or raw GPUI only with a hand-written text input?
+- [ ] Lua 5.4 (integers) or Luau (hardened sandbox) for scripts and plugins?
+- [ ] Is monitor mode enough for the first release, or do you need full VT emulation on day one for U-Boot style menus?
+- [ ] Which USB adapters and boards are on hand for the optional hardware tier?
+- [ ] Should the plugin API be public and versioned from milestone 5, or internal until it settles?
+
+## Sources
+
+- [gpui on crates.io](https://crates.io/crates/gpui), [gpui-pre](https://crates.io/crates/gpui-pre), [gpui-kit docs](https://gpui-kit.com/docs/), [gpui-book](https://matinaniss.github.io/gpui-book/)
+- [Zed repository](https://github.com/zed-industries/zed), [blade removal PR](https://github.com/zed-industries/zed/pull/46758), [TerminalElement source](https://github.com/zed-industries/zed/blob/main/crates/terminal_view/src/terminal_element.rs), [Zed extensions post](https://zed.dev/blog/zed-decoded-extensions)
+- [Baudrun](https://github.com/packetThrower/Baudrun), [scope-rs](https://github.com/matheuswhite/scope-rs), [serial-monitor-rust](https://github.com/hacknus/serial-monitor-rust), [tio](https://github.com/tio/tio)
+- [serialport-rs](https://github.com/serialport/serialport-rs), [serialport platform notes](https://docs.rs/crate/serialport/latest/source/doc/platforms.md), [tokio-serial issue 29](https://github.com/berkowski/tokio-serial/issues/29), [nusb hotplug](https://docs.rs/nusb/latest/nusb/hotplug/index.html)
+- [mlua](https://github.com/mlua-rs/mlua), [Rhai on threading](https://rhai.rs/book/patterns/multi-threading.html), [wasmtime](https://github.com/bytecodealliance/wasmtime)
+- [vte](https://docs.rs/vte), [alacritty\_terminal Term](https://docs.rs/alacritty_terminal/latest/alacritty_terminal/term/struct.Term.html), [jsonc-parser](https://crates.io/crates/jsonc-parser)
