@@ -3,6 +3,11 @@
 //! The list is a plain model ([`DeviceList`]) fed from a [`PortSource`] subscription;
 //! the panel only renders it and turns a connect request into a
 //! [`DevicesPanelEvent::Connect`] for the workspace, which owns sessions.
+//!
+//! Device profiles from the settings show here: a port a profile matches is listed
+//! under the profile's `name` with a "profile" badge, and selecting it fills the baud
+//! field with the profile's rate. Connecting uses the profile's framing and flow
+//! control with the rate in the field.
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,6 +17,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serialist_core::{PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig};
 
 use crate::actions::{Connect, SelectNext, SelectPrevious, context};
+use crate::config::Config;
 use crate::prelude::*;
 
 const ROW_HEIGHT: Pixels = px(44.);
@@ -27,8 +33,12 @@ pub(crate) const PORT_EVENT_FRAME: Duration = Duration::from_millis(8);
 /// Apply `events` to the panel's list until the source or the panel goes away. The
 /// wait happens on the background executor (crossbeam channels have no async receive),
 /// never on the main thread, and each wake applies everything queued at once.
-fn follow_port_events(events: Receiver<PortEvent>, cx: &mut Context<DevicesPanel>) -> Task<()> {
-    cx.spawn(async move |this, cx| {
+fn follow_port_events(
+    events: Receiver<PortEvent>,
+    window: &mut Window,
+    cx: &mut Context<DevicesPanel>,
+) -> Task<()> {
+    cx.spawn_in(window, async move |this, cx| {
         loop {
             let rx = events.clone();
             let (batch, closed) = cx
@@ -45,11 +55,13 @@ fn follow_port_events(events: Receiver<PortEvent>, cx: &mut Context<DevicesPanel
                 })
                 .await;
             let alive = this
-                .update(cx, |panel, cx| {
+                .update_in(cx, |panel, window, cx| {
                     if !batch.is_empty() {
                         for event in batch {
                             panel.list.apply(event);
                         }
+                        // A port selected before it was listed has its profile now.
+                        panel.prefill_baud(window, cx);
                         cx.notify();
                     }
                 })
@@ -235,8 +247,12 @@ pub enum DevicesPanelEvent {
 pub struct DevicesPanel {
     list: DeviceList,
     baud: Entity<InputState>,
-    /// Line settings other than baud, used as the template for every connect.
-    serial: SerialConfig,
+    /// The `--baud` flag: the baud field always starts from it, profiles or not.
+    baud_override: Option<u32>,
+    /// The port and configuration generation the baud field was last filled for, so a
+    /// rate the user typed survives hotplug events and is replaced only when the
+    /// selection or the settings change.
+    prefilled: Option<(PortId, u64)>,
     notice: Option<SharedString>,
     connected: Option<PortId>,
     focus_handle: FocusHandle,
@@ -256,17 +272,30 @@ impl Focusable for DevicesPanel {
     }
 }
 
+/// The settings in force, or the bundled ones for a panel built without the app's
+/// configuration.
+fn settings_of(cx: &App) -> Option<&serialist_core::Settings> {
+    cx.try_global::<Config>()
+        .map(|config| config.settings().as_ref())
+}
+
 impl DevicesPanel {
+    /// A panel listing `source`'s ports. `baud_override` (the `--baud` flag) fixes the
+    /// rate the baud field starts from; without it the field shows the selected port's
+    /// profile rate, else the `default_baud` setting.
     pub fn new(
         source: Arc<dyn PortSource>,
-        serial: SerialConfig,
+        baud_override: Option<u32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let initial = baud_override
+            .or_else(|| settings_of(cx).map(|settings| settings.default_baud))
+            .unwrap_or(SerialConfig::default().baud);
         let baud = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Baud")
-                .default_value(serial.baud.to_string())
+                .default_value(initial.to_string())
         });
         let baud_events = cx.subscribe_in(&baud, window, |this, _, event, _, cx| match event {
             InputEvent::PressEnter { .. } => {
@@ -278,20 +307,26 @@ impl DevicesPanel {
             }
             _ => {}
         });
+        // Profiles may have changed: refill the field and redraw the names and badges.
+        let config_changes = cx.observe_global_in::<Config>(window, |this, window, cx| {
+            this.prefill_baud(window, cx);
+            cx.notify();
+        });
 
-        let port_events = follow_port_events(source.subscribe(), cx);
+        let port_events = follow_port_events(source.subscribe(), window, cx);
 
         Self {
             list: DeviceList::default(),
             baud,
-            serial,
+            baud_override,
+            prefilled: None,
             notice: None,
             connected: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             _source: source,
             _port_events: port_events,
-            _subscriptions: vec![baud_events],
+            _subscriptions: vec![baud_events, config_changes],
         }
     }
 
@@ -303,10 +338,58 @@ impl DevicesPanel {
         self.notice.as_ref()
     }
 
-    pub fn select_port(&mut self, id: PortId, cx: &mut Context<Self>) {
+    pub fn select_port(&mut self, id: PortId, window: &mut Window, cx: &mut Context<Self>) {
         self.list.select(id);
         self.scroll_to_selection();
+        self.prefill_baud(window, cx);
         cx.notify();
+    }
+
+    /// The name a port is listed under: its device profile's `name`, else the
+    /// transport's display name.
+    pub fn display_name(&self, info: &PortInfo, cx: &App) -> String {
+        settings_of(cx)
+            .and_then(|settings| settings.device_name_for(info))
+            .map_or_else(|| info.display_name.clone(), str::to_owned)
+    }
+
+    /// Whether a device profile matches `info`.
+    pub fn has_profile(&self, info: &PortInfo, cx: &App) -> bool {
+        settings_of(cx).is_some_and(|settings| settings.profile_for(info).is_some())
+    }
+
+    /// The line settings to open `info` with, other than the rate: its device profile's
+    /// framing and flow control over 8N1.
+    fn serial_for(&self, info: &PortInfo, cx: &App) -> SerialConfig {
+        settings_of(cx).map_or_else(SerialConfig::default, |settings| {
+            settings.serial_config_for(info)
+        })
+    }
+
+    /// The rate the baud field starts from for `info`.
+    fn baud_for(&self, info: &PortInfo, cx: &App) -> u32 {
+        self.baud_override
+            .unwrap_or_else(|| self.serial_for(info, cx).baud)
+    }
+
+    /// Fill the baud field for the selected port, unless it was already filled for
+    /// this port under the current settings.
+    fn prefill_baud(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.list.selected() else {
+            return;
+        };
+        let generation = cx
+            .try_global::<Config>()
+            .map_or(0, |config| config.generation());
+        let key = (entry.info.id.clone(), generation);
+        if self.prefilled.as_ref() == Some(&key) {
+            return;
+        }
+        let baud = self.baud_for(&entry.info, cx).to_string();
+        self.prefilled = Some(key);
+        if self.baud_text(cx) != baud {
+            self.set_baud_text(&baud, window, cx);
+        }
     }
 
     pub fn set_connected(&mut self, port: Option<PortId>, cx: &mut Context<Self>) {
@@ -333,17 +416,17 @@ impl DevicesPanel {
     /// Validate the selection and baud, then ask the workspace to connect. Returns whether
     /// a [`DevicesPanelEvent::Connect`] was emitted; otherwise the reason is in [`Self::notice`].
     pub fn connect_selected(&mut self, cx: &mut Context<Self>) -> bool {
-        let port = match self.list.selected() {
+        let info = match self.list.selected() {
             None => {
                 self.set_notice(Some("Select a port first".into()), cx);
                 return false;
             }
             Some(entry) if !entry.present => {
-                let notice = format!("{} is unplugged", entry.info.display_name);
+                let notice = format!("{} is unplugged", self.display_name(&entry.info, cx));
                 self.set_notice(Some(notice.into()), cx);
                 return false;
             }
-            Some(entry) => entry.info.id.clone(),
+            Some(entry) => entry.info.clone(),
         };
         let baud = match parse_baud(&self.baud_text(cx)) {
             Ok(baud) => baud,
@@ -354,10 +437,13 @@ impl DevicesPanel {
         };
         let serial = SerialConfig {
             baud,
-            ..self.serial.clone()
+            ..self.serial_for(&info, cx)
         };
         self.notice = None;
-        cx.emit(DevicesPanelEvent::Connect { port, serial });
+        cx.emit(DevicesPanelEvent::Connect {
+            port: info.id,
+            serial,
+        });
         cx.notify();
         true
     }
@@ -368,15 +454,17 @@ impl DevicesPanel {
         }
     }
 
-    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
         self.list.select_next();
         self.scroll_to_selection();
+        self.prefill_baud(window, cx);
         cx.notify();
     }
 
-    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+    fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
         self.list.select_previous();
         self.scroll_to_selection();
+        self.prefill_baud(window, cx);
         cx.notify();
     }
 
@@ -407,6 +495,8 @@ impl DevicesPanel {
         if !entry.present {
             details = details.child(div().flex_none().italic().child("unplugged"));
         }
+        let name = SharedString::from(self.display_name(&entry.info, cx));
+        let profiled = self.has_profile(&entry.info, cx);
 
         v_flex()
             .id(("device-row", ix))
@@ -432,8 +522,22 @@ impl DevicesPanel {
                             .text_sm()
                             .truncate()
                             .text_color(name_color)
-                            .child(SharedString::from(entry.info.display_name.clone())),
+                            .child(name),
                     )
+                    .when(profiled, |this| {
+                        this.child(
+                            div()
+                                .id(("device-profile", ix))
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme.border)
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("profile"),
+                        )
+                    })
                     .when(connected, |this| {
                         this.child(div().flex_none().size_2().rounded_full().bg(theme.success))
                     }),
@@ -442,6 +546,7 @@ impl DevicesPanel {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
                 this.list.select_index(ix);
+                this.prefill_baud(window, cx);
                 if event.click_count() >= 2 {
                     this.connect_selected(cx);
                 }
@@ -681,7 +786,7 @@ mod tests {
     fn panel_follows_the_port_source(cx: &mut TestAppContext) {
         let source = FakePortSource::new([port("/dev/a")]);
         let (_window, panel) = open_test_window(cx, |window, cx| {
-            DevicesPanel::new(source.clone(), SerialConfig::default(), window, cx)
+            DevicesPanel::new(source.clone(), None, window, cx)
         });
         cx.run_until_parked();
         let read = |cx: &mut TestAppContext| {
@@ -708,7 +813,7 @@ mod tests {
     fn connect_emits_the_selection_and_typed_baud(cx: &mut TestAppContext) {
         let source = FakePortSource::new([port("/dev/a"), port("/dev/b")]);
         let (window, panel) = open_test_window(cx, |window, cx| {
-            DevicesPanel::new(source.clone(), SerialConfig::default(), window, cx)
+            DevicesPanel::new(source.clone(), None, window, cx)
         });
         cx.run_until_parked();
 
@@ -756,7 +861,7 @@ mod tests {
         // its source rather than only the subscription.
         let source = FakePortSource::new([port("/dev/a")]);
         let (_window, panel) = open_test_window(cx, |window, cx| {
-            DevicesPanel::new(source.clone(), SerialConfig::default(), window, cx)
+            DevicesPanel::new(source.clone(), None, window, cx)
         });
         cx.run_until_parked();
         assert_eq!(Arc::strong_count(&source), 2);
@@ -767,7 +872,7 @@ mod tests {
     fn unplugged_ports_do_not_connect(cx: &mut TestAppContext) {
         let source = FakePortSource::new([port("/dev/a")]);
         let (_window, panel) = open_test_window(cx, |window, cx| {
-            DevicesPanel::new(source.clone(), SerialConfig::default(), window, cx)
+            DevicesPanel::new(source.clone(), None, window, cx)
         });
         cx.run_until_parked();
         source.unplug(&PortId::new("/dev/a"));

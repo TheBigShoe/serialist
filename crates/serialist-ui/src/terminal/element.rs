@@ -35,7 +35,7 @@ use crate::terminal::palette::{ResolvedStyle, TerminalPalette};
 use crate::terminal::scroll::TerminalScrollHandle;
 use crate::terminal::selection::{Selection, SelectionPoint, column_of_byte};
 use crate::terminal::stats::{FrameSample, FrameStats};
-use crate::terminal::timestamps::{Clock, TimestampMode};
+use crate::terminal::timestamps::{Clock, TimestampMode, TimestampModeExt};
 use crate::terminal::view::TerminalView;
 
 /// Space between the element's left edge and the gutter or the text.

@@ -1,6 +1,8 @@
 //! Command-line flags. Hand-rolled: three flags do not justify an argument-parser
 //! dependency, and keeping `main` free of one keeps cold start small.
 
+use std::path::PathBuf;
+
 use anyhow::{Context as _, bail};
 
 pub const USAGE: &str = "\
@@ -14,6 +16,8 @@ Options:
                       NAME, also open virtual:<NAME> at startup (repeatable; the
                       first is opened unless --port is given). Built-ins: echo,
                       echo-lines, at, firehose, firehose-ansi
+  --config-dir <DIR>  Read settings.json, keymap.json and themes/ from DIR instead
+                      of the user config directory (also SERIALIST_CONFIG_DIR)
   --terminal-demo     Open only the milestone 1 terminal element, fed by an
                       in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help
@@ -31,6 +35,9 @@ pub struct Args {
     pub simulator: bool,
     /// `--terminal-demo`: the terminal element alone, over an in-memory stream.
     pub terminal_demo: bool,
+    /// `--config-dir`: where settings, keymap and themes live, over the environment
+    /// and the platform default.
+    pub config_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +77,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
             "-V" | "--version" => return Ok(Command::Version),
             "--terminal-demo" if inline.is_none() => parsed.terminal_demo = true,
             "--port" => parsed.port = Some(value("--port")?),
+            "--config-dir" => parsed.config_dir = Some(PathBuf::from(value("--config-dir")?)),
             "--baud" => {
                 let text = value("--baud")?;
                 let baud = serialist_ui::parse_baud(&text)
@@ -110,6 +118,7 @@ mod tests {
             virtual_devices: vec!["echo".into(), "at".into()],
             simulator: true,
             terminal_demo: false,
+            config_dir: Some(PathBuf::from("/tmp/serialist config")),
         });
         let spaced = run(&[
             "--port",
@@ -120,12 +129,15 @@ mod tests {
             "echo",
             "--virtual",
             "at",
+            "--config-dir",
+            "/tmp/serialist config",
         ]);
         let joined = run(&[
             "--port=/dev/cu.usbserial-1420",
             "--baud=921600",
             "--virtual=echo",
             "--virtual=at",
+            "--config-dir=/tmp/serialist config",
         ]);
         assert_eq!(spaced.unwrap(), expected);
         assert_eq!(joined.unwrap(), expected);
@@ -178,6 +190,7 @@ mod tests {
     fn errors_name_the_problem() {
         let message = |args: &[&str]| format!("{:#}", run(args).unwrap_err());
         assert_eq!(message(&["--port"]), "--port needs a value");
+        assert_eq!(message(&["--config-dir"]), "--config-dir needs a value");
         assert_eq!(message(&["--baud="]), "--baud needs a value");
         assert!(message(&["--baud", "fast"]).starts_with("invalid --baud \"fast\""));
         assert!(message(&["--baud", "0"]).contains("above zero"));

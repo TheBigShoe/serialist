@@ -32,5 +32,5 @@ pub use scroll::TerminalScrollHandle;
 pub use search::SearchResults;
 pub use selection::{Selection, SelectionMode, SelectionPoint};
 pub use stats::{FrameSample, FrameStats, FrameSummary};
-pub use timestamps::{Clock, TimestampMode};
+pub use timestamps::{Clock, TimestampMode, TimestampModeExt};
 pub use view::{DisplayMode, TerminalView};
