@@ -70,7 +70,11 @@ impl SerialConfig {
             DataBits::Seven => 7,
             DataBits::Eight => 8,
         };
-        let parity = if matches!(self.parity, Parity::None) { 0 } else { 1 };
+        let parity = if matches!(self.parity, Parity::None) {
+            0
+        } else {
+            1
+        };
         let stop = match self.stop_bits {
             StopBits::One => 1,
             StopBits::Two => 2,

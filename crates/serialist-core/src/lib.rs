@@ -6,10 +6,12 @@
 
 pub mod config;
 pub mod port;
+pub mod session;
 pub mod transport;
 
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
+pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use transport::{
     ControlLine, Transport, TransportError, TransportFactory, TransportReader, TransportWriter,
 };
