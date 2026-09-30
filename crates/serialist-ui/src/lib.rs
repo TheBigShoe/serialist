@@ -16,6 +16,7 @@ pub mod config;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
+pub mod framed;
 pub mod history;
 pub mod inline;
 pub mod keymap;
@@ -55,8 +56,9 @@ pub use config::{Config, ConfigPiece, ConfigProblem, Opener};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
-pub use export::{ExportFormat, ExportJob};
+pub use export::{ExportFormat, ExportJob, FramesFormat};
 pub use fonts::{TerminalFont, UiFont};
+pub use framed::{FilteredText, FramedFilter};
 pub use history::PersistentHistory;
 pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
@@ -68,7 +70,7 @@ pub use session_handle::{
     CoreSessionOpener, SessionControl, SessionHandle, SessionOpener, SharedSession,
 };
 pub use session_options::{DisplayDefaults, SessionOptions};
-pub use session_view::{SessionView, SessionViewEvent};
+pub use session_view::{ActiveCodec, SessionView, SessionViewEvent};
 pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
@@ -105,9 +107,14 @@ pub mod prelude {
     pub use gpui_kit::component::{WindowExt, v_resizable};
     // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait
     // through its private re-export, and `#[schemars(crate = …)]` points the derive here.
+    pub use gpui_kit::component::IndexPath;
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
+    pub use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+    pub use gpui_kit::component::table::{
+        Column, DataTable, TableDelegate, TableEvent, TableState,
+    };
     pub use gpui_kit::component::{
         ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeConfig, ThemeConfigColors,
         ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,

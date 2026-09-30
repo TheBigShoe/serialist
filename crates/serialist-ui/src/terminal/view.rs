@@ -430,6 +430,25 @@ impl TerminalView {
         &self.marks
     }
 
+    /// Replace every mark with `marks` (sorted here, the last [`MAX_MARKS`] kept), as when
+    /// the owner keeps them in ids of its own and the source's ids changed meaning.
+    pub fn set_marks(&mut self, mut marks: Vec<SearchMatch>, cx: &mut Context<Self>) {
+        marks.sort_by_key(|m| (m.line, m.range.start));
+        if marks.len() > MAX_MARKS {
+            marks.drain(..marks.len() - MAX_MARKS);
+        }
+        if *self.marks != marks {
+            self.marks = Arc::new(marks);
+            cx.notify();
+        }
+    }
+
+    /// Scroll so that `line` of the source on screen is in view, if it is not.
+    pub fn reveal(&mut self, line: LineId, cx: &mut Context<Self>) {
+        self.scroll.reveal(line);
+        cx.notify();
+    }
+
     /// Highlight `range` of text line `line`, keeping the newest [`MAX_MARKS`].
     pub fn add_mark(&mut self, mark: SearchMatch, cx: &mut Context<Self>) {
         let marks = Arc::make_mut(&mut self.marks);

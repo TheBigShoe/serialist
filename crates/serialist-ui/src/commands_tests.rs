@@ -612,7 +612,15 @@ fn the_bundled_examples_are_read_only_and_copy_to_the_user(cx: &mut TestAppConte
         .collection("AT basics (copy)")
         .expect("the copy is loaded");
     assert!(!copied.is_read_only());
-    assert_eq!(copied.commands().count(), 5);
+    assert_eq!(
+        copied.commands().count(),
+        CommandCollection::bundled_examples().commands().count()
+    );
+    // The RACE commands' frame predicates survive the copy.
+    let (_, version) = copied
+        .find("RACE version")
+        .expect("the RACE group is copied");
+    assert!(version.expect.as_ref().is_some_and(|e| e.frame.is_some()));
 }
 
 /// Copying a collection that has been copied before numbers the new one instead of

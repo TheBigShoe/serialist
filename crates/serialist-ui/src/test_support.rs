@@ -291,6 +291,32 @@ impl Drop for TestDir {
     }
 }
 
+/// The rows of a CSV file as an export writes it, quotes undone.
+pub(crate) fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut cell = String::new();
+    let mut quoted = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', true) if chars.peek() == Some(&'"') => {
+                cell.push('"');
+                chars.next();
+            }
+            ('"', true) => quoted = false,
+            ('"', false) if cell.is_empty() => quoted = true,
+            (',', false) => row.push(std::mem::take(&mut cell)),
+            ('\n', false) => {
+                row.push(std::mem::take(&mut cell));
+                rows.push(std::mem::take(&mut row));
+            }
+            (c, _) => cell.push(c),
+        }
+    }
+    rows
+}
+
 // Driving the real engine (Session and ingest threads over SimWorld links) from a
 // headless workspace. The engine runs on real threads, so waits are bounded in real
 // time. Each step runs whatever the ingest thread's doorbell woke, then advances the
