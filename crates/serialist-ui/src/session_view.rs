@@ -81,8 +81,8 @@ use crate::config::Config;
 use crate::export::{ExportFormat, ExportJob};
 use crate::history::PersistentHistory;
 use crate::inline::{
-    EchoLine, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
-    paste_bytes,
+    Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
+    paste_bytes, paste_echo,
 };
 use crate::prelude::*;
 use crate::scrollback::{Floors, Scrollback};
@@ -160,6 +160,19 @@ fn bound_in_innermost_context(keystroke: &Keystroke, stack: &[KeyContext], cx: &
         })
 }
 
+/// Echo one key into the scrollback with local echo on: text grows the `Tx` line being
+/// typed, Backspace takes its last character back, Enter ends it. Control keys and
+/// escape sequences echo as nothing.
+fn echo_key(ingest: &IngestHandle, echo: &Echo) {
+    // Nothing to do about an ingest thread that has stopped: the session is over.
+    let _ = match echo {
+        Echo::Text(text) => ingest.append_local_inline(text.as_str(), Direction::Tx),
+        Echo::Backspace => ingest.truncate_local_line(1),
+        Echo::Enter => ingest.append_local_inline("\n", Direction::Tx),
+        Echo::Nothing => Ok(()),
+    };
+}
+
 /// A paste going out in chunks.
 struct PasteJob {
     id: u64,
@@ -171,8 +184,6 @@ struct PasteJob {
 /// Inline mode's state.
 #[derive(Default)]
 struct InlineState {
-    /// Typed since the last Enter, for local echo.
-    echo: EchoLine,
     chord: EscapeChord,
     paste: Option<PasteJob>,
     next_paste: u64,
@@ -581,14 +592,15 @@ impl SessionView {
 
     /// Hand `snapshot` to the terminal if it holds anything new. Returns whether it did.
     fn show(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) -> bool {
-        let before = self.snapshot().stats();
-        let after = snapshot.stats();
-        if before == after {
+        // A snapshot of what the view already has: a wake that found nothing new. (Not
+        // the stats, which cannot see a line being typed change without changing size.)
+        if self.snapshot().is_same_publication(&snapshot) {
             return false;
         }
-        // The line that was still arriving may have grown, so it counts as changed.
-        let changed =
-            LineId(before.end_line.0.saturating_sub(1)).max(after.first_line)..after.end_line;
+        let after = snapshot.stats();
+        // The lines that were still open (the one arriving, the ones being typed) may
+        // have changed, so they count as changed along with the new ones.
+        let changed = self.snapshot().committed_end().max(after.first_line)..after.end_line;
         self.scrollback = Scrollback::with_hex_row(&snapshot, self.floors, self.hex_bytes_per_row);
         self.push_sources(cx, |terminal, cx| terminal.lines_appended(changed, cx));
         true
@@ -846,12 +858,11 @@ impl SessionView {
             }
             Mode::Command => {
                 self.inline.paste = None;
-                let typed = self.inline.echo.take();
-                if !typed.is_empty()
-                    && self.compose.read(cx).local_echo()
+                // What was typed and not ended with Enter stays as the line it is.
+                if self.compose.read(cx).local_echo()
                     && let Some((_, ingest)) = self.live()
                 {
-                    let _ = ingest.append_local(typed, Direction::Tx);
+                    let _ = ingest.append_local_inline("\n", Direction::Tx);
                 }
                 self.terminal
                     .update(cx, |terminal, cx| terminal.set_inline(false, cx));
@@ -932,38 +943,23 @@ impl SessionView {
         }
     }
 
-    /// Write one key's bytes, echoing it first when local echo is on: typed text
-    /// collects until Enter, which echoes the line before the line ending goes out.
+    /// Write one key's bytes, echoing it first when local echo is on: the key is typed
+    /// into the scrollback's `Tx` line as it is pressed (see [`crate::inline`]). The
+    /// echo is queued before the write, and ingest applies it before the next session
+    /// event, so it always lands before the reply it causes.
     pub fn send_key(&mut self, key: EncodedKey, cx: &mut Context<Self>) {
-        if self.live().is_none() {
+        let echo = self.compose.read(cx).local_echo();
+        let Some((session, ingest)) = self.live() else {
             self.notice = Some(Notice::error("Not connected; key not sent"));
             cx.notify();
             return;
-        }
-        let finished = if self.compose.read(cx).local_echo() {
-            let finished = self.inline.echo.key(&key.echo);
-            self.show_pending_input(cx);
-            finished
-        } else {
-            None
         };
-        let Some((session, ingest)) = self.live() else {
-            return;
-        };
-        if let Some(line) = finished.filter(|line| !line.is_empty()) {
-            let _ = ingest.append_local(line, Direction::Tx);
+        if echo {
+            echo_key(ingest, &key.echo);
         }
         if session.write(key.bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
         }
-    }
-
-    /// Show what was typed since the last Enter at the terminal's foot.
-    fn show_pending_input(&self, cx: &mut Context<Self>) {
-        let pending = SharedString::from(self.inline.echo.text().to_owned());
-        self.terminal.update(cx, |terminal, cx| {
-            terminal.set_pending_input(Some(pending), cx)
-        });
     }
 
     /// Send `text` as a paste: line breaks become what Enter sends, and the bytes go
@@ -981,14 +977,10 @@ impl SessionView {
             cx.notify();
             return;
         }
-        if self.compose.read(cx).local_echo() {
-            let lines = self.inline.echo.paste(text);
-            self.show_pending_input(cx);
-            if let Some((_, ingest)) = self.live() {
-                for line in lines.into_iter().filter(|line| !line.is_empty()) {
-                    let _ = ingest.append_local(line, Direction::Tx);
-                }
-            }
+        if self.compose.read(cx).local_echo()
+            && let Some((_, ingest)) = self.live()
+        {
+            let _ = ingest.append_local_inline(paste_echo(text), Direction::Tx);
         }
         let chunks: Vec<Vec<u8>> = bytes
             .chunks(settings.paste_chunk_bytes.max(1))
