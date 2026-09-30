@@ -9,13 +9,17 @@ pub const USAGE: &str = "\
 Usage: serialist [OPTIONS]
 
 Options:
-  --port <PATH>       Open this port at startup (virtual:<NAME> for a simulated one)
+  --port <PATH>       Open this port at startup in a tab of its own (virtual:<NAME>
+                      for a simulated one). Repeatable
   --baud <N>          Baud rate for --port and the Connect field, any positive
                       integer (default 115200)
   --virtual [NAME]    List the simulated devices next to the real ports; with a
-                      NAME, also open virtual:<NAME> at startup (repeatable; the
-                      first is opened unless --port is given). Built-ins: echo,
-                      echo-lines, at, firehose, firehose-ansi, race
+                      NAME, also open virtual:<NAME> at startup in a tab of its
+                      own. Repeatable. Built-ins: echo, echo-lines, at, firehose,
+                      firehose-ansi, race
+                      Ports named with --port and --virtual open in the order
+                      given, the first one in front; with none, the tabs open at
+                      the last quit reopen (the restore_session setting)
   --config-dir <DIR>  Read settings.json, keymap.json, themes/, commands/ and
                       scripts/, and keep history.jsonl, in DIR instead of the user
                       config directory (also SERIALIST_CONFIG_DIR)
@@ -31,10 +35,14 @@ Logging follows RUST_LOG, for example RUST_LOG=serialist=debug.";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Args {
-    pub port: Option<String>,
+    /// Ports named with `--port`, in order.
+    pub ports: Vec<String>,
     pub baud: Option<u32>,
     /// Simulated devices named with `--virtual NAME`, in order.
     pub virtual_devices: Vec<String>,
+    /// Every port to open at startup, a tab each: `--port PATH` and `--virtual NAME`
+    /// (as `virtual:NAME`) in the order they were given.
+    pub open: Vec<String>,
     /// `--virtual` was given at all, with or without a name.
     pub simulator: bool,
     /// `--terminal-demo`: the terminal element alone, over an in-memory stream.
@@ -61,7 +69,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
             // The name is optional, so only a following non-flag argument is taken.
             parsed.simulator = true;
             if let Some(name) = args.next_if(|next| !next.starts_with('-')) {
-                parsed.virtual_devices.push(name);
+                parsed.add_virtual(name);
             }
             continue;
         }
@@ -82,7 +90,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
             "--terminal-demo" if inline.is_none() => parsed.terminal_demo = true,
-            "--port" => parsed.port = Some(value("--port")?),
+            "--port" => {
+                let port = value("--port")?;
+                parsed.open.push(port.clone());
+                parsed.ports.push(port);
+            }
             "--config-dir" => parsed.config_dir = Some(PathBuf::from(value("--config-dir")?)),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--baud" => {
@@ -94,14 +106,22 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
             "--virtual" => {
                 // Only the `--virtual=NAME` spelling reaches here.
                 parsed.simulator = true;
-                parsed
-                    .virtual_devices
-                    .extend(inline.filter(|name| !name.is_empty()));
+                if let Some(name) = inline.filter(|name| !name.is_empty()) {
+                    parsed.add_virtual(name);
+                }
             }
             other => bail!("unknown argument {other:?}"),
         }
     }
     Ok(Command::Run(parsed))
+}
+
+impl Args {
+    /// `--virtual NAME`: list the simulator and open `virtual:NAME`.
+    fn add_virtual(&mut self, name: String) {
+        self.open.push(format!("virtual:{name}"));
+        self.virtual_devices.push(name);
+    }
 }
 
 #[cfg(test)]
@@ -120,9 +140,14 @@ mod tests {
     #[test]
     fn all_flags_in_both_spellings() {
         let expected = Command::Run(Args {
-            port: Some("/dev/cu.usbserial-1420".into()),
+            ports: vec!["/dev/cu.usbserial-1420".into()],
             baud: Some(921_600),
             virtual_devices: vec!["echo".into(), "at".into()],
+            open: vec![
+                "/dev/cu.usbserial-1420".into(),
+                "virtual:echo".into(),
+                "virtual:at".into(),
+            ],
             simulator: true,
             terminal_demo: false,
             config_dir: Some(PathBuf::from("/tmp/serialist config")),
@@ -171,6 +196,27 @@ mod tests {
             "a flag is not a device name"
         );
         assert_eq!(args.baud, Some(9600));
+    }
+
+    #[test]
+    fn ports_and_virtual_devices_open_in_the_order_given() {
+        let Command::Run(args) = run(&[
+            "--virtual",
+            "at",
+            "--port",
+            "/dev/ttyUSB0",
+            "--virtual=race",
+            "--port=virtual:echo",
+        ])
+        .unwrap() else {
+            panic!("expected run");
+        };
+        assert_eq!(
+            args.open,
+            ["virtual:at", "/dev/ttyUSB0", "virtual:race", "virtual:echo"]
+        );
+        assert_eq!(args.ports, ["/dev/ttyUSB0", "virtual:echo"]);
+        assert_eq!(args.virtual_devices, ["at", "race"]);
     }
 
     #[test]

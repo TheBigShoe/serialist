@@ -66,8 +66,8 @@ fn open(cx: &mut TestAppContext, dir: &TestDir, watch: bool) -> Opened {
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         baud: None,
-        select_port: Some(PortId::new("virtual:race")),
-        connect_on_start: true,
+        select_port: None,
+        open_ports: vec![PortId::new("virtual:race")],
         store: None,
     };
     let paths = ConfigPaths::new(dir.path());

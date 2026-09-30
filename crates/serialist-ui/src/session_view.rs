@@ -37,6 +37,22 @@
 //! none while idle. A slow timer ([`HOUSEKEEPING`]) covers what moves without new lines:
 //! TX counters and a recording's byte count.
 //!
+//! # In a background tab
+//!
+//! The workspace hides the views of the tabs that are not active
+//! ([`SessionView::set_visible`]). A hidden view does not answer its doorbell: a ring
+//! only marks it stale, and since nothing acknowledges the stores, the ingest thread
+//! does not ring again. Everything behind the view carries on as before (the session,
+//! ingest and the store, the codec slot and the frame store, the recording sink, the
+//! script thread, pending expectations), but no snapshot is taken, no line is handed to
+//! the terminal and nothing repaints. Only the housekeeping timer looks in: it reads
+//! the counters and the link state (so a lost device still ends the session and stops
+//! its script and recording), puts the summaries of newly decoded frames into the
+//! scrollback, and notifies only when what the tab's label shows
+//! ([`SessionView::tab_status`]: the dot and the bytes received since the tab was left)
+//! changed. Showing the view again answers the missed ring at once: one snapshot of
+//! everything that arrived meanwhile.
+//!
 //! # Two modes
 //!
 //! In command mode the compose bar sends a line at a time. In inline mode (see
@@ -148,6 +164,7 @@ use crate::status::{
     ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusInputs, StatusLine,
     file_name, format_bytes,
 };
+use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
 use crate::terminal::{Clock, DisplayMode, TerminalView, TimestampMode};
 
@@ -448,6 +465,14 @@ pub struct SessionView {
     codec_select: Entity<SelectState<Vec<String>>>,
     codec_select_stale: bool,
     focus_handle: FocusHandle,
+    /// On screen: its tab is the active one. A hidden view leaves its doorbell
+    /// unanswered (see "In a background tab").
+    visible: bool,
+    /// A ring came while hidden.
+    missed_wake: bool,
+    /// RX bytes counted when the view was hidden, for what its tab label says arrived
+    /// since.
+    rx_seen: u64,
     _wake: Task<()>,
     _housekeeping: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -681,6 +706,9 @@ impl SessionView {
             codec_select,
             codec_select_stale: false,
             focus_handle: cx.focus_handle(),
+            visible: true,
+            missed_wake: false,
+            rx_seen: 0,
             _wake: wake,
             _housekeeping: housekeeping,
             _subscriptions: vec![
@@ -815,12 +843,92 @@ impl SessionView {
             .update(cx, |compose, cx| compose.focus(window, cx));
     }
 
+    /// Focus where typing goes in the current mode: the compose bar, or the terminal in
+    /// inline mode.
+    pub fn focus_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Command => self.focus_compose(window, cx),
+            Mode::Inline => {
+                let focus = self.terminal.focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+        }
+    }
+
+    // --- Tabs ------------------------------------------------------------------------
+
+    /// Whether the view is on screen (its tab is the active one).
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Put the view on screen or take it off (see "In a background tab"). Showing it
+    /// answers a ring missed meanwhile with one snapshot of everything that arrived.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            self.missed_wake = false;
+            self.refresh(cx);
+            cx.notify();
+        } else {
+            self.poll_session(cx);
+            self.rx_seen = self.stats.rx_bytes;
+        }
+        tracing::debug!(port = %self.port, visible, "session view");
+    }
+
+    /// Whether a ring came while the view was hidden and has not been answered.
+    pub fn missed_wake(&self) -> bool {
+        self.missed_wake
+    }
+
+    /// What the view's tab shows: the dot (recording over paused over connected), and
+    /// the bytes received since the tab was left.
+    pub fn tab_status(&self) -> TabStatus {
+        let state = match &self.state {
+            ConnectionState::Disconnected { error: None } => TabState::Disconnected,
+            ConnectionState::Disconnected { error: Some(_) } => TabState::Lost,
+            ConnectionState::Connected if self.recording_status.is_some() => TabState::Recording,
+            ConnectionState::Connected if self.pause.is_some() => TabState::Paused,
+            ConnectionState::Connected => TabState::Connected,
+        };
+        let unseen_bytes = if self.visible {
+            0
+        } else {
+            self.stats.rx_bytes.saturating_sub(self.rx_seen)
+        };
+        TabStatus {
+            state,
+            unseen_bytes,
+        }
+    }
+
+    /// The store's newest snapshot, taken now: what a hidden view would show if it were
+    /// on screen. `None` once the ingest thread is gone.
+    pub fn latest_snapshot(&self) -> Option<Snapshot> {
+        self.ingest.as_ref().map(IngestHandle::snapshot)
+    }
+
     // --- The data path ---------------------------------------------------------------
 
-    /// One ring of the doorbell: acknowledge both stores, then snapshot both, then show.
-    /// The frames are taken first: a chunk is stored before it is decoded, so the store
-    /// snapshot taken after holds the bytes of every frame in it.
+    /// One ring of the doorbell. On screen: [`Self::refresh`]. Hidden: remember it and
+    /// leave the stores unacknowledged, so the ingest thread rings no more until the
+    /// view is shown.
     fn wake(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.missed_wake = true;
+            return;
+        }
+        self.refresh(cx);
+    }
+
+    /// Acknowledge both stores, then snapshot both, then show. The frames are taken
+    /// first: a chunk is stored before it is decoded, so the store snapshot taken after
+    /// holds the bytes of every frame in it.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(ingest) = &self.ingest else {
             return;
         };
@@ -895,7 +1003,7 @@ impl SessionView {
     /// gone), or because it panicked, which takes its store with it. Show what it
     /// published last, then join it off the main thread to learn which.
     fn ingest_ended(&mut self, cx: &mut Context<Self>) {
-        self.wake(cx);
+        self.refresh(cx);
         let Some(ingest) = self.ingest.take() else {
             return;
         };
@@ -1082,6 +1190,10 @@ impl SessionView {
     }
 
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
+        if !self.visible {
+            self.background_housekeeping(cx);
+            return;
+        }
         // A running script's time in the status line moves on its own.
         let mut changed = self.poll_session(cx) | self.script_status().is_some();
         let recorded = self
@@ -1094,6 +1206,22 @@ impl SessionView {
             changed = true;
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    /// Housekeeping while hidden: read the counters and the link state, put the
+    /// summaries of new frames into the scrollback, and notify only if the tab's label
+    /// changed. No snapshot is taken and nothing reaches the terminal.
+    fn background_housekeeping(&mut self, cx: &mut Context<Self>) {
+        let before = self.tab_status();
+        self.poll_session(cx);
+        if self.decoded_inline && self.codec.is_some() {
+            // Without acknowledging the frame store: the doorbell stays quiet.
+            let frames = self.frames.snapshot();
+            self.take_frames(frames);
+        }
+        if self.tab_status() != before {
             cx.notify();
         }
     }

@@ -390,8 +390,8 @@ fn open_workspace_options(
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         baud: None,
-        select_port: connect_to.map(PortId::new),
-        connect_on_start: connect_to.is_some(),
+        select_port: None,
+        open_ports: connect_to.map(PortId::new).into_iter().collect(),
         store,
     };
     open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))

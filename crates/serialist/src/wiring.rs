@@ -2,10 +2,10 @@
 //!
 //! Real ports always: `RealPortSource` for the list and `SerialportFactory` to open
 //! them. With `--virtual` (or a `virtual:` `--port`), the simulator's devices are listed
-//! alongside them and `virtual:` ids open through the simulator; the first device named
-//! with `--virtual NAME` opens at startup, so `--virtual firehose` streams right away. A
-//! `RoutingTransportFactory` picks the backend from the id, so the UI never needs to
-//! know which one a port belongs to.
+//! alongside them and `virtual:` ids open through the simulator. Every port named with
+//! `--port PATH` or `--virtual NAME` opens at startup in a tab of its own, in the order
+//! given (so `--virtual firehose` streams right away). A `RoutingTransportFactory` picks
+//! the backend from the id, so the UI never needs to know which one a port belongs to.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use serialist_core::{
     MergedPortSource, PortId, PortSource, RealPortSource, RoutingTransportFactory,
     SerialportFactory, TransportFactory, VIRTUAL_SCHEME,
 };
-use serialist_sim::{SimWorld, virtual_port_id};
+use serialist_sim::SimWorld;
 use serialist_ui::AppOptions;
 
 use crate::cli::Args;
@@ -45,17 +45,10 @@ pub fn app_options(args: &Args) -> anyhow::Result<AppOptions> {
 /// [`app_options`] with the backends supplied, so tests can stand in for real hardware.
 pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppOptions> {
     let known = virtual_names(&world);
-    let port = args.port.as_ref().map(|path| PortId::new(path.clone()));
-    let virtual_port = port
-        .as_ref()
-        .filter(|p| scheme_of(p) == Some(VIRTUAL_SCHEME));
-
-    let requested = args
-        .virtual_devices
-        .iter()
-        .map(String::as_str)
-        .chain(virtual_port.map(|p| p.as_str().trim_start_matches("virtual:")));
-    for name in requested {
+    let open: Vec<PortId> = args.open.iter().cloned().map(PortId::new).collect();
+    let is_virtual = |port: &&PortId| scheme_of(port) == Some(VIRTUAL_SCHEME);
+    for port in open.iter().filter(is_virtual) {
+        let name = port.as_str().trim_start_matches("virtual:");
         if !known.iter().any(|k| k == name) {
             bail!(
                 "unknown virtual device {name:?}; known devices: {}",
@@ -64,7 +57,7 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
         }
     }
 
-    let simulate = args.simulator || virtual_port.is_some();
+    let simulate = args.simulator || open.iter().any(|port| is_virtual(&port));
     let router = RoutingTransportFactory::new(real.transport_factory);
     let (port_source, transport_factory) = if simulate {
         let source = MergedPortSource::new(vec![real.port_source, world.port_source()]);
@@ -75,15 +68,15 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
         (real.port_source, router)
     };
 
-    let first_virtual = args.virtual_devices.first().map(|n| virtual_port_id(n));
     Ok(AppOptions {
         port_source,
         transport_factory: Arc::new(transport_factory),
         // Without --baud the rate comes from the settings: a device profile, else
         // `default_baud`.
         baud: args.baud,
-        connect_on_start: port.is_some() || first_virtual.is_some(),
-        select_port: port.or(first_virtual),
+        select_port: open.first().cloned(),
+        // A tab each, in the order given; with none, the last session's tabs reopen.
+        open_ports: open,
         // Sized by the `scrollback_budget_bytes` setting.
         store: None,
     })
@@ -133,7 +126,12 @@ mod tests {
         }
     }
 
-    fn options(args: Args) -> anyhow::Result<AppOptions> {
+    /// The options for these flags, parsed as `main` parses them.
+    fn options(flags: &[&str]) -> anyhow::Result<AppOptions> {
+        let args = match crate::cli::parse(flags.iter().map(|flag| flag.to_string()))? {
+            crate::cli::Command::Run(args) => args,
+            other => panic!("{other:?}"),
+        };
         build(&args, fake_real(), SimWorld::new())
     }
 
@@ -155,12 +153,7 @@ mod tests {
 
     #[test]
     fn named_virtual_device_is_listed_with_real_ports_and_opened() {
-        let options = options(Args {
-            virtual_devices: vec!["echo".into()],
-            simulator: true,
-            ..Args::default()
-        })
-        .unwrap();
+        let options = options(&["--virtual", "echo"]).unwrap();
         assert_eq!(
             listed(&options),
             [
@@ -174,7 +167,11 @@ mod tests {
             ]
         );
         assert_eq!(options.select_port, Some(PortId::new("virtual:echo")));
-        assert!(options.connect_on_start, "a named device opens at startup");
+        assert_eq!(
+            options.open_ports,
+            [PortId::new("virtual:echo")],
+            "a named device opens at startup"
+        );
 
         assert_eq!(
             opens(&options, "virtual:echo").unwrap(),
@@ -192,20 +189,41 @@ mod tests {
     }
 
     #[test]
-    fn bare_virtual_lists_the_built_ins_without_selecting() {
-        let options = options(Args {
-            simulator: true,
-            ..Args::default()
-        })
+    fn several_ports_open_a_tab_each_in_the_order_given() {
+        let options = options(&[
+            "--virtual",
+            "at",
+            "--port",
+            FAKE_ADAPTER,
+            "--virtual",
+            "race",
+        ])
         .unwrap();
+        assert_eq!(
+            options.open_ports,
+            [
+                PortId::new("virtual:at"),
+                PortId::new(FAKE_ADAPTER),
+                PortId::new("virtual:race"),
+            ]
+        );
+        assert_eq!(options.select_port, Some(PortId::new("virtual:at")));
+    }
+
+    #[test]
+    fn bare_virtual_lists_the_built_ins_without_selecting() {
+        let options = options(&["--virtual"]).unwrap();
         assert_eq!(listed(&options).len(), 7);
         assert_eq!(options.select_port, None);
-        assert!(!options.connect_on_start);
+        assert!(
+            options.open_ports.is_empty(),
+            "the last session's tabs reopen"
+        );
     }
 
     #[test]
     fn without_virtual_only_real_ports_exist() {
-        let options = options(Args::default()).unwrap();
+        let options = options(&[]).unwrap();
         assert_eq!(listed(&options), [FAKE_ADAPTER]);
         assert!(matches!(
             opens(&options, "virtual:echo"),
@@ -215,48 +233,29 @@ mod tests {
 
     #[test]
     fn unknown_virtual_devices_are_rejected_with_the_list() {
-        let error = options(Args {
-            virtual_devices: vec!["toaster".into()],
-            simulator: true,
-            ..Args::default()
-        })
-        .err()
-        .expect("an error");
+        let error = options(&["--virtual", "at", "--virtual", "toaster"])
+            .err()
+            .expect("an error");
         assert_eq!(
             error.to_string(),
             "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi, race"
         );
-        assert!(
-            options(Args {
-                port: Some("virtual:toaster".into()),
-                ..Args::default()
-            })
-            .is_err()
-        );
+        assert!(options(&["--port", "virtual:toaster"]).is_err());
     }
 
     #[test]
     fn port_preselects_and_connects_at_the_given_baud() {
-        let options = options(Args {
-            port: Some(FAKE_ADAPTER.into()),
-            baud: Some(921_600),
-            ..Args::default()
-        })
-        .unwrap();
+        let options = options(&["--port", FAKE_ADAPTER, "--baud", "921600"]).unwrap();
         assert_eq!(options.select_port, Some(PortId::new(FAKE_ADAPTER)));
-        assert!(options.connect_on_start);
+        assert_eq!(options.open_ports, [PortId::new(FAKE_ADAPTER)]);
         assert_eq!(options.baud, Some(921_600), "--baud wins over profiles");
     }
 
     #[test]
     fn a_virtual_port_turns_the_simulator_on() {
-        let options = options(Args {
-            port: Some("virtual:at".into()),
-            ..Args::default()
-        })
-        .unwrap();
+        let options = options(&["--port", "virtual:at"]).unwrap();
         assert!(listed(&options).contains(&"virtual:at".to_owned()));
-        assert!(options.connect_on_start);
+        assert_eq!(options.open_ports, [PortId::new("virtual:at")]);
         assert!(opens(&options, "virtual:at").is_ok());
     }
 }

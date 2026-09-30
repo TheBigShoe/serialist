@@ -106,8 +106,8 @@ fn open(
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         baud: None,
-        select_port: Some(PortId::new(port)),
-        connect_on_start: true,
+        select_port: None,
+        open_ports: vec![PortId::new(port)],
         store: None,
     };
     let paths = ConfigPaths::new(dir.path());
