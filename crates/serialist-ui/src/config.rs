@@ -399,11 +399,6 @@ impl Config {
         self.set_problems(ConfigPiece::Commands, problems);
     }
 
-    /// Use `store` as the saved commands, as a reload would.
-    pub fn set_commands(&mut self, store: CommandStore) {
-        self.commands = Arc::new(store);
-    }
-
     /// Read the themes folder again.
     pub fn reload_themes(&mut self) {
         self.themes = Arc::new(ThemeRegistry::load_from(&self.paths));

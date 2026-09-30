@@ -16,8 +16,9 @@ Options:
                       NAME, also open virtual:<NAME> at startup (repeatable; the
                       first is opened unless --port is given). Built-ins: echo,
                       echo-lines, at, firehose, firehose-ansi
-  --config-dir <DIR>  Read settings.json, keymap.json and themes/ from DIR instead
-                      of the user config directory (also SERIALIST_CONFIG_DIR)
+  --config-dir <DIR>  Read settings.json, keymap.json, themes/ and commands/, and
+                      keep history.jsonl, in DIR instead of the user config
+                      directory (also SERIALIST_CONFIG_DIR)
   --terminal-demo     Open only the milestone 1 terminal element, fed by an
                       in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help
@@ -35,8 +36,8 @@ pub struct Args {
     pub simulator: bool,
     /// `--terminal-demo`: the terminal element alone, over an in-memory stream.
     pub terminal_demo: bool,
-    /// `--config-dir`: where settings, keymap and themes live, over the environment
-    /// and the platform default.
+    /// `--config-dir`: where settings, keymap, themes, saved commands and the compose
+    /// history live, over the environment and the platform default.
     pub config_dir: Option<PathBuf>,
 }
 
