@@ -69,6 +69,16 @@
 //! before the session event the thread is about to handle, so a sent-command echo
 //! always lands before the reply it caused.
 //!
+//! # Matchers
+//!
+//! [`IngestHandle::matchers`] hands out a [`MatcherHandle`], through which any thread can
+//! wait for a received line matching a regex (see [`crate::matcher`]). After each `Data`
+//! chunk is stored, published and shown to the sinks, the thread gives the lines the
+//! chunk finished to the pending expectations, and it expires overdue ones after every
+//! chunk and local line and on each idle tick. With nothing pending this costs one
+//! uncontended lock per chunk. The session's `Disconnected`, or the thread ending for any
+//! reason (a panic included), resolves every pending expectation as closed.
+//!
 //! The thread ends when the session's event channel closes (the session is gone) or on
 //! [`IngestHandle::stop`]; either way the store is handed back by `stop`/`join`, so a
 //! reconnect can keep the same scrollback. A panic on the thread (in a sink, say) is
@@ -84,6 +94,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select, unbounded};
 use parking_lot::Mutex;
 
+use crate::matcher::MatcherHandle;
 use crate::session::SessionEvent;
 use crate::store::{Snapshot, Store, StoreReader, StoreStats};
 use crate::text::Direction;
@@ -179,6 +190,16 @@ struct Shared {
     chunks: AtomicU64,
     bytes: AtomicU64,
     wakes: AtomicU64,
+    matchers: MatcherHandle,
+}
+
+/// Resolves the pending expectations when the worker ends, however it ends.
+struct CloseMatchers(Arc<Shared>);
+
+impl Drop for CloseMatchers {
+    fn drop(&mut self) {
+        self.0.matchers.close();
+    }
 }
 
 /// Starts ingest threads.
@@ -254,6 +275,13 @@ impl IngestHandle {
         self.commands
             .send(Command::Local(text.into(), direction, Instant::now()))
             .map_err(|_| IngestStopped)
+    }
+
+    /// The handle for waiting on received lines. It belongs to this ingest thread: once the
+    /// session disconnects or the thread ends, it resolves everything as closed, and a
+    /// reconnect (a new session, a new ingest thread) needs the new handle's matchers.
+    pub fn matchers(&self) -> MatcherHandle {
+        self.shared.matchers.clone()
     }
 
     /// Where the link stands now. The ingest thread updates it before it stores the
@@ -347,6 +375,8 @@ enum Flow {
 
 impl Worker {
     fn run(mut self) -> Store {
+        // Dropped on the way out, and while unwinding from a panic.
+        let _close_matchers = CloseMatchers(Arc::clone(&self.shared));
         loop {
             let flow = select! {
                 recv(self.commands) -> command => match command {
@@ -408,10 +438,11 @@ impl Worker {
 
     /// Tell the sinks that still expect chunks that the thread has been idle.
     fn idle(&mut self) {
+        let now = Instant::now();
+        self.shared.matchers.idle(now);
         if self.sinks_closed {
             return;
         }
-        let now = Instant::now();
         for sink in &mut self.sinks {
             sink.on_idle(now);
         }
@@ -445,6 +476,7 @@ impl Worker {
         match command {
             Command::Local(text, direction, at) => {
                 self.store.append_local_at(&text, direction, at);
+                self.local_lines_stored();
                 Flow::Continue
             }
             Command::Stop => Flow::Stop,
@@ -454,7 +486,7 @@ impl Worker {
     fn event(&mut self, event: SessionEvent) {
         match event {
             SessionEvent::Data { bytes, received_at } => {
-                self.store.append(&bytes, received_at);
+                let report = self.store.append(&bytes, received_at);
                 for sink in &mut self.sinks {
                     sink.on_chunk(&bytes, received_at);
                 }
@@ -462,6 +494,9 @@ impl Worker {
                 self.shared
                     .bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                self.shared
+                    .matchers
+                    .on_append(&self.store, &report, received_at);
             }
             SessionEvent::Connected { description } => {
                 self.set_state(LinkState::Connected {
@@ -469,6 +504,7 @@ impl Worker {
                 });
                 self.store
                     .append_local(&format!("Connected to {description}"), Direction::Notice);
+                self.local_lines_stored();
                 for sink in &mut self.sinks {
                     sink.on_connect(&description);
                 }
@@ -481,13 +517,25 @@ impl Worker {
                 };
                 self.set_state(LinkState::Disconnected { error });
                 self.store.append_local(&text, Direction::Notice);
+                self.local_lines_stored();
+                // Nothing more can arrive from this session.
+                self.shared.matchers.close();
                 self.close_sinks();
             }
             SessionEvent::WriteFailed(error) => {
                 self.store
                     .append_local(&format!("Write failed: {error}"), Direction::Notice);
+                self.local_lines_stored();
             }
         }
+    }
+
+    /// Lines that are not received data were just stored: tell the matchers, so an
+    /// expectation registered from now on starts after them.
+    fn local_lines_stored(&self) {
+        self.shared
+            .matchers
+            .advance(self.store.end(), Instant::now());
     }
 
     /// Publish a new link state. Called before the matching notice line is stored.
@@ -707,6 +755,64 @@ mod tests {
         );
         tx.send(data(b"boom\n")).unwrap();
         drop(handle);
+    }
+
+    /// A panic on the ingest thread resolves the pending expectations instead of leaving
+    /// them waiting for a thread that is gone.
+    #[test]
+    fn a_panicking_thread_closes_the_matchers() {
+        use crate::matcher::ExpectResult;
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(Exploding)],
+            Box::new(|| {}),
+        );
+        let expectation = handle
+            .matchers()
+            .expect("^never", Duration::from_secs(60))
+            .unwrap();
+        tx.send(data(b"boom\n")).unwrap();
+        assert_eq!(
+            expectation.wait_timeout(Duration::from_secs(5)),
+            Some(ExpectResult::Closed)
+        );
+        assert!(handle.join().is_err());
+    }
+
+    /// Received lines reach the matchers; local lines do not, and move the start.
+    #[test]
+    fn received_lines_reach_the_matchers_and_local_lines_do_not() {
+        use crate::matcher::ExpectResult;
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(rx, Store::default(), Vec::new(), Box::new(|| {}));
+        let matchers = handle.matchers();
+        let wanted = matchers.expect("^hello", Duration::from_secs(60)).unwrap();
+        handle.append_local("hello (echo)", Direction::Tx).unwrap();
+        tx.send(connected("virtual:x")).unwrap();
+        wait_for_lines(&handle, 2);
+        assert_eq!(
+            wanted.try_wait(),
+            None,
+            "an echo and a notice are not replies"
+        );
+        tx.send(data(b"hello\n")).unwrap();
+        match wanted.wait_timeout(Duration::from_secs(5)) {
+            Some(ExpectResult::Matched { line, text, .. }) => {
+                assert_eq!((line, text.as_str()), (LineId(2), "hello"));
+            }
+            other => panic!("expected a match, got {other:?}"),
+        }
+        // The session's Disconnected closes the registry.
+        let late = matchers.expect("x", Duration::from_secs(60)).unwrap();
+        tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+        assert_eq!(
+            late.wait_timeout(Duration::from_secs(5)),
+            Some(ExpectResult::Closed)
+        );
+        drop(tx);
+        handle.join().expect("the ingest thread ran cleanly");
     }
 
     /// Logs the link events a sink hears, in order.

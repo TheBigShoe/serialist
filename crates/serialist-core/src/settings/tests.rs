@@ -944,3 +944,109 @@ fn uncommenting_a_template_line_overrides_that_key() {
 fn bundled_defaults_text_is_exposed() {
     assert!(DEFAULT_SETTINGS_JSONC.contains("\"buffer_font_size\": 15.0"));
 }
+
+#[test]
+fn commands_and_history_live_in_the_config_directory() {
+    let paths = ConfigPaths::new("/cfg/serialist");
+    assert_eq!(paths.commands_dir(), Path::new("/cfg/serialist/commands"));
+    assert_eq!(
+        paths.history_path(),
+        Path::new("/cfg/serialist/history.jsonl")
+    );
+    assert_eq!(paths.project_commands, None);
+}
+
+#[test]
+fn project_commands_are_found_by_searching_upward() {
+    let root = TempDir::new("project-commands");
+    let deep = root.path().join("repo").join("fw").join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    assert_eq!(ConfigPaths::project_commands_path(&deep), None);
+
+    let outer = root.write("repo/.serialist/commands.json", "{}");
+    assert_eq!(ConfigPaths::project_commands_path(&deep), Some(outer));
+    // A nearer one wins.
+    let nearer = root.write("repo/fw/.serialist/commands.json", "{}");
+    assert_eq!(ConfigPaths::project_commands_path(&deep), Some(nearer));
+    // A directory of that name is not a file.
+    let elsewhere = TempDir::new("no-commands");
+    std::fs::create_dir_all(elsewhere.path().join(".serialist/commands.json")).unwrap();
+    assert_eq!(ConfigPaths::project_commands_path(elsewhere.path()), None);
+
+    // Settings and commands are found independently.
+    root.write("repo/.serialist/settings.json", "{}");
+    let paths = ConfigPaths::new(root.path().join("config")).with_project_from(&deep);
+    assert!(paths.project_settings.is_some());
+    assert!(paths.project_commands.is_some());
+    let only_settings = TempDir::new("only-settings");
+    only_settings.write(".serialist/settings.json", "{}");
+    let paths =
+        ConfigPaths::new(root.path().join("config")).with_project_from(only_settings.path());
+    assert!(paths.project_settings.is_some());
+    assert_eq!(paths.project_commands, None);
+}
+
+/// The template's commented lines with the leading `// ` taken off.
+fn uncommented(template: &str) -> String {
+    template
+        .lines()
+        .skip_while(|line| !line.trim().is_empty())
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.strip_prefix("// ") {
+                Some(code) => format!("{}{code}", &line[..line.len() - trimmed.len()]),
+                None => line.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_keymap_template_is_valid_changes_nothing_and_uncomments_to_the_defaults() {
+    for platform in [Platform::MacOs, Platform::Linux, Platform::Windows] {
+        let template = keymap_template(platform);
+        let parsed = crate::Keymap::parse(&template, Path::new("keymap.json")).unwrap();
+        assert!(parsed.entries.is_empty(), "{platform:?}");
+        for line in template.lines() {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.is_empty() || trimmed.starts_with("//") || trimmed == "[" || trimmed == "]",
+                "live line in the {platform:?} template: {line:?}"
+            );
+        }
+        // Uncommenting every line gives back the bundled defaults.
+        let restored = crate::Keymap::parse(&uncommented(&template), Path::new("keymap.json"))
+            .unwrap_or_else(|err| panic!("{platform:?}: {err}"));
+        assert_eq!(restored, crate::Keymap::bundled(platform), "{platform:?}");
+        // The header teaches the format, and the defaults are there to copy.
+        assert!(template.contains("Bind a key to null"), "{platform:?}");
+        let clear = template
+            .lines()
+            .find(|line| line.contains("\"terminal::Clear\""))
+            .unwrap_or_else(|| panic!("{platform:?}: no terminal::Clear binding"));
+        assert!(clear.trim_start().starts_with("// \""), "{clear}");
+    }
+    // The header does not repeat the bundled file's own.
+    assert!(!keymap_template(Platform::MacOs).contains("default key bindings for macOS"));
+}
+
+#[test]
+fn ensure_keymap_file_writes_a_commented_template_once() {
+    let root = TempDir::new("ensure-keymap");
+    let paths = ConfigPaths::new(root.path().join("nested").join("config"));
+
+    assert!(paths.ensure_keymap_file().unwrap());
+    let text = std::fs::read_to_string(&paths.keymap).unwrap();
+    assert_eq!(text, keymap_template(Platform::current()));
+    // Loading it adds nothing to the bundled defaults.
+    let loaded = crate::load_keymap(Some(&paths.keymap)).unwrap();
+    assert_eq!(loaded, crate::Keymap::bundled_default());
+
+    // A second call leaves the user's file alone.
+    std::fs::write(&paths.keymap, "[]").unwrap();
+    assert!(!paths.ensure_keymap_file().unwrap());
+    assert_eq!(std::fs::read_to_string(&paths.keymap).unwrap(), "[]");
+    // And the settings file is separate.
+    assert!(paths.ensure_settings_file().unwrap());
+}

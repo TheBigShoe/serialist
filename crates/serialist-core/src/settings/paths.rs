@@ -6,6 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::defaults::DEFAULT_SETTINGS_JSONC;
+use crate::keymap::Keymap;
 
 /// Set to a directory to use it as the config directory on any platform.
 pub const CONFIG_DIR_ENV: &str = "SERIALIST_CONFIG_DIR";
@@ -49,6 +50,8 @@ pub struct ConfigPaths {
     pub themes: PathBuf,
     /// A project-local `.serialist/settings.json`, when one was found.
     pub project_settings: Option<PathBuf>,
+    /// A project-local `.serialist/commands.json`, when one was found.
+    pub project_commands: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -60,6 +63,7 @@ impl ConfigPaths {
             keymap: dir.join("keymap.json"),
             themes: dir.join("themes"),
             project_settings: None,
+            project_commands: None,
             dir,
         }
     }
@@ -94,9 +98,20 @@ impl ConfigPaths {
         }))
     }
 
-    /// Adds the project settings file found by searching up from `cwd`.
+    /// `commands/` in `dir`: saved-command collections, one `*.json` each.
+    pub fn commands_dir(&self) -> PathBuf {
+        self.dir.join("commands")
+    }
+
+    /// `history.jsonl` in `dir`: the compose bar's history, one JSON string per line.
+    pub fn history_path(&self) -> PathBuf {
+        self.dir.join("history.jsonl")
+    }
+
+    /// Adds the project settings and commands files found by searching up from `cwd`.
     pub fn with_project_from(mut self, cwd: &Path) -> Self {
         self.project_settings = Self::project_settings_path(cwd);
+        self.project_commands = Self::project_commands_path(cwd);
         self
     }
 
@@ -107,24 +122,71 @@ impl ConfigPaths {
             .find(|candidate| candidate.is_file())
     }
 
+    /// The nearest `.serialist/commands.json` in `cwd` or any of its ancestors.
+    pub fn project_commands_path(cwd: &Path) -> Option<PathBuf> {
+        cwd.ancestors()
+            .map(|dir| dir.join(".serialist").join("commands.json"))
+            .find(|candidate| candidate.is_file())
+    }
+
     /// Writes the commented settings template if `settings.json` does not exist,
     /// creating the config directory as needed. Returns whether it wrote the file.
     /// An existing file is never touched.
     pub fn ensure_settings_file(&self) -> io::Result<bool> {
+        self.create_new(&self.settings, &settings_template())
+    }
+
+    /// Writes the commented keymap template if `keymap.json` does not exist, creating
+    /// the config directory as needed. Returns whether it wrote the file. An existing
+    /// file is never touched. The template is an empty keymap, so it changes nothing
+    /// until a section is uncommented; see [`keymap_template`].
+    pub fn ensure_keymap_file(&self) -> io::Result<bool> {
+        self.create_new(&self.keymap, &keymap_template(Platform::current()))
+    }
+
+    fn create_new(&self, path: &Path, text: &str) -> io::Result<bool> {
         std::fs::create_dir_all(&self.dir)?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.settings)
-        {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                file.write_all(settings_template().as_bytes())?;
+                file.write_all(text.as_bytes())?;
                 Ok(true)
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(err) => Err(err),
         }
     }
+}
+
+/// A keymap file that is valid and changes nothing: the header explains the format, and
+/// the bundled defaults for `platform` follow with every line commented out, so a section
+/// can be uncommented and edited to override it. The array brackets stay live.
+pub fn keymap_template(platform: Platform) -> String {
+    let mut out = String::from(
+        "// Serialist key bindings, in Zed's keymap format: a list of sections, each with an\n\
+         // optional key context and a map of keystrokes to actions. This file is applied\n\
+         // after the bundled defaults, so its bindings win. Bind a key to null to unbind it.\n\
+         // The defaults for this platform are listed below, commented out: uncomment a\n\
+         // section and change a key to override it. A saved command can also carry its own\n\
+         // \"keybinding\" in its commands/*.json file.\n\n",
+    );
+    let source = Keymap::bundled_source(platform);
+    // Drop the bundled file's own header, which describes the bundled copy.
+    let body = source.split_once("\n[\n").map_or(source, |(_, rest)| rest);
+    out.push_str("[\n");
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        // The outer closing bracket is the only line in column 0 that is code.
+        if line == "]" || trimmed.is_empty() || trimmed.starts_with("//") {
+            out.push_str(line);
+        } else {
+            let indent = &line[..line.len() - trimmed.len()];
+            out.push_str(indent);
+            out.push_str("// ");
+            out.push_str(trimmed);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// The bundled defaults with every setting commented out, so the file is valid, changes
