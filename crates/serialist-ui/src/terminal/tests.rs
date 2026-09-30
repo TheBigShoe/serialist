@@ -16,6 +16,13 @@ use crate::terminal::layout::Viewport;
 use crate::terminal::{DisplayMode, FrameSample, TerminalView, TimestampMode};
 use crate::test_support::open_test_window;
 
+/// gpui-kit's `Input` binds select-all to the platform primary modifier.
+const INPUT_SELECT_ALL: &str = if cfg!(target_os = "macos") {
+    "cmd-a"
+} else {
+    "ctrl-a"
+};
+
 fn open(
     cx: &mut TestAppContext,
     source: Arc<dyn LineSource>,
@@ -562,9 +569,10 @@ fn escape_cancels_an_in_flight_search(cx: &mut TestAppContext) {
         assert!(!view.search_results().pending);
     });
 
-    // Typing a new query cancels the old one the same way.
+    // Typing a new query cancels the old one the same way. Select-all here is the search
+    // input's own chord (the terminal's select-all is ctrl-shift-a off macOS).
     press(cx, window, keys::SEARCH);
-    press(cx, window, keys::SELECT_ALL);
+    press(cx, window, INPUT_SELECT_ALL);
     cx.update_window(window, |_, window, cx| window.input("err", cx))
         .unwrap();
     let first = view
