@@ -56,6 +56,9 @@ impl Default for HexStyles {
 /// arrive and are evicted. Each row is one [`StyledLine`] with three runs (offset, hex,
 /// ASCII); `raw` is the row's byte range and `received_at` the arrival time of the line
 /// holding its first byte. A row clipped by eviction shows blanks for the missing bytes.
+///
+/// A hex view is also a [`Searcher`] over the rows' text, and [`HexView::search_in`]
+/// bounds that search to a range of rows.
 #[derive(Clone, Debug)]
 pub struct HexView {
     snap: Snapshot,
