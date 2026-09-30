@@ -258,6 +258,12 @@ pub(crate) fn open_test_window_sized<V: Render>(
     build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
 ) -> (AnyWindowHandle, Entity<V>) {
     cx.update(|cx| {
+        // Animations (a dialog's 250 ms slide and fade) run on the wall clock, not on the
+        // test clock. A click aimed at a button in a dialog that is still sliding in lands
+        // where the button was some frames ago: close enough on a fast machine, a miss on
+        // a loaded one. With reduced motion they show their end state from the first frame,
+        // as in the screenshot harness.
+        cx.set_reduce_motion(true);
         crate::workspace::init(cx);
         let bounds = Bounds {
             origin: Point::default(),
