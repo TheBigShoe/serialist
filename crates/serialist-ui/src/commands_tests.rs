@@ -403,11 +403,17 @@ fn the_highlight_is_the_range_the_matcher_found(cx: &mut TestAppContext) {
     let first = marks(cx);
     assert_eq!(first.len(), 1);
     // The mark lands when the expectation resolves; the view's snapshot follows on the
-    // next wake, so wait for the marked line to be shown before reading it.
+    // next wake, so wait for the marked line to be shown before reading it. The matcher
+    // only sees finished lines, while the snapshot may still hold the line half received
+    // (the link is paced), so wait for it to be complete too.
     let source_with = |cx: &mut TestAppContext, line: LineId| {
-        run_until(cx, "the marked line to be shown", |cx| {
+        run_until(cx, "the marked line to be shown whole", |cx| {
             view.read_with(cx, |v, cx| {
-                v.terminal().read(cx).source().line(line).is_some()
+                v.terminal()
+                    .read(cx)
+                    .source()
+                    .line(line)
+                    .is_some_and(|line| line.complete)
             })
         });
         view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone())
