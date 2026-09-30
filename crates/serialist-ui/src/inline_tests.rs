@@ -55,6 +55,14 @@ fn open_view(
     (window, view, feed)
 }
 
+/// Wait until ingest has applied everything a test queued so far. Ingest applies local
+/// lines queued before a received chunk ahead of it, so once a line the device sends
+/// now is shown, so is the effect of every key pressed before it.
+fn settle(cx: &mut TestAppContext, view: &Entity<SessionView>, feed: &FakeFeed, marker: &str) {
+    feed.data(format!("{marker}\r\n").as_bytes());
+    run_until(cx, marker, |cx| has_rx_line(cx, view, marker));
+}
+
 fn set_mode(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
@@ -202,7 +210,7 @@ fn local_echo_shows_typed_text_as_it_is_typed(cx: &mut TestAppContext) {
         press(cx, window, key);
     }
     run_until(cx, "the backspace", |cx| tx_lines(cx, &view) == ["hi"]);
-    step(cx, 3);
+    // (The other two keys queue nothing for ingest, so this is the whole state.)
     assert_eq!(tx_lines(cx, &view), ["hi"]);
     let open = displayed(cx, &view).pop().expect("lines");
     assert_eq!(
@@ -231,18 +239,21 @@ fn local_echo_shows_typed_text_as_it_is_typed(cx: &mut TestAppContext) {
     // Leaving inline mode ends what was typed since the last Enter.
     press(cx, window, "o");
     press(cx, window, "k");
-    run_until(cx, "the partial line", |cx| tx_lines(cx, &view).len() == 2);
-    assert_eq!(tx_lines(cx, &view), ["hi", "ok"]);
+    run_until(cx, "the partial line", |cx| {
+        tx_lines(cx, &view) == ["hi", "ok"]
+    });
     set_mode(cx, window, &view, Mode::Command);
     run_until(cx, "the line to end", |cx| {
         displayed(cx, &view)
             .last()
             .is_some_and(|line| line.complete)
     });
-    // Backspace in the next session of typing does not eat into it.
+    // Backspace in the next session of typing does not eat into it. It does queue a
+    // take-back for ingest, so wait for a line the device sends after it: ingest applies
+    // what was queued before a received chunk before the chunk.
     set_mode(cx, window, &view, Mode::Inline);
     press(cx, window, "backspace");
-    step(cx, 3);
+    settle(cx, &view, &feed, "after the backspace");
     assert_eq!(tx_lines(cx, &view), ["hi", "ok"]);
 }
 
@@ -326,9 +337,9 @@ fn without_local_echo_nothing_is_echoed(cx: &mut TestAppContext) {
     run_until(cx, "the reply", |cx| has_rx_line(cx, &view, "reply"));
     assert!(tx_lines(cx, &view).is_empty());
     assert_eq!(feed.written().len(), 4);
-    // Leaving inline mode adds nothing either.
+    // Leaving inline mode adds nothing either (with echo off it queues nothing).
     set_mode(cx, window, &view, Mode::Command);
-    step(cx, 3);
+    settle(cx, &view, &feed, "after leaving");
     assert!(tx_lines(cx, &view).is_empty());
 }
 

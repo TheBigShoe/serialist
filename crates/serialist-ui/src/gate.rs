@@ -198,6 +198,11 @@ fn stress_firehose_stays_in_budget_and_counts_every_byte(cx: &mut TestAppContext
             format_bytes(stats.raw_start)
         ))
     );
+    // The ingest thread counts a chunk after it publishes it, so a snapshot holding every
+    // byte can be read a moment before the counter has them.
+    run_until(cx, "ingest to have counted every byte", |cx| {
+        view.read_with(cx, |v, _| v.ingest_stats().unwrap().bytes == CAP)
+    });
     let ingest = view.read_with(cx, |v, _| v.ingest_stats().unwrap());
     assert_eq!(ingest.bytes, CAP, "ingest took in every byte");
     assert!(snapshots > 0);
