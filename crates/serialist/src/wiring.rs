@@ -2,7 +2,8 @@
 //!
 //! Real ports always: `RealPortSource` for the list and `SerialportFactory` to open
 //! them. With `--virtual` (or a `virtual:` `--port`), the simulator's devices are listed
-//! alongside them and `virtual:` ids open through the simulator. A
+//! alongside them and `virtual:` ids open through the simulator; the first device named
+//! with `--virtual NAME` opens at startup, so `--virtual firehose` streams right away. A
 //! `RoutingTransportFactory` picks the backend from the id, so the UI never needs to
 //! know which one a port belongs to.
 
@@ -83,7 +84,7 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
         port_source,
         transport_factory: Arc::new(transport_factory),
         serial,
-        connect_on_start: port.is_some(),
+        connect_on_start: port.is_some() || first_virtual.is_some(),
         select_port: port.or(first_virtual),
         store: StoreConfig::default(),
     })
@@ -154,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn named_virtual_device_is_listed_with_real_ports_and_selected() {
+    fn named_virtual_device_is_listed_with_real_ports_and_opened() {
         let options = options(Args {
             virtual_devices: vec!["echo".into()],
             simulator: true,
@@ -173,7 +174,7 @@ mod tests {
             ]
         );
         assert_eq!(options.select_port, Some(PortId::new("virtual:echo")));
-        assert!(!options.connect_on_start);
+        assert!(options.connect_on_start, "a named device opens at startup");
 
         assert_eq!(
             opens(&options, "virtual:echo").unwrap(),
@@ -199,6 +200,7 @@ mod tests {
         .unwrap();
         assert_eq!(listed(&options).len(), 6);
         assert_eq!(options.select_port, None);
+        assert!(!options.connect_on_start);
     }
 
     #[test]
