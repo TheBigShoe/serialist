@@ -10,9 +10,15 @@ authors.workspace = true
 [dependencies]
 serialist-core.workspace = true
 crossbeam-channel.workspace = true
+memchr.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "link_throughput"
+harness = false
