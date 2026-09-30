@@ -89,6 +89,9 @@ pub mod prelude {
     pub use gpui_kit::prelude::*;
     pub use gpui_kit::*;
     pub use gpui_kit::{init as kit_init, open_window as kit_open_window};
+    // The bundled icon set (chevrons, the dialog's close X, ...). An app registers it with
+    // `Application::with_assets`; without one every SVG icon renders as nothing.
+    pub use gpui_kit::assets::Assets;
 
     // Headless UI-test helpers; they exist only with gpui-kit's `test-support` feature,
     // which the dev-dependency turns on.

@@ -425,12 +425,11 @@ impl Stage {
             .expect("write the example scripts");
         let world = (shot.world)();
 
-        // No asset source, as in the app: the binary's `application()` installs none, so
-        // SVG icons (a select's chevron, a dialog's close button) do not draw there
-        // either. Keep this in step with `crates/serialist/src/main.rs`.
+        // The bundled icon set, as in the app, so SVG icons (a select's chevron, a
+        // dialog's close button) draw. Keep this in step with `crates/serialist/src/main.rs`.
         let mut cx = HeadlessAppContext::with_platform(
             text_system,
-            Arc::new(()),
+            Arc::new(Assets),
             platform::current_headless_renderer,
         );
         // The engine's ingest thread rings the session view's doorbell from its own
