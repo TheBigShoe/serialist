@@ -181,9 +181,11 @@ impl Config {
     pub fn load(paths: ConfigPaths, system_dark: bool) -> Self {
         let mut config = Self::bundled(paths);
         config.system_dark = system_dark;
-        config.reload_settings();
-        config.reload_keymap();
+        // Themes first, so the settings resolve their theme against the user's files
+        // rather than warning that it is missing from the bundled ones.
         config.reload_themes();
+        config.reload_keymap();
+        config.reload_settings();
         config
     }
 
@@ -526,9 +528,9 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
 /// Reload everything from disk.
 pub fn reload_all(cx: &mut App) {
     update(cx, |config| {
-        config.reload_settings();
-        config.reload_keymap();
         config.reload_themes();
+        config.reload_keymap();
+        config.reload_settings();
     });
 }
 
