@@ -42,6 +42,68 @@ impl SearchResults {
         self.pending = false;
     }
 
+    /// A search of the lines from `from` on (the new lines and the one that was still
+    /// arriving) found `oldest_first`: they replace every match at or after `from`, and
+    /// the oldest matches go if that takes the total past [`MAX_MATCHES`]. The active
+    /// match stays on the same match while it exists.
+    pub fn extend(&mut self, from: LineId, oldest_first: Vec<SearchMatch>) {
+        let active = self.active_match().cloned();
+        let kept = self.matches.partition_point(|m| m.line < from);
+        let mut matches = Vec::with_capacity(kept + oldest_first.len());
+        matches.extend_from_slice(&self.matches[..kept]);
+        matches.extend(oldest_first);
+        if matches.len() > MAX_MATCHES {
+            matches.drain(..matches.len() - MAX_MATCHES);
+            self.truncated = true;
+        }
+        self.matches = Arc::new(matches);
+        self.reselect(active);
+        self.error = None;
+        self.pending = false;
+    }
+
+    /// A fresh search of everything displayed, newest first, found `newest_first`.
+    /// Unlike [`Self::finish`] the active match stays on the same match while it exists.
+    pub fn rescanned(&mut self, mut newest_first: Vec<SearchMatch>) {
+        let active = self.active_match().cloned();
+        newest_first.reverse();
+        self.truncated = newest_first.len() >= MAX_MATCHES;
+        self.matches = Arc::new(newest_first);
+        self.reselect(active);
+        self.error = None;
+        self.pending = false;
+    }
+
+    /// Drop matches outside `lines`: evicted, cleared, or past a paused view's end.
+    pub fn retain_lines(&mut self, lines: std::ops::Range<LineId>) {
+        let start = self.matches.partition_point(|m| m.line < lines.start);
+        let end = self.matches.partition_point(|m| m.line < lines.end);
+        if start == 0 && end == self.matches.len() {
+            return;
+        }
+        let active = self.active_match().cloned();
+        self.matches = Arc::new(self.matches[start..end].to_vec());
+        self.reselect(active);
+    }
+
+    /// Point `active` at `previous` if it is still a match, else at the nearest match
+    /// after it, else the newest.
+    fn reselect(&mut self, previous: Option<SearchMatch>) {
+        if self.matches.is_empty() {
+            self.active = None;
+            return;
+        }
+        let newest = self.matches.len() - 1;
+        self.active = Some(match previous {
+            Some(previous) => {
+                let key = |m: &SearchMatch| (m.line, m.range.start);
+                let at = self.matches.partition_point(|m| key(m) < key(&previous));
+                at.min(newest)
+            }
+            None => newest,
+        });
+    }
+
     pub fn fail(&mut self, error: String) {
         self.matches = Arc::default();
         self.active = None;
@@ -149,6 +211,71 @@ mod tests {
         assert_eq!(results.select_next().unwrap().line, LineId(1));
         assert_eq!(results.select_previous().unwrap().line, LineId(3));
         assert_eq!(results.count_label(), "3/3");
+    }
+
+    fn lines_of(results: &SearchResults) -> Vec<u64> {
+        results.matches.iter().map(|m| m.line.0).collect()
+    }
+
+    #[test]
+    fn extending_replaces_from_the_changed_line_and_keeps_the_active_match() {
+        let mut results = SearchResults {
+            query: "x".into(),
+            ..SearchResults::default()
+        };
+        results.finish(vec![at(9, 0), at(5, 0), at(1, 0)], LineId(4));
+        assert_eq!(results.active_match().unwrap().line, LineId(5));
+
+        // Line 9 was still arriving; the new search covers it again and finds more.
+        results.extend(LineId(9), vec![at(9, 0), at(9, 4), at(12, 0)]);
+        assert_eq!(lines_of(&results), [1, 5, 9, 9, 12]);
+        assert_eq!(results.active_match().unwrap().line, LineId(5));
+        assert_eq!(results.count_label(), "2/5");
+
+        // Eviction takes lines below 6, the active match with them: the next one is active.
+        results.retain_lines(LineId(6)..LineId(100));
+        assert_eq!(lines_of(&results), [9, 9, 12]);
+        assert_eq!(results.active, Some(0));
+
+        // A pause cuts the display at line 10.
+        results.retain_lines(LineId(6)..LineId(10));
+        assert_eq!(lines_of(&results), [9, 9]);
+
+        // With nothing active before, the newest match becomes active.
+        let mut empty = SearchResults::default();
+        empty.finish(Vec::new(), LineId(0));
+        empty.extend(LineId(0), vec![at(3, 0), at(4, 0)]);
+        assert_eq!(empty.active, Some(1));
+    }
+
+    #[test]
+    fn extending_past_the_cap_drops_the_oldest() {
+        let mut results = SearchResults::default();
+        results.finish(
+            (0..MAX_MATCHES as u64 - 1)
+                .rev()
+                .map(|l| at(l, 0))
+                .collect(),
+            LineId(0),
+        );
+        assert!(!results.truncated);
+        results.extend(
+            LineId(MAX_MATCHES as u64),
+            vec![at(20_000, 0), at(20_001, 0)],
+        );
+        assert_eq!(results.matches.len(), MAX_MATCHES);
+        assert!(results.truncated);
+        assert_eq!(results.matches[0].line, LineId(1));
+        assert_eq!(results.matches.last().unwrap().line, LineId(20_001));
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_active_match() {
+        let mut results = SearchResults::default();
+        results.finish(vec![at(9, 0), at(5, 0), at(1, 0)], LineId(4));
+        results.rescanned(vec![at(11, 0), at(9, 0), at(5, 0)]);
+        assert_eq!(lines_of(&results), [5, 9, 11]);
+        assert_eq!(results.active, Some(0), "still line 5");
     }
 
     #[test]

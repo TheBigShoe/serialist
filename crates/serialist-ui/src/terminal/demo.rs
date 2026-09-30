@@ -1,6 +1,6 @@
 //! A window that runs the terminal element on its own, fed by the in-memory double:
-//! `serialist --terminal-demo`. Until the page store lands the session view still draws
-//! with the milestone 0 line list, so this is how to see the element in the app.
+//! `serialist --terminal-demo`. The session view draws the same element over the page
+//! store; this keeps a store-free way to look at the element with styled content.
 //!
 //! It starts with 200 000 styled lines, appends 2 000 a second (a sent line and an app
 //! notice every fifty, a highlighted alert now and then), keeps at most 300 000 so
@@ -101,8 +101,12 @@ pub fn open_terminal_demo(cx: &mut App) -> Result<Entity<TerminalView>> {
                 loop {
                     cx.background_executor().timer(TICK).await;
                     append(&lines, &hex, &generator, next..next + per_tick);
+                    let changed = LineId(next)..LineId(next + per_tick);
                     next += per_tick;
-                    if this.update(cx, |view, cx| view.lines_appended(cx)).is_err() {
+                    if this
+                        .update(cx, |view, cx| view.lines_appended(changed, cx))
+                        .is_err()
+                    {
                         break;
                     }
                 }
