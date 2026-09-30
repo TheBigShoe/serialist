@@ -77,6 +77,37 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
+  # The WebAssembly plugin tier (serialist-plugins' `wasm` feature: wasmtime and
+  # Cranelift) is off by default, so the test job never builds it; this job does, on one
+  # OS. The plugins run from the committed builds in serialist-plugins/tests/fixtures.
+  # The wasm32-wasip2 target is deliberately not installed: the test that rebuilds those
+  # plugins and compares bytes is only known to be reproducible on one host OS, so here
+  # it skips with a message. `just wasm-fixtures` refreshes the builds locally.
+  wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # serialport's libudev feature, through serialist-core. No GPUI here.
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev
+
+      - name: Clippy (wasm feature)
+        run: cargo clippy -p serialist-plugins --features wasm --all-targets --locked -- -D warnings
+
+      - name: Test (wasm feature)
+        run: cargo test -p serialist-plugins --features wasm --locked --no-fail-fast
+
   licenses:
     runs-on: ubuntu-latest
     timeout-minutes: 15
