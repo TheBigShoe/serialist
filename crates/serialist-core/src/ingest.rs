@@ -28,7 +28,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, select, unbounded};
 use parking_lot::Mutex;
@@ -44,6 +44,9 @@ pub const INGEST_THREAD_NAME: &str = "serialist-ingest";
 /// wakes it promptly.
 const MAX_BATCH: usize = 256;
 
+/// How long the thread waits for an event before it calls [`ChunkSink::on_idle`].
+pub const IDLE_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Receives every chunk exactly as the session delivered it, on the ingest thread.
 /// Keep it quick: the ingest thread waits for it.
 pub trait ChunkSink: Send {
@@ -56,6 +59,13 @@ pub trait ChunkSink: Send {
     /// notice is stored. The default does nothing.
     fn on_connect(&mut self, description: &str) {
         let _ = description;
+    }
+    /// The thread has waited [`IDLE_INTERVAL`] without a session event or a local line,
+    /// at `now`: a buffered recorder can flush without anything driving it. It repeats
+    /// every interval for as long as the quiet lasts, and stops after
+    /// [`on_disconnect`](Self::on_disconnect). The default does nothing.
+    fn on_idle(&mut self, now: Instant) {
+        let _ = now;
     }
 }
 
@@ -301,6 +311,12 @@ impl Worker {
                         Flow::Stop
                     }
                 },
+                // Nothing arrived for a while. Nothing was published either, so there
+                // is nobody to wake.
+                default(IDLE_INTERVAL) => {
+                    self.idle();
+                    continue;
+                }
             };
             self.wake();
             if let Flow::Stop = flow {
@@ -337,6 +353,17 @@ impl Worker {
             self.event(event);
         }
         flow
+    }
+
+    /// Tell the sinks that still expect chunks that the thread has been idle.
+    fn idle(&mut self) {
+        if self.sinks_closed {
+            return;
+        }
+        let now = Instant::now();
+        for sink in &mut self.sinks {
+            sink.on_idle(now);
+        }
     }
 
     /// Tell every sink the stream has ended, once.
@@ -777,5 +804,87 @@ mod tests {
             assert_eq!(info.state, LinkState::Disconnected { error: None });
             assert_eq!(info.description.is_some(), send_connected);
         }
+    }
+
+    #[derive(Default)]
+    struct IdleState {
+        idles: Vec<Instant>,
+        disconnected: bool,
+        idles_after_disconnect: usize,
+    }
+
+    /// Records every `on_idle`, and any that come after `on_disconnect`.
+    struct IdleSink(Arc<Mutex<IdleState>>);
+
+    impl ChunkSink for IdleSink {
+        fn on_chunk(&mut self, _bytes: &[u8], _at: Instant) {}
+
+        fn on_idle(&mut self, now: Instant) {
+            let mut state = self.0.lock().unwrap();
+            state.idles.push(now);
+            if state.disconnected {
+                state.idles_after_disconnect += 1;
+            }
+        }
+
+        fn on_disconnect(&mut self) {
+            self.0.lock().unwrap().disconnected = true;
+        }
+    }
+
+    #[test]
+    fn a_quiet_thread_tells_its_sinks_it_is_idle() {
+        let (tx, rx) = unbounded::<SessionEvent>();
+        let state = Arc::new(Mutex::new(IdleState::default()));
+        let wakes = Arc::new(AtomicU64::new(0));
+        let waker_wakes = Arc::clone(&wakes);
+        let started = Instant::now();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(IdleSink(Arc::clone(&state)))],
+            Box::new(move || {
+                waker_wakes.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        let deadline = started + Duration::from_secs(10);
+        while state.lock().unwrap().idles.len() < 3 {
+            assert!(Instant::now() < deadline, "no idle calls arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let idles = state.lock().unwrap().idles.clone();
+        // Each call comes after a full quiet interval (allowing for clock granularity).
+        let slack = Duration::from_millis(15);
+        assert!(idles[0] - started + slack >= IDLE_INTERVAL, "{idles:?}");
+        for pair in idles.windows(2) {
+            assert!(pair[1] - pair[0] + slack >= IDLE_INTERVAL, "{idles:?}");
+        }
+        // Idling publishes nothing, so it wakes nobody.
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        drop(tx);
+        handle.join().expect("the ingest thread ran cleanly");
+    }
+
+    #[test]
+    fn no_idle_call_follows_the_disconnect() {
+        let (tx, rx) = unbounded::<SessionEvent>();
+        let state = Arc::new(Mutex::new(IdleState::default()));
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(IdleSink(Arc::clone(&state)))],
+            Box::new(|| {}),
+        );
+        tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.lock().unwrap().disconnected {
+            assert!(Instant::now() < deadline, "no disconnect");
+            thread::sleep(Duration::from_millis(2));
+        }
+        // The thread lives on until the channel closes; it must stay quiet meanwhile.
+        thread::sleep(IDLE_INTERVAL * 2 + Duration::from_millis(100));
+        assert_eq!(state.lock().unwrap().idles_after_disconnect, 0);
+        drop(tx);
+        handle.join().expect("the ingest thread ran cleanly");
     }
 }
