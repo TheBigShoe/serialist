@@ -1,6 +1,8 @@
 //! The configuration applied to the running app: real loaders from `serialist-core`
 //! over a temporary config directory, installed into headless windows.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -306,6 +308,52 @@ fn font_features_weight_and_fallbacks_reach_the_font(cx: &mut TestAppContext) {
         px(18.),
         "gpui-kit's root sets the rem size from the UI font"
     );
+}
+
+#[gpui_test]
+fn a_format_only_change_redraws_the_terminal_at_once(cx: &mut TestAppContext) {
+    let (window, view) = open_terminal(cx);
+    view.update(cx, |t, cx| {
+        t.set_timestamps(serialist_core::TimestampMode::Absolute, cx)
+    });
+    let dir = ConfigDir::new("format-redraw")
+        .with_settings(r#"{ "display": { "timestamp_format": "%H:%M" } }"#);
+    load(cx, &dir);
+    draw(cx, window);
+
+    let redraws = Rc::new(Cell::new(0usize));
+    cx.update(|cx| {
+        let redraws = redraws.clone();
+        cx.observe(&view, move |_, _| redraws.set(redraws.get() + 1))
+            .detach();
+    });
+    let reload = |cx: &mut TestAppContext| {
+        cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+        cx.run_until_parked();
+    };
+
+    // Only the format changes: not the fonts, not the palette. The terminal repaints
+    // without waiting for a line to arrive.
+    dir.write_settings(r#"{ "display": { "timestamp_format": "%H:%M:%S%.6f" } }"#);
+    reload(cx);
+    assert_eq!(
+        cx.update(|cx| cx.global::<Config>().timestamp_format().to_owned()),
+        "%H:%M:%S%.6f"
+    );
+    assert_eq!(redraws.get(), 1, "one repaint for the new format");
+
+    // The same format again, or a reload about something else, repaints nothing.
+    reload(cx);
+    dir.write_settings(
+        r#"{ "default_baud": 9600, "display": { "timestamp_format": "%H:%M:%S%.6f" } }"#,
+    );
+    reload(cx);
+    assert_eq!(redraws.get(), 1, "an unchanged format does not repaint");
+
+    // Changing it back is a change again.
+    dir.write_settings(r#"{ "display": { "timestamp_format": "%H:%M" } }"#);
+    reload(cx);
+    assert_eq!(redraws.get(), 2);
 }
 
 // --- Themes ------------------------------------------------------------------------
