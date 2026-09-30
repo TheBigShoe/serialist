@@ -5,11 +5,13 @@ use std::sync::Arc;
 
 use serialist_core::{PortId, PortSource, SerialConfig, TransportError, TransportFactory};
 
-use crate::actions::{self, Clear, Disconnect, Quit, context};
+use crate::actions::{self, Clear, Disconnect, Export, Pause, Quit, ToggleRecord, context};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
+use crate::export::ExportFormat;
 use crate::prelude::*;
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-use crate::session_view::{ConnectionState, SessionView, StatusLine};
+use crate::session_model::{ConnectionState, StatusLine};
+use crate::session_view::SessionView;
 
 const STATUS_LINE_HEIGHT: Pixels = px(26.);
 
@@ -221,6 +223,24 @@ impl Workspace {
         }
     }
 
+    fn pause(&mut self, _: &Pause, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.update(cx, |view, cx| view.toggle_pause(cx));
+        }
+    }
+
+    fn export(&mut self, _: &Export, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.update(cx, |view, cx| view.export(ExportFormat::Text, cx));
+        }
+    }
+
+    fn toggle_record(&mut self, _: &ToggleRecord, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.update(cx, |view, cx| view.toggle_record(cx));
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(session) = &self.session {
             return session.clone().into_any_element();
@@ -293,6 +313,28 @@ impl Workspace {
         .children(status.settings.map(SharedString::from))
         .child(SharedString::from(status.rx))
         .child(SharedString::from(status.tx))
+        .children(status.paused.map(|paused| {
+            div()
+                .text_color(theme.warning)
+                .child(SharedString::from(paused))
+        }))
+        .children(status.recording.map(|recording| {
+            h_flex()
+                .gap_1p5()
+                .text_color(theme.danger)
+                .child(dot(theme.danger))
+                .child(SharedString::from(recording))
+        }))
+        .children(status.notice.map(|notice| {
+            div()
+                .truncate()
+                .text_color(if notice.is_error {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                })
+                .child(SharedString::from(notice.text))
+        }))
     }
 
     /// The status line's text for the current session, as rendered.
@@ -317,6 +359,9 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::clear))
             .on_action(cx.listener(Self::disconnect))
+            .on_action(cx.listener(Self::pause))
+            .on_action(cx.listener(Self::export))
+            .on_action(cx.listener(Self::toggle_record))
             .size_full()
             .bg(background)
             .text_color(foreground)
