@@ -5,13 +5,15 @@
 //! # Tabs
 //!
 //! The workspace owns the tabs, and each tab owns at most one session view: its
-//! session, ingest thread and store, codec slot, script host, pause, recording and
-//! export state all live in the view (see [`session_view`](crate::session_view)), so a
-//! tab is a port and a view, nothing more. A tab outlives the views that come and go in
-//! it: connecting again after a disconnect puts a new view in the same tab, which keeps
-//! its place, its [`TabId`] and its Script console output. A tab may hold no view: a new
-//! tab (`tabs::NewTab`) before a port is picked, a port being opened, or a restored port
-//! whose device is not plugged in.
+//! session, ingest thread and store, codec slot, script host, pause, recording, port
+//! settings and export state all live in the view (see
+//! [`session_view`](crate::session_view)), so a tab is a port and a view, nothing more.
+//! Connecting again after a disconnect (the toolbar's Connect, or Connect in the Devices
+//! panel) hands the new session to the same view, which carries on in the same store
+//! with its scrollback and settings ([`SessionView::reconnect`]); the tab keeps its
+//! place, its [`TabId`] and its Script console output. A tab may hold no view: a new tab
+//! (`tabs::NewTab`) before a port is picked, a port being opened for the first time, or
+//! a restored port whose device is not plugged in.
 //!
 //! "Connect" in the Devices panel goes to the tab already holding that port if there is
 //! one (and opens it again if it was disconnected), else fills the active tab if it is

@@ -187,11 +187,8 @@ fn the_popover_reconfigures_the_open_port_live(cx: &mut TestAppContext) {
     assert_eq!(link.link_config().serial.baud, 57_600);
 
     // The simulator has no break: the form says so.
-    cx.update_window(window, |_, window, cx| {
-        form.update(cx, |f, cx| f.send_break(cx));
-        let _ = window;
-    })
-    .unwrap();
+    form.update(cx, |f, cx| f.send_break(cx));
+    assert_eq!(error(cx, &form), None, "a new try clears the last error");
     run_until(cx, "the break's refusal", |cx| error(cx, &form).is_some());
     assert!(error(cx, &form).unwrap().contains("break"));
 
@@ -204,6 +201,18 @@ fn the_popover_reconfigures_the_open_port_live(cx: &mut TestAppContext) {
     view.read_with(cx, |v, cx| {
         assert_eq!(v.line_ending(cx), LineEnding::Lf);
         assert!(v.compose().read(cx).local_echo());
+    });
+
+    // Changed elsewhere (the compose bar's own picker), the form catches up when the
+    // toolbar button opens it.
+    let compose = view.read_with(cx, |v, _| v.compose().clone());
+    compose.update(cx, |c, cx| c.set_line_ending(LineEnding::Cr, cx));
+    cx.update_window(window, |_, window, cx| window.click("port-settings", cx))
+        .unwrap();
+    cx.run_until_parked();
+    form.read_with(cx, |f, _| {
+        assert_eq!(f.settings().line_ending, LineEnding::Cr);
+        assert_eq!(f.settings().serial.baud, 57_600);
     });
 }
 
