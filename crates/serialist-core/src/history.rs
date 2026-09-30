@@ -8,7 +8,9 @@
 //! temp file and a rename.
 //!
 //! Pushing an entry equal to the newest one changes nothing, and an empty entry is
-//! ignored. Only the newest [`MAX_ENTRIES`] are kept.
+//! ignored. Only the newest [`MAX_ENTRIES`] are kept. A skipped line is not kept: the
+//! next [`save`](History::save) writes the file without it, and bytes that are not UTF-8
+//! read as U+FFFD.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -171,3 +173,6 @@ impl Default for History {
         Self::in_memory()
     }
 }
+
+#[cfg(test)]
+mod tests;
