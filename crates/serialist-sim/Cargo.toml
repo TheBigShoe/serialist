@@ -1,0 +1,18 @@
+[package]
+name = "serialist-sim"
+description = "Hardware-free test doubles for Serialist: virtual links, simulated devices, fake port source."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serialist-core.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

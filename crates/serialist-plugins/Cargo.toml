@@ -1,0 +1,11 @@
+[package]
+name = "serialist-plugins"
+description = "Codec plugins for Serialist: Lua and WebAssembly adapters, Airoha RACE reference (milestone 5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serialist-core.workspace = true
