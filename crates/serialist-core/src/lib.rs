@@ -5,12 +5,15 @@
 //! so the whole engine can be exercised without hardware.
 
 pub mod ansi;
+pub mod commands;
 pub mod composite;
 pub mod config;
 pub mod config_watch;
 pub mod discovery;
+pub mod history;
 pub mod ingest;
 pub mod keymap;
+pub mod matcher;
 pub mod port;
 pub mod serial;
 pub mod session;
@@ -24,15 +27,21 @@ pub mod transport;
 mod test_util;
 
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
+pub use commands::{
+    CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
+    CommandWarning, EditError, Expect, Param, ParamKind, ParamValues, Payload, PayloadError,
+};
 pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use config_watch::{ConfigEvent, ConfigWatcher};
 pub use discovery::RealPortSource;
+pub use history::History;
 pub use ingest::{
     ChunkSink, ConnectionInfo, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped,
     LinkState,
 };
 pub use keymap::{ActionRef, KeyBinding, Keymap, KeymapError, load_keymap};
+pub use matcher::{ExpectResult, Expectation, MatcherHandle};
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
 pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
