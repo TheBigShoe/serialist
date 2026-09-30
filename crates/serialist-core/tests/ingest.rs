@@ -100,7 +100,7 @@ fn firehose_at_3_mbaud_is_stored_whole() {
     }
     let wakes = handle.stats().wakes;
     session.close();
-    let store = handle.join();
+    let store = handle.join().expect("the ingest thread ran cleanly");
 
     assert!(acks > 50, "only {acks} frames in 2 s");
     assert!(wakes <= acks + 2, "{wakes} wakes for {acks} acknowledges");
@@ -185,7 +185,7 @@ fn tx_echo_and_notices_keep_their_order() {
         });
     }
     session.close();
-    let store = handle.join();
+    let store = handle.join().expect("the ingest thread ran cleanly");
     let got: Vec<_> = lines(&store)
         .into_iter()
         .map(|l| (l.direction, l.text))

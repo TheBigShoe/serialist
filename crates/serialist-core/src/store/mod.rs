@@ -62,7 +62,8 @@
 //!
 //! [`LineSource::first_line`]: crate::text::LineSource::first_line
 
-mod buf;
+#[doc(hidden)]
+pub mod buf;
 mod export;
 mod hex;
 mod index;
@@ -77,7 +78,8 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::ansi::{
-    AnsiParser, DEFAULT_MAX_LINE_BYTES, MAX_LINE_BYTES_LIMIT, ParsedLine, TAB_WIDTH,
+    AnsiParser, DEFAULT_MAX_LINE_BYTES, MAX_LINE_BYTES_LIMIT, MAX_RUNS, MIN_LINE_BYTES,
+    MOTION_WIDTH, ParsedLine, TAB_WIDTH,
 };
 use crate::text::{Direction, Epoch, LineId, Style, StyleRun};
 
@@ -99,6 +101,8 @@ const B: u64 = BLOCK_LINES as u64;
 const P: u64 = PAGE_SIZE as u64;
 /// Bookkeeping not otherwise counted: the published record, the store struct, slack.
 const FIXED_OVERHEAD: usize = 4096;
+/// History the minimum budget keeps room for beyond the unevictable parts.
+const HISTORY_HEADROOM: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -129,11 +133,27 @@ impl StoreConfig {
         }
     }
 
-    /// The smallest budget that leaves room for the fixed costs (the open block, the
-    /// open pages, the line in progress) with pages to spare.
+    /// The smallest budget that covers everything eviction cannot free, at its worst,
+    /// with a megabyte of history to spare: the parser holding the widest possible line
+    /// in progress, a published copy of that line, the pages holding it, the open index
+    /// block, the open text page and the record buffer. With at least this much, the
+    /// store is back within budget after every append whatever the input. About 3 MiB
+    /// at the default 64 KiB line limit.
     pub fn min_budget(&self) -> usize {
-        let line = self.max_line_bytes.clamp(1, MAX_LINE_BYTES_LIMIT);
-        1024 * 1024 + 4 * line + 4 * PAGE_SIZE
+        let line = self
+            .max_line_bytes
+            .clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT);
+        let cols = line + MOTION_WIDTH;
+        let parser = AnsiParser::worst_case_heap(line);
+        let tail_copy = 4 * cols + MAX_RUNS * size_of::<StyleRun>() + 64;
+        let line_pages = (line / PAGE_SIZE + 2) * PAGE_SIZE;
+        parser
+            + tail_copy
+            + line_pages
+            + index::OPEN_BLOCK_BYTES
+            + 2 * TEXT_PAGE_SIZE
+            + FIXED_OVERHEAD
+            + HISTORY_HEADROOM
     }
 }
 
@@ -457,6 +477,12 @@ impl Store {
         if let Some(line) = self.parser.current() {
             self.w.check_tail(line);
         }
+        // Count the copy of the line in progress this append will publish, so eviction
+        // makes room for it.
+        self.w.tail_bytes = self
+            .parser
+            .current()
+            .map_or(0, |line| self.w.tail_heap(line));
         let (evicted_lines, evicted_bytes) = self.evict();
         self.publish();
         let end = self.end().0;
@@ -505,6 +531,7 @@ impl Store {
             w.push_line(start, LineFlags::decoded(direction, true), ns, Some(dec));
         }
         let end = w.next_line;
+        w.tail_bytes = 0;
         self.evict();
         self.publish();
         LineId(first.max(self.w.first_line))..LineId(end)
@@ -754,24 +781,30 @@ impl Writer {
         self.tail_check = TailCheck::new();
     }
 
+    /// Index a line. A block is sealed the moment it fills, so the open block is never
+    /// full: every block that eviction can drain is a sealed one.
     fn push_line(&mut self, start: u64, flags: LineFlags, ns: u64, dec: Option<(u32, u32)>) {
-        if self.open_block.as_ref().is_none_or(BlockWriter::is_full) {
-            debug_assert_eq!(self.next_line % B, 0);
-            if let Some(open) = self.open_block.take() {
-                let sealed = open.seal();
-                self.sealed_block_bytes += sealed.heap_bytes();
-                *self.blocks.last_mut().expect("open block is listed") = sealed;
+        let open = match &mut self.open_block {
+            Some(open) => open,
+            None => {
+                debug_assert_eq!(self.next_line % B, 0);
+                let open = BlockWriter::new(self.next_line, start);
+                self.blocks.push(Arc::clone(&open.block));
+                self.dirs_dirty = true;
+                self.open_block.insert(open)
             }
-            let open = BlockWriter::new(self.next_line, start);
-            self.blocks.push(Arc::clone(&open.block));
-            self.open_block = Some(open);
+        };
+        open.push(start, flags, ns, dec);
+        self.next_line += 1;
+        if open.is_full() {
+            let sealed = open.seal();
+            self.sealed_block_bytes += sealed.heap_bytes();
+            let last = self.blocks.last_mut().expect("the open block is listed");
+            debug_assert!(Arc::ptr_eq(last, &open.block));
+            *last = sealed;
+            self.open_block = None;
             self.dirs_dirty = true;
         }
-        self.open_block
-            .as_mut()
-            .expect("just opened")
-            .push(start, flags, ns, dec);
-        self.next_line += 1;
     }
 
     /// Write the decoded text of the line about to be pushed. Returns its location.
@@ -797,6 +830,10 @@ impl Writer {
         let writer = self.open_text.as_mut().expect("just opened");
         let off = writer.len();
         writer.extend(&self.record);
+        if self.record.capacity() > TEXT_PAGE_SIZE {
+            // One huge line must not pin its encoding buffer against the budget.
+            self.record = Vec::new();
+        }
         let page = self.text_pages.last_mut().expect("open page is listed");
         page.last_line = self.next_line;
         ((self.next_text_seq - 1) as u32, off as u32)
@@ -804,10 +841,13 @@ impl Writer {
 
     /// Free blocks and text pages that hold no retained line.
     fn drop_unreferenced(&mut self) {
+        // The open block is never full (see `push_line`), so it never qualifies; the
+        // check keeps it that way should that ever change.
+        let open_first = self.open_block.as_ref().map(|b| b.block.first);
         let dead_blocks = self
             .blocks
             .iter()
-            .take_while(|b| b.first + B <= self.first_line)
+            .take_while(|b| b.first + B <= self.first_line && Some(b.first) != open_first)
             .count();
         for block in self.blocks.drain(..dead_blocks) {
             self.sealed_block_bytes -= block.heap_bytes();
@@ -826,15 +866,36 @@ impl Writer {
         }
     }
 
+    /// The raw lead of the line in progress if its text can be read from the raw pages;
+    /// `None` if it must be published as a decoded copy.
+    fn plain_tail_lead(&self, line: ParsedLine<'_>) -> Option<u64> {
+        if !(self.tail_check.plain && line.simple) {
+            return None;
+        }
+        if line.text.is_empty() {
+            return Some(0);
+        }
+        self.tail_check
+            .lead
+            .filter(|_| self.tail_check.verified == line.text.len())
+            .map(u64::from)
+    }
+
+    /// Heap the published copy of the line in progress will take (see `TailText`).
+    fn tail_heap(&self, line: ParsedLine<'_>) -> usize {
+        match self.plain_tail_lead(line) {
+            Some(_) => 0,
+            None => line.text.len() + size_of_val(line.runs) + 64,
+        }
+    }
+
     fn tail(&self, line: ParsedLine<'_>) -> Tail {
-        let plain = self.tail_check.plain && line.simple;
-        let text = match (plain, self.tail_check.lead) {
-            (true, _) if line.text.is_empty() => TailText::Plain { lead: 0, len: 0 },
-            (true, Some(lead)) if self.tail_check.verified == line.text.len() => TailText::Plain {
-                lead: u64::from(lead),
+        let text = match self.plain_tail_lead(line) {
+            Some(lead) => TailText::Plain {
+                lead,
                 len: line.text.len(),
             },
-            _ => TailText::Decoded(Arc::new((line.text.to_owned(), line.runs.to_vec()))),
+            None => TailText::Decoded(Arc::new((line.text.to_owned(), line.runs.to_vec()))),
         };
         Tail {
             start: self.line_start,

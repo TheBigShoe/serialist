@@ -156,7 +156,13 @@ fn large_streams_match_the_reference() {
 }
 
 fn large_stream(content: FirehoseContent, seed: u64, chunks: usize, budget: usize) {
-    let mut store = Store::new(StoreConfig::with_budget(budget));
+    // A 4 KiB line limit keeps the minimum budget near 1.7 MiB, so the budget-0 streams
+    // evict; longer lines are broken, which the reference sees too.
+    let mut store = Store::new(StoreConfig {
+        budget,
+        max_line_bytes: 4096,
+        ..StoreConfig::default()
+    });
     let mut generator = FirehoseGenerator::new(content, seed);
     let mut chunk = Vec::new();
     let now = Instant::now();
