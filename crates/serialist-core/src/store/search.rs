@@ -96,15 +96,28 @@ pub(crate) struct Query {
 }
 
 impl Query {
+    /// The pattern with smart case, for a source that can also search runs of lines as
+    /// one haystack.
     pub fn new(pattern: &str) -> Result<Self, String> {
+        Self::build(pattern, true)
+    }
+
+    /// The same pattern and case rule for a source that searches one line at a time
+    /// (hex rows), which has no use for the bulk regex.
+    pub fn per_line(pattern: &str) -> Result<Self, String> {
+        Self::build(pattern, false)
+    }
+
+    fn build(pattern: &str, with_bulk: bool) -> Result<Self, String> {
         let insensitive = smart_case_insensitive(pattern);
         let line = RegexBuilder::new(pattern)
             .case_insensitive(insensitive)
             .build()
             .map_err(|e| e.to_string())?;
-        let bulk_safe = !["\\A", "\\z", "-m", "-R"]
-            .iter()
-            .any(|needle| pattern.contains(needle));
+        let bulk_safe = with_bulk
+            && !["\\A", "\\z", "-m", "-R"]
+                .iter()
+                .any(|needle| pattern.contains(needle));
         let bulk = if bulk_safe {
             RegexBuilder::new(pattern)
                 .case_insensitive(insensitive)
@@ -119,7 +132,13 @@ impl Query {
     }
 
     /// Push the matches of `text` (line `id`), in order, until `out` holds `limit`.
-    fn match_line(&self, text: &[u8], id: u64, limit: usize, out: &mut Vec<SearchMatch>) {
+    pub(super) fn match_line(
+        &self,
+        text: &[u8],
+        id: u64,
+        limit: usize,
+        out: &mut Vec<SearchMatch>,
+    ) {
         for m in self.line.find_iter(text) {
             if out.len() >= limit {
                 break;

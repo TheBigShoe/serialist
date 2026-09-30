@@ -849,3 +849,66 @@ fn a_bounded_search_clips_to_the_retained_lines() {
     // From below the retained lines, backward finds nothing, as `search` does.
     assert!(search_in(&snap, "needle", 0..end, first - 1, true, 5).is_empty());
 }
+
+/// Hex rows are rendered one at a time, so the bound saves real work: a backward search
+/// from a floor renders only the rows above it.
+#[test]
+fn a_bounded_hex_search_renders_no_row_outside_its_range() {
+    use super::search::{reset_scanned, scanned};
+
+    let store = numbered_store(5_000);
+    let snap = store.snapshot();
+    let hex = snap.hex_view(16);
+    let rows = hex.end().0;
+    assert!(rows > 4_000, "{rows} rows");
+    let cancel = AtomicBool::new(false);
+    let floor = rows - 100;
+
+    reset_scanned();
+    let none = hex
+        .search_in(
+            "zzz",
+            LineId(floor)..LineId(rows),
+            LineId(u64::MAX),
+            true,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(scanned(), 100, "only the rows above the floor");
+
+    reset_scanned();
+    let none = hex
+        .search("zzz", LineId(u64::MAX), true, 1, &cancel)
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(scanned(), rows, "the unbounded search walks every row");
+
+    // Forward, both ends of the range are respected.
+    reset_scanned();
+    let hits = hex
+        .search_in(
+            "^[0-9a-f]{8} ",
+            LineId(10)..LineId(20),
+            LineId(0),
+            false,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(scanned(), 10);
+    assert_eq!(hit_lines(&hits), (10..20).collect::<Vec<_>>());
+    // A range past the retained rows clips to nothing.
+    let none = hex
+        .search_in(
+            "^[0-9a-f]{8} ",
+            LineId(rows)..LineId(rows + 50),
+            LineId(0),
+            false,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert!(none.is_empty());
+}
