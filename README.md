@@ -171,7 +171,8 @@ Rust trait (`serialist_core::Codec`):
 | Lua | A folder with `plugin.lua`, which returns `describe`, `decode` and `encode` | `plugins/<name>/plugin.lua` |
 | WebAssembly | A folder with `plugin.wasm` (a component) and `plugin.toml`, written against `serialist-plugin-sdk` or any language that can build the WIT world | `plugins/<name>/plugin.wasm` and `plugin.toml` |
 
-The WebAssembly tier sits behind the `wasm` Cargo feature of `serialist-plugins`, which is
+The WebAssembly tier sits behind the `wasm` Cargo feature of `serialist-plugins` (the app
+forwards it: `cargo build -p serialist --features wasm`), which is
 off by default: wasmtime and Cranelift make up most of a clean build and add minutes to it.
 Without the feature, a `plugin.wasm` folder is found but reported as needing it. The Lua
 tier needs nothing extra. Airoha RACE exists in all three tiers, and the tests hold them to
