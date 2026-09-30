@@ -224,7 +224,7 @@ mod tests {
         .expect("an error");
         assert_eq!(
             error.to_string(),
-            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi"
+            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi, race"
         );
         assert!(
             options(Args {
