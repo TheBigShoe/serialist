@@ -3,19 +3,19 @@
 //! ```text
 //! plugins/
 //!   airoha-race/plugin.lua     tier 1, loaded by the Lua adapter
-//!   my-proto/plugin.wasm       tier 2, recognised but not loaded yet
+//!   my-proto/plugin.wasm       tier 2, next to my-proto/plugin.toml, loaded by the
+//!                              WebAssembly adapter (the `wasm` feature)
 //! ```
 //!
-//! # The WebAssembly seam
+//! # WebAssembly
 //!
-//! Tier 2 plugins are recognised here ([`PluginKind::Wasm`]) and reported as not
-//! supported yet. They arrive as a second [`CodecFactory`](serialist_core::CodecFactory)
-//! next to [`LuaCodecFactory`]: a wasmtime component whose WIT world mirrors the Lua
-//! contract (`describe() -> codec-info`, `decode(list<u8>) -> tuple<list<frame>, u32>`
-//! returning frames and the count of bytes held back, `encode(request) -> result<list<u8>,
-//! codec-error>`), wrapped in the same [`Codec`](serialist_core::Codec) trait. Nothing
-//! above this module changes: [`load_plugins`] dispatches on the kind, and the registry,
-//! the sink and the conformance tests take any factory.
+//! Tier 2 plugins ([`PluginKind::Wasm`]) load through `WasmCodecFactory` (in the `wasm`
+//! module), a second [`CodecFactory`](serialist_core::CodecFactory) next to
+//! [`LuaCodecFactory`]. The folder's `plugin.toml` is read first, and a plugin API other
+//! than `api = "1"` is refused with a warning that says so. Without the `wasm` feature
+//! they are found but reported as needing it. Nothing above this module changes:
+//! [`load_plugins`] dispatches on the kind, and the registry, the sink and the
+//! conformance tests take any factory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ pub const WASM_ENTRY: &str = "plugin.wasm";
 pub enum PluginKind {
     /// Tier 1: `plugin.lua`.
     Lua,
-    /// Tier 2: `plugin.wasm`. Not loaded yet.
+    /// Tier 2: `plugin.wasm` and `plugin.toml`. Loaded with the `wasm` feature.
     Wasm,
 }
 
@@ -99,9 +99,21 @@ pub fn load_plugins(
                     message: err.to_string(),
                 }),
             },
+            #[cfg(feature = "wasm")]
+            PluginKind::Wasm => match crate::wasm::load_plugin_dir(&plugin.dir) {
+                Ok(factory) => {
+                    registry.register(Arc::new(factory));
+                }
+                Err(err) => warnings.push(PluginWarning {
+                    path: plugin.entry,
+                    message: err.to_string(),
+                }),
+            },
+            #[cfg(not(feature = "wasm"))]
             PluginKind::Wasm => warnings.push(PluginWarning {
                 path: plugin.entry,
-                message: "WebAssembly plugins are not supported yet".to_owned(),
+                message: "WebAssembly plugins need Serialist built with the `wasm` feature"
+                    .to_owned(),
             }),
         }
     }
