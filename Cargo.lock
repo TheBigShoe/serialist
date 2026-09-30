@@ -6587,6 +6587,7 @@ dependencies = [
  "serde_json",
  "serialist-sim",
  "serialport",
+ "smol_str",
  "thiserror 2.0.21",
  "tracing",
  "vte",

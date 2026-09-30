@@ -5,11 +5,13 @@
 //! so the whole engine can be exercised without hardware.
 
 pub mod ansi;
+pub mod codec;
 pub mod commands;
 pub mod composite;
 pub mod config;
 pub mod config_watch;
 pub mod discovery;
+pub mod frames;
 pub mod history;
 pub mod ingest;
 pub mod keymap;
@@ -27,6 +29,10 @@ pub mod transport;
 mod test_util;
 
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
+pub use codec::{
+    Codec, CodecError, CodecFactory, CodecInfo, CodecRegistry, CommandInfo, EncodeRequest,
+    FieldInfo, FieldType, FnCodecFactory, Frame, FrameKindInfo, Severity, SmolStr, Value,
+};
 pub use commands::{
     CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
     CommandWarning, EditError, Expect, Param, ParamKind, ParamValues, Payload, PayloadError,
@@ -35,6 +41,9 @@ pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use config_watch::{ConfigEvent, ConfigWatcher};
 pub use discovery::RealPortSource;
+pub use frames::{
+    CodecSink, FrameId, FrameSnapshot, FrameStats, FrameStore, FrameStoreConfig, FrameStoreReader,
+};
 pub use history::History;
 pub use ingest::{
     ChunkSink, ConnectionInfo, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped,
