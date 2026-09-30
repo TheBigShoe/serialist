@@ -548,3 +548,116 @@ fn texts_helper_matches_lines() {
     store.append(b"a\nb\nc", Instant::now());
     assert_eq!(texts(&store.snapshot()), vec!["a", "b", "c"]);
 }
+
+/// The reported crash: at the minimum budget, one local append of exactly a block of
+/// large lines filled the open block while eviction removed every line, and the full,
+/// unsealed block was drained (subtract overflow in debug, a panic in release).
+#[test]
+fn a_block_filled_while_everything_is_evicted() {
+    let mut store = Store::with_budget(0);
+    let line = "x".repeat(1000);
+    let text = vec![line.as_str(); BLOCK_LINES].join("\n");
+    store.append_local(&text, Direction::Tx);
+    let stats = store.stats();
+    assert!(stats.memory <= stats.budget, "{stats:?}");
+    assert_eq!(stats.end_line, LineId(B));
+    assert!(
+        stats.first_line > LineId(0),
+        "the budget forces eviction: {stats:?}"
+    );
+    // The store keeps working across the next blocks.
+    store.append(b"after\n", Instant::now());
+    store.append_local(&text, Direction::Tx);
+    store.append_local(&text, Direction::Notice);
+    let snap = store.snapshot();
+    assert_eq!(snap.end(), LineId(3 * B + 1));
+    assert_eq!(snap.line(LineId(3 * B)).unwrap().text, line);
+    assert!(snap.stats().memory <= snap.stats().budget);
+}
+
+/// A megabyte-long line that changes style on every character must not leave the
+/// parser's buffers (or the store's) pinned over budget once it ends.
+#[test]
+fn one_pathological_line_does_not_pin_memory() {
+    let mut store = Store::new(StoreConfig {
+        budget: 0,
+        max_line_bytes: MAX_LINE_BYTES_LIMIT,
+        ..StoreConfig::default()
+    });
+    let budget = store.budget();
+    let now = Instant::now();
+    let mut line = Vec::new();
+    let mut i = 0;
+    while line.len() < MAX_LINE_BYTES_LIMIT - 64 {
+        line.extend_from_slice(format!("\x1b[3{}m\u{e9}", 1 + i % 7).as_bytes());
+        i += 1;
+    }
+    for chunk in line.chunks(4096) {
+        store.append(chunk, now);
+        let stats = store.stats();
+        assert!(
+            stats.memory <= budget,
+            "{} > {budget} mid-line",
+            stats.memory
+        );
+    }
+    store.append(b"\r\n", now);
+    assert!(store.stats().memory <= budget);
+    for i in 0..2000 {
+        store.append(format!("normal {i}\r\n").as_bytes(), now);
+    }
+    let snap = store.snapshot();
+    let stats = snap.stats();
+    assert!(
+        stats.memory < budget / 2,
+        "{} held for budget {budget}",
+        stats.memory
+    );
+    assert!(
+        snap.line_count() > 2000,
+        "later lines must be kept: {stats:?}"
+    );
+    assert_eq!(
+        snap.line(LineId(snap.end().0 - 1)).unwrap().text,
+        "normal 1999"
+    );
+}
+
+/// A local line larger than the whole budget is let go, and its encoding buffer with it.
+#[test]
+fn a_local_line_larger_than_the_budget_is_let_go() {
+    let mut store = Store::with_budget(0);
+    let budget = store.budget();
+    store.append_local(&"y".repeat(2 * budget), Direction::Notice);
+    assert!(store.stats().memory <= budget);
+    let now = Instant::now();
+    for i in 0..2000 {
+        store.append(format!("normal {i}\r\n").as_bytes(), now);
+    }
+    let snap = store.snapshot();
+    let stats = snap.stats();
+    assert!(
+        stats.memory < budget / 2,
+        "{} held for budget {budget}",
+        stats.memory
+    );
+    assert!(snap.line_count() >= 2000, "{stats:?}");
+}
+
+#[test]
+fn min_budget_scales_with_the_line_limit() {
+    let at = |max_line_bytes| {
+        StoreConfig {
+            max_line_bytes,
+            ..StoreConfig::default()
+        }
+        .min_budget()
+    };
+    let default = at(DEFAULT_MAX_LINE_BYTES);
+    assert!(default < 4 * 1024 * 1024, "{default}");
+    assert!(at(MAX_LINE_BYTES_LIMIT) > 16 * MAX_LINE_BYTES_LIMIT);
+    assert_eq!(
+        Store::with_budget(0).budget(),
+        StoreConfig::default().min_budget()
+    );
+}

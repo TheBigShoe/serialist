@@ -18,8 +18,12 @@
 //!
 //! The thread ends when the session's event channel closes (the session is gone) or on
 //! [`IngestHandle::stop`]; either way the store is handed back by `stop`/`join`, so a
-//! reconnect can keep the same scrollback.
+//! reconnect can keep the same scrollback. Every sink hears `on_disconnect` exactly once
+//! before the thread ends, from the session's `Disconnected` or, if the thread stops
+//! first, on the way out. A panic on the thread (in a sink, say) is logged and reported
+//! as [`IngestPanicked`]; it never reaches the caller's thread.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,6 +55,14 @@ pub trait ChunkSink: Send {
 #[derive(Debug, thiserror::Error)]
 #[error("the ingest thread has stopped")]
 pub struct IngestStopped;
+
+/// The ingest thread panicked, so its store is gone. The panic has been logged.
+#[derive(Debug, thiserror::Error)]
+#[error("the ingest thread panicked: {message}")]
+pub struct IngestPanicked {
+    /// The panic's message, if it had one.
+    pub message: String,
+}
 
 /// Counters for the status line and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +111,7 @@ impl Ingest {
             sinks,
             waker,
             shared: Arc::clone(&shared),
+            sinks_closed: false,
         };
         let thread = thread::Builder::new()
             .name(INGEST_THREAD_NAME.into())
@@ -171,35 +184,46 @@ impl IngestHandle {
         self.thread.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    /// Stop now, after the event in hand, and return the store. Events still queued are
-    /// not ingested.
-    pub fn stop(mut self) -> Store {
+    /// Stop now and return the store. The event the thread has in hand is still
+    /// ingested; events still queued are not. Sinks hear `on_disconnect` if they have
+    /// not already.
+    pub fn stop(mut self) -> Result<Store, IngestPanicked> {
         let _ = self.commands.send(Command::Stop);
         self.take_store()
     }
 
     /// Wait until the session's event channel closes and everything in it is ingested,
     /// then return the store.
-    pub fn join(mut self) -> Store {
+    pub fn join(mut self) -> Result<Store, IngestPanicked> {
         self.take_store()
     }
 
-    fn take_store(&mut self) -> Store {
-        let thread = self.thread.take().expect("joined once");
-        match thread.join() {
-            Ok(store) => store,
-            Err(panic) => std::panic::resume_unwind(panic),
-        }
+    fn take_store(&mut self) -> Result<Store, IngestPanicked> {
+        let thread = self.thread.take().expect("the thread is joined once");
+        thread.join().map_err(|payload| {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(%message, "the ingest thread panicked");
+            IngestPanicked { message }
+        })
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic without a message".to_owned()
     }
 }
 
 impl Drop for IngestHandle {
     fn drop(&mut self) {
-        if let Some(thread) = self.thread.take() {
+        if self.thread.is_some() {
             let _ = self.commands.send(Command::Stop);
-            if thread.join().is_err() {
-                tracing::error!("the ingest thread panicked");
-            }
+            // A panic is logged by take_store; a drop has nobody to report it to.
+            let _ = self.take_store();
         }
     }
 }
@@ -211,6 +235,8 @@ struct Worker {
     sinks: Vec<Box<dyn ChunkSink>>,
     waker: Box<dyn Fn() + Send>,
     shared: Arc<Shared>,
+    /// Every sink has heard `on_disconnect`.
+    sinks_closed: bool,
 }
 
 /// Why the loop should end.
@@ -233,34 +259,46 @@ impl Worker {
                     Err(_) => {
                         // The session is gone. Apply queued local lines, then finish.
                         self.drain_commands();
-                        self.wake();
-                        return self.store;
+                        Flow::Stop
                     }
                 },
             };
             self.wake();
             if let Flow::Stop = flow {
-                return self.store;
+                break;
             }
         }
+        self.close_sinks();
+        self.store
     }
 
-    /// Handle `first` and whatever else is already queued, up to a batch.
+    /// Handle `first` and whatever else is already queued, up to a batch. Local lines
+    /// queued before an event are applied before it, and an event taken off the queue
+    /// is always ingested, even when a stop was queued with those lines.
     fn batch(&mut self, first: SessionEvent) -> Flow {
-        if let Flow::Stop = self.drain_commands() {
-            return Flow::Stop;
-        }
+        let mut flow = self.drain_commands();
         self.event(first);
         for _ in 1..MAX_BATCH {
+            if let Flow::Stop = flow {
+                break;
+            }
             let Ok(event) = self.events.try_recv() else {
                 break;
             };
-            if let Flow::Stop = self.drain_commands() {
-                return Flow::Stop;
-            }
+            flow = self.drain_commands();
             self.event(event);
         }
-        Flow::Continue
+        flow
+    }
+
+    /// Tell every sink the stream has ended, once.
+    fn close_sinks(&mut self) {
+        if !self.sinks_closed {
+            self.sinks_closed = true;
+            for sink in &mut self.sinks {
+                sink.on_disconnect();
+            }
+        }
     }
 
     fn drain_commands(&mut self) -> Flow {
@@ -309,9 +347,7 @@ impl Worker {
                     None => "Disconnected".to_owned(),
                 };
                 self.store.append_local(&text, Direction::Notice);
-                for sink in &mut self.sinks {
-                    sink.on_disconnect();
-                }
+                self.close_sinks();
             }
             SessionEvent::WriteFailed(error) => {
                 self.store
@@ -337,7 +373,8 @@ mod tests {
     use super::*;
     use crate::text::{LineId, LineSource};
 
-    struct Recorder(Arc<Mutex<(Vec<u8>, bool)>>);
+    /// Records chunks and counts `on_disconnect` calls.
+    struct Recorder(Arc<Mutex<(Vec<u8>, usize)>>);
 
     impl ChunkSink for Recorder {
         fn on_chunk(&mut self, bytes: &[u8], _at: Instant) {
@@ -345,14 +382,32 @@ mod tests {
         }
 
         fn on_disconnect(&mut self) {
-            self.0.lock().unwrap().1 = true;
+            self.0.lock().unwrap().1 += 1;
+        }
+    }
+
+    /// Panics on the first chunk.
+    struct Exploding;
+
+    impl ChunkSink for Exploding {
+        fn on_chunk(&mut self, _bytes: &[u8], _at: Instant) {
+            panic!("sink exploded");
+        }
+
+        fn on_disconnect(&mut self) {}
+    }
+
+    fn data(bytes: &[u8]) -> SessionEvent {
+        SessionEvent::Data {
+            bytes: Arc::from(bytes),
+            received_at: Instant::now(),
         }
     }
 
     #[test]
     fn events_become_lines_and_sinks_see_chunks() {
         let (tx, rx) = unbounded();
-        let recorded = Arc::new(Mutex::new((Vec::new(), false)));
+        let recorded = Arc::new(Mutex::new((Vec::new(), 0)));
         let handle = Ingest::spawn(
             rx,
             Store::default(),
@@ -376,7 +431,7 @@ mod tests {
         .unwrap();
         tx.send(SessionEvent::Disconnected { error: None }).unwrap();
         drop(tx);
-        let store = handle.join();
+        let store = handle.join().expect("the ingest thread ran cleanly");
         let snap = store.snapshot();
         let mut lines = Vec::new();
         snap.lines(LineId(0)..snap.end(), &mut lines);
@@ -395,7 +450,7 @@ mod tests {
         );
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded.0, b"hello\r\nworld\n");
-        assert!(recorded.1);
+        assert_eq!(recorded.1, 1, "exactly one on_disconnect");
     }
 
     #[test]
@@ -410,9 +465,103 @@ mod tests {
             thread::yield_now();
         }
         let reader = handle.reader();
-        let store = handle.stop();
+        let store = handle.stop().expect("the ingest thread ran cleanly");
         assert_eq!(store.snapshot().line(LineId(0)).unwrap().text, "note");
         assert_eq!(reader.snapshot().line_count(), 1);
         drop(tx);
+    }
+
+    /// A stop racing the session's `Disconnected`: however the race falls, the store
+    /// comes back and every sink hears `on_disconnect` exactly once.
+    #[test]
+    fn stop_racing_a_disconnect_still_closes_sinks() {
+        for round in 0..300 {
+            let (tx, rx) = unbounded();
+            let recorded = Arc::new(Mutex::new((Vec::new(), 0)));
+            let handle = Ingest::spawn(
+                rx,
+                Store::default(),
+                vec![Box::new(Recorder(Arc::clone(&recorded)))],
+                Box::new(|| {}),
+            );
+            tx.send(data(b"last words\n")).unwrap();
+            tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+            if round % 3 == 0 {
+                thread::yield_now();
+            }
+            let store = handle.stop().expect("the ingest thread ran cleanly");
+            let (bytes, disconnects) = recorded.lock().unwrap().clone();
+            assert_eq!(disconnects, 1, "round {round}");
+            // Whatever reached the sink also reached the store.
+            assert_eq!(store.stats().raw_len, bytes.len() as u64, "round {round}");
+        }
+    }
+
+    /// The event taken off the queue is ingested even when a stop was queued with the
+    /// local lines ahead of it.
+    #[test]
+    fn the_event_in_hand_is_ingested_despite_a_queued_stop() {
+        let (tx, rx) = unbounded::<SessionEvent>();
+        let (cmd_tx, cmd_rx) = unbounded();
+        let recorded = Arc::new(Mutex::new((Vec::new(), 0)));
+        let mut worker = Worker {
+            events: rx,
+            commands: cmd_rx,
+            store: Store::default(),
+            sinks: vec![Box::new(Recorder(Arc::clone(&recorded)))],
+            waker: Box::new(|| {}),
+            shared: Arc::new(Shared::default()),
+            sinks_closed: false,
+        };
+        cmd_tx
+            .send(Command::Local("echo".into(), Direction::Tx, Instant::now()))
+            .unwrap();
+        cmd_tx.send(Command::Stop).unwrap();
+        tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+        let first = worker.events.try_recv().unwrap();
+        assert!(matches!(worker.batch(first), Flow::Stop));
+        let snap = worker.store.snapshot();
+        let mut lines = Vec::new();
+        snap.lines(LineId(0)..snap.end(), &mut lines);
+        let got: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(got, vec!["echo", "Disconnected"]);
+        assert_eq!(recorded.lock().unwrap().1, 1);
+    }
+
+    /// A panic on the ingest thread is reported, not re-raised on the caller.
+    #[test]
+    fn a_panicking_sink_is_reported_not_propagated() {
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(Exploding)],
+            Box::new(|| {}),
+        );
+        tx.send(data(b"boom\n")).unwrap();
+        let err = handle.join().expect_err("the sink panicked");
+        assert!(err.message.contains("sink exploded"), "{err}");
+        // Stopping or dropping a handle whose thread panicked is quiet too.
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(Exploding)],
+            Box::new(|| {}),
+        );
+        tx.send(data(b"boom\n")).unwrap();
+        while !handle.is_finished() {
+            thread::yield_now();
+        }
+        assert!(handle.stop().is_err());
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(Exploding)],
+            Box::new(|| {}),
+        );
+        tx.send(data(b"boom\n")).unwrap();
+        drop(handle);
     }
 }
