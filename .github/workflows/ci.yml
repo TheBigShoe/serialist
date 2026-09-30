@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per ref. A new push cancels the previous run, except on main, where every
+# commit should get a verdict and finish warming the cache.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Keep file and line info for backtraces but drop full debuginfo: it dominates the
+  # size of target/ and the cache, and nothing in CI reads it.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Cold builds are long: gpui-pre, wgpu and gpui-kit compile from scratch on every
+    # runner when the cache misses. Warm runs are much shorter.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # dtolnay/rust-toolchain needs an explicit version and does not read
+      # rust-toolchain.toml. With no arguments rustup installs the toolchain,
+      # components and channel pinned in that file, so there is one source of truth.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      # Only main saves the cache; PRs restore it. Three OS caches of a GPUI build are
+      # large, and PR caches would evict main's from the repository's 10 GB limit.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # System libraries for the GPUI Linux backend (wgpu with Wayland and X11).
+      # Sources: zed-industries/zed script/linux and longbridge/gpui-kit
+      # script/install-linux.sh. Both list libwayland-dev, libxkbcommon-x11-dev,
+      # libx11-xcb-dev, libfontconfig-dev and libvulkan1. Build-time links: xkbcommon
+      # (libxkbcommon, libxkbcommon-x11) and fontconfig via pkg-config. libudev-dev is
+      # for serialport's default libudev feature, which lands with the transport work.
+      # libasound2-dev is Zed's audio dependency and nothing in our tree uses ALSA.
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig-dev \
+            libudev-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # No serial hardware on any runner. Hardware tests are #[ignore] and stay skipped.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  licenses:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Licenses and bans
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans
+          arguments: --all-features
+
+      # cargo-deny has no warn level for vulnerabilities, so the advisories check is
+      # made non-blocking here: a new RUSTSEC entry shows as a failed step but does not
+      # fail the workflow. Licenses and bans above are hard failures.
+      - name: Advisories (non-blocking)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          arguments: --all-features
