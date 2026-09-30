@@ -16,6 +16,7 @@ use serialist_sim::{DeviceOutput, LinkConfig, SimDevice, SimWorld};
 use crate::actions::keys;
 use crate::commands_panel::{Field, PayloadKind, Row, copy_collection};
 use crate::config::{self, Config, ConfigPiece};
+use crate::dialog_footer;
 use crate::history::SAVE_DELAY;
 use crate::prelude::*;
 use crate::session_view::SessionView;
@@ -321,6 +322,139 @@ fn a_hex16_parameter_is_asked_for_encoded_and_remembered(cx: &mut TestAppContext
     assert_eq!(received.lock()[6..], [0x05, 0x5A, 0x02, 0x00, 0x34, 0x12]);
     assert_eq!(received.lock().len(), 12, "sent once");
     assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
+}
+
+/// Click the dialog footer's button `id` and let the dialog finish what that starts.
+fn click_dialog_button(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(id, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn dialog_is_open(cx: &mut TestAppContext, window: AnyWindowHandle) -> bool {
+    cx.update_window(window, |_, window, cx| window.has_active_dialog(cx))
+        .unwrap()
+}
+
+#[gpui_test]
+fn the_parameter_dialogs_buttons_send_or_dismiss(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-params-buttons");
+    let (world, received) = world();
+    let (window, workspace, _view) = open(cx, &world, &dir, "virtual:recorder", false);
+
+    send_from_panel(cx, &workspace, reference("Frames", "Query"));
+    let prompt = workspace
+        .read_with(cx, |w, _| w.param_prompt().cloned())
+        .expect("a parameter dialog");
+    assert!(dialog_is_open(cx, window));
+
+    // A value that is not valid keeps the dialog open and says why; nothing is sent.
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |prompt, cx| prompt.set_value("id", "zz", window, cx));
+    })
+    .unwrap();
+    click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    assert!(dialog_is_open(cx, window), "Send refuses a bad value");
+    assert!(prompt.read_with(cx, |p, _| p.errors()[0].is_some()));
+    assert!(received.lock().is_empty());
+
+    // Cancel closes it and sends nothing.
+    click_dialog_button(cx, window, dialog_footer::CANCEL_BUTTON);
+    run_until(cx, "the dialog to close", |cx| !dialog_is_open(cx, window));
+    assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
+    assert!(received.lock().is_empty());
+
+    // Send with a good value sends it and closes the dialog.
+    send_from_panel(cx, &workspace, reference("Frames", "Query"));
+    let prompt = workspace
+        .read_with(cx, |w, _| w.param_prompt().cloned())
+        .expect("a parameter dialog");
+    cx.update_window(window, |_, window, cx| {
+        prompt.update(cx, |prompt, cx| {
+            prompt.set_value("id", "0x1234", window, cx)
+        });
+    })
+    .unwrap();
+    click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    run_until(cx, "the frame at the device", |_| {
+        received.lock().len() == 6
+    });
+    assert_eq!(*received.lock(), [0x05, 0x5A, 0x02, 0x00, 0x34, 0x12]);
+    run_until(cx, "the dialog to close", |cx| !dialog_is_open(cx, window));
+    assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
+}
+
+#[gpui_test]
+fn the_command_forms_save_button_writes_the_file_and_cancel_does_not(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-form-buttons");
+    let (world, _) = world();
+    let (window, workspace, _view) = open(cx, &world, &dir, "virtual:at", false);
+    let panel = workspace.read_with(cx, |w, _| w.commands().clone());
+    let file = dir.join("commands").join("bench.json");
+    let before = std::fs::read_to_string(&file).unwrap();
+
+    // Cancel closes the form and leaves the file alone, edits and all.
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit(&reference("Modem", "Reset"), window, cx)
+        });
+    })
+    .unwrap();
+    let editor = panel
+        .read_with(cx, |p, _| p.editor().cloned())
+        .expect("the editor opened");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_field(Field::Name, "Discarded", window, cx)
+        });
+    })
+    .unwrap();
+    click_dialog_button(cx, window, dialog_footer::CANCEL_BUTTON);
+    run_until(cx, "the form to close", |cx| !dialog_is_open(cx, window));
+    assert!(panel.read_with(cx, |p, _| p.editor().is_none()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // A value that cannot be saved keeps the form open, with the reason in it.
+    cx.update_window(window, |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.edit(&reference("Modem", "Reset"), window, cx)
+        });
+    })
+    .unwrap();
+    let editor = panel
+        .read_with(cx, |p, _| p.editor().cloned())
+        .expect("the editor opened");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_field(Field::ExpectPattern, "(unclosed", window, cx)
+        });
+    })
+    .unwrap();
+    click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    assert!(
+        dialog_is_open(cx, window),
+        "a bad value keeps the form open"
+    );
+    assert!(editor.read_with(cx, |e, _| e.error().is_some()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+
+    // Save writes the file and closes the form.
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_field(Field::ExpectPattern, "", window, cx);
+            editor.set_field(Field::Name, "Restart", window, cx);
+        });
+    })
+    .unwrap();
+    click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    run_until(cx, "the form to close", |cx| !dialog_is_open(cx, window));
+    assert!(panel.read_with(cx, |p, _| p.editor().is_none()));
+    let loaded = CommandCollection::load(&file, CollectionSource::User(file.clone())).unwrap();
+    assert!(loaded.collection.find("Restart").is_some());
+    assert!(loaded.collection.find("Reset").is_none());
 }
 
 #[gpui_test]

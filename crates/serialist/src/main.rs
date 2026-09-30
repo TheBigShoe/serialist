@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serialist_script::{ScriptOutcome, StdioUi};
 use serialist_sim::SimWorld;
 use serialist_ui::config;
-use serialist_ui::prelude::application;
+use serialist_ui::prelude::{Application, Assets, application};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Args, Command};
@@ -51,7 +51,7 @@ fn main() {
     let config_paths = config::paths_for(args.config_dir.clone());
 
     if args.terminal_demo {
-        application().run(move |cx| {
+        app().run(move |cx| {
             serialist_ui::init(cx);
             config::start(config_paths, cx);
             if let Err(error) = serialist_ui::terminal::open_terminal_demo(cx) {
@@ -75,7 +75,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    application().run(move |cx| {
+    app().run(move |cx| {
         serialist_ui::init(cx);
         // Settings, keymap and themes: loaded before the window opens so it starts in
         // the user's theme and fonts, then watched for changes.
@@ -85,6 +85,14 @@ fn main() {
             cx.quit();
         }
     });
+}
+
+/// The GPUI application with gpui-kit's bundled icon set registered. Without an asset
+/// source every SVG icon (a select's chevron, a dialog's close button) draws as nothing.
+/// The screenshot harness (`serialist-ui/examples/screenshots.rs`) registers the same
+/// source; change both together.
+fn app() -> Application {
+    application().with_assets(Assets)
 }
 
 /// `--script`: run the script headless and return the exit status. The script's output

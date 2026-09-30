@@ -17,6 +17,7 @@ pub mod compose;
 pub mod config;
 pub mod decoded_panel;
 pub mod devices_panel;
+pub mod dialog_footer;
 pub mod export;
 pub mod fonts;
 pub mod framed;
@@ -69,6 +70,7 @@ pub use decoded_panel::{DecodedPanel, FrameTable};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
+pub use dialog_footer::DialogButtons;
 pub use export::{ExportFormat, ExportJob, FramesFormat};
 pub use fonts::{TerminalFont, UiFont};
 pub use framed::{FilteredText, FramedFilter};
@@ -100,6 +102,9 @@ pub mod prelude {
     pub use gpui_kit::prelude::*;
     pub use gpui_kit::*;
     pub use gpui_kit::{init as kit_init, open_window as kit_open_window};
+    // The bundled icon set (chevrons, the dialog's close X, ...). An app registers it with
+    // `Application::with_assets`; without one every SVG icon renders as nothing.
+    pub use gpui_kit::assets::Assets;
 
     // Headless UI-test helpers; they exist only with gpui-kit's `test-support` feature,
     // which the dev-dependency turns on.
@@ -118,7 +123,9 @@ pub mod prelude {
     pub use gpui_kit::test as gpui_test;
 
     pub use gpui_kit::component::button::{Button, ButtonVariants};
-    pub use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+    pub use gpui_kit::component::dialog::{
+        Cancel, Confirm, Dialog, DialogButtonProps, DialogFooter,
+    };
     pub use gpui_kit::component::tooltip::Tooltip;
     pub use gpui_kit::component::{WindowExt, v_resizable};
     // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait

@@ -43,7 +43,7 @@ wasm-fixtures:
 # Everything the CI test job runs.
 ci: fmt-check lint test
 
-# Render the real workspace offscreen with Metal in ten states (macOS only) and write
+# Render the real workspace offscreen with Metal in eleven states (macOS only) and write
 # PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
 screenshots *names:
     cargo run -p serialist-ui --example screenshots --locked -- --out target/screenshots {{names}}

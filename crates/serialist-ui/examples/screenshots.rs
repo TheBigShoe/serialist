@@ -149,6 +149,14 @@ const SHOTS: &[Shot] = &[
         connect: Some("virtual:race"),
         drive: decoded_race,
     },
+    Shot {
+        file: "11-param-prompt.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: Some("virtual:at"),
+        drive: param_prompt,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -245,6 +253,24 @@ fn commands(stage: &mut Stage) {
         .expect("the window is open");
     run_until(&mut stage.cx, "the command form", |cx| {
         commands.read_with(cx, |panel, _| panel.editor().is_some())
+    });
+}
+
+/// The parameter prompt a saved command with a parameter (the Echo example) opens when
+/// it is sent from the Commands panel.
+fn param_prompt(stage: &mut Stage) {
+    stage.session();
+    let (commands, workspace) = (
+        stage
+            .workspace
+            .read_with(&stage.cx, |w, _| w.commands().clone()),
+        stage.workspace.clone(),
+    );
+    commands.update(&mut stage.cx, |panel, cx| {
+        panel.send(CommandRef::new("AT basics", "With parameters", "Echo"), cx);
+    });
+    run_until(&mut stage.cx, "the parameter prompt", |cx| {
+        workspace.read_with(cx, |w, _| w.param_prompt().is_some())
     });
 }
 
@@ -425,12 +451,11 @@ impl Stage {
             .expect("write the example scripts");
         let world = (shot.world)();
 
-        // No asset source, as in the app: the binary's `application()` installs none, so
-        // SVG icons (a select's chevron, a dialog's close button) do not draw there
-        // either. Keep this in step with `crates/serialist/src/main.rs`.
+        // The bundled icon set, as in the app, so SVG icons (a select's chevron, a
+        // dialog's close button) draw. Keep this in step with `crates/serialist/src/main.rs`.
         let mut cx = HeadlessAppContext::with_platform(
             text_system,
-            Arc::new(()),
+            Arc::new(Assets),
             platform::current_headless_renderer,
         );
         // The engine's ingest thread rings the session view's doorbell from its own

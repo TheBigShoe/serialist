@@ -20,6 +20,10 @@ use crate::fonts::{TerminalFont, UiFont};
 use crate::prelude::*;
 use crate::terminal::palette::contrast_ratio;
 
+/// The dimming behind a dialog: black at 60% on a dark theme, 35% on a light one.
+const DARK_OVERLAY: &str = "#00000099";
+const LIGHT_OVERLAY: &str = "#00000059";
+
 /// `#rrggbbaa`, the form gpui-kit's theme files use.
 pub fn hex(color: Hsla) -> SharedString {
     let rgba = color.to_rgb();
@@ -74,6 +78,7 @@ impl ZedColors<'_> {
 /// | `scrollbar.*` | `scrollbar.track.background`, `scrollbar.thumb.background`, `scrollbar.thumb.hover_background` |
 /// | `selection.background`, `caret` | `players[0].selection`, `players[0].cursor` |
 /// | `success`, `danger`, `warning`, `info` backgrounds | `success`, `error`, `warning`, `info` |
+/// | `overlay` (a dialog's backdrop) | none: black at 60% (dark) or 35% (light) |
 /// | highlight `editor.background`, `editor.foreground` | `editor.background`, `editor.foreground` |
 ///
 /// The primary foreground has no Zed key: it is whichever of `background` and `text`
@@ -145,6 +150,15 @@ pub fn kit_theme_config(zed: &ZedColors<'_>, ui: &UiFont, terminal: &TerminalFon
     c.scrollbar_thumb_hover = zed.hex(&["scrollbar.thumb.hover_background"]);
     c.selection = zed.hex(&["players[0].selection"]);
     c.caret = zed.hex(&["players[0].cursor"]);
+
+    // Zed has no key for a modal's backdrop. gpui-kit's own default (20% black on dark,
+    // 5% on light) barely shows on a window that is dark to begin with, so a dialog would
+    // not read as modal.
+    c.overlay = Some(SharedString::from(if zed.dark {
+        DARK_OVERLAY
+    } else {
+        LIGHT_OVERLAY
+    }));
 
     c.success = zed.hex(&["success"]);
     c.danger = zed.hex(&["error"]);

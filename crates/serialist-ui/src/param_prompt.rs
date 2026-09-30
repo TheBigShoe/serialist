@@ -3,12 +3,13 @@
 //! One input per [`Param`], labelled and prefilled with the value used last in this
 //! session (the session view remembers them) or the parameter's default. Each value is
 //! checked against its kind as the user types; confirming (Enter in any field, which is
-//! the dialog's own Enter binding, or the dialog's Send button) emits
+//! the dialog's own Enter binding, or the Send button the prompt ends in) emits
 //! [`ParamPromptEvent::Confirmed`] with the values, and the workspace sends and closes
-//! the dialog.
+//! the dialog. Cancel, Escape and the dialog's close button dismiss it.
 
 use serialist_core::{CommandRef, Param, ParamValues};
 
+use crate::dialog_footer::DialogButtons;
 use crate::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,37 +153,44 @@ impl ParamPrompt {
 impl Render for ParamPrompt {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        v_flex().id("param-prompt").gap_2().children(
-            self.params
-                .iter()
-                .zip(&self.inputs)
-                .zip(&self.errors)
-                .enumerate()
-                .map(|(ix, ((param, input), error))| {
-                    v_flex()
-                        .gap_0p5()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div().w(px(120.)).flex_none().text_sm().truncate().child(
-                                        SharedString::from(param.display_label().to_owned()),
+        v_flex()
+            .id("param-prompt")
+            .gap_2()
+            .children(
+                self.params
+                    .iter()
+                    .zip(&self.inputs)
+                    .zip(&self.errors)
+                    .enumerate()
+                    .map(|(ix, ((param, input), error))| {
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div().w(px(120.)).flex_none().text_sm().truncate().child(
+                                            SharedString::from(param.display_label().to_owned()),
+                                        ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .font_family(theme.mono_font_family.clone())
+                                            .child(Input::new(input).id(("param", ix)).small()),
                                     ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .font_family(theme.mono_font_family.clone())
-                                        .child(Input::new(input).id(("param", ix)).small()),
-                                ),
-                        )
-                        .children(error.clone().map(|error| {
-                            div()
-                                .text_xs()
-                                .text_color(theme.danger)
-                                .child(SharedString::from(error))
-                        }))
-                }),
-        )
+                            )
+                            .children(error.clone().map(|error| {
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.danger)
+                                    .child(SharedString::from(error))
+                            }))
+                    }),
+            )
+            // The dialog is opened by the workspace, which sets no footer of its own (and
+            // gpui-component draws none unless one is set), so the prompt ends in its own:
+            // Send dispatches the dialog's Confirm, as Enter does, and Cancel its Cancel.
+            .child(div().mt_2().child(DialogButtons::new("Send")))
     }
 }
