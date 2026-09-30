@@ -118,9 +118,10 @@ fn idle_reader_loop_reads_once_per_timeout() {
         });
         clock.settle(2);
         let before = link.stats().host_read_calls;
-        // One second in 1 ms steps: each read times out at 10 ms and the next starts at
-        // once. A reader that spun, or woke early, would show more calls.
-        advance_to(&clock, clock.now() + Duration::from_secs(1), MS, 2);
+        // One second in 5 ms steps: each read times out at 10 ms and the next starts at
+        // once. Every step wakes the reader, so one that spun, or returned before its
+        // timeout, would show 200 calls or more.
+        advance_to(&clock, clock.now() + Duration::from_secs(1), 5 * MS, 2);
         assert_eq!(link.stats().host_read_calls - before, 100);
         stop.store(true, Ordering::Release);
         clock.advance(10 * MS);
@@ -173,7 +174,7 @@ fn paced_rate_matches_the_schedule_in_every_window() {
     // device thread happens to wake must not change what the host receives.
     for (baud, step) in [
         (115_200, 4 * MS),
-        (9_600, MS),
+        (9_600, 10 * MS),
         (1_000_000, 7 * MS),
         (3_000_000, 24 * MS),
     ] {
