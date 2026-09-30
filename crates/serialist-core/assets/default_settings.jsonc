@@ -75,9 +75,10 @@
     // text is on screen already.
     "decoded_inline": true,
     // While a codec plugin decodes the session, leave out of the text view the received
-    // lines whose bytes all belong to decoded binary frames. Text is never hidden, and
-    // the hex view, the Decoded panel and raw export still have every byte.
-    "hide_framed_bytes": false
+    // lines whose bytes all belong to decoded binary frames: the Decoded panel shows those
+    // frames. Text is never hidden, and the hex view, the Decoded panel and raw export
+    // still have every byte. The codec menu in the session's toolbar turns it off.
+    "hide_framed_bytes": true
   },
 
   // ---- Sessions ----

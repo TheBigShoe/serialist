@@ -50,6 +50,26 @@ with `--port <PATH> --baud <N>`.
 
 Logging follows `RUST_LOG`, for example `RUST_LOG=serialist=debug`.
 
+### The window
+
+Devices and Commands sit in the left dock, the session in the center, the Decoded panel and
+the Script console in the right dock, and the status bar along the bottom. Each dock has a
+rail of icons that opens and closes its panels. The Decoded panel opens when a session
+decodes with a codec and the Script console when a script prints; drag a dock's edge to
+resize it (the widths are kept in `state.json`). Below 1100 px of window width the right dock
+folds to its rail, and below 900 px the left one does; a panel opened from the rail stays open.
+
+The session toolbar is one row of icons, each with its shortcut in its tooltip: the port and
+its settings, Connect or Disconnect, Command / Inline, Pause, Record and Clear, Search, Hex,
+Timestamps and Wrap, an Export menu (text, raw bytes, decoded frames), and the codec menu
+(which also turns summaries and hidden frames on and off). Whatever does not fit the width
+goes to the `…` menu at its right end. The status bar shows the port and its settings (click
+for the settings), the newest notice, then the mode (click to switch), RX and TX with their
+rates, and chips for the codec, a pause, a recording and a running script.
+
+`cmd-shift-p` (`ctrl-shift-p` on Linux and Windows) opens the command palette: every action,
+saved command and script, filtered as you type, with its key binding; Enter runs it.
+
 ### Tabs
 
 Every open port has a tab: `serialist --virtual at --virtual race` opens two, the first in
@@ -63,12 +83,13 @@ bytes that arrived meanwhile. When the window closes the tabs are written to `st
 and reopen at the next start (the `restore_session` setting; ports named on the command line
 open instead).
 
-The button at the left of a session's toolbar (`115200 8N1`) opens its port settings: baud
+The button at the left of a session's toolbar (`115200 8N1`), and the port in the status
+bar, open its port settings: baud
 (any integer, or one from the list), data bits, parity, stop bits, flow control, line ending,
 local echo, live DTR and RTS switches and Send break, applied to the open port at once. The
-gear on a Devices row sets the same things for the next connect to that port. Disconnect in
-the toolbar closes the port and keeps the scrollback; Connect in its place opens it again,
-with the same settings, into the same scrollback.
+gear on a Devices row (hover the row) sets the same things for the next connect to that port.
+Disconnect in the toolbar closes the port and keeps the scrollback; Connect in its place opens
+it again, with the same settings, into the same scrollback.
 
 ### The config directory
 

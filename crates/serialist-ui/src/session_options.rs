@@ -43,7 +43,7 @@ impl Default for DisplayDefaults {
             view: DisplayMode::Text,
             hex_bytes_per_row: HEX_BYTES_PER_ROW,
             decoded_inline: true,
-            hide_framed_bytes: false,
+            hide_framed_bytes: true,
         }
     }
 }
@@ -139,7 +139,7 @@ mod tests {
                 "local_echo": true,
                 "display": { "wrap": true, "timestamps": "delta", "view": "hex_ascii",
                              "hex_bytes_per_row": 8, "decoded_inline": false,
-                             "hide_framed_bytes": true },
+                             "hide_framed_bytes": false },
                 "devices": [ { "match": { "product": "Airoha" }, "eol": "cr",
                                "plugin": "airoha-race" } ]
             }"#,
@@ -157,7 +157,7 @@ mod tests {
                 view: DisplayMode::Hex,
                 hex_bytes_per_row: 8,
                 decoded_inline: false,
-                hide_framed_bytes: true,
+                hide_framed_bytes: false,
             }
         );
         assert_eq!(airoha.codec.as_deref(), Some("airoha-race"));

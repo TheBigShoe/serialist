@@ -115,6 +115,24 @@ pub mod commands {
     }
 }
 
+/// The command palette's actions (see [`palette`](crate::palette)).
+pub mod command_palette {
+    use crate::prelude::*;
+
+    actions!(
+        command_palette,
+        [
+            /// Open the command palette: every action and saved command, filtered as you
+            /// type.
+            Toggle,
+            /// Move the palette's selection down.
+            SelectNext,
+            /// Move the palette's selection up.
+            SelectPrevious,
+        ]
+    );
+}
+
 /// The session tabs' actions: a tab per open port (see [`workspace`](crate::workspace)).
 pub mod tabs {
     use crate::prelude::*;
@@ -201,6 +219,9 @@ pub mod context {
     pub const TERMINAL_INLINE: &str = "TerminalInline";
     pub const TERMINAL_SEARCH: &str = "TerminalSearch";
     pub const SCRIPT_CONSOLE: &str = "ScriptConsole";
+    pub const COMMAND_PALETTE: &str = "CommandPalette";
+    /// The palette's query field, where Up and Down move the selection.
+    pub const COMMAND_PALETTE_INPUT: &str = "CommandPalette > Input";
 }
 
 /// The default chords tests press. The bundled keymap in `serialist-core` is where they
@@ -229,6 +250,7 @@ pub(crate) mod keys {
     pub const TOGGLE_INLINE: &str = "cmd-i";
     pub const PASTE: &str = "cmd-v";
     pub const SAVE_AS_COMMAND: &str = "cmd-alt-s";
+    pub const COMMAND_PALETTE: &str = "cmd-shift-p";
 }
 
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
@@ -258,6 +280,7 @@ pub(crate) mod keys {
     pub const TOGGLE_INLINE: &str = "ctrl-i";
     pub const PASTE: &str = "ctrl-shift-v";
     pub const SAVE_AS_COMMAND: &str = "ctrl-alt-s";
+    pub const COMMAND_PALETTE: &str = "ctrl-shift-p";
 }
 
 /// App-level setup: remember gpui-kit's own key bindings (so a keymap reload can put
@@ -437,5 +460,12 @@ mod tests {
             bound(Some(context::COMPOSE_BAR), keys::SAVE_AS_COMMAND),
             "compose::SaveAsCommand"
         );
+        assert_eq!(
+            bound(workspace, keys::COMMAND_PALETTE),
+            "command_palette::Toggle"
+        );
+        let palette = Some(context::COMMAND_PALETTE_INPUT);
+        assert_eq!(bound(palette, "down"), "command_palette::SelectNext");
+        assert_eq!(bound(palette, "up"), "command_palette::SelectPrevious");
     }
 }

@@ -102,7 +102,7 @@
 //! The ingest thread also runs the session's [`CodecSlotSink`], built on that thread
 //! ([`Ingest::spawn_with`]), which decodes with the codec the view selects (see
 //! [`codecs`](crate::codecs)): the device profile's `plugin` at opening, then the
-//! toolbar's picker. Decoded frames go to a [`FrameStore`](serialist_core::FrameStore)
+//! toolbar's codec menu. Decoded frames go to a [`FrameStore`](serialist_core::FrameStore)
 //! whose waker rings the same doorbell, so one wake acknowledges both stores, then takes
 //! both snapshots. Per wake, with the new frames, the view:
 //!
@@ -139,12 +139,14 @@ use serialist_script::{ScriptOutcome, ScriptSource};
 
 use crate::actions::{self, context};
 use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
+use crate::chrome;
 use crate::codecs::{
     CodecSelection, CodecSlotSink, FrameTime, NO_CODEC, encode_codec_command, fill_placeholders,
     frame_matches, hides_bytes, inline_summary, is_text_frame,
 };
 use crate::compose::{ComposeBar, ComposeEvent};
 use crate::config::Config;
+use crate::dialog_footer::DialogButtons;
 use crate::export::{ExportFormat, ExportJob, FramesFormat, SharedSource};
 use crate::framed::{FilteredText, FramedFilter};
 use crate::history::PersistentHistory;
@@ -163,12 +165,13 @@ use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
 use crate::session_options::SessionOptions;
 use crate::status::{
-    ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusInputs, StatusLine,
-    file_name, format_bytes,
+    ConnectionState, Notice, PauseMark, RateMeter, RecordingStatus, ScriptStatus, StatusInputs,
+    StatusLine, file_name, format_bytes,
 };
 use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
-use crate::terminal::{Clock, DisplayMode, TerminalView, TimestampMode};
+use crate::terminal::{Clock, DisplayMode, TerminalView, TimestampMode, TimestampModeExt};
+use crate::toolbar::{self, ToolbarItem, ToolbarLayout, ToolbarMetrics};
 
 /// The shortest time between two snapshots: about a frame at 120 Hz.
 pub const FRAME: Duration = Duration::from_millis(8);
@@ -576,9 +579,18 @@ pub struct SessionView {
     reply_marks: Vec<SearchMatch>,
     frame_marks: Vec<SearchMatch>,
     selected_frame: Option<FrameId>,
-    /// The toolbar's codec picker, and whether it must be told the codec changed.
-    codec_select: Entity<SelectState<Vec<String>>>,
-    codec_select_stale: bool,
+    /// The toolbar's width as the workspace lays it out (the center's), and as last
+    /// measured; the hint wins, the measure serves a view with no workspace around it.
+    width_hint: Option<Pixels>,
+    measured_width: Option<Pixels>,
+    /// What the toolbar showed and put in its overflow menu, as last laid out.
+    toolbar_layout: ToolbarLayout,
+    /// The labelled toolbar controls' widths as last drawn, for the next layout.
+    tool_widths: ToolWidths,
+    /// Byte rates for the status line, sampled by housekeeping.
+    rates: RateMeter,
+    /// The terminal's toggles as the toolbar last showed them.
+    terminal_tools: TerminalTools,
     focus_handle: FocusHandle,
     /// On screen: its tab is the active one. A hidden view leaves its doorbell
     /// unanswered (see "In a background tab").
@@ -738,24 +750,18 @@ impl SessionView {
         });
         tracing::info!(%port, serial = %serial.summary(), "session open");
 
-        let choices = codec_choices(cx);
-        let codec_select = cx.new(|cx| {
-            SelectState::new(choices, Some(IndexPath::new(0)), window, cx).searchable(false)
+        // The toolbar shows the terminal's toggles, however they are flipped (its keys
+        // too), but the terminal's other changes (new lines) are no reason to repaint.
+        let terminal_changes = cx.observe(&terminal, |this, terminal, cx| {
+            let tools = TerminalTools::of(terminal.read(cx));
+            if tools != this.terminal_tools {
+                this.terminal_tools = tools;
+                cx.notify();
+            }
         });
-        let codec_picked = cx.subscribe(
-            &codec_select,
-            |this, _, event: &SelectEvent<Vec<String>>, cx| {
-                let SelectEvent::Confirm(Some(name)) = event else {
-                    return;
-                };
-                if this.codec_name().unwrap_or(NO_CODEC) != name {
-                    this.set_codec(Some(name.as_str()), cx);
-                }
-            },
-        );
-        // A plugin reload reaches the codec this session runs, and the picker's list.
-        let config_changes = cx.observe_global_in::<Config>(window, |this, window, cx| {
-            this.codecs_changed(window, cx);
+        // A plugin reload reaches the codec this session runs.
+        let config_changes = cx.observe_global::<Config>(|this, cx| {
+            this.codecs_changed(cx);
         });
         let initial_codec = options.codec.clone();
         let decoded_inline = options.display.decoded_inline;
@@ -819,8 +825,12 @@ impl SessionView {
             reply_marks: Vec::new(),
             frame_marks: Vec::new(),
             selected_frame: None,
-            codec_select,
-            codec_select_stale: false,
+            width_hint: None,
+            measured_width: None,
+            toolbar_layout: ToolbarLayout::default(),
+            tool_widths: ToolWidths::default(),
+            rates: RateMeter::default(),
+            terminal_tools: TerminalTools::default(),
             focus_handle: cx.focus_handle(),
             visible: true,
             missed_wake: false,
@@ -840,7 +850,7 @@ impl SessionView {
                 compose_events,
                 release,
                 interceptor,
-                codec_picked,
+                terminal_changes,
                 config_changes,
                 port_settings_events,
             ],
@@ -971,6 +981,7 @@ impl SessionView {
             paste: self.paste_progress(),
             script: script.as_ref(),
             codec,
+            rates: self.rates.rates(),
         })
     }
 
@@ -1330,6 +1341,15 @@ impl SessionView {
         changed
     }
 
+    /// The rates as the status line words them, to repaint only when that changes.
+    fn status_rates(&self) -> (Option<String>, Option<String>) {
+        let rates = self.rates.rates();
+        (
+            crate::status::format_rate(rates.rx),
+            crate::status::format_rate(rates.tx),
+        )
+    }
+
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
         if !self.visible {
             self.background_housekeeping(cx);
@@ -1337,6 +1357,12 @@ impl SessionView {
         }
         // A running script's time in the status line moves on its own.
         let mut changed = self.poll_session(cx) | self.script_status().is_some();
+        // So do the byte rates, until they settle to nothing.
+        let before = self.status_rates();
+        let now = cx.background_executor().now();
+        self.rates
+            .record(now, self.stats.rx_bytes, self.stats.tx_bytes);
+        changed |= self.status_rates() != before;
         let recorded = self
             .recording_status
             .as_ref()
@@ -1711,22 +1737,16 @@ impl SessionView {
         // Summaries start with the frames of this codec.
         self.inline_next = self.frame_snapshot.end().max(self.frames.stats().end);
         self.decoded_generation += 1;
-        self.codec_select_stale = true;
         self.update_filter(cx);
         cx.notify();
         true
     }
 
-    /// The configuration changed: list its codecs in the picker, and if the factory of
-    /// the codec this session runs was replaced (a plugin reloaded), decode with the new
-    /// one from the next chunk on.
-    fn codecs_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let choices = codec_choices(cx);
+    /// The configuration changed: if the factory of the codec this session runs was
+    /// replaced (a plugin reloaded), decode with the new one from the next chunk on. (The
+    /// codec menu lists the configuration's codecs each time it opens.)
+    fn codecs_changed(&mut self, cx: &mut Context<Self>) {
         let registry = codec_registry(cx);
-        self.codec_select.update(cx, |select, cx| {
-            select.set_items(choices, window, cx);
-        });
-        self.codec_select_stale = true;
         let Some(codec) = &self.codec else {
             return;
         };
@@ -2103,7 +2123,7 @@ impl SessionView {
                 .title(title.clone())
                 .w(px(420.))
                 .child(prompt.clone())
-                .button_props(DialogButtonProps::default().ok_text("OK").show_cancel(true))
+                .footer(DialogButtons::new("OK"))
                 .on_ok(move |_, _, cx| {
                     confirm
                         .update(cx, |view, cx| view.answer_script_prompt(true, cx))
@@ -2499,11 +2519,7 @@ impl SessionView {
                 .title(title.clone())
                 .w(px(420.))
                 .child(div().text_sm().child(message.clone()))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Disconnect")
-                        .show_cancel(true),
-                )
+                .footer(DialogButtons::new("Disconnect"))
                 .on_ok(move |_, window, cx| {
                     confirm
                         .update(cx, |view, cx| view.confirm_disconnect(window, cx))
@@ -3214,26 +3230,136 @@ impl SessionView {
 
     // --- Rendering -------------------------------------------------------------------
 
-    /// Tell the codec picker which codec runs, after a change it did not make.
-    fn sync_codec_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.codec_select_stale) {
-            return;
+    /// The width the workspace gives the view (the center's), so the toolbar is laid out
+    /// for it in the frame it is drawn in. `None` falls back to measuring.
+    pub fn set_width_hint(&mut self, width: Option<Pixels>) {
+        self.width_hint = width;
+    }
+
+    /// What the toolbar showed and put in its overflow menu, as last drawn.
+    pub fn toolbar_layout(&self) -> &ToolbarLayout {
+        &self.toolbar_layout
+    }
+
+    /// The widths of the toolbar's labelled controls: as last drawn with the same label,
+    /// else estimated from the label's length (the first frame, a new label).
+    fn toolbar_metrics(&self, codecs: usize, window: &Window) -> ToolbarMetrics {
+        // Button labels are small text; a character is a little over half its size.
+        let char_width = f32::from(window.rem_size()) * 0.875 * 0.6;
+        let text = |text: &str| text.chars().count() as f32 * char_width;
+        let summary = self.serial.summary();
+        let codec = self.codec_label();
+        let measured = |width: &Option<(String, f32)>, label: &str| {
+            width
+                .as_ref()
+                .filter(|(was, _)| was == label)
+                .map(|(_, width)| *width)
+        };
+        ToolbarMetrics {
+            connection: measured(&self.tool_widths.connection, &summary)
+                .unwrap_or_else(|| 12. + 8. + text(&summary) + 16. + toolbar::ICON),
+            mode: self
+                .tool_widths
+                .mode
+                .unwrap_or_else(|| text("Command") + text("Inline") + 34.),
+            codec: (codecs > 1).then(|| {
+                measured(&self.tool_widths.codec, &codec)
+                    .unwrap_or_else(|| (text(&codec) + 44.).min(f32::from(CODEC_MAX_WIDTH)))
+            }),
         }
-        let name = self.codec_name().unwrap_or(NO_CODEC).to_owned();
-        self.codec_select.update(cx, |select, cx| {
-            if select.selected_value() != Some(&name) {
-                select.set_selected_value(&name, window, cx);
+    }
+
+    /// What the codec menu's button says: the codec, or "Codec" with none.
+    fn codec_label(&self) -> String {
+        self.codec_name().unwrap_or("Codec").to_owned()
+    }
+
+    /// Keep a labelled control's drawn width for the next layout; a change lays the
+    /// toolbar out again.
+    fn measured(
+        view: &WeakEntity<Self>,
+        control: ToolControl,
+        label: String,
+    ) -> impl FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static {
+        let view = view.clone();
+        move |bounds, _, cx| {
+            let width = f32::from(bounds.size.width);
+            view.update(cx, |this, cx| {
+                let slot = match control {
+                    ToolControl::Connection => &mut this.tool_widths.connection,
+                    ToolControl::Codec => &mut this.tool_widths.codec,
+                    ToolControl::Mode => {
+                        if this.tool_widths.mode != Some(width) {
+                            this.tool_widths.mode = Some(width);
+                            cx.notify();
+                        }
+                        return;
+                    }
+                };
+                if slot.as_ref() != Some(&(label.clone(), width)) {
+                    *slot = Some((label, width));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }
+    }
+
+    /// The pressed states the menus show, as of this frame.
+    fn tool_state(&self, cx: &App) -> ToolState {
+        let terminal = self.terminal.read(cx);
+        ToolState {
+            inline: self.mode == Mode::Inline,
+            paused: self.is_paused(),
+            recording: self.recording_status.is_some(),
+            search: terminal.is_search_open(),
+            hex: terminal.display_mode() == DisplayMode::Hex,
+            has_hex: terminal.has_hex_source(),
+            timestamps: terminal.timestamps(),
+            wrap: terminal.wrap(),
+            decoding: self.codec.is_some(),
+            decoded_inline: self.decoded_inline,
+            hide_framed: self.hide_framed,
+            codec: self.codec_name().unwrap_or(NO_CODEC).to_owned(),
+            codecs: codec_choices(cx),
+        }
+    }
+
+    /// Open the search bar, or close it.
+    pub fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal.update(cx, |terminal, cx| {
+            if terminal.is_search_open() {
+                terminal.dismiss_search(window, cx);
+            } else {
+                terminal.deploy_search(window, cx);
             }
         });
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
+    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.tool_state(cx);
+        let metrics = self.toolbar_metrics(state.codecs.len(), window);
+        let available = self
+            .width_hint
+            .or(self.measured_width)
+            .unwrap_or_else(|| window.viewport_size().width);
+        // A couple of pixels in hand for rounding.
+        let layout = toolbar::lay_out(f32::from(available) - 2., &metrics);
+        self.toolbar_layout = layout.clone();
+
+        let view = cx.entity().downgrade();
         let theme = cx.theme();
-        let paused = self.is_paused();
-        let recording = self.recording_status.is_some();
-        let inline = self.mode == Mode::Inline;
-        let decoding = self.codec.is_some();
+        let (muted, danger, border) = (theme.muted_foreground, theme.danger, theme.border);
+        let dot_color = match &self.state {
+            ConnectionState::Connected => theme.success,
+            ConnectionState::Disconnected { error: None } => muted,
+            ConnectionState::Disconnected { error: Some(_) } => danger,
+        };
+        let background = Config::toolbar_background(cx);
         let open = !self.state.is_disconnected();
+        let workspace = Some(context::WORKSPACE);
+        let terminal = Some(context::TERMINAL);
+
         let form = self.port_form.clone();
         let port_settings = Popover::new("port-settings-popover")
             .trigger(
@@ -3250,137 +3376,501 @@ impl SessionView {
                 }
             }));
         let connection = if open {
-            Button::new("session-disconnect")
-                .label("Disconnect")
-                .tooltip("Close the port; the scrollback stays")
-                .small()
-                .ghost()
+            chrome::icon_button("session-disconnect", IconName::Unplug, cx)
+                .tooltip_with_action(
+                    "Disconnect (the scrollback stays)",
+                    &actions::Disconnect,
+                    workspace,
+                )
                 .on_click(cx.listener(|this, _, window, cx| this.request_disconnect(window, cx)))
         } else {
             Button::new("session-connect")
-                .label("Connect")
-                .tooltip("Open the port again with these settings")
+                .icon(IconName::Plug)
                 .small()
                 .primary()
+                .tooltip("Connect: open the port again with these settings")
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SessionViewEvent::Reconnect)))
         };
-        h_flex()
+
+        let summary = self.serial.summary();
+        let mut bar = h_flex()
+            .id("session-toolbar")
             .flex_none()
             .w_full()
-            .gap_1()
+            .h(chrome::HEADER_HEIGHT)
             .px_2()
-            .py_1()
+            .items_center()
+            .overflow_hidden()
             .border_b_1()
-            .border_color(theme.border)
-            .child(port_settings)
-            .child(connection)
+            .border_color(border)
+            .when_some(background, |bar, background| bar.bg(background))
             .child(
-                div().id("codec-picker").flex_none().w(px(150.)).child(
-                    Select::new(&self.codec_select)
-                        .small()
-                        .title_prefix("Codec: ")
-                        .menu_width(px(220.)),
+                h_flex()
+                    .id("toolbar-connection")
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .child(div().pl_1().child(chrome::state_dot(dot_color, !open)))
+                    .child(port_settings)
+                    .child(connection)
+                    .on_prepaint(Self::measured(&view, ToolControl::Connection, summary)),
+            );
+
+        for group in ToolbarItem::GROUPS {
+            let items: Vec<ToolbarItem> = group
+                .iter()
+                .copied()
+                .filter(|item| layout.shows(*item))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            bar = bar.child(chrome::toolbar_separator(cx)).child(
+                h_flex().flex_none().gap_0p5().items_center().children(
+                    items
+                        .into_iter()
+                        .map(|item| self.render_tool(item, &state, &view, workspace, terminal, cx)),
                 ),
-            )
-            .child(
-                Button::new("decoded-inline")
-                    .label("Summaries")
-                    .tooltip("Put a one-line summary of each decoded frame in the scrollback")
-                    .small()
-                    .ghost()
-                    .toggled(self.decoded_inline)
-                    .disabled(!decoding)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_decoded_inline(!this.decoded_inline, cx);
-                    })),
-            )
-            .child(
-                Button::new("hide-framed")
-                    .label("Hide frames")
-                    .tooltip("Leave out the lines of decoded binary frames (text stays)")
-                    .small()
-                    .ghost()
-                    .toggled(self.hide_framed)
-                    .disabled(!decoding)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_hide_framed_bytes(!this.hide_framed, cx);
-                    })),
-            )
-            .child(
-                Button::new("inline-mode")
-                    .label(if inline { "Inline" } else { "Command" })
-                    .tooltip(
-                        "Inline: every keystroke goes to the port (the escape chord, ctrl-] by \
-                         default, leaves). Command: the compose bar and saved commands.",
-                    )
-                    .small()
-                    .ghost()
-                    .toggled(inline)
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_mode(window, cx))),
-            )
-            .child(
-                Button::new("pause")
-                    .label(if paused { "Resume" } else { "Pause" })
-                    .tooltip("Freeze the view while data keeps arriving")
-                    .small()
-                    .ghost()
-                    .toggled(paused)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))),
-            )
-            .child(
-                Button::new("export-text")
-                    .label("Export…")
-                    .tooltip("Save the displayed lines (.txt) or the raw bytes (.bin)")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Text, cx))),
-            )
-            .child(
-                Button::new("export-raw")
-                    .label("Export raw…")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Raw, cx))),
-            )
-            .when(decoding, |bar| {
-                bar.child(
-                    Button::new("export-decoded")
-                        .label("Export frames…")
-                        .tooltip("Save the decoded frames as CSV (.csv) or JSON (.json)")
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Csv, cx))),
-                )
-            })
-            .child(
-                Button::new("record")
-                    .label(if recording {
-                        "Stop recording"
-                    } else {
-                        "Record…"
-                    })
-                    .tooltip("Append every received byte to a file")
-                    .small()
-                    .ghost()
-                    .toggled(recording)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_record(cx))),
-            )
-            .when(paused, |bar| {
-                bar.child(
-                    div()
-                        .ml_auto()
-                        .text_xs()
-                        .text_color(theme.warning)
-                        .child("Paused: showing a snapshot, still receiving"),
-                )
-            })
+            );
+        }
+
+        if !layout.overflow.is_empty() {
+            let overflow = layout.overflow.clone();
+            let menu_state = state.clone();
+            let menu_view = view.clone();
+            bar = bar.child(
+                div().flex_none().ml_auto().pl_2().child(
+                    chrome::icon_button("toolbar-overflow", IconName::Ellipsis, cx)
+                        .tooltip("More")
+                        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                            overflow_menu(menu, &overflow, &menu_state, &menu_view, window, cx)
+                        }),
+                ),
+            );
+        }
+
+        // A view with no workspace to say how wide it is measures itself.
+        let measure = view.clone();
+        bar.on_prepaint(move |bounds, _, cx| {
+            measure
+                .update(cx, |this, cx| {
+                    if this.width_hint.is_none() && this.measured_width != Some(bounds.size.width) {
+                        this.measured_width = Some(bounds.size.width);
+                        cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .test_support()
+        .into_any_element()
     }
+
+    /// One control of the toolbar.
+    fn render_tool(
+        &self,
+        item: ToolbarItem,
+        state: &ToolState,
+        view: &WeakEntity<SessionView>,
+        workspace: Option<&str>,
+        terminal: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match item {
+            ToolbarItem::Mode => {
+                let chord = cx
+                    .try_global::<Config>()
+                    .map(|config| config.inline().escape_chord.unparse())
+                    .unwrap_or_else(|| "ctrl-]".to_owned());
+                let (muted, foreground) = (cx.theme().muted_foreground, cx.theme().foreground);
+                let group = ButtonGroup::new("mode-toggle")
+                    .small()
+                    .child(
+                        Button::new("mode-command")
+                            .label("Command")
+                            .selected(!state.inline)
+                            .text_color(if state.inline { muted } else { foreground })
+                            .tooltip_with_action(
+                                "Command mode: the compose bar and saved commands",
+                                &actions::ToggleInline,
+                                workspace,
+                            ),
+                    )
+                    .child(
+                        Button::new("mode-inline")
+                            .label("Inline")
+                            .selected(state.inline)
+                            .text_color(if state.inline { foreground } else { muted })
+                            .tooltip(format!(
+                                "Inline mode: every keystroke goes to the port ({chord} leaves)"
+                            )),
+                    )
+                    .on_click(cx.listener(|this, clicked: &Vec<usize>, window, cx| {
+                        let mode = if clicked.contains(&1) {
+                            Mode::Inline
+                        } else {
+                            Mode::Command
+                        };
+                        this.set_mode(mode, window, cx);
+                    }));
+                div()
+                    .flex_none()
+                    .child(group)
+                    .on_prepaint(Self::measured(view, ToolControl::Mode, String::new()))
+                    .into_any_element()
+            }
+            ToolbarItem::Pause => chrome::toggle_button(
+                "pause",
+                if state.paused {
+                    IconName::Play
+                } else {
+                    IconName::Pause
+                },
+                state.paused,
+                cx,
+            )
+            .tooltip_with_action(
+                if state.paused {
+                    "Resume following the stream"
+                } else {
+                    "Pause the view (capture goes on)"
+                },
+                &actions::Pause,
+                workspace,
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx)))
+            .into_any_element(),
+            ToolbarItem::Record => {
+                chrome::toggle_button("record", IconName::CircleDot, state.recording, cx)
+                    .when(state.recording, |button| {
+                        button.text_color(cx.theme().danger)
+                    })
+                    .tooltip_with_action(
+                        if state.recording {
+                            "Stop recording"
+                        } else {
+                            "Record every received byte to a file"
+                        },
+                        &actions::ToggleRecord,
+                        workspace,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_record(cx)))
+                    .into_any_element()
+            }
+            ToolbarItem::Clear => chrome::icon_button("clear", IconName::Eraser, cx)
+                .tooltip_with_action("Clear the scrollback", &actions::Clear, workspace)
+                .on_click(cx.listener(|this, _, _, cx| this.clear(cx)))
+                .into_any_element(),
+            ToolbarItem::Search => {
+                chrome::toggle_button("search", IconName::Search, state.search, cx)
+                    .tooltip_with_action("Search the scrollback", &actions::Search, terminal)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_search(window, cx)))
+                    .into_any_element()
+            }
+            ToolbarItem::Hex => chrome::toggle_button("hex-view", IconName::Binary, state.hex, cx)
+                .disabled(!state.has_hex)
+                .tooltip_with_action("Hex view", &actions::ToggleHexView, terminal)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.terminal
+                        .update(cx, |terminal, cx| terminal.toggle_hex(cx));
+                }))
+                .into_any_element(),
+            ToolbarItem::Timestamps => chrome::toggle_button(
+                "timestamps",
+                IconName::Clock,
+                state.timestamps != TimestampMode::Off,
+                cx,
+            )
+            .tooltip_with_action(
+                format!(
+                    "Timestamps: {} (click for the next)",
+                    state.timestamps.label()
+                ),
+                &actions::CycleTimestamps,
+                terminal,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.terminal
+                    .update(cx, |terminal, cx| terminal.cycle_timestamps(cx));
+            }))
+            .into_any_element(),
+            ToolbarItem::Wrap => chrome::toggle_button("wrap", IconName::TextWrap, state.wrap, cx)
+                .tooltip_with_action("Wrap long lines", &actions::ToggleWrap, terminal)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.terminal
+                        .update(cx, |terminal, cx| terminal.toggle_wrap(cx));
+                }))
+                .into_any_element(),
+            ToolbarItem::Export => {
+                let (decoding, view) = (state.decoding, view.clone());
+                chrome::icon_button("export", IconName::Download, cx)
+                    .tooltip_with_action("Export", &actions::Export, workspace)
+                    .dropdown_menu(move |menu, _, _| export_items(menu, decoding, &view))
+                    .into_any_element()
+            }
+            ToolbarItem::Codec => {
+                let (menu_state, menu_view) = (state.clone(), view.clone());
+                let decoding = state.decoding;
+                let button = Button::new("codec-picker")
+                    .label(SharedString::from(if decoding {
+                        state.codec.clone()
+                    } else {
+                        "Codec".to_owned()
+                    }))
+                    .icon(IconName::Braces)
+                    .small()
+                    .ghost()
+                    .dropdown_caret(true)
+                    .max_w(CODEC_MAX_WIDTH)
+                    .when(!decoding, |button| {
+                        button.text_color(cx.theme().muted_foreground)
+                    })
+                    .tooltip("Codec: decode the stream into frames")
+                    .dropdown_menu(move |menu, _, _| codec_items(menu, &menu_state, &menu_view));
+                div()
+                    .flex_none()
+                    .child(button)
+                    .on_prepaint(Self::measured(view, ToolControl::Codec, self.codec_label()))
+                    .into_any_element()
+            }
+        }
+    }
+}
+
+/// The terminal's toggles the toolbar shows pressed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalTools {
+    wrap: bool,
+    timestamps: TimestampMode,
+    hex: bool,
+    search: bool,
+}
+
+impl TerminalTools {
+    fn of(terminal: &TerminalView) -> Self {
+        Self {
+            wrap: terminal.wrap(),
+            timestamps: terminal.timestamps(),
+            hex: terminal.display_mode() == DisplayMode::Hex,
+            search: terminal.is_search_open(),
+        }
+    }
+}
+
+/// A toolbar control whose width depends on its label.
+#[derive(Clone, Copy, Debug)]
+enum ToolControl {
+    Connection,
+    Mode,
+    Codec,
+}
+
+/// The labelled controls' widths as last drawn, with the label they were drawn with.
+#[derive(Clone, Debug, Default)]
+struct ToolWidths {
+    connection: Option<(String, f32)>,
+    mode: Option<f32>,
+    codec: Option<(String, f32)>,
+}
+
+/// The codec button's widest.
+const CODEC_MAX_WIDTH: Pixels = px(168.);
+
+/// What the toolbar's menus show checked, as of the frame they opened in.
+#[derive(Clone, Debug)]
+struct ToolState {
+    inline: bool,
+    paused: bool,
+    recording: bool,
+    search: bool,
+    hex: bool,
+    has_hex: bool,
+    timestamps: TimestampMode,
+    wrap: bool,
+    decoding: bool,
+    decoded_inline: bool,
+    hide_framed: bool,
+    /// The codec running, or [`NO_CODEC`].
+    codec: String,
+    /// What the codec menu lists: [`NO_CODEC`] first.
+    codecs: Vec<String>,
+}
+
+/// A menu item's click, run on the session view.
+fn on_view(
+    view: &WeakEntity<SessionView>,
+    run: impl Fn(&mut SessionView, &mut Window, &mut Context<SessionView>) + 'static,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let view = view.clone();
+    move |_, window, cx| {
+        view.update(cx, |view, cx| run(view, window, cx)).ok();
+    }
+}
+
+/// The Export menu: the displayed text, the raw bytes, the decoded frames.
+fn export_items(menu: PopupMenu, decoding: bool, view: &WeakEntity<SessionView>) -> PopupMenu {
+    menu.min_w(px(200.))
+        .item(
+            PopupMenuItem::new("Text\u{2026}")
+                .icon(IconName::FileText)
+                .action(Box::new(actions::Export))
+                .on_click(on_view(view, |view, _, cx| {
+                    view.export(ExportFormat::Text, cx)
+                })),
+        )
+        .item(
+            PopupMenuItem::new("Raw bytes\u{2026}")
+                .icon(IconName::Binary)
+                .on_click(on_view(view, |view, _, cx| {
+                    view.export(ExportFormat::Raw, cx)
+                })),
+        )
+        .item(
+            PopupMenuItem::new("Decoded frames\u{2026}")
+                .icon(IconName::Braces)
+                .disabled(!decoding)
+                .on_click(on_view(view, |view, _, cx| {
+                    view.export(ExportFormat::Csv, cx)
+                })),
+        )
+}
+
+/// The codec menu: the codecs to decode with, and what decoding does to the scrollback.
+fn codec_items(menu: PopupMenu, state: &ToolState, view: &WeakEntity<SessionView>) -> PopupMenu {
+    let mut menu = menu.min_w(px(220.)).label("Decode with");
+    for codec in &state.codecs {
+        let name = codec.clone();
+        menu = menu.item(
+            PopupMenuItem::new(codec.clone())
+                .checked(*codec == state.codec)
+                .on_click(on_view(view, move |view, _, cx| {
+                    if view.codec_name().unwrap_or(NO_CODEC) != name {
+                        view.set_codec(Some(&name), cx);
+                    }
+                })),
+        );
+    }
+    let (decoded_inline, hide_framed) = (state.decoded_inline, state.hide_framed);
+    menu.separator()
+        .item(
+            PopupMenuItem::new("Summaries in the scrollback")
+                .checked(decoded_inline)
+                .disabled(!state.decoding)
+                .on_click(on_view(view, move |view, _, cx| {
+                    view.set_decoded_inline(!decoded_inline, cx)
+                })),
+        )
+        .item(
+            PopupMenuItem::new("Hide framed bytes")
+                .checked(hide_framed)
+                .disabled(!state.decoding)
+                .on_click(on_view(view, move |view, _, cx| {
+                    view.set_hide_framed_bytes(!hide_framed, cx)
+                })),
+        )
+}
+
+/// The overflow menu: the toolbar's controls that did not fit, by group.
+fn overflow_menu(
+    menu: PopupMenu,
+    items: &[ToolbarItem],
+    state: &ToolState,
+    view: &WeakEntity<SessionView>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let mut menu = menu.min_w(px(220.));
+    let mut last_group = None;
+    for item in items {
+        let group = ToolbarItem::GROUPS
+            .iter()
+            .position(|group| group.contains(item));
+        if last_group.is_some() && group != last_group {
+            menu = menu.separator();
+        }
+        last_group = group;
+        menu = match item {
+            ToolbarItem::Mode => menu.item(
+                PopupMenuItem::new("Inline mode")
+                    .checked(state.inline)
+                    .action(Box::new(actions::ToggleInline))
+                    .on_click(on_view(view, |view, window, cx| {
+                        view.toggle_mode(window, cx)
+                    })),
+            ),
+            ToolbarItem::Pause => menu.item(
+                PopupMenuItem::new("Pause")
+                    .checked(state.paused)
+                    .action(Box::new(actions::Pause))
+                    .on_click(on_view(view, |view, _, cx| view.toggle_pause(cx))),
+            ),
+            ToolbarItem::Record => menu.item(
+                PopupMenuItem::new("Record\u{2026}")
+                    .checked(state.recording)
+                    .action(Box::new(actions::ToggleRecord))
+                    .on_click(on_view(view, |view, _, cx| view.toggle_record(cx))),
+            ),
+            ToolbarItem::Clear => menu.item(
+                PopupMenuItem::new("Clear scrollback")
+                    .action(Box::new(actions::Clear))
+                    .on_click(on_view(view, |view, _, cx| view.clear(cx))),
+            ),
+            ToolbarItem::Search => menu.item(
+                PopupMenuItem::new("Search\u{2026}")
+                    .checked(state.search)
+                    .on_click(on_view(view, |_, window, cx| {
+                        // After the menu has given the focus back, so the field keeps it.
+                        let this = cx.entity().downgrade();
+                        window.defer(cx, move |window, cx| {
+                            this.update(cx, |view, cx| view.toggle_search(window, cx))
+                                .ok();
+                        });
+                    })),
+            ),
+            ToolbarItem::Hex => menu.item(
+                PopupMenuItem::new("Hex view")
+                    .checked(state.hex)
+                    .disabled(!state.has_hex)
+                    .on_click(on_view(view, |view, _, cx| {
+                        view.terminal
+                            .update(cx, |terminal, cx| terminal.toggle_hex(cx))
+                    })),
+            ),
+            ToolbarItem::Timestamps => menu.item(
+                PopupMenuItem::new(format!("Timestamps: {}", state.timestamps.label()))
+                    .checked(state.timestamps != TimestampMode::Off)
+                    .on_click(on_view(view, |view, _, cx| {
+                        view.terminal
+                            .update(cx, |terminal, cx| terminal.cycle_timestamps(cx))
+                    })),
+            ),
+            ToolbarItem::Wrap => menu.item(
+                PopupMenuItem::new("Wrap lines")
+                    .checked(state.wrap)
+                    .on_click(on_view(view, |view, _, cx| {
+                        view.terminal
+                            .update(cx, |terminal, cx| terminal.toggle_wrap(cx))
+                    })),
+            ),
+            ToolbarItem::Export => {
+                let (decoding, view) = (state.decoding, view.clone());
+                menu.submenu("Export", window, cx, move |menu, _, _| {
+                    export_items(menu, decoding, &view)
+                })
+            }
+            ToolbarItem::Codec => {
+                let (state, view) = (state.clone(), view.clone());
+                menu.submenu("Codec", window, cx, move |menu, _, _| {
+                    codec_items(menu, &state, &view)
+                })
+            }
+        };
+    }
+    menu
 }
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_codec_select(window, cx);
-        let toolbar = self.render_toolbar(cx);
+        let toolbar = self.render_toolbar(window, cx);
         let theme = cx.theme();
         v_flex()
             .id("session-view")
@@ -3515,7 +4005,14 @@ mod tests {
             assert_eq!(v.stats().rx_chunks, 200);
         });
 
-        // Nothing new: idle housekeeping must not repaint.
+        // Nothing new: once the byte rates in the status line have settled to nothing
+        // (a window after the burst), idle housekeeping must not repaint.
+        let settle = crate::status::RATE_WINDOW.as_millis() / HOUSEKEEPING.as_millis() + 2;
+        for _ in 0..settle {
+            cx.executor().advance_clock(HOUSEKEEPING);
+            cx.run_until_parked();
+        }
+        assert_eq!(view.read_with(cx, |v, _| v.status_line().rx_rate), None);
         let before = notifies.get();
         for _ in 0..3 {
             cx.executor().advance_clock(HOUSEKEEPING);

@@ -38,6 +38,7 @@ use std::collections::VecDeque;
 
 use serialist_core::{CodecInfo, Frame, FrameId, FrameSnapshot, Severity, Snapshot, Value};
 
+use crate::chrome;
 use crate::codecs::{FrameTime, direction_label};
 use crate::prelude::*;
 use crate::session_view::SessionView;
@@ -867,36 +868,26 @@ impl DecodedPanel {
         } else {
             format!("{} of {total} frames", table.rows.len())
         };
-        h_flex()
-            .flex_none()
-            .justify_between()
-            .gap_1()
-            .px_3()
-            .h(px(32.))
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(
-                h_flex()
+        let (info, muted) = (theme.info, theme.muted_foreground);
+        chrome::panel_header("Decoded", cx)
+            .children(self.codec.clone().map(|codec| {
+                chrome::chip(info)
                     .min_w_0()
-                    .gap_2()
-                    .child("DECODED")
-                    .children(self.codec.clone().map(|codec| {
-                        div()
-                            .truncate()
-                            .text_color(theme.info)
-                            .child(SharedString::from(codec))
-                    })),
+                    .child(div().truncate().child(SharedString::from(codec)))
+            }))
+            .child(
+                div()
+                    .ml_auto()
+                    .flex_none()
+                    .text_size(chrome::LABEL_SIZE)
+                    .text_color(muted)
+                    .child(SharedString::from(count)),
             )
             .child(
-                h_flex().gap_2().child(SharedString::from(count)).child(
-                    Button::new("decoded-follow")
-                        .label("Follow")
-                        .tooltip("Keep the newest frame in view")
-                        .xsmall()
-                        .ghost()
-                        .toggled(self.follow)
-                        .on_click(cx.listener(|this, _, _, cx| this.follow(cx))),
-                ),
+                chrome::toggle_button("decoded-follow", IconName::ArrowDownToLine, self.follow, cx)
+                    .xsmall()
+                    .tooltip("Follow: keep the newest frame in view")
+                    .on_click(cx.listener(|this, _, _, cx| this.follow(cx))),
             )
     }
 }
@@ -966,7 +957,7 @@ impl Render for DecodedPanel {
         let theme = cx.theme();
         let body = if self.codec.is_none() && !has_frames {
             let message = if self.session.is_some() {
-                "No codec decodes this session. Pick one with the Codec menu in the session's \
+                "No codec decodes this session. Pick one from the codec menu in the session's \
                  toolbar, or name one as a device profile's \"plugin\"."
             } else {
                 "Decoded frames of the session show here."
@@ -1000,16 +991,17 @@ impl Render for DecodedPanel {
                                 .child(Input::new(&self.filter).small().id("decoded-filter")),
                         )
                         .child(
-                            Button::new("decoded-raw")
-                                .label("Hex")
-                                .tooltip("Show each frame's raw bytes as a column")
-                                .small()
-                                .ghost()
-                                .toggled(self.table.read(cx).delegate().show_raw)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let show = !this.raw_column(cx);
-                                    this.set_raw_column(show, cx);
-                                })),
+                            chrome::toggle_button(
+                                "decoded-raw",
+                                IconName::Binary,
+                                self.table.read(cx).delegate().show_raw,
+                                cx,
+                            )
+                            .tooltip("Show each frame's raw bytes as a column")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let show = !this.raw_column(cx);
+                                this.set_raw_column(show, cx);
+                            })),
                         ),
                 )
                 .child(
@@ -1047,8 +1039,6 @@ impl Render for DecodedPanel {
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .border_l_1()
-            .border_color(theme.border)
             .child(header)
             .child(body)
     }
