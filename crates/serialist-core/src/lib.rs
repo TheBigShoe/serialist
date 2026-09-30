@@ -7,6 +7,7 @@
 pub mod ansi;
 pub mod composite;
 pub mod config;
+pub mod config_watch;
 pub mod discovery;
 pub mod ingest;
 pub mod keymap;
@@ -25,6 +26,7 @@ mod test_util;
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
 pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+pub use config_watch::{ConfigEvent, ConfigWatcher};
 pub use discovery::RealPortSource;
 pub use ingest::{ChunkSink, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped};
 pub use keymap::{ActionRef, KeyBinding, Keymap, KeymapError, load_keymap};
