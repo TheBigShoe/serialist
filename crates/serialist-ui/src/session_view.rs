@@ -120,7 +120,7 @@ fn command_echo(command: &Command, bytes: &[u8], session_eol: LineEnding) -> Str
             let body = bytes.strip_suffix(eol).unwrap_or(bytes);
             String::from_utf8_lossy(body).into_owned()
         }
-        Payload::Hex(_) | Payload::Codec { .. } => bytes
+        Payload::Hex(_) | Payload::Codec { .. } | Payload::Script { .. } => bytes
             .iter()
             .map(|byte| format!("{byte:02X}"))
             .collect::<Vec<_>>()

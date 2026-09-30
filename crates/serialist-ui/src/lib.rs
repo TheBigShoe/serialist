@@ -18,6 +18,7 @@ pub mod history;
 pub mod inline;
 pub mod keymap;
 pub mod param_prompt;
+pub mod script_files;
 pub mod scrollback;
 pub mod session_handle;
 pub mod session_options;

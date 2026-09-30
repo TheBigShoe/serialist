@@ -33,7 +33,7 @@ const GRACE: Duration = Duration::from_millis(500);
 /// Time for the OS watcher to be ready before a test touches a file.
 const SETTLE: Duration = Duration::from_millis(200);
 
-use ConfigEvent::{Commands, Keymap, Settings, Themes};
+use ConfigEvent::{Commands, Keymap, Scripts, Settings, Themes};
 
 struct Fixture {
     _root: TempDir,
@@ -176,6 +176,20 @@ fn a_commands_file_is_noticed() {
     assert!(f.paths.commands_dir().is_dir());
     fs::write(f.paths.commands_dir().join("mine.json"), "{}").unwrap();
     assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
+}
+
+#[test]
+fn a_script_file_is_noticed_at_any_depth() {
+    let f = watched();
+    // The scripts folder was made by the watcher and is already watched, recursively.
+    assert!(f.paths.scripts_dir().is_dir());
+    fs::write(f.paths.scripts_dir().join("probe.lua"), "print(1)").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+    let lib = f.paths.scripts_dir().join("lib");
+    fs::create_dir(&lib).unwrap();
+    std::thread::sleep(SETTLE);
+    fs::write(lib.join("util.lua"), "return {}").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
 }
 
 #[test]
@@ -455,6 +469,7 @@ fn targets() -> Targets {
         themes: PathBuf::from("/cfg/themes"),
         commands: PathBuf::from("/cfg/commands"),
         project_commands: Some(PathBuf::from("/proj/.serialist/commands.json")),
+        scripts: PathBuf::from("/cfg/scripts"),
     }
 }
 
@@ -532,6 +547,30 @@ fn command_files_count_directly_in_the_commands_folder() {
         targets().events(&batch),
         vec![Settings, Keymap, Themes, Commands]
     );
+}
+
+#[test]
+fn script_files_count_at_any_depth() {
+    let modify = EventKind::Modify(ModifyKind::Any);
+    for path in [
+        "/cfg/scripts/probe.lua",
+        "/cfg/scripts/lib/util.LUA",
+        "/cfg/scripts/a/b/c.lua",
+    ] {
+        assert_eq!(targets().events(&[event(modify, &[path])]), vec![Scripts]);
+    }
+    for path in [
+        "/cfg/scripts",
+        "/cfg/scripts/notes.txt",
+        "/cfg/scripts.lua",
+        "/cfg/probe.lua",
+        "/cfg/themes/probe.lua",
+    ] {
+        assert!(
+            targets().events(&[event(modify, &[path])]).is_empty(),
+            "{path}"
+        );
+    }
 }
 
 #[test]
