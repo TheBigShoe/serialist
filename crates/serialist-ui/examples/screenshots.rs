@@ -2,7 +2,8 @@
 //!
 //! Each shot opens the workspace the way the headless tests do (GPUI's test platform, the
 //! simulator's devices behind the real engine, a temporary config directory with the
-//! example scripts loaded by the real loaders), drives it with the same flows (keys
+//! example scripts, and for the shots of `virtual:race` the example RACE plugin, loaded
+//! by the real loaders), drives it with the same flows (keys
 //! pressed through the window, commands sent from the Commands panel, waits on the
 //! engine's state rather than on time), then draws a frame and reads it back from a
 //! Metal texture. No window reaches the screen and no screen-recording permission is
@@ -46,6 +47,8 @@ const WIDE: (f32, f32) = (1440., 900.);
 const NARROW: (f32, f32) = (1024., 640.);
 const DARK: &str = "Serialist Dark";
 const LIGHT: &str = "Serialist Light";
+/// The simulated RACE device, which the shots that decode connect to.
+const RACE_PORT: &str = "virtual:race";
 
 /// Lines the firehose shots send before the picture is taken.
 const FIREHOSE_LINES: usize = 200;
@@ -213,9 +216,10 @@ fn firehose(stage: &mut Stage) {
     }
 }
 
-/// `virtual:race` decoded by the `airoha-race` codec (the device profile in the
-/// settings), with the bundled RACE version command sent from the Commands panel and
-/// its response selected in the Decoded panel.
+/// `virtual:race` decoded by the example `airoha-race` plugin (installed into the shot's
+/// config directory, and named by the device profile in the settings), with the bundled
+/// RACE version command sent from the Commands panel and its response selected in the
+/// Decoded panel.
 fn decoded_race(stage: &mut Stage) {
     stage.session();
     let (commands, decoded) = stage.workspace.read_with(&stage.cx, |w, _| {
@@ -495,6 +499,16 @@ impl Stage {
         paths
             .ensure_example_scripts()
             .expect("write the example scripts");
+        // The app ships with no decoder active: a shot of the RACE device decoding
+        // installs the example plugin first, as "Install example plugin" does. The others
+        // show a fresh configuration, where the profile's plugin is not installed.
+        if shot.connect == Some(RACE_PORT) {
+            let example =
+                serialist_plugins::example_plugin("airoha-race").expect("the bundled example");
+            paths
+                .install_example_plugin(example)
+                .expect("install the example plugin");
+        }
         let world = (shot.world)();
 
         // The bundled icon set, as in the app, so SVG icons (a select's chevron, a
@@ -641,7 +655,7 @@ fn has_rx_line(cx: &mut HeadlessAppContext, view: &Entity<SessionView>, text: &s
 }
 
 /// The settings every shot loads: the theme, and a device profile that decodes
-/// `virtual:race` with the bundled `airoha-race` codec.
+/// `virtual:race` with the `airoha-race` plugin (installed for the shots that open it).
 fn settings(theme: &str) -> String {
     format!(
         r#"{{
