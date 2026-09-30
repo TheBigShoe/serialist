@@ -7,34 +7,42 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serialist_core::Epoch;
 
-/// What the gutter shows next to each line.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum TimestampMode {
-    #[default]
-    Off,
-    /// Wall-clock time the line started arriving: `14:03:07.042`.
-    Absolute,
-    /// Time since the session started: `+00:01:23.456`.
-    Relative,
-    /// Time since the previous line started: `+    0.004`.
-    Delta,
+/// What the gutter shows next to each line: off, wall-clock time the line started
+/// arriving (`14:03:07.042`), time since the session started (`+00:01:23.456`), or
+/// time since the previous line started (`+    0.004`). The settings type, so the
+/// `display.timestamps` setting is used as is.
+pub use serialist_core::TimestampMode;
+
+/// What the terminal does with a [`TimestampMode`] beyond what settings need.
+pub trait TimestampModeExt: Sized + 'static {
+    /// The order the toggle action walks through.
+    const ALL: [Self; 4];
+
+    /// The next mode in [`Self::ALL`], wrapping.
+    fn next(self) -> Self;
+
+    fn label(self) -> &'static str;
+
+    /// Width of the formatted stamp in cells, excluding the gap before the text. Longer
+    /// values (a relative stamp past 99 hours, a delta past 99 999 s) overflow into the
+    /// gap rather than widening the gutter, so the gutter never jumps while scrolling.
+    fn width(self) -> usize;
 }
 
-impl TimestampMode {
-    /// The order the toggle action walks through.
-    pub const ALL: [TimestampMode; 4] = [
+impl TimestampModeExt for TimestampMode {
+    const ALL: [TimestampMode; 4] = [
         TimestampMode::Off,
         TimestampMode::Absolute,
         TimestampMode::Relative,
         TimestampMode::Delta,
     ];
 
-    pub fn next(self) -> Self {
+    fn next(self) -> Self {
         let ix = Self::ALL.iter().position(|m| *m == self).unwrap_or(0);
         Self::ALL[(ix + 1) % Self::ALL.len()]
     }
 
-    pub fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             TimestampMode::Off => "Off",
             TimestampMode::Absolute => "Absolute",
@@ -43,10 +51,7 @@ impl TimestampMode {
         }
     }
 
-    /// Width of the formatted stamp in cells, excluding the gap before the text. Longer
-    /// values (a relative stamp past 99 hours, a delta past 99 999 s) overflow into the
-    /// gap rather than widening the gutter, so the gutter never jumps while scrolling.
-    pub fn width(self) -> usize {
+    fn width(self) -> usize {
         match self {
             TimestampMode::Off => 0,
             TimestampMode::Absolute => "HH:MM:SS.mmm".len(),

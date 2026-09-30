@@ -16,6 +16,7 @@ use crate::actions::{
     self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
     SearchNext, SearchPrevious, SelectAll, ToggleFrameStats, ToggleHexView, ToggleWrap, context,
 };
+use crate::config::Config;
 use crate::fonts::TerminalFont;
 use crate::prelude::*;
 use crate::terminal::element::{
@@ -27,7 +28,7 @@ use crate::terminal::scroll::TerminalScrollHandle;
 use crate::terminal::search::{MAX_MATCHES, SearchResults};
 use crate::terminal::selection::{Selection, SelectionMode, SelectionPoint, word_at};
 use crate::terminal::stats::{FrameStats, FrameSummary};
-use crate::terminal::timestamps::{Clock, TimestampMode};
+use crate::terminal::timestamps::{Clock, TimestampMode, TimestampModeExt};
 
 /// Which source is on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,6 +121,17 @@ impl TerminalView {
                 InputEvent::Focus | InputEvent::Blur => {}
             });
         let clock = Clock::local(source.epoch());
+        // The font and colors follow the configuration, when the app has one.
+        let (font, palette) = match cx.try_global::<Config>() {
+            Some(config) => (config.terminal_font().clone(), config.palette().clone()),
+            None => (TerminalFont::default(), TerminalPalette::default()),
+        };
+        let config_changes = cx.observe_global::<Config>(|this, cx| {
+            let config = cx.global::<Config>();
+            let (font, palette) = (config.terminal_font().clone(), config.palette().clone());
+            this.set_font(font, cx);
+            this.set_palette(palette, cx);
+        });
         Self {
             text_source: source,
             text_searcher: None,
@@ -132,8 +144,8 @@ impl TerminalView {
             selecting: false,
             wrap: false,
             timestamps: TimestampMode::Off,
-            palette: Rc::new(TerminalPalette::default()),
-            font: TerminalFont::default(),
+            palette: Rc::new(palette),
+            font,
             generation: 1,
             clock,
             cache: Rc::default(),
@@ -149,7 +161,7 @@ impl TerminalView {
                 stale: false,
             },
             focus_handle: cx.focus_handle(),
-            _subscriptions: vec![input_events],
+            _subscriptions: vec![input_events, config_changes],
         }
     }
 
@@ -228,6 +240,13 @@ impl TerminalView {
 
     pub fn display_mode(&self) -> DisplayMode {
         self.display
+    }
+
+    /// Show text or hex. Hex needs a hex source; without one this stays on text.
+    pub fn set_display_mode(&mut self, mode: DisplayMode, cx: &mut Context<Self>) {
+        if mode != self.display {
+            self.toggle_hex(cx);
+        }
     }
 
     pub fn has_hex_source(&self) -> bool {

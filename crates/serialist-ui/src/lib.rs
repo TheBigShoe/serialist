@@ -3,16 +3,20 @@
 //!
 //! A workspace with a Devices panel on the left, a session view in the center (the
 //! terminal element over the session's page store, and a compose bar) and a status
-//! line.
+//! line. Settings, themes, fonts and key bindings come from Zed-format files through
+//! [`config`], and apply to the running app as the files change.
 
 pub mod actions;
 pub mod capture;
 pub mod compose;
+pub mod config;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
+pub mod keymap;
 pub mod scrollback;
 pub mod session_handle;
+pub mod session_options;
 pub mod session_view;
 pub mod status;
 pub mod terminal;
@@ -27,13 +31,16 @@ mod stream_tests;
 mod test_support;
 
 pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
-pub use compose::{ComposeBar, ComposeEvent, History, LineEnding};
+pub use compose::{ComposeBar, ComposeEvent, History, LineEnding, LineEndingExt};
+pub use config::{Config, ConfigPiece, ConfigProblem, Opener};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
 pub use export::{ExportFormat, ExportJob};
+pub use fonts::{TerminalFont, UiFont};
 pub use scrollback::{Floored, Floors, Scrollback};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
+pub use session_options::{DisplayDefaults, SessionOptions};
 pub use session_view::SessionView;
 pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};

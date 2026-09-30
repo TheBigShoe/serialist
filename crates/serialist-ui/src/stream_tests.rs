@@ -17,8 +17,8 @@ use crate::session_view::SessionView;
 use crate::status::{Notice, format_bytes};
 use crate::terminal::{DisplayMode, TerminalView, TimestampMode};
 use crate::test_support::{
-    TestDir, displayed, has_rx_line, open_workspace, open_workspace_with, run_until, step,
-    type_line, wait_connected,
+    TestDir, displayed, enable_local_echo, has_rx_line, open_workspace, open_workspace_with,
+    run_until, step, type_line, wait_connected,
 };
 
 /// Fast enough to fill a few screens in a fraction of a second, slow enough that every
@@ -537,6 +537,8 @@ fn hex_view_shows_the_same_snapshot_and_keeps_pause_and_selection(cx: &mut TestA
     let world = SimWorld::new();
     let (window, workspace) = open_workspace(cx, &world, Some("virtual:echo"));
     let view = wait_connected(cx, &workspace);
+    // The text view below shows each sent line and its echo.
+    enable_local_echo(cx, &view);
     // Sixteen bytes with the line ending: exactly one full hex row.
     type_line(cx, window, "hello world 12");
     run_until(cx, "the echo", |cx| {

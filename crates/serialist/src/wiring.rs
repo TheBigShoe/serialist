@@ -12,8 +12,8 @@ use std::sync::Arc;
 use anyhow::bail;
 use serialist_core::composite::scheme_of;
 use serialist_core::{
-    MergedPortSource, PortId, PortSource, RealPortSource, RoutingTransportFactory, SerialConfig,
-    SerialportFactory, StoreConfig, TransportFactory, VIRTUAL_SCHEME,
+    MergedPortSource, PortId, PortSource, RealPortSource, RoutingTransportFactory,
+    SerialportFactory, TransportFactory, VIRTUAL_SCHEME,
 };
 use serialist_sim::{SimWorld, virtual_port_id};
 use serialist_ui::AppOptions;
@@ -76,17 +76,16 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
     };
 
     let first_virtual = args.virtual_devices.first().map(|n| virtual_port_id(n));
-    let serial = SerialConfig {
-        baud: args.baud.unwrap_or(SerialConfig::default().baud),
-        ..SerialConfig::default()
-    };
     Ok(AppOptions {
         port_source,
         transport_factory: Arc::new(transport_factory),
-        serial,
+        // Without --baud the rate comes from the settings: a device profile, else
+        // `default_baud`.
+        baud: args.baud,
         connect_on_start: port.is_some() || first_virtual.is_some(),
         select_port: port.or(first_virtual),
-        store: StoreConfig::default(),
+        // Sized by the `scrollback_budget_bytes` setting.
+        store: None,
     })
 }
 
@@ -102,7 +101,7 @@ fn virtual_names(world: &SimWorld) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use serialist_core::{PortInfo, PortKind, TransportError, UsbInfo};
+    use serialist_core::{PortInfo, PortKind, SerialConfig, TransportError, UsbInfo};
     use serialist_sim::{EchoDevice, LinkConfig};
 
     use super::*;
@@ -245,8 +244,7 @@ mod tests {
         .unwrap();
         assert_eq!(options.select_port, Some(PortId::new(FAKE_ADAPTER)));
         assert!(options.connect_on_start);
-        assert_eq!(options.serial.baud, 921_600);
-        assert_eq!(options.serial.summary(), "921600 8N1");
+        assert_eq!(options.baud, Some(921_600), "--baud wins over profiles");
     }
 
     #[test]
