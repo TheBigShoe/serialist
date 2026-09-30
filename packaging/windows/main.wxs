@@ -1,0 +1,168 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX (v3) source for the Serialist installer, built by `cargo wix` (see
+  packaging/package.sh and [package.metadata.wix] in crates/serialist/Cargo.toml).
+  The structure follows the template `cargo wix init` generates (Apache-2.0,
+  Copyright (C) 2017 Christopher R. Field).
+
+  cargo-wix defines Version, Platform and CargoTargetBinDir. package.sh also sets the
+  environment variable SERIALIST_ROOT to the repository root, for the license and icon
+  paths below. Both GUIDs must never change: the UpgradeCode lets a new version replace
+  an old one, and the PATH component GUID keeps that component stable across upgrades.
+
+  What it installs, per machine:
+    C:\Program Files\Serialist\bin\serialist.exe
+    C:\Program Files\Serialist\LICENSE-MIT.txt and LICENSE-APACHE.txt
+    a Start menu shortcut
+    optionally (Customize page, off by default): the bin folder on the system PATH, so
+    scripted runs (serialist with the script flag) work from any terminal.
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='Serialist'
+        UpgradeCode='C6DA1F40-676A-4BD0-9D96-A6786DD5E5F5'
+        Manufacturer='John Gunn'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='A native, GPU-rendered serial terminal.'
+            Manufacturer='John Gunn'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='Serialist Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='Serialist'>
+
+                    <Component Id='LicenseMit' Guid='*'>
+                        <File
+                            Id='LicenseMitFile'
+                            Name='LICENSE-MIT.txt'
+                            DiskId='1'
+                            Source='$(env.SERIALIST_ROOT)\LICENSE-MIT'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='LicenseApache' Guid='*'>
+                        <File
+                            Id='LicenseApacheFile'
+                            Name='LICENSE-APACHE.txt'
+                            DiskId='1'
+                            Source='$(env.SERIALIST_ROOT)\LICENSE-APACHE'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='EDB2349B-73DF-4778-967C-07874C730A98' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='serialist.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\serialist.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <Directory Id='ProgramMenuFolder'>
+                <Component Id='StartMenuShortcut' Guid='*'>
+                    <!-- The shortcut takes its icon from the icon resource inside serialist.exe. -->
+                    <Shortcut
+                        Id='StartMenuShortcutLink'
+                        Name='Serialist'
+                        Description='A native, GPU-rendered serial terminal'
+                        Target='[#exe0]'
+                        WorkingDirectory='APPLICATIONFOLDER'/>
+                    <!-- A shortcut outside the install folder needs a per-user registry
+                         value as its key path (ICE38, ICE43). -->
+                    <RegistryValue
+                        Root='HKCU'
+                        Key='Software\Serialist'
+                        Name='StartMenuShortcut'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Serialist'
+            Description='Installs Serialist, its licenses and a Start menu shortcut.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='LicenseMit'/>
+            <ComponentRef Id='LicenseApache'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+
+            <!-- Level 2 is above the default install level (1): off unless ticked on
+                 the Customize page, or installed with ADDLOCAL=Binaries,Environment. -->
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the [ProductName] folder to the system PATH so that serialist can be run from any terminal, for example serialist --script.'
+                Level='2'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!-- The icon in Settings > Apps and Programs and Features. -->
+        <Icon Id='Serialist.ico' SourceFile='$(env.SERIALIST_ROOT)\packaging\icons\serialist.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='Serialist.ico'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/TheBigShoe/serialist'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+
+            <!-- No license agreement page: Serialist is MIT OR Apache-2.0 and the license
+                 files are installed next to the program. These two rules skip the EULA
+                 dialog that WixUI_FeatureTree would show. -->
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

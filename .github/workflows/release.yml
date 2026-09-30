@@ -1,0 +1,239 @@
+name: Release
+
+# Builds release packages on macOS, Linux and Windows and attaches them to a DRAFT GitHub
+# Release. Nothing is published until you press the button on the draft.
+#
+#   - Push a tag `vX.Y.Z` that matches the workspace version in Cargo.toml.
+#   - Or run it by hand (Actions > Release > Run workflow). By default that only uploads the
+#     packages as workflow artifacts; tick "draft_release" to also create the draft.
+#
+# The packages are UNSIGNED. macOS builds are ad-hoc signed but neither signed with a
+# Developer ID nor notarized, so Gatekeeper blocks them at first launch. To open one:
+# Control-click the app and choose Open (macOS 14 and earlier), or press "Open Anyway" in
+# System Settings > Privacy & Security (macOS 15 and later), or run
+# `xattr -dr com.apple.quarantine /Applications/Serialist.app`. Windows SmartScreen also
+# warns: More info, then Run anyway. The release notes and README say the same. A commented
+# block in the macOS job shows how to turn on signing and notarization later.
+#
+# All the real work is in packaging/package.sh, so `just release-<os>` reproduces a job
+# locally. See docs/releasing.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      draft_release:
+        description: Also create a draft GitHub Release named after the version in Cargo.toml
+        type: boolean
+        default: false
+
+# One run per ref, and never cancelled part-way: a half-built release helps nobody.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    # Cold release builds are long: gpui-pre, wgpu and gpui-kit compile from scratch with
+    # thin LTO. The cache below shortens warm runs.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is Apple Silicon, so the .dmg is arm64. An Intel build needs an
+          # Intel runner (macos-15-intel or macos-26-intel) and another matrix row.
+          - name: macos
+            os: macos-latest
+          # ubuntu-22.04 rather than ubuntu-latest: a binary links against the glibc of the
+          # machine that built it, so the older baseline runs on more distributions. CI
+          # tests on ubuntu-latest; move this to it if 22.04 packages ever fail to build.
+          - name: linux
+            os: ubuntu-22.04
+          - name: windows
+            os: windows-latest
+    defaults:
+      run:
+        # Git Bash on Windows; packaging/package.sh is a bash script.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag `v0.2.0` must ship version 0.2.0. Catches a tag pushed before the version bump.
+      - name: Check the tag matches the workspace version
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml; bump the version, then re-tag"
+            exit 1
+          fi
+
+      # Same as ci.yml: dtolnay/rust-toolchain does not read rust-toolchain.toml, but with no
+      # arguments rustup installs the toolchain and components pinned in that file.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      # Same policy as ci.yml, adapted: only main saves the cache (here, by a manual run on
+      # main), and a tag run restores the newest one from main and never saves. `key` keeps
+      # release-profile artifacts apart from the dev-profile ones CI caches.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The same system libraries as ci.yml (GPUI's Linux backend, with wgpu, Wayland and
+      # X11; libudev for serialport). dpkg-dev is already on the runner image; it provides
+      # dpkg-shlibdeps, which cargo-deb uses to compute the .deb's Depends, and is listed so
+      # the dependency is visible.
+      - name: Install Linux system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dpkg-dev \
+            libfontconfig-dev \
+            libudev-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install cargo-deb
+        if: runner.os == 'Linux'
+        run: cargo install cargo-deb --version 3.8.0 --locked
+
+      - name: Install cargo-wix
+        if: runner.os == 'Windows'
+        run: cargo install cargo-wix --version 0.3.9 --locked
+
+      # windows-latest ships WiX Toolset 3.14 (candle.exe and light.exe), which cargo-wix
+      # needs. This step only proves it is found and falls back to Chocolatey if a future
+      # image drops it.
+      - name: Check for the WiX Toolset
+        if: runner.os == 'Windows'
+        run: |
+          if command -v candle.exe >/dev/null 2>&1 || [ -n "${WIX:-}" ]; then
+            echo "WiX Toolset found (WIX=${WIX:-unset}, candle: $(command -v candle.exe || echo 'not on PATH'))"
+          else
+            choco install wixtoolset --no-progress -y
+            echo "WIX=C:\\Program Files (x86)\\WiX Toolset v3.14\\" >> "$GITHUB_ENV"
+          fi
+
+      # ---------------------------------------------------------------------------------
+      # macOS signing and notarization: OFF. To turn it on you need a paid Apple Developer
+      # account and a "Developer ID Application" certificate exported as a .p12. Add these
+      # repository secrets (Settings > Secrets and variables > Actions):
+      #
+      #   MACOS_CERTIFICATE           the .p12, base64-encoded: base64 -i cert.p12 | pbcopy
+      #   MACOS_CERTIFICATE_PASSWORD  the password set when exporting the .p12
+      #   MACOS_KEYCHAIN_PASSWORD     any random string; protects a throwaway keychain
+      #   MACOS_SIGN_IDENTITY         e.g. Developer ID Application: John Gunn (ABCDE12345)
+      #   APPLE_ID                    the Apple ID that owns the developer account
+      #   APPLE_TEAM_ID               the 10-character team ID
+      #   APPLE_APP_PASSWORD          an app-specific password from appleid.apple.com
+      #
+      # Then (1) uncomment "Import the signing certificate" here, (2) uncomment the `env`
+      # block on "Build and package" below, so that bundle.sh and dmg.sh sign with the
+      # identity and the hardened runtime, and (3) uncomment "Notarize" after it. Update
+      # README.md, the release notes and this file's header, which say the build is unsigned.
+      #
+      # - name: Import the signing certificate
+      #   if: runner.os == 'macOS'
+      #   env:
+      #     MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      #     MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      #     MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+      #   run: |
+      #     echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+      #     security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+      #     security set-keychain-settings -lut 21600 build.keychain
+      #     security default-keychain -s build.keychain
+      #     security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+      #     security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+      #       -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+      #     security set-key-partition-list -S apple-tool:,apple:,codesign: \
+      #       -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+      #     rm "$RUNNER_TEMP/certificate.p12"
+      # ---------------------------------------------------------------------------------
+
+      # Builds the release binary, checks that it starts and reports the workspace version,
+      # then packages it for this OS into dist/.
+      - name: Build and package
+        run: packaging/package.sh
+        # env:
+        #   CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+
+      # - name: Notarize and staple the disk image
+      #   if: runner.os == 'macOS'
+      #   env:
+      #     APPLE_ID: ${{ secrets.APPLE_ID }}
+      #     APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      #     APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+      #   run: packaging/macos/notarize.sh dist/Serialist-*-macos-*.dmg
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: draft release
+    needs: package
+    if: github.ref_type == 'tag' || inputs.draft_release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Creating a release and uploading its assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: packages-*
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * | tee SHA256SUMS.tmp
+          mv SHA256SUMS.tmp SHA256SUMS
+
+      # The release is a draft: publishing it is a manual step, after trying the packages.
+      # Re-running the workflow for the same version refreshes the draft's files.
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          tag="v$version"
+          packaging/release-notes.sh "$version" > release-notes.md
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            flags=()
+            # 0.2.0-rc.1 is a pre-release.
+            case "$version" in *-*) flags+=(--prerelease) ;; esac
+            gh release create "$tag" dist/* \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Serialist $version" \
+              --notes-file release-notes.md \
+              --generate-notes \
+              "${flags[@]}"
+          fi

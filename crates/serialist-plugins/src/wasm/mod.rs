@@ -69,8 +69,11 @@
 //!
 //! # Threads
 //!
-//! The codec runs on the ingest thread, synchronously. [`WasmCodec`] is `Send` without
-//! any `unsafe`: a wasmtime store holds no thread-bound state.
+//! The codec runs on the ingest thread, synchronously. As with every codec, the app hands
+//! the ingest thread the [`WasmCodecFactory`] (`Send + Sync`) and the codec is made
+//! there, by [`CodecSink::from_factory`](serialist_core::CodecSink::from_factory). A
+//! [`WasmCodec`] happens to be `Send` as well, without any `unsafe`: a wasmtime store
+//! holds no thread-bound state. The only other thread is the engine's epoch ticker.
 
 mod codec;
 mod convert;
