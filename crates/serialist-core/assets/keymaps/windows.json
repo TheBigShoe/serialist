@@ -1,0 +1,69 @@
+// Serialist default key bindings for Windows, in Zed's keymap format: a list of sections,
+// each with an optional key context and a map of keystrokes to actions. Your keymap.json
+// is applied after this one, so its bindings win. Bind a key to null to unbind it.
+//
+// Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
+// (ctrl-s is XOFF), so most bindings here use shifted chords. Pause is the exception at
+// plain ctrl-p.
+[
+  {
+    "bindings": {
+      "ctrl-q": "serialist::Quit"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-shift-k": "terminal::Clear",
+      "ctrl-shift-w": "serial::Disconnect",
+      "ctrl-p": "terminal::Pause",
+      "ctrl-shift-s": "terminal::Export",
+      "ctrl-shift-r": "terminal::ToggleRecord"
+    }
+  },
+  {
+    "context": "DevicesPanel",
+    "bindings": {
+      "down": "devices::SelectNext",
+      "up": "devices::SelectPrevious",
+      "enter": "serial::Connect"
+    }
+  },
+  {
+    "context": "ComposeBar > Input",
+    "bindings": {
+      "up": "compose::HistoryPrevious",
+      "down": "compose::HistoryNext"
+    }
+  },
+  {
+    "context": "ComposeBar",
+    "bindings": {
+      "ctrl-shift-e": "compose::CycleLineEnding"
+    }
+  },
+  {
+    "context": "Terminal",
+    "bindings": {
+      "ctrl-shift-c": "terminal::Copy",
+      "ctrl-shift-a": "terminal::SelectAll",
+      "ctrl-shift-f": "terminal::Search",
+      "alt-z": "terminal::ToggleWrap",
+      "alt-t": "terminal::CycleTimestamps",
+      "alt-h": "terminal::ToggleHexView",
+      "ctrl-alt-i": "terminal::ToggleFrameStats",
+      "pageup": "terminal::PageUp",
+      "pagedown": "terminal::PageDown",
+      "home": "terminal::ScrollToTop",
+      "end": "terminal::JumpToBottom",
+      "ctrl-home": "terminal::ScrollToTop",
+      "ctrl-end": "terminal::JumpToBottom"
+    }
+  },
+  {
+    "context": "TerminalSearch",
+    "bindings": {
+      "escape": "terminal::DismissSearch"
+    }
+  }
+]
