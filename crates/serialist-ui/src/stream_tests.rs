@@ -18,7 +18,7 @@ use crate::status::{Notice, format_bytes};
 use crate::terminal::{DisplayMode, TerminalView, TimestampMode};
 use crate::test_support::{
     TestDir, displayed, enable_local_echo, has_rx_line, open_workspace, open_workspace_with,
-    run_until, step, type_line, wait_connected,
+    run_until, step, type_line, wait_connected, wait_for_received,
 };
 
 /// Fast enough to fill a few screens in a fraction of a second, slow enough that every
@@ -302,7 +302,9 @@ fn raw_export_is_exactly_what_the_device_sent(cx: &mut TestAppContext) {
     let view = wait_connected(cx, &workspace);
     type_line(cx, window, "hello");
     type_line(cx, window, "world");
-    run_until(cx, "both echoes", |cx| has_rx_line(cx, &view, "world"));
+    // The link is paced, so the echo arrives in pieces: a line reading "world" may still
+    // lack its line ending. Wait for every byte.
+    wait_for_received(cx, &view, 14);
 
     export_now(cx, &view, dir.join("echo.bin"), ExportFormat::Raw);
     let notice = wait_notice(cx, &view, "echo.bin");
@@ -412,6 +414,9 @@ fn recording_writes_the_raw_stream_until_stopped(cx: &mut TestAppContext) {
     run_until(cx, "more data after the stop", |cx| {
         received(cx, &view) > after_stop
     });
+    // The view's snapshot follows the ingest thread by a wake, so it may not hold yet
+    // everything the recorder took before the stop.
+    wait_for_received(cx, &view, recorded.len() as u64);
     assert_eq!(
         fs::read(&path).unwrap().len(),
         recorded.len(),
@@ -444,7 +449,7 @@ fn pause_export_and_record_have_default_keys(cx: &mut TestAppContext) {
     let (window, workspace) = open_workspace(cx, &world, Some("virtual:echo"));
     let view = wait_connected(cx, &workspace);
     type_line(cx, window, "hello");
-    run_until(cx, "the echo", |cx| has_rx_line(cx, &view, "hello"));
+    wait_for_received(cx, &view, 7);
 
     let (pause, export, record) = if cfg!(target_os = "macos") {
         ("cmd-p", "cmd-s", "cmd-shift-r")
@@ -474,7 +479,7 @@ fn pause_export_and_record_have_default_keys(cx: &mut TestAppContext) {
     cx.simulate_new_path_selection(move |_| Some(chosen));
     wait_recording(cx, &view);
     type_line(cx, window, "again");
-    run_until(cx, "the second echo", |cx| has_rx_line(cx, &view, "again"));
+    wait_for_received(cx, &view, 14);
     press(cx, window, record);
     wait_notice(cx, &view, "Recorded");
     assert_eq!(fs::read(&raw_path).unwrap(), b"again\r\n");
@@ -497,7 +502,7 @@ fn recording_survives(
     view.update(cx, |v, cx| v.start_recording(path.clone(), cx));
     wait_recording(cx, &view);
     type_line(cx, window, "bye");
-    run_until(cx, "the echo", |cx| has_rx_line(cx, &view, "bye"));
+    wait_for_received(cx, &view, 5);
 
     end(cx, &world, &view);
     let notice = wait_notice(cx, &view, "Recorded");
@@ -541,9 +546,9 @@ fn hex_view_shows_the_same_snapshot_and_keeps_pause_and_selection(cx: &mut TestA
     enable_local_echo(cx, &view);
     // Sixteen bytes with the line ending: exactly one full hex row.
     type_line(cx, window, "hello world 12");
-    run_until(cx, "the echo", |cx| {
-        has_rx_line(cx, &view, "hello world 12")
-    });
+    // All sixteen bytes: the hex row below needs the line ending too, which a paced link
+    // may deliver after the text.
+    wait_for_received(cx, &view, 16);
 
     focus_terminal(cx, window, &view);
     press(cx, window, "alt-h");
