@@ -33,6 +33,24 @@ impl Platform {
     }
 }
 
+/// A codec plugin that ships with the app as an example. It decodes nothing until it is
+/// installed: [`ConfigPaths::install_example_plugin`] copies its folder into `plugins/`.
+/// The app's list of them is `serialist_plugins::EXAMPLE_PLUGINS`; this crate only knows
+/// how to put one on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExamplePlugin {
+    /// Its folder under `plugins/`, and so the name the app registers it under, which a
+    /// device profile's `plugin` and a saved command's `codec` name: `airoha-race`.
+    pub name: &'static str,
+    /// What menus call it: `Airoha RACE`.
+    pub title: &'static str,
+    /// One line on what it decodes.
+    pub description: &'static str,
+    /// Its files, by name inside the folder: `plugin.lua`, or `plugin.wasm` and
+    /// `plugin.toml`.
+    pub files: &'static [(&'static str, &'static [u8])],
+}
+
 /// The user's config directory and the files inside it.
 ///
 /// The directory is `~/.config/serialist` on macOS and Linux (Zed uses `~/.config/zed`
@@ -115,13 +133,97 @@ impl ConfigPaths {
         self.dir.join("scripts")
     }
 
-    /// `plugins/` in `dir`: codec plugins, one folder each (`plugins/<name>/plugin.lua`).
-    /// The app registers each under its folder's name, so `plugins/airoha-race/`
-    /// replaces the built-in `airoha-race` codec and `plugins/my-proto/` adds
-    /// `my-proto`. Saving a file in there reloads the plugins
+    /// `plugins/` in `dir`: codec plugins, one folder each (`plugins/<name>/plugin.lua`,
+    /// or `plugin.wasm` and `plugin.toml`). They are the only decoders the app has, and
+    /// it ships with none active. The app registers each under its folder's name, so
+    /// `plugins/my-proto/` adds the codec `my-proto`. Saving a file in there, or copying
+    /// a plugin's folder in, reloads the plugins
     /// ([`ConfigEvent::Plugins`](crate::ConfigEvent::Plugins)).
     pub fn plugins_dir(&self) -> PathBuf {
         self.dir.join("plugins")
+    }
+
+    /// `plugins/examples/` in `dir`: copies of the example plugins that ship with the
+    /// app, to read and to copy from (see
+    /// [`ensure_example_plugins`](Self::ensure_example_plugins)). A folder in here is
+    /// not a plugin: only the folders directly in `plugins/` load.
+    pub fn example_plugins_dir(&self) -> PathBuf {
+        self.plugins_dir().join("examples")
+    }
+
+    /// Creates `plugins/` and writes a copy of each of `examples` whose folder is missing
+    /// into [`example_plugins_dir`](Self::example_plugins_dir), where it does not load.
+    /// Returns the files it wrote.
+    ///
+    /// The counterpart of [`ensure_example_scripts`](Self::ensure_example_scripts), with
+    /// one difference: an example plugin in `plugins/` would decode, and the app ships
+    /// with no decoder active, so the examples go one level down and a plugin is enabled
+    /// by copying its folder up into `plugins/`, which
+    /// [`install_example_plugin`](Self::install_example_plugin) does. An example folder
+    /// that exists is left alone, edits and all, and a file that already exists is never
+    /// overwritten.
+    ///
+    /// Safe to call while a [`ConfigWatcher`](crate::ConfigWatcher) runs: the watcher
+    /// reports what it writes, since it is under `plugins/`, and the reload that follows
+    /// finds no new plugin.
+    pub fn ensure_example_plugins(&self, examples: &[ExamplePlugin]) -> io::Result<Vec<PathBuf>> {
+        let root = self.example_plugins_dir();
+        std::fs::create_dir_all(&root)?;
+        let mut written = Vec::new();
+        for example in examples {
+            let folder = root.join(example.name);
+            if folder.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(&folder)?;
+            for (name, bytes) in example.files {
+                let path = folder.join(name);
+                if self.create_new(&path, bytes)? {
+                    written.push(path);
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Enables `example`: writes its folder into `plugins/` as `plugins/<name>/`, from
+    /// the copy bundled with the app, and returns the folder. The watcher reports it and
+    /// the app loads it like any plugin.
+    ///
+    /// The files go into a staging folder under
+    /// [`example_plugins_dir`](Self::example_plugins_dir) first, and that folder is then
+    /// renamed into place, so a reload never finds the plugin half written. Fails with
+    /// [`io::ErrorKind::AlreadyExists`] if `plugins/<name>` exists: the example is
+    /// installed already, or a plugin of the user's own has its name, and neither is
+    /// touched.
+    pub fn install_example_plugin(&self, example: &ExamplePlugin) -> io::Result<PathBuf> {
+        let target = self.plugins_dir().join(example.name);
+        if target.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", target.display()),
+            ));
+        }
+        let staging = self
+            .example_plugins_dir()
+            .join(format!(".installing-{}", example.name));
+        if staging.exists() {
+            // Left over from an install that failed part way.
+            std::fs::remove_dir_all(&staging)?;
+        }
+        let staged = std::fs::create_dir_all(&staging)
+            .and_then(|()| {
+                example
+                    .files
+                    .iter()
+                    .try_for_each(|(name, bytes)| std::fs::write(staging.join(name), bytes))
+            })
+            .and_then(|()| std::fs::rename(&staging, &target));
+        if let Err(error) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        Ok(target)
     }
 
     /// The example scripts that ship with the app, as `(file name, source)`.
@@ -198,7 +300,7 @@ impl ConfigPaths {
     /// creating the config directory as needed. Returns whether it wrote the file.
     /// An existing file is never touched.
     pub fn ensure_settings_file(&self) -> io::Result<bool> {
-        self.create_new(&self.settings, &settings_template())
+        self.create_new(&self.settings, settings_template())
     }
 
     /// Writes the commented keymap template if `keymap.json` does not exist, creating
@@ -206,14 +308,14 @@ impl ConfigPaths {
     /// file is never touched. The template is an empty keymap, so it changes nothing
     /// until a section is uncommented; see [`keymap_template`].
     pub fn ensure_keymap_file(&self) -> io::Result<bool> {
-        self.create_new(&self.keymap, &keymap_template(Platform::current()))
+        self.create_new(&self.keymap, keymap_template(Platform::current()))
     }
 
-    fn create_new(&self, path: &Path, text: &str) -> io::Result<bool> {
+    fn create_new(&self, path: &Path, contents: impl AsRef<[u8]>) -> io::Result<bool> {
         std::fs::create_dir_all(&self.dir)?;
         match OpenOptions::new().write(true).create_new(true).open(path) {
             Ok(mut file) => {
-                file.write_all(text.as_bytes())?;
+                file.write_all(contents.as_ref())?;
                 Ok(true)
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -320,5 +422,64 @@ mod tests {
         root.write("other/scripts/mine.LUA", "print(1)");
         assert!(other.ensure_example_scripts().unwrap().is_empty());
         assert!(!other.scripts_dir().join("version_probe.lua").exists());
+    }
+
+    const PROTO: ExamplePlugin = ExamplePlugin {
+        name: "proto",
+        title: "Proto",
+        description: "A test plugin",
+        files: &[("plugin.lua", b"return {}"), ("notes.txt", b"hi")],
+    };
+
+    #[test]
+    fn example_plugins_are_copied_beside_the_plugins_not_into_them() {
+        let root = TempDir::new("example-plugins");
+        let paths = ConfigPaths::new(root.path().join("config"));
+        let written = paths.ensure_example_plugins(&[PROTO]).unwrap();
+        let folder = paths.plugins_dir().join("examples").join("proto");
+        assert_eq!(
+            written,
+            [folder.join("plugin.lua"), folder.join("notes.txt")]
+        );
+        assert!(
+            !paths.plugins_dir().join("proto").exists(),
+            "an example is not installed by being shipped"
+        );
+
+        // An example folder that is there is left alone, edits and all.
+        std::fs::write(folder.join("plugin.lua"), "-- mine").unwrap();
+        std::fs::remove_file(folder.join("notes.txt")).unwrap();
+        assert!(paths.ensure_example_plugins(&[PROTO]).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(folder.join("plugin.lua")).unwrap(),
+            "-- mine"
+        );
+    }
+
+    #[test]
+    fn installing_an_example_writes_its_folder_into_plugins_once() {
+        let root = TempDir::new("install-plugin");
+        let paths = ConfigPaths::new(root.path().join("config"));
+        let folder = paths.install_example_plugin(&PROTO).unwrap();
+        assert_eq!(folder, paths.plugins_dir().join("proto"));
+        assert_eq!(
+            std::fs::read(folder.join("plugin.lua")).unwrap(),
+            b"return {}"
+        );
+        assert_eq!(std::fs::read(folder.join("notes.txt")).unwrap(), b"hi");
+        let staging: Vec<_> = std::fs::read_dir(paths.example_plugins_dir())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(staging.is_empty(), "no staging folder is left behind");
+
+        // Installed already (or a plugin of the user's own by that name): untouched.
+        std::fs::write(folder.join("plugin.lua"), "-- edited").unwrap();
+        let again = paths.install_example_plugin(&PROTO).unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(folder.join("plugin.lua")).unwrap(),
+            "-- edited"
+        );
     }
 }
