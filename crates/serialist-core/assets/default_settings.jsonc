@@ -1,0 +1,95 @@
+// Serialist default settings.
+//
+// This file is bundled into the binary and is the base layer: every key a settings
+// file leaves out takes its value from here. Serialist reads Zed's settings
+// vocabulary, so keys you already have in Zed's settings.json work as they are.
+//
+// Layers, lowest to highest: these defaults, your user settings.json, then a
+// project-local .serialist/settings.json. Objects merge key by key; arrays and
+// scalars from a higher layer replace the lower one. A `null` unsets an optional key.
+{
+  // ---- Buffer font: the terminal text ----
+
+  // Font family name. null uses the bundled monospace font.
+  "buffer_font_family": null,
+  // Size in points.
+  "buffer_font_size": 15.0,
+  // 100 to 900. 400 is regular, 700 is bold.
+  "buffer_font_weight": 400,
+  // OpenType features by four-letter tag. true/false become 1/0, integers pass through.
+  // Example: { "calt": false, "ss01": true, "cv01": 7 }. "calt": false turns ligatures off.
+  "buffer_font_features": {},
+  // "comfortable" (1.618), "standard" (1.3), a number, or { "custom": 1.5 }.
+  "buffer_line_height": "standard",
+  // Families tried, in order, for glyphs the main family lacks.
+  "buffer_font_fallbacks": [],
+
+  // ---- UI font: panels, tabs and the status line ----
+
+  "ui_font_family": null,
+  "ui_font_size": 16.0,
+  "ui_font_weight": 400,
+  "ui_font_features": {},
+  "ui_font_fallbacks": [],
+
+  // ---- Terminal overrides ----
+  // Any key set here replaces the matching buffer_font_* value for the terminal only.
+  // null means "use the buffer value".
+  "terminal": {
+    "font_family": null,
+    "font_size": null,
+    "font_weight": null,
+    "font_features": null,
+    "font_fallbacks": null,
+    "line_height": null
+  },
+
+  // ---- Theme ----
+  // A theme name, or { "mode": "system" | "light" | "dark", "light": name, "dark": name }.
+  // "system" follows the operating system appearance. Themes are Zed theme files
+  // (schema v0.2.0) in the themes folder next to this file.
+  "theme": {
+    "mode": "system",
+    "light": "Serialist Light",
+    "dark": "Serialist Dark"
+  },
+
+  // ---- Display ----
+  "display": {
+    // Timestamp gutter: "off" | "absolute" | "relative" | "delta".
+    "timestamps": "off",
+    // strftime-style format for absolute timestamps.
+    "timestamp_format": "%H:%M:%S%.3f",
+    // How received bytes are shown: "text" | "hex" | "hex_ascii".
+    "view": "text",
+    "hex_bytes_per_row": 16,
+    // Render CR, LF and ESC as dim glyphs.
+    "show_control_chars": false,
+    // Wrap long lines instead of scrolling sideways.
+    "wrap": false
+  },
+
+  // ---- Sessions ----
+
+  // Upper bound on scrollback memory per session, in bytes (268435456 = 256 MiB).
+  "scrollback_budget_bytes": 268435456,
+  // Baud rate for a device with no matching profile.
+  "default_baud": 115200,
+  // What Enter appends when sending: "none" | "cr" | "lf" | "crlf".
+  "line_ending": "crlf",
+  // Show what you type in the scrollback.
+  "local_echo": false,
+
+  // ---- Device profiles ----
+  // The first profile whose "match" fits a port applies when it is connected.
+  // "match" keys, all optional: "vid" and "pid" (hex string such as "0x0e8d", or a
+  // number), "product", "manufacturer" and "serial_number" (case-insensitive
+  // substrings), "path" (exact port path or a prefix of it). A profile may set
+  // "baud", "data_bits", "parity", "stop_bits", "flow_control", "plugin", "eol",
+  // "on_connect" (a script path) and "name" (shown in the Devices panel).
+  //
+  // Example:
+  //   { "match": { "vid": "0x0e8d", "product": "Airoha" },
+  //     "baud": 921600, "plugin": "airoha-race", "eol": "crlf" }
+  "devices": []
+}

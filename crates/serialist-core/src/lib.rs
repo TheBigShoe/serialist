@@ -12,9 +12,13 @@ pub mod ingest;
 pub mod port;
 pub mod serial;
 pub mod session;
+pub mod settings;
 pub mod store;
 pub mod text;
 pub mod transport;
+
+#[cfg(test)]
+mod test_util;
 
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
 pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
@@ -24,6 +28,11 @@ pub use ingest::{ChunkSink, Ingest, IngestHandle, IngestPanicked, IngestStats, I
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
 pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
+pub use settings::{
+    ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView, FontFeatures, FontSpec,
+    LineEnding, LineHeight, Platform, Settings, SettingsError, SettingsWarning, TerminalSettings,
+    ThemeMode, ThemeSelection, TimestampMode, UsbId, load_settings,
+};
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,
     TextOptions, Timestamps,
