@@ -25,6 +25,41 @@
 //! - A line keeps at most [`MAX_RUNS`] style runs; past that, new text takes the style
 //!   of the last run. The text itself is never affected.
 //!
+//! # Showing control characters
+//!
+//! [`AnsiParser::show_control_chars`] (off by default) makes the bytes above that leave
+//! no trace visible as placeholder glyphs in the line's text, each in a run of its own
+//! whose style is `DIM | CONTROL` in the default colors (see [`CONTROL_STYLE`]). A C0
+//! byte `b` shows as the Unicode Control Picture U+2400 + `b`; DEL is U+2421.
+//!
+//! | Input | Glyph |
+//! | --- | --- |
+//! | CR | `␍` |
+//! | the LF that ends a line | `␊`, at the end of the line |
+//! | each escape sequence the parser consumed (CSI, OSC, DCS, a bare ESC pair) | `␛` |
+//! | BS | `␈` |
+//! | any other C0 byte except TAB (NUL, BEL, VT, FF, ...) | U+2400 + the byte (`␀`, `␇`, `␋`, `␌`) |
+//! | DEL | `␡` |
+//!
+//! An OSC or DCS string ended by ST shows two: one for the string, one for the `ESC \`.
+//! A string that a line feed cuts off shows one, before the line's `␊`. SOS, PM and
+//! APC strings and a CSI sequence with an invalid parameter are dropped by the tokenizer
+//! without a callback, so they show nothing unless a line feed cuts them off. TAB keeps
+//! expanding to spaces and shows no glyph; the bytes 0x80..=0x9F already show U+FFFD.
+//!
+//! The glyphs are visual only. They are not columns: the cursor, CR overwrites, BS, tabs
+//! and erases behave exactly as with the flag off, and the text without its `CONTROL` runs
+//! is the text the flag-off parser gives (the runs coalesce the same way). A glyph is
+//! anchored to the column the cursor was in when its byte arrived, and sits before the
+//! character in that column, so the placeholder for a CR goes at the end of the text it
+//! is about to overwrite, and `abcdef\rXY\n` shows `XYcdef␍␊`. Glyphs at the
+//! same column keep their order; a column past the end of the text puts the glyph at the
+//! end. A line shows at most [`MAX_CONTROL_GLYPHS`] of them.
+//!
+//! A line with a glyph is never plain: the store keeps its decoded text, so a session
+//! with the flag on costs about what an ANSI-heavy one does (see the store's memory
+//! model). Searches see the glyphs as part of the text.
+//!
 //! Appending at the end of the line (almost all traffic) edits the text and runs
 //! directly. The first edit that is not an append (an overwrite after CR or BS, an
 //! erase) switches the line to one cell per column, so every later edit is O(1) and the
@@ -60,6 +95,15 @@ pub const MIN_LINE_BYTES: usize = 16;
 pub const MOTION_WIDTH: usize = 512;
 /// Style runs kept per line; past this, new text takes the style of the last run.
 pub const MAX_RUNS: usize = 2048;
+/// Control-character glyphs a line shows when [`AnsiParser::show_control_chars`] is on;
+/// past this, further control bytes show nothing.
+pub const MAX_CONTROL_GLYPHS: usize = 4096;
+/// The style of a control-character glyph run: dim, flagged `CONTROL`, default colors.
+pub const CONTROL_STYLE: Style = Style {
+    fg: Color::Default,
+    bg: Color::Default,
+    flags: StyleFlags(StyleFlags::DIM.0 | StyleFlags::CONTROL.0),
+};
 /// Distinct styles a line in cell mode can hold (11 bits of a packed cell); past this,
 /// new styles reuse the last one.
 const MAX_PALETTE: usize = 1 << 11;
@@ -68,6 +112,7 @@ const KEEP_TEXT: usize = 16 * 1024;
 const KEEP_RUNS: usize = 256;
 const KEEP_CELLS: usize = 4 * 1024;
 const KEEP_PALETTE: usize = 64;
+const KEEP_MARKS: usize = 256;
 const KEEP_JOINED: usize = 64 * 1024;
 
 /// A line as the parser produced it. Borrowed from the parser; copy what you keep.
@@ -156,6 +201,14 @@ impl AnsiParser {
         }
     }
 
+    /// Show control characters as dim placeholder glyphs (default off). See the module
+    /// docs for the glyphs and what they do not change. Set it before the first `feed`:
+    /// the lines already parsed, and the one in progress, are not redone.
+    pub fn show_control_chars(mut self, show: bool) -> Self {
+        self.line.show_control = show;
+        self
+    }
+
     pub fn max_line_bytes(&self) -> usize {
         self.max_line_bytes
     }
@@ -230,7 +283,9 @@ impl AnsiParser {
                     if !self.line.lf_executed {
                         // Swallowed by a string sequence: the LF still ends the line.
                         self.vte = vte::Parser::new();
+                        self.line.mark(ESC_GLYPH);
                     }
+                    self.line.mark_end(LF_GLYPH);
                     self.line.raw_len += i + 1;
                     self.line.sync();
                     on_line(self.line.view(true));
@@ -278,6 +333,9 @@ impl AnsiParser {
             + line.runs.capacity() * size_of::<StyleRun>()
             + line.cells.capacity() * size_of::<u32>()
             + line.palette.capacity() * size_of::<Style>()
+            + line.marks.capacity() * size_of::<Mark>()
+            + line.shown_text.capacity()
+            + line.shown_runs.capacity() * size_of::<StyleRun>()
     }
 
     /// The most heap a parser with this `max_line_bytes` holds after a `feed`, whatever
@@ -290,6 +348,18 @@ impl AnsiParser {
             + cols * size_of::<u32>()
             + MAX_PALETTE * size_of::<Style>())
             + KEEP_JOINED
+    }
+
+    /// The most heap the control-glyph buffers add to [`AnsiParser::worst_case_heap`]
+    /// after a `feed` with this `max_line_bytes`, when [`AnsiParser::show_control_chars`]
+    /// is on: the glyph anchors, and the text and runs with the glyphs merged in, at
+    /// twice their length for vector growth.
+    pub fn worst_case_control_heap(max_line_bytes: usize) -> usize {
+        let cols = max_line_bytes.clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT) + MOTION_WIDTH;
+        2 * (MAX_CONTROL_GLYPHS * size_of::<Mark>()
+            + 4 * cols
+            + 3 * MAX_CONTROL_GLYPHS
+            + MAX_RUNS * size_of::<StyleRun>())
     }
 
     /// Parse a whole buffer and return every line, the one in progress last. Convenient
@@ -328,6 +398,35 @@ struct LineState {
     simple: bool,
     raw_len: usize,
     lf_executed: bool,
+    /// Control glyphs are on (see [`AnsiParser::show_control_chars`]).
+    show_control: bool,
+    /// The glyphs of this line, anchored to columns; sorted (stably) when composed.
+    marks: Vec<Mark>,
+    /// With marks: `text` and `runs` with the glyphs merged in, which is what a view
+    /// of the line borrows.
+    shown_text: String,
+    shown_runs: Vec<StyleRun>,
+    /// `text`, `runs` or `marks` changed since `shown_*` was composed.
+    shown_stale: bool,
+}
+
+const CR_GLYPH: char = '\u{240D}';
+const LF_GLYPH: char = '\u{240A}';
+const ESC_GLYPH: char = '\u{241B}';
+const BS_GLYPH: char = '\u{2408}';
+const DEL_GLYPH: char = '\u{2421}';
+
+/// A control glyph anchored before column `col` (see the module docs).
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    col: u32,
+    glyph: char,
+}
+
+/// The Control Picture standing for the C0 byte `byte`.
+fn control_picture(byte: u8) -> char {
+    debug_assert!(byte < 0x20);
+    char::from_u32(0x2400 + u32::from(byte)).unwrap_or(char::REPLACEMENT_CHARACTER)
 }
 
 fn pack(c: char, index: u32) -> u32 {
@@ -369,14 +468,28 @@ impl LineState {
             simple: true,
             raw_len: 0,
             lf_executed: false,
+            show_control: false,
+            marks: Vec::new(),
+            shown_text: String::new(),
+            shown_runs: Vec::new(),
+            shown_stale: false,
         }
     }
 
     fn view(&self, complete: bool) -> ParsedLine<'_> {
         debug_assert!(!self.stale, "view of an unsynced line");
+        debug_assert!(
+            !self.shown_stale || self.marks.is_empty(),
+            "view of an unsynced line"
+        );
+        let (text, runs) = if self.marks.is_empty() {
+            (&self.text, &self.runs)
+        } else {
+            (&self.shown_text, &self.shown_runs)
+        };
         ParsedLine {
-            text: &self.text,
-            runs: &self.runs,
+            text,
+            runs,
             raw_len: self.raw_len,
             complete,
             simple: self.simple,
@@ -397,6 +510,19 @@ impl LineState {
         self.cursor = 0;
         self.simple = true;
         self.raw_len = 0;
+        self.marks.clear();
+        self.shown_text.clear();
+        self.shown_runs.clear();
+        self.shown_stale = false;
+        if self.marks.capacity() > KEEP_MARKS {
+            self.marks.shrink_to(KEEP_MARKS);
+        }
+        if self.shown_text.capacity() > KEEP_TEXT {
+            self.shown_text.shrink_to(KEEP_TEXT);
+        }
+        if self.shown_runs.capacity() > KEEP_RUNS {
+            self.shown_runs.shrink_to(KEEP_RUNS);
+        }
         if self.text.capacity() > KEEP_TEXT {
             self.text.shrink_to(KEEP_TEXT);
         }
@@ -418,6 +544,7 @@ impl LineState {
         self.cells.clear();
         self.cols = 0;
         self.stale = false;
+        self.shown_stale = true;
     }
 
     /// Switch to one cell per column, built from the current text and runs.
@@ -452,32 +579,112 @@ impl LineState {
         self.stale = false;
     }
 
-    /// Rebuild `text` and `runs` from the cells, if they changed.
+    /// Rebuild `text` and `runs` from the cells, if they changed, and the text and runs
+    /// with the control glyphs in them, if either changed.
     fn sync(&mut self) {
-        if !self.stale {
+        if self.stale {
+            let Self {
+                text,
+                runs,
+                cells,
+                palette,
+                ..
+            } = self;
+            text.clear();
+            runs.clear();
+            for &cell in cells.iter() {
+                let (c, index) = unpack(cell);
+                text.push(c);
+                push_run(runs, c.len_utf8(), palette[index]);
+            }
+            self.stale = false;
+            self.shown_stale = true;
+        }
+        if self.shown_stale {
+            if !self.marks.is_empty() {
+                self.compose();
+            }
+            self.shown_stale = false;
+        }
+    }
+
+    /// Show `glyph` before the column the cursor is in (see the module docs), if control
+    /// characters are shown. The line is no longer plain.
+    fn mark(&mut self, glyph: char) {
+        self.mark_at(self.cursor, glyph);
+    }
+
+    /// Show `glyph` at the end of the line, wherever the text ends up.
+    fn mark_end(&mut self, glyph: char) {
+        self.mark_at(usize::MAX, glyph);
+    }
+
+    fn mark_at(&mut self, col: usize, glyph: char) {
+        if !self.show_control {
             return;
+        }
+        self.simple = false;
+        if self.marks.len() < MAX_CONTROL_GLYPHS {
+            let col = u32::try_from(col).unwrap_or(u32::MAX);
+            self.marks.push(Mark { col, glyph });
+            self.shown_stale = true;
+        }
+    }
+
+    /// Merge the marks into `text` and `runs`, giving `shown_text` and `shown_runs`. A
+    /// mark goes before the character in its column, after the marks anchored earlier
+    /// in the same column, and at the end if the text is shorter than its column.
+    fn compose(&mut self) {
+        // Marks arrive in time order, columns in any order; equal columns keep theirs.
+        if !self.marks.is_sorted_by_key(|mark| mark.col) {
+            self.marks.sort_by_key(|mark| mark.col);
         }
         let Self {
             text,
             runs,
-            cells,
-            palette,
+            marks,
+            shown_text,
+            shown_runs,
             ..
         } = self;
-        text.clear();
-        runs.clear();
-        for &cell in cells.iter() {
-            let (c, index) = unpack(cell);
-            text.push(c);
-            push_run(runs, c.len_utf8(), palette[index]);
+        shown_text.clear();
+        shown_runs.clear();
+        let mut put_text = |part: &str, style: Style| {
+            if !part.is_empty() {
+                shown_text.push_str(part);
+                push_run(shown_runs, part.len(), style);
+            }
+        };
+        let mut next = 0;
+        let mut col = 0;
+        let mut at = 0;
+        for run in runs.iter() {
+            let end = (at + run.len).min(text.len());
+            let mut from = at;
+            for (offset, _) in text[at..end].char_indices() {
+                if marks.get(next).is_some_and(|mark| mark.col as usize <= col) {
+                    put_text(&text[from..at + offset], run.style);
+                    from = at + offset;
+                    while let Some(mark) = marks.get(next).filter(|m| m.col as usize <= col) {
+                        put_text(mark.glyph.encode_utf8(&mut [0; 4]), CONTROL_STYLE);
+                        next += 1;
+                    }
+                }
+                col += 1;
+            }
+            put_text(&text[from..end], run.style);
+            at = end;
         }
-        self.stale = false;
+        for mark in &marks[next..] {
+            put_text(mark.glyph.encode_utf8(&mut [0; 4]), CONTROL_STYLE);
+        }
     }
 
     fn append(&mut self, c: char, style: Style) {
         self.text.push(c);
         push_run(&mut self.runs, c.len_utf8(), style);
         self.cols += 1;
+        self.shown_stale = true;
     }
 
     /// Draw `c` at the cursor and advance it.
@@ -679,6 +886,7 @@ impl Perform for LineState {
     fn print(&mut self, c: char) {
         if c == '\u{7f}' {
             self.simple = false;
+            self.mark(DEL_GLYPH);
             return;
         }
         if c == char::REPLACEMENT_CHARACTER
@@ -693,9 +901,13 @@ impl Perform for LineState {
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' => self.lf_executed = true,
-            b'\r' => self.cursor = 0,
+            b'\r' => {
+                self.mark(CR_GLYPH);
+                self.cursor = 0;
+            }
             0x08 => {
                 self.simple = false;
+                self.mark(BS_GLYPH);
                 self.cursor = self.cursor.saturating_sub(1);
             }
             b'\t' => {
@@ -706,12 +918,18 @@ impl Perform for LineState {
                 self.simple = false;
                 self.draw(char::REPLACEMENT_CHARACTER);
             }
-            _ => self.simple = false,
+            _ => {
+                self.simple = false;
+                if byte < 0x20 {
+                    self.mark(control_picture(byte));
+                }
+            }
         }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         self.simple = false;
+        self.mark(ESC_GLYPH);
         if ignore || !intermediates.is_empty() {
             return;
         }
@@ -736,10 +954,12 @@ impl Perform for LineState {
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
         self.simple = false;
+        self.mark(ESC_GLYPH);
     }
 
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
         self.simple = false;
+        self.mark(ESC_GLYPH);
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {
@@ -748,6 +968,11 @@ impl Perform for LineState {
 
     fn put(&mut self, _byte: u8) {
         self.simple = false;
+    }
+
+    fn unhook(&mut self) {
+        self.simple = false;
+        self.mark(ESC_GLYPH);
     }
 }
 
@@ -1493,6 +1718,460 @@ mod tests {
             proptest::prop_assert_eq!(lines.len(), 1);
             proptest::prop_assert_eq!(&lines[0].text, &text);
             proptest::prop_assert_eq!(&lines[0].runs, &runs);
+        }
+    }
+}
+
+/// The control-glyph mode: what each control byte shows as, and that showing it changes
+/// nothing else.
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    const D: Style = Style {
+        fg: Color::Default,
+        bg: Color::Default,
+        flags: StyleFlags::NONE,
+    };
+
+    fn run(len: usize, style: Style) -> StyleRun {
+        StyleRun { len, style }
+    }
+
+    /// A glyph run of `glyphs` glyphs: each is three bytes of UTF-8.
+    fn glyphs(count: usize) -> StyleRun {
+        run(3 * count, CONTROL_STYLE)
+    }
+
+    fn parse(bytes: &[u8], show: bool) -> Vec<OwnedLine> {
+        let mut parser = AnsiParser::new().show_control_chars(show);
+        let mut lines = Vec::new();
+        parser.feed(bytes, |line| lines.push(line.into()));
+        if let Some(line) = parser.current() {
+            lines.push(line.into());
+        }
+        lines
+    }
+
+    fn well_formed(line: &OwnedLine) {
+        let total: usize = line.runs.iter().map(|r| r.len).sum();
+        assert_eq!(total, line.text.len(), "runs cover text: {line:?}");
+        assert!(line.runs.iter().all(|r| r.len > 0), "no empty runs");
+        for pair in line.runs.windows(2) {
+            assert_ne!(pair[0].style, pair[1].style, "coalesced: {line:?}");
+        }
+        let mut pos = 0;
+        for r in &line.runs {
+            pos += r.len;
+            assert!(line.text.is_char_boundary(pos), "run on char boundary");
+        }
+        assert!(
+            !line.text.chars().any(|c| c.is_control()),
+            "no real controls in {:?}",
+            line.text
+        );
+    }
+
+    /// The text of the runs that are not control glyphs, with runs merged again.
+    fn without_glyphs(line: &OwnedLine) -> (String, Vec<StyleRun>) {
+        let (mut text, mut runs) = (String::new(), Vec::new());
+        let mut at = 0;
+        for r in &line.runs {
+            if !r.style.flags.contains(StyleFlags::CONTROL) {
+                text.push_str(&line.text[at..at + r.len]);
+                push_run(&mut runs, r.len, r.style);
+            }
+            at += r.len;
+        }
+        (text, runs)
+    }
+
+    #[test]
+    fn the_glyph_for_each_control_byte() {
+        let red = Style {
+            fg: Color::Ansi(1),
+            ..D
+        };
+        let cases: Vec<(&str, &[u8], &str, Vec<StyleRun>)> = vec![
+            (
+                "lf ends the line",
+                b"abc\n",
+                "abc\u{240a}",
+                vec![run(3, D), glyphs(1)],
+            ),
+            ("empty line", b"\n", "\u{240a}", vec![glyphs(1)]),
+            (
+                "crlf",
+                b"abc\r\n",
+                "abc\u{240d}\u{240a}",
+                vec![run(3, D), glyphs(2)],
+            ),
+            (
+                "cr goes at the end of what it overwrites",
+                b"abcdef\rXY\n",
+                "XYcdef\u{240d}\u{240a}",
+                vec![run(6, D), glyphs(2)],
+            ),
+            (
+                "cr progress",
+                b"10%\r20%\r100%\r\n",
+                "100\u{240d}\u{240d}%\u{240d}\u{240a}",
+                vec![run(3, D), glyphs(2), run(1, D), glyphs(2)],
+            ),
+            (
+                "bs",
+                b"abc\x08X\n",
+                "abX\u{2408}\u{240a}",
+                vec![run(3, D), glyphs(2)],
+            ),
+            (
+                "bs at the start",
+                b"\x08\x08a\n",
+                "\u{2408}\u{2408}a\u{240a}",
+                vec![glyphs(2), run(1, D), glyphs(1)],
+            ),
+            (
+                "sgr",
+                b"\x1b[31mred\x1b[0m!\n",
+                "\u{241b}red\u{241b}!\u{240a}",
+                vec![glyphs(1), run(3, red), glyphs(1), run(1, D), glyphs(1)],
+            ),
+            (
+                "osc ended by bel",
+                b"a\x1b]0;title\x07b\n",
+                "a\u{241b}b\u{240a}",
+                vec![run(1, D), glyphs(1), run(1, D), glyphs(1)],
+            ),
+            (
+                "osc ended by st is two escapes",
+                b"a\x1b]0;title\x1b\\b\n",
+                "a\u{241b}\u{241b}b\u{240a}",
+                vec![run(1, D), glyphs(2), run(1, D), glyphs(1)],
+            ),
+            (
+                "dcs ended by st is two escapes",
+                b"a\x1bPq#0\x1b\\b\n",
+                "a\u{241b}\u{241b}b\u{240a}",
+                vec![run(1, D), glyphs(2), run(1, D), glyphs(1)],
+            ),
+            (
+                "esc pair",
+                b"a\x1b7b\n",
+                "a\u{241b}b\u{240a}",
+                vec![run(1, D), glyphs(1), run(1, D), glyphs(1)],
+            ),
+            (
+                "unsupported csi",
+                b"a\x1b[?25lb\n",
+                "a\u{241b}b\u{240a}",
+                vec![run(1, D), glyphs(1), run(1, D), glyphs(1)],
+            ),
+            (
+                "other c0 bytes are their control pictures",
+                b"a\x00b\x07c\x0bd\x0ce\x1af\n",
+                "a\u{2400}b\u{2407}c\u{240b}d\u{240c}e\u{241a}f\u{240a}",
+                vec![
+                    run(1, D),
+                    glyphs(1),
+                    run(1, D),
+                    glyphs(1),
+                    run(1, D),
+                    glyphs(1),
+                    run(1, D),
+                    glyphs(1),
+                    run(1, D),
+                    glyphs(1),
+                    run(1, D),
+                    glyphs(1),
+                ],
+            ),
+            (
+                "del",
+                b"a\x7fb\n",
+                "a\u{2421}b\u{240a}",
+                vec![run(1, D), glyphs(1), run(1, D), glyphs(1)],
+            ),
+            (
+                "tab is spaces and has no glyph",
+                b"a\tb\n",
+                "a       b\u{240a}",
+                vec![run(9, D), glyphs(1)],
+            ),
+            (
+                "invalid utf-8 is still the replacement character",
+                b"a\xffb\x9bc\n",
+                "a\u{fffd}b\u{fffd}c\u{240a}",
+                vec![run(9, D), glyphs(1)],
+            ),
+            (
+                "el0 truncates, glyphs go to the end",
+                b"abcdef\x1b[3D\x1b[0K\n",
+                "abc\u{241b}\u{241b}\u{240a}",
+                vec![run(3, D), glyphs(3)],
+            ),
+            (
+                "cuf pads after the glyph anchored before it",
+                b"a\x1b[3Cb\n",
+                "a\u{241b}   b\u{240a}",
+                vec![run(1, D), glyphs(1), run(4, D), glyphs(1)],
+            ),
+            (
+                "a glyph stays where the cursor was, not where the sequence moves it",
+                b"abc\x1b[2DX\n",
+                "aXc\u{241b}\u{240a}",
+                vec![run(3, D), glyphs(2)],
+            ),
+            (
+                "a line feed cuts off an unterminated string",
+                b"a\x1b]0;never\nb\n",
+                "a\u{241b}\u{240a}",
+                vec![run(1, D), glyphs(2)],
+            ),
+        ];
+        for (name, input, text, runs) in cases {
+            let lines = parse(input, true);
+            for line in &lines {
+                well_formed(line);
+            }
+            assert_eq!(lines[0].text, text, "{name}: text");
+            assert_eq!(lines[0].runs, runs, "{name}: runs");
+            assert!(lines[0].complete, "{name}: complete");
+        }
+    }
+
+    #[test]
+    fn a_string_cut_off_by_a_line_feed_starts_the_next_line_clean() {
+        let lines = parse(b"a\x1b]0;never\nb\n", true);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].text, "b\u{240a}");
+        assert_eq!(lines[1].runs, vec![run(1, D), glyphs(1)]);
+    }
+
+    #[test]
+    fn a_line_in_progress_and_a_broken_line_have_no_line_feed_glyph() {
+        let lines = parse(b"abc\r", true);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].complete);
+        assert_eq!(lines[0].text, "abc\u{240d}");
+        // Ended early by the length limit: no LF, so no glyph for one.
+        let mut parser = AnsiParser::with_max_line_bytes(16).show_control_chars(true);
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        parser.feed(&[b'a'; 40], |l| lines.push(l.into()));
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.complete && !l.text.contains('\u{240a}'))
+        );
+        // Ended by a local line: the glyphs so far stay, and nothing is added.
+        let mut parser = AnsiParser::new().show_control_chars(true);
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        parser.feed(b"half\r\x1b[1m", |l| lines.push(l.into()));
+        parser.break_line(|l| lines.push(l.into()));
+        parser.feed(b"rest\n", |l| lines.push(l.into()));
+        // The escape sequence came after the CR, so its glyph is anchored at column 0.
+        assert_eq!(lines[0].text, "\u{241b}half\u{240d}");
+        assert!(!lines[0].complete);
+        assert_eq!(lines[1].text, "rest\u{240a}");
+        assert_eq!(lines[1].runs[0].style.flags, StyleFlags::BOLD);
+    }
+
+    #[test]
+    fn the_flag_is_off_by_default_and_changes_nothing_when_off() {
+        let input = b"a\rb\x08\x1b[31mc\x00\x7f\x1b]0;t\x07\n";
+        let default = {
+            let mut parser = AnsiParser::new();
+            let mut lines = Vec::new();
+            parser.feed(input, |l| lines.push(OwnedLine::from(l)));
+            lines
+        };
+        assert_eq!(default, parse(input, false));
+        assert!(
+            default[0]
+                .runs
+                .iter()
+                .all(|r| !r.style.flags.contains(StyleFlags::CONTROL))
+        );
+        assert_ne!(default, parse(input, true));
+    }
+
+    #[test]
+    fn glyph_runs_are_dim_control_and_default_colored() {
+        assert_eq!(CONTROL_STYLE.fg, Color::Default);
+        assert_eq!(CONTROL_STYLE.bg, Color::Default);
+        assert!(CONTROL_STYLE.flags.contains(StyleFlags::DIM));
+        assert!(CONTROL_STYLE.flags.contains(StyleFlags::CONTROL));
+        assert_eq!(
+            CONTROL_STYLE.flags,
+            StyleFlags(StyleFlags::DIM.0 | StyleFlags::CONTROL.0)
+        );
+        // The pen's color does not leak into the glyphs, and they do not touch the pen.
+        let lines = parse(b"\x1b[31;1mx\ry\n", true);
+        let glyph = lines[0].runs.iter().find(|r| r.style == CONTROL_STYLE);
+        assert!(glyph.is_some(), "{:?}", lines[0]);
+        let mut parser = AnsiParser::new().show_control_chars(true);
+        parser.feed(b"\x1b[31;1m\r", |_| {});
+        assert_eq!(
+            parser.pen(),
+            Style {
+                fg: Color::Ansi(1),
+                bg: Color::Default,
+                flags: StyleFlags::BOLD
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_with_glyphs_is_never_plain() {
+        let simple = |b: &[u8], show: bool| {
+            let mut p = AnsiParser::new().show_control_chars(show);
+            let mut s = None;
+            p.feed(b, |l| s = Some(l.simple));
+            s.expect("a line")
+        };
+        assert!(simple(b"hello\r\n", false));
+        assert!(!simple(b"hello\r\n", true), "the LF has a glyph");
+        assert!(!simple(b"\rhello\n", true));
+    }
+
+    #[test]
+    fn a_line_shows_at_most_the_glyph_limit() {
+        let mut input = b"x".to_vec();
+        input.extend(std::iter::repeat_n(b'\r', MAX_CONTROL_GLYPHS + 100));
+        input.push(b'\n');
+        let lines = parse(&input, true);
+        assert_eq!(lines.len(), 1);
+        well_formed(&lines[0]);
+        let shown = lines[0].text.chars().filter(|&c| c == '\u{240d}').count();
+        assert!(shown == MAX_CONTROL_GLYPHS, "{shown} glyphs");
+        assert!(!lines[0].text.contains('\u{240a}'), "past the cap, nothing");
+        assert!(lines[0].text.replace('\u{240d}', "") == "x");
+    }
+
+    #[test]
+    fn heap_stays_within_the_stated_worst_case() {
+        let mut parser =
+            AnsiParser::with_max_line_bytes(MAX_LINE_BYTES_LIMIT).show_control_chars(true);
+        let small = parser.heap_bytes();
+        let mut input = Vec::new();
+        while input.len() < MAX_LINE_BYTES_LIMIT - 64 {
+            input.extend_from_slice(b"\x1b[31m\xc3\xa9\r\x08\x1b[0m\xc3\xa9\x00");
+        }
+        parser.feed(&input, |_| {});
+        let held = parser.heap_bytes();
+        let limit = AnsiParser::worst_case_heap(MAX_LINE_BYTES_LIMIT)
+            + AnsiParser::worst_case_control_heap(MAX_LINE_BYTES_LIMIT);
+        assert!(held <= limit, "{held} > {limit}");
+        parser.feed(b"\n", |_| {});
+        parser.feed(b"short\n", |_| {});
+        let after = parser.heap_bytes();
+        let kept = 2 * KEEP_TEXT
+            + 2 * KEEP_RUNS * size_of::<StyleRun>()
+            + KEEP_CELLS * size_of::<u32>()
+            + KEEP_PALETTE * size_of::<Style>()
+            + KEEP_MARKS * size_of::<Mark>();
+        assert!(
+            after <= small + kept,
+            "{after} bytes held after the long line"
+        );
+    }
+
+    /// Pieces of a stream that between them exercise every kind of control byte.
+    const PIECES: &[&[u8]] = &[
+        b"a",
+        b"b",
+        b" ",
+        "\u{e9}".as_bytes(),
+        "\u{20ac}".as_bytes(),
+        b"\r",
+        b"\n",
+        b"\r\n",
+        b"\x08",
+        b"\t",
+        b"\x00",
+        b"\x07",
+        b"\x7f",
+        b"\x18",
+        b"\x1a",
+        b"\x1b[31m",
+        b"\x1b[0m",
+        b"\x1b[1;4m",
+        b"\x1b[K",
+        b"\x1b[2K",
+        b"\x1b[3D",
+        b"\x1b[5C",
+        b"\x1b[2G",
+        b"\x1b[?25l",
+        b"\x1b[3:",
+        b"\x1b]0;title\x07",
+        b"\x1b]0;title\x1b\\",
+        b"\x1b]0;never ends",
+        b"\x1bPq#0\x1b\\",
+        b"\x1b7",
+        b"\x1b(B",
+        b"\xff",
+        b"\x9b",
+    ];
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Splitting the stream anywhere gives the same lines with the flag on, as it
+        /// does with it off.
+        #[test]
+        fn chunk_boundaries_do_not_matter_with_glyphs_on(
+            pieces in proptest::collection::vec(proptest::sample::select(PIECES), 0..80),
+            cuts in proptest::collection::vec(0usize..400, 1..4),
+        ) {
+            let bytes: Vec<u8> = pieces.concat();
+            let whole = parse(&bytes, true);
+            let mut cuts: Vec<usize> = cuts.into_iter().map(|c| c.min(bytes.len())).collect();
+            cuts.sort_unstable();
+            let mut parser = AnsiParser::new().show_control_chars(true);
+            let mut lines: Vec<OwnedLine> = Vec::new();
+            let mut from = 0;
+            for cut in cuts.into_iter().chain([bytes.len()]) {
+                parser.feed(&bytes[from..cut], |l| lines.push(l.into()));
+                if let Some(l) = parser.current() {
+                    let total: usize = l.runs.iter().map(|r| r.len).sum();
+                    proptest::prop_assert_eq!(total, l.text.len());
+                }
+                from = cut;
+            }
+            if let Some(l) = parser.current() {
+                lines.push(l.into());
+            }
+            proptest::prop_assert_eq!(lines, whole);
+        }
+
+        /// The glyphs are visual only: without them the line is what the flag-off parser
+        /// makes of the same bytes, and every glyph run is a dim control run of glyphs.
+        #[test]
+        fn glyphs_change_nothing_else(
+            pieces in proptest::collection::vec(proptest::sample::select(PIECES), 0..80),
+        ) {
+            let bytes: Vec<u8> = pieces.concat();
+            let plain = parse(&bytes, false);
+            let shown = parse(&bytes, true);
+            proptest::prop_assert_eq!(plain.len(), shown.len());
+            for (plain, shown) in plain.iter().zip(&shown) {
+                well_formed(shown);
+                proptest::prop_assert_eq!(plain.raw_len, shown.raw_len);
+                proptest::prop_assert_eq!(plain.complete, shown.complete);
+                let (text, runs) = without_glyphs(shown);
+                proptest::prop_assert_eq!(&text, &plain.text);
+                proptest::prop_assert_eq!(&runs, &plain.runs);
+                let mut at = 0;
+                for r in &shown.runs {
+                    if r.style.flags.contains(StyleFlags::CONTROL) {
+                        proptest::prop_assert_eq!(r.style, CONTROL_STYLE);
+                        let all_pictures = shown.text[at..at + r.len]
+                            .chars()
+                            .all(|c| ('\u{2400}'..='\u{2421}').contains(&c));
+                        proptest::prop_assert!(all_pictures);
+                    }
+                    at += r.len;
+                }
+            }
         }
     }
 }
