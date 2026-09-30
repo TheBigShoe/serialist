@@ -454,7 +454,7 @@ fn text_export_modes() {
         snap.text(all.clone(), delta),
         "[+0.000000] first\n[+0.500000] second\n"
     );
-    let abs = TextOptions::received_only().with_timestamps(Timestamps::Absolute);
+    let abs = TextOptions::received_only().with_timestamps(Timestamps::AbsoluteUtc);
     let wall = store.epoch().wall + Duration::from_millis(1500);
     let text = snap.text(all.clone(), abs);
     assert!(
@@ -944,12 +944,16 @@ fn counted_text_export_reports_lines_and_bytes() {
         TextOptions::default(),
         TextOptions::received_only(),
         TextOptions::default().with_timestamps(Timestamps::Absolute),
+        TextOptions::default()
+            .with_timestamps(Timestamps::Absolute)
+            .with_timestamp_format("%Y-%m-%d %H:%M:%S%.6f"),
+        TextOptions::default().with_timestamps(Timestamps::AbsoluteUtc),
         TextOptions::default().with_timestamps(Timestamps::Relative),
         TextOptions::received_only().with_timestamps(Timestamps::Delta),
     ] {
         let mut out = Vec::new();
         let report = snap
-            .write_text_counted(all.clone(), options, &mut out)
+            .write_text_counted(all.clone(), options.clone(), &mut out)
             .unwrap();
         let text = to_string(out);
         assert_eq!(
@@ -958,7 +962,7 @@ fn counted_text_export_reports_lines_and_bytes() {
             "{options:?}: {text}"
         );
         assert_eq!(report.bytes, text.len() as u64, "{options:?}");
-        assert_eq!(text, snap.text(all.clone(), options), "{options:?}");
+        assert_eq!(text, snap.text(all.clone(), options.clone()), "{options:?}");
         // The plain writer is the counting one without the counts.
         let mut plain = Vec::new();
         snap.write_text(all.clone(), options, &mut plain).unwrap();
@@ -1020,7 +1024,7 @@ fn write_lines_stamps_hex_rows_like_text_lines() {
             rows[0], rows[1], rows[2]
         )
     );
-    let (report, absolute) = export(Timestamps::Absolute);
+    let (report, absolute) = export(Timestamps::AbsoluteUtc);
     let wall = |ms| format_utc(store.epoch().wall + Duration::from_millis(ms));
     assert_eq!(
         absolute,
@@ -1039,7 +1043,7 @@ fn write_lines_stamps_hex_rows_like_text_lines() {
     // The row range clips, and the store's own lines go through the same function.
     let mut out = Vec::new();
     let options = TextOptions::default().with_timestamps(Timestamps::Delta);
-    write_lines(&hex, LineId(1)..LineId(99), options, &mut out).unwrap();
+    write_lines(&hex, LineId(1)..LineId(99), options.clone(), &mut out).unwrap();
     assert_eq!(
         to_string(out),
         format!("[+0.000000] {}\n[+0.500000] {}\n", rows[1], rows[2])
@@ -1047,7 +1051,7 @@ fn write_lines_stamps_hex_rows_like_text_lines() {
     let mut from_snapshot = Vec::new();
     let mut from_write_text = Vec::new();
     let all = snap.first_line()..snap.end();
-    write_lines(&snap, all.clone(), options, &mut from_snapshot).unwrap();
+    write_lines(&snap, all.clone(), options.clone(), &mut from_snapshot).unwrap();
     snap.write_text(all, options, &mut from_write_text).unwrap();
     assert_eq!(from_snapshot, from_write_text);
 }
