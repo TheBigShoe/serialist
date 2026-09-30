@@ -62,7 +62,8 @@
 //!
 //! [`LineSource::first_line`]: crate::text::LineSource::first_line
 
-mod buf;
+#[doc(hidden)]
+pub mod buf;
 mod export;
 mod hex;
 mod index;
