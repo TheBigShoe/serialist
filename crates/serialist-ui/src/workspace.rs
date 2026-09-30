@@ -89,6 +89,7 @@ use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
 use crate::inline::Mode;
 use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
+use crate::port_settings::PortSettings;
 use crate::prelude::*;
 use crate::script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, inline_source};
 use crate::script_console::{ScriptConsole, ScriptConsoleEvent};
@@ -161,6 +162,19 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
     Ok(workspace)
 }
 
+/// Frames a reconnect waits for the last session's ingest thread to end by itself
+/// before stopping it.
+const REATTACH_PATIENCE: u32 = 10;
+
+/// A session opened for a tab that already has a view, on its way into it.
+struct Reopen {
+    port: PortId,
+    serial: SerialConfig,
+    session: Box<dyn SessionHandle>,
+    /// Frames waited so far for the view to be ready.
+    waited: u32,
+}
+
 /// What a restored tab applies to its session once the port opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Restore {
@@ -183,6 +197,9 @@ struct SessionTab {
     connecting: bool,
     /// A restored tab's codec and mode, applied when its port opens.
     restore: Option<Restore>,
+    /// Port settings a Devices row set for this port: its line ending, echo and control
+    /// levels, applied when the port opens.
+    port_settings: Option<PortSettings>,
     /// Why the last open failed.
     error: Option<String>,
     /// Made by the connect in flight, which removes it again if the port does not
@@ -205,6 +222,7 @@ impl SessionTab {
             view: None,
             connecting: false,
             restore: None,
+            port_settings: None,
             error: None,
             provisional: None,
             shown: None,
@@ -344,8 +362,12 @@ impl Workspace {
         let devices = cx.new(|cx| DevicesPanel::new(port_source.clone(), baud, window, cx));
         let devices_events =
             cx.subscribe_in(&devices, window, |this, _, event, window, cx| match event {
-                DevicesPanelEvent::Connect { port, serial } => {
-                    this.connect(port.clone(), serial.clone(), window, cx);
+                DevicesPanelEvent::Connect {
+                    port,
+                    serial,
+                    settings,
+                } => {
+                    this.connect_with(port.clone(), serial.clone(), settings.clone(), window, cx);
                 }
             });
         let decoded = cx.new(|cx| DecodedPanel::new(window, cx));
@@ -930,6 +952,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.connect_with(port, serial, None, window, cx);
+    }
+
+    /// [`Self::connect`], with the port settings a Devices row set for the port (its
+    /// line ending, echo and control levels) for the session to take once open.
+    pub fn connect_with(
+        &mut self,
+        port: PortId,
+        serial: SerialConfig,
+        settings: Option<PortSettings>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.devices
             .update(cx, |devices, cx| devices.set_notice(None, cx));
         let blank = self
@@ -953,6 +988,9 @@ impl Workspace {
             self.activate(id, window, cx);
             id
         };
+        if let Some(tab) = self.tab_mut(id) {
+            tab.port_settings = settings;
+        }
         self.open_in_tab(id, port, serial, window, cx);
     }
 
@@ -969,7 +1007,9 @@ impl Workspace {
         }
     }
 
-    /// Open the port of tab `id` again, with the settings it was opened with.
+    /// Open the port of tab `id` again with the settings it has: its session view's
+    /// (as the port settings last left them), else those it was restored or opened
+    /// with.
     pub fn reconnect_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tab(id) else {
             return;
@@ -981,8 +1021,10 @@ impl Workspace {
             return;
         }
         let serial = tab
-            .serial
-            .clone()
+            .view
+            .as_ref()
+            .map(|view| view.read(cx).serial().clone())
+            .or_else(|| tab.serial.clone())
             .unwrap_or_else(|| self.serial_for(&port, cx));
         self.open_in_tab(id, port, serial, window, cx);
     }
@@ -1039,8 +1081,21 @@ impl Workspace {
             return;
         };
         tab.connecting = false;
+        let view = tab.view.clone();
         match result {
-            Ok(session) => self.install_session(id, port, serial, session, window, cx),
+            Ok(session) => match view {
+                // Connecting again: the same view carries on, scrollback and all.
+                Some(view) => {
+                    let reopen = Reopen {
+                        port,
+                        serial,
+                        session,
+                        waited: 0,
+                    };
+                    self.reattach(id, view, reopen, window, cx);
+                }
+                None => self.install_session(id, port, serial, session, window, cx),
+            },
             Err(error) => {
                 tracing::warn!(%port, %error, "could not open port");
                 let notice = format!("Could not open {port}: {error}");
@@ -1054,6 +1109,88 @@ impl Workspace {
                 if let Some(return_to) = provisional {
                     self.remove_tab(id, return_to, window, cx);
                 }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Hand the opened session to the view already in tab `id` (see
+    /// [`SessionView::reconnect`]). If the view's last ingest thread is still handing
+    /// its store back, try again a frame later, and after a few frames stop it.
+    fn reattach(
+        &mut self,
+        id: TabId,
+        view: Entity<SessionView>,
+        reopen: Reopen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab(id).is_none() {
+            let session = reopen.session;
+            cx.background_spawn(async move { session.close() }).detach();
+            return;
+        }
+        if !view.read(cx).can_reconnect() {
+            if reopen.waited == REATTACH_PATIENCE {
+                view.update(cx, |view, cx| view.retire_ingest(cx));
+            }
+            let later = view.clone();
+            let task = cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(crate::session_view::FRAME)
+                    .await;
+                let reopen = Reopen {
+                    waited: reopen.waited + 1,
+                    ..reopen
+                };
+                this.update_in(cx, |this, window, cx| {
+                    this.reattach(id, later, reopen, window, cx);
+                })
+                .ok();
+            });
+            if let Some(tab) = self.tab_mut(id) {
+                tab.connecting = true;
+                tab._connect_task = Some(task);
+            }
+            return;
+        }
+        let Reopen {
+            port,
+            serial,
+            session,
+            ..
+        } = reopen;
+        let info = self.port_info(&port, cx);
+        let on_connect = cx
+            .try_global::<Config>()
+            .and_then(|config| config.settings().on_connect_for(&info).cloned());
+        let settings = self.tab_mut(id).and_then(|tab| {
+            tab.connecting = false;
+            tab.serial = Some(serial.clone());
+            tab.info = Some(info);
+            tab.error = None;
+            tab.shown = None;
+            tab.port_settings.take()
+        });
+        view.update(cx, |view, cx| {
+            view.reconnect(session, serial, cx);
+            if let Some(settings) = &settings {
+                view.apply_port_settings(settings, cx);
+            }
+        });
+        if self.active == Some(id) {
+            view.update(cx, |view, cx| view.focus_default(window, cx));
+        }
+        self.sync_connected_ports(cx);
+        tracing::info!(tab = %id, %port, "session open again in its tab");
+        if let Some(script) = on_connect {
+            match self.read_script(&script, cx) {
+                Ok(source) => {
+                    view.update(cx, |view, cx| {
+                        view.run_script(source, "on_connect", window, cx);
+                    });
+                }
+                Err(message) => self.script_problem_in(Some(id), message, cx),
             }
         }
         cx.notify();
@@ -1094,15 +1231,22 @@ impl Workspace {
                         console.push_lines_to(Some(id), lines.iter().cloned(), cx);
                     });
                 }
+                SessionViewEvent::Reconnect => this.reconnect_tab(id, window, cx),
             },
         );
         let active = self.active == Some(id);
-        let restore = self.tab_mut(id).and_then(|tab| tab.restore.take());
+        let (restore, settings) = self
+            .tab_mut(id)
+            .map(|tab| (tab.restore.take(), tab.port_settings.take()))
+            .unwrap_or_default();
         let history = self.history.clone();
         let env = self.script_env(cx);
         view.update(cx, |view, cx| {
             view.set_history(history, cx);
             view.attach_scripts(env);
+            if let Some(settings) = &settings {
+                view.apply_port_settings(settings, cx);
+            }
             if let Some(restore) = &restore {
                 if let Some(codec) = &restore.codec {
                     view.set_codec(Some(codec), cx);
@@ -1116,8 +1260,7 @@ impl Workspace {
         let Some(tab) = self.tab_mut(id) else {
             return;
         };
-        // Connecting again in a tab replaces its view, whose session is already over.
-        let previous = tab.view.replace(view.clone());
+        tab.view = Some(view.clone());
         tab.port = Some(port.clone());
         tab.info = Some(info);
         tab.serial = Some(serial);
@@ -1126,9 +1269,6 @@ impl Workspace {
         tab.shown = None;
         tab._observer = Some(observer);
         tab._events = Some(events);
-        if let Some(previous) = previous {
-            previous.update(cx, |view, cx| view.disconnect(cx));
-        }
         if active {
             self.show_active(window, cx);
         } else if restore.is_some_and(|restore| restore.mode == Mode::Inline) {
@@ -1513,9 +1653,11 @@ impl Workspace {
         }
     }
 
-    fn disconnect(&mut self, _: &Disconnect, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(session) = self.session() {
-            session.update(cx, |view, cx| view.disconnect(cx));
+    /// Disconnect the active tab's session, asking first while it records or runs a
+    /// script.
+    fn disconnect(&mut self, _: &Disconnect, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = self.session().cloned() {
+            session.update(cx, |view, cx| view.request_disconnect(window, cx));
         }
     }
 
@@ -2102,15 +2244,25 @@ mod tests {
             assert_eq!(w.tab_labels(cx)[0].state, TabState::Disconnected);
         });
 
-        // Connect again: the same tab, a new session view.
+        // Connect again: the same tab and the same view, which carries on.
         devices.update(cx, |devices, cx| {
             devices.connect_selected(cx);
         });
-        cx.run_until_parked();
+        run_until(cx, "the view to take the new session", |cx| {
+            session.read_with(cx, |v, _| !v.state().is_disconnected())
+        });
         assert_eq!(opener.opened().len(), 2);
         workspace.read_with(cx, |w, _| {
             assert_eq!(w.tab_count(), 1);
-            assert_ne!(w.session().unwrap(), &session, "a new session view");
+            assert_eq!(w.session().unwrap(), &session, "the same view carries on");
+        });
+        let again = opener.opened()[1].2.clone();
+        again.connected("dev");
+        again.data(b"three\n");
+        run_until(cx, "the new session's line", |cx| {
+            displayed(cx, &session)
+                .iter()
+                .any(|line| line.text == "three")
         });
 
         cx.update_window(window, |_, window, cx| window.press(keys::CLOSE_TAB, cx))
