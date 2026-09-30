@@ -72,6 +72,7 @@ fn matched(result: ExpectResult) -> (LineId, String, Vec<Option<String>>, Durati
             text,
             captures,
             elapsed,
+            ..
         } => (line, text, captures, elapsed),
         other => panic!("expected a match, got {other:?}"),
     }
@@ -97,6 +98,31 @@ fn at_gets_ok() {
         (Direction::Rx, "OK")
     );
     assert_eq!(rig.ingest.matchers().pending(), 0);
+}
+
+#[test]
+fn a_match_carries_its_ranges_within_the_stored_line() {
+    let rig = rig();
+    let expectation = rig.expect(r"(O)(K)$", Duration::from_secs(2));
+    rig.send("AT\r\n");
+    let ExpectResult::Matched {
+        line,
+        text,
+        range,
+        capture_ranges,
+        ..
+    } = resolve(&expectation)
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(range, 0..2);
+    assert_eq!(capture_ranges, [Some(0..2), Some(0..1), Some(1..2)]);
+    // The ranges are into the text of the line as the scrollback holds it.
+    let stored = rig.ingest.snapshot();
+    let mut lines = Vec::new();
+    stored.lines(line..line.next(), &mut lines);
+    assert_eq!(lines[0].text, text);
+    assert_eq!(&lines[0].text[range], "OK");
 }
 
 #[test]

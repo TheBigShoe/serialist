@@ -354,6 +354,65 @@ fn a_matched_reply_is_highlighted_and_timed(cx: &mut TestAppContext) {
     assert_eq!(marks[0].range, 0..marked.text.len());
 }
 
+/// A second collection whose patterns match only part of the reply.
+const PARTS: &str = r#"{
+  "name": "Parts",
+  "groups": [
+    {
+      "name": "Modem",
+      "commands": [
+        {
+          "name": "Number",
+          "payload": { "text": "AT+VER?" },
+          "expect": { "pattern": "(\\d+)\\.(\\d+)", "timeout_ms": 2000 }
+        },
+        {
+          "name": "Anything",
+          "payload": { "text": "AT+VER?" },
+          "expect": { "pattern": "\\b", "timeout_ms": 2000 }
+        }
+      ]
+    }
+  ]
+}"#;
+
+#[gpui_test]
+fn the_highlight_is_the_range_the_matcher_found(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-expect-range");
+    std::fs::write(dir.join("commands").join("parts.json"), PARTS).unwrap();
+    let (world, _) = world();
+    let (_window, workspace, view) = open(cx, &world, &dir, "virtual:at", false);
+    let marks =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, cx| v.terminal().read(cx).marks().clone());
+
+    // Only the part of the line the pattern matched is marked.
+    send_from_panel(cx, &workspace, CommandRef::new("Parts", "Modem", "Number"));
+    run_until(cx, "the reply to be matched", |cx| {
+        notice(cx, &view).is_some_and(|text| text.contains("OK in"))
+    });
+    let first = marks(cx);
+    assert_eq!(first.len(), 1);
+    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    let marked = source.line(first[0].line).expect("the marked line");
+    assert_eq!(marked.text, "+VER: 1.0.0");
+    assert_eq!(first[0].range, 6..9, "the first match, 1.0");
+    assert_eq!(&marked.text[first[0].range.clone()], "1.0");
+
+    // A pattern that matches the empty string (a word boundary, in a line with words)
+    // marks the whole line.
+    send_from_panel(
+        cx,
+        &workspace,
+        CommandRef::new("Parts", "Modem", "Anything"),
+    );
+    run_until(cx, "the second match", |cx| marks(cx).len() == 2);
+    let second = marks(cx);
+    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    let marked = source.line(second[1].line).expect("the marked line");
+    assert!(!marked.text.is_empty(), "a line with a word boundary");
+    assert_eq!(second[1].range, 0..marked.text.len());
+}
+
 #[gpui_test]
 fn a_timeout_adds_a_notice_line_and_a_status_notice(cx: &mut TestAppContext) {
     let dir = config_dir("commands-timeout");

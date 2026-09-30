@@ -128,14 +128,14 @@ fn command_echo(command: &Command, bytes: &[u8], session_eol: LineEnding) -> Str
     }
 }
 
-/// Where in `text` the pattern matched, for the highlight: the first match of the
-/// expectation's regex (compiled the same way the matcher does), else the whole line.
-fn match_range(pattern: &str, text: &str) -> Range<usize> {
-    serialist_core::matcher::compile_pattern(pattern)
-        .ok()
-        .and_then(|regex| regex.find(text).map(|found| found.range()))
-        .filter(|range| !range.is_empty())
-        .unwrap_or(0..text.len())
+/// What to highlight for a match at `range` in `text`: that range, or the whole line
+/// when the pattern matched nothing in particular (`^`, an empty group).
+fn highlight_range(range: Range<usize>, text: &str) -> Range<usize> {
+    if range.is_empty() {
+        0..text.len()
+    } else {
+        range
+    }
 }
 
 /// The `inline.*` settings in force, or the defaults without the app's configuration.
@@ -777,9 +777,8 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             loop {
                 if let Some(result) = expectation.try_wait() {
-                    let pattern = expectation.pattern().to_owned();
                     this.update(cx, |view, cx| {
-                        view.reply(&name, &pattern, timeout_ms, result, cx);
+                        view.reply(&name, timeout_ms, result, cx);
                     })
                     .ok();
                     return;
@@ -794,22 +793,16 @@ impl SessionView {
         .detach();
     }
 
-    fn reply(
-        &mut self,
-        name: &str,
-        pattern: &str,
-        timeout_ms: u64,
-        result: ExpectResult,
-        cx: &mut Context<Self>,
-    ) {
+    fn reply(&mut self, name: &str, timeout_ms: u64, result: ExpectResult, cx: &mut Context<Self>) {
         match result {
             ExpectResult::Matched {
                 line,
                 text,
+                range,
                 elapsed,
                 ..
             } => {
-                let range = match_range(pattern, &text);
+                let range = highlight_range(range, &text);
                 self.terminal.update(cx, |terminal, cx| {
                     terminal.add_mark(SearchMatch { line, range }, cx);
                 });
