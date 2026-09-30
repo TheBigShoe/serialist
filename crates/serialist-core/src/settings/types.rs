@@ -276,6 +276,9 @@ pub struct Settings {
     pub line_ending: LineEnding,
     #[serde(default = "d::local_echo")]
     pub local_echo: bool,
+    /// Reopen the tabs open at the last quit (kept in `state.json`). Default true.
+    #[serde(default = "d::restore_session")]
+    pub restore_session: bool,
 
     /// Inline interactive mode: the Backspace byte, the escape chord and paste pacing.
     #[serde(default = "d::inline")]

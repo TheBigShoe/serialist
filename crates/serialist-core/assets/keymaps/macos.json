@@ -4,7 +4,8 @@
 //
 // In inline mode (TerminalInline) the terminal sends every key it can encode to the
 // port, plain ctrl chords included; the bindings in that section are the exceptions,
-// which run as actions instead of being sent.
+// which run as actions instead of being sent. Cmd chords are never sent, so the
+// Workspace bindings (tabs included) work in inline mode too.
 [
   {
     "bindings": {
@@ -15,7 +16,20 @@
     "context": "Workspace",
     "bindings": {
       "cmd-k": "terminal::Clear",
-      "cmd-w": "serial::Disconnect",
+      "cmd-w": "tabs::CloseTab",
+      "cmd-shift-w": "serial::Disconnect",
+      "cmd-t": "tabs::NewTab",
+      "cmd-shift-]": "tabs::NextTab",
+      "cmd-shift-[": "tabs::PreviousTab",
+      "cmd-1": "tabs::ActivateTab1",
+      "cmd-2": "tabs::ActivateTab2",
+      "cmd-3": "tabs::ActivateTab3",
+      "cmd-4": "tabs::ActivateTab4",
+      "cmd-5": "tabs::ActivateTab5",
+      "cmd-6": "tabs::ActivateTab6",
+      "cmd-7": "tabs::ActivateTab7",
+      "cmd-8": "tabs::ActivateTab8",
+      "cmd-9": "tabs::ActivateTab9",
       "cmd-p": "terminal::Pause",
       "cmd-s": "terminal::Export",
       "cmd-shift-r": "terminal::ToggleRecord",

@@ -66,6 +66,7 @@ defaults! {
     default_baud: u32 = "default_baud";
     line_ending: LineEnding = "line_ending";
     local_echo: bool = "local_echo";
+    restore_session: bool = "restore_session";
     devices: Vec<DeviceProfile> = "devices";
     display_timestamps: TimestampMode = "display"."timestamps";
     display_timestamp_format: String = "display"."timestamp_format";

@@ -4,7 +4,9 @@
 //
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
 // (ctrl-s is XOFF), so most bindings here use shifted chords. Pause is the exception at
-// plain ctrl-p, which inline mode sends to the device; there it is ctrl-shift-p.
+// plain ctrl-p, which inline mode sends to the device; there it is ctrl-shift-p. So are
+// the tab numbers, ctrl-1 to ctrl-9, and ctrl-pageup/ctrl-pagedown, which inline mode
+// sends to the device too; there ctrl-shift-[ and ctrl-shift-] switch tabs.
 //
 // In inline mode (TerminalInline) the terminal sends every key it can encode to the
 // port, plain ctrl chords included; the bindings in that section are the exceptions,
@@ -19,7 +21,22 @@
     "context": "Workspace",
     "bindings": {
       "ctrl-shift-k": "terminal::Clear",
-      "ctrl-shift-w": "serial::Disconnect",
+      "ctrl-shift-w": "tabs::CloseTab",
+      "ctrl-alt-w": "serial::Disconnect",
+      "ctrl-shift-t": "tabs::NewTab",
+      "ctrl-shift-]": "tabs::NextTab",
+      "ctrl-shift-[": "tabs::PreviousTab",
+      "ctrl-pagedown": "tabs::NextTab",
+      "ctrl-pageup": "tabs::PreviousTab",
+      "ctrl-1": "tabs::ActivateTab1",
+      "ctrl-2": "tabs::ActivateTab2",
+      "ctrl-3": "tabs::ActivateTab3",
+      "ctrl-4": "tabs::ActivateTab4",
+      "ctrl-5": "tabs::ActivateTab5",
+      "ctrl-6": "tabs::ActivateTab6",
+      "ctrl-7": "tabs::ActivateTab7",
+      "ctrl-8": "tabs::ActivateTab8",
+      "ctrl-9": "tabs::ActivateTab9",
       "ctrl-p": "terminal::Pause",
       "ctrl-shift-s": "terminal::Export",
       "ctrl-shift-r": "terminal::ToggleRecord",
@@ -93,7 +110,11 @@
       "shift-pageup": "terminal::PageUp",
       "shift-pagedown": "terminal::PageDown",
       "ctrl-shift-k": "terminal::Clear",
-      "ctrl-shift-w": "serial::Disconnect",
+      "ctrl-shift-w": "tabs::CloseTab",
+      "ctrl-alt-w": "serial::Disconnect",
+      "ctrl-shift-t": "tabs::NewTab",
+      "ctrl-shift-]": "tabs::NextTab",
+      "ctrl-shift-[": "tabs::PreviousTab",
       "ctrl-shift-p": "terminal::Pause",
       "ctrl-shift-s": "terminal::Export",
       "ctrl-shift-r": "terminal::ToggleRecord"
