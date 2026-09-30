@@ -1,92 +1,19 @@
 //! The milestone 0 gate, headless: the real engine (`Session` reader and writer threads
 //! over the simulator's virtual links) driven through the real workspace, keyboard
-//! included. No fake sits anywhere between the compose bar and the scrollback.
-//!
-//! The engine runs on real threads, so waits are bounded in real time. Each step advances
-//! the test clock by one frame, which fires the drain loop's pacing timer; the drain
-//! worker then blocks for at most its idle wait and returns the moment data arrives, so
-//! nothing here sleeps longer than the engine takes.
+//! included. No fake sits anywhere between the compose bar and the scrollback. The
+//! stepping helpers are in `test_support`.
 
 use std::time::{Duration, Instant};
 
-use serialist_core::{PortId, SerialConfig};
+use serialist_core::PortId;
 use serialist_sim::{
     FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator, LinkConfig, SimWorld,
 };
 
-use crate::drain::FRAME;
 use crate::line_buffer::{DEFAULT_MAX_LINES, LineKind};
 use crate::prelude::*;
-use crate::session_view::{ConnectionState, SessionView, format_bytes};
-use crate::test_support::open_test_window;
-use crate::workspace::{AppOptions, Workspace};
-
-/// Generous failure bound; the tests finish far sooner.
-const LIMIT: Duration = Duration::from_secs(10);
-
-fn run_until(
-    cx: &mut TestAppContext,
-    what: &str,
-    mut done: impl FnMut(&mut TestAppContext) -> bool,
-) {
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        cx.run_until_parked();
-        if done(cx) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {LIMIT:?} waiting for {what}"
-        );
-        cx.executor().advance_clock(FRAME);
-    }
-}
-
-fn open_workspace(
-    cx: &mut TestAppContext,
-    world: &SimWorld,
-    connect_to: Option<&str>,
-) -> (AnyWindowHandle, Entity<Workspace>) {
-    let options = AppOptions {
-        port_source: world.port_source(),
-        transport_factory: world.transport_factory(),
-        serial: SerialConfig::default(),
-        select_port: connect_to.map(PortId::new),
-        connect_on_start: connect_to.is_some(),
-    };
-    open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))
-}
-
-fn session(cx: &mut TestAppContext, workspace: &Entity<Workspace>) -> Option<Entity<SessionView>> {
-    workspace.read_with(cx, |w, _| w.session().cloned())
-}
-
-fn wait_connected(cx: &mut TestAppContext, workspace: &Entity<Workspace>) -> Entity<SessionView> {
-    run_until(cx, "the session to connect", |cx| {
-        session(cx, workspace)
-            .is_some_and(|s| s.read_with(cx, |v, _| v.model().state == ConnectionState::Connected))
-    });
-    session(cx, workspace).expect("session view")
-}
-
-fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, text: &str) -> bool {
-    view.read_with(cx, |v, _| {
-        v.model()
-            .buffer
-            .rows()
-            .any(|r| r.kind == LineKind::Rx && r.text == text)
-    })
-}
-
-/// Type into whatever has focus and press Enter, as a user would.
-fn type_line(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
-    cx.update_window(window, |_, window, cx| {
-        window.input(text, cx);
-        window.press("enter", cx);
-    })
-    .unwrap();
-}
+use crate::session_model::format_bytes;
+use crate::test_support::{has_rx_line, open_workspace, run_until, type_line, wait_connected};
 
 #[gpui_test]
 fn echo_device_returns_what_the_compose_bar_sends(cx: &mut TestAppContext) {

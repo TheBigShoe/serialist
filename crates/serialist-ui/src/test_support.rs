@@ -2,9 +2,10 @@
 //! whose events a test feeds by hand. The simulator crate will provide richer ones; these
 //! keep the UI crate's tests independent of it.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -12,9 +13,15 @@ use serialist_core::{
     PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig, SessionClosed, SessionEvent,
     SessionStats, TransportError, UsbInfo,
 };
+use serialist_sim::SimWorld;
 
+use crate::drain::FRAME;
+use crate::line_buffer::LineKind;
 use crate::prelude::*;
 use crate::session_handle::{SessionHandle, SessionOpener};
+use crate::session_model::ConnectionState;
+use crate::session_view::SessionView;
+use crate::workspace::{AppOptions, Workspace};
 
 pub(crate) fn port(id: &str) -> PortInfo {
     PortInfo {
@@ -247,4 +254,113 @@ pub(crate) fn open_test_window<V: Render>(
         )
         .expect("open test window")
     })
+}
+
+/// A scratch directory under the system temp dir, removed on drop.
+pub(crate) struct TestDir(PathBuf);
+
+impl TestDir {
+    pub fn new(name: &str) -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("serialist-test-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create a test directory");
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// Driving the real engine (Session threads over SimWorld links) from a headless
+// workspace. The engine runs on real threads, so waits are bounded in real time. Each
+// step advances the test clock by one frame, which fires the drain loop's pacing timer;
+// the drain worker then blocks for at most its idle wait and returns the moment data
+// arrives, so nothing sleeps longer than the engine takes.
+
+/// Generous failure bound for engine-driven waits; tests finish far sooner.
+pub(crate) const ENGINE_WAIT: Duration = Duration::from_secs(10);
+
+pub(crate) fn run_until(
+    cx: &mut TestAppContext,
+    what: &str,
+    mut done: impl FnMut(&mut TestAppContext) -> bool,
+) {
+    let deadline = Instant::now() + ENGINE_WAIT;
+    loop {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {ENGINE_WAIT:?} waiting for {what}"
+        );
+        cx.executor().advance_clock(FRAME);
+    }
+}
+
+/// A workspace over `world`, optionally opening `connect_to` at startup as `--port` does.
+pub(crate) fn open_workspace(
+    cx: &mut TestAppContext,
+    world: &SimWorld,
+    connect_to: Option<&str>,
+) -> (AnyWindowHandle, Entity<Workspace>) {
+    let options = AppOptions {
+        port_source: world.port_source(),
+        transport_factory: world.transport_factory(),
+        serial: SerialConfig::default(),
+        select_port: connect_to.map(PortId::new),
+        connect_on_start: connect_to.is_some(),
+    };
+    open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))
+}
+
+pub(crate) fn session_of(
+    cx: &mut TestAppContext,
+    workspace: &Entity<Workspace>,
+) -> Option<Entity<SessionView>> {
+    workspace.read_with(cx, |w, _| w.session().cloned())
+}
+
+pub(crate) fn wait_connected(
+    cx: &mut TestAppContext,
+    workspace: &Entity<Workspace>,
+) -> Entity<SessionView> {
+    run_until(cx, "the session to connect", |cx| {
+        session_of(cx, workspace)
+            .is_some_and(|s| s.read_with(cx, |v, _| v.model().state == ConnectionState::Connected))
+    });
+    session_of(cx, workspace).expect("session view")
+}
+
+pub(crate) fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, text: &str) -> bool {
+    view.read_with(cx, |v, _| {
+        v.model()
+            .buffer
+            .rows()
+            .any(|r| r.kind == LineKind::Rx && r.text == text)
+    })
+}
+
+/// Type into whatever has focus and press Enter, as a user would.
+pub(crate) fn type_line(cx: &mut TestAppContext, window: AnyWindowHandle, text: &str) {
+    cx.update_window(window, |_, window, cx| {
+        window.input(text, cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
 }

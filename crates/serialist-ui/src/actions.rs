@@ -4,7 +4,7 @@
 use crate::prelude::*;
 
 actions!(serialist, [Quit]);
-actions!(terminal, [Clear, JumpToBottom]);
+actions!(terminal, [Clear, JumpToBottom, Pause, Export, ToggleRecord]);
 actions!(serial, [Connect, Disconnect]);
 actions!(devices, [SelectNext, SelectPrevious]);
 actions!(compose, [HistoryPrevious, HistoryNext, CycleLineEnding]);
@@ -23,16 +23,23 @@ mod keys {
     pub const CLEAR: &str = "cmd-k";
     pub const DISCONNECT: &str = "cmd-w";
     pub const CYCLE_LINE_ENDING: &str = "cmd-e";
+    pub const PAUSE: &str = "cmd-p";
+    pub const EXPORT: &str = "cmd-s";
+    pub const TOGGLE_RECORD: &str = "cmd-shift-r";
 }
 
-// Plain ctrl-k and ctrl-w belong to the device once inline mode sends keystrokes to the
-// port, so the other platforms take the shifted chords.
+// Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
+// (ctrl-s is XOFF), so the other platforms take shifted chords. Pause is the exception
+// at plain ctrl-p; inline mode will need an escape for it.
 #[cfg(not(target_os = "macos"))]
 mod keys {
     pub const QUIT: &str = "ctrl-q";
     pub const CLEAR: &str = "ctrl-shift-k";
     pub const DISCONNECT: &str = "ctrl-shift-w";
     pub const CYCLE_LINE_ENDING: &str = "ctrl-shift-e";
+    pub const PAUSE: &str = "ctrl-p";
+    pub const EXPORT: &str = "ctrl-shift-s";
+    pub const TOGGLE_RECORD: &str = "ctrl-shift-r";
 }
 
 pub fn bind_keys(cx: &mut App) {
@@ -44,6 +51,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(keys::QUIT, Quit, None),
         KeyBinding::new(keys::CLEAR, Clear, Some(context::WORKSPACE)),
         KeyBinding::new(keys::DISCONNECT, Disconnect, Some(context::WORKSPACE)),
+        KeyBinding::new(keys::PAUSE, Pause, Some(context::WORKSPACE)),
+        KeyBinding::new(keys::EXPORT, Export, Some(context::WORKSPACE)),
+        KeyBinding::new(keys::TOGGLE_RECORD, ToggleRecord, Some(context::WORKSPACE)),
         KeyBinding::new("down", SelectNext, Some(context::DEVICES_PANEL)),
         KeyBinding::new("up", SelectPrevious, Some(context::DEVICES_PANEL)),
         KeyBinding::new("enter", Connect, Some(context::DEVICES_PANEL)),
