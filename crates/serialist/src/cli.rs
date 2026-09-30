@@ -7,12 +7,14 @@ pub const USAGE: &str = "\
 Usage: serialist [OPTIONS]
 
 Options:
-  --port <PATH>      Open this serial port at startup
-  --baud <N>         Baud rate, any positive integer (default 115200)
-  --virtual <NAME>   List a simulated device as virtual:<NAME> and select it
-                     (repeatable)
-  -h, --help         Print this help
-  -V, --version      Print the version
+  --port <PATH>       Open this port at startup (virtual:<NAME> for a simulated one)
+  --baud <N>          Baud rate for --port and the Connect field, any positive
+                      integer (default 115200)
+  --virtual [NAME]    List the simulated devices next to the real ports; with a
+                      NAME, also select virtual:<NAME> (repeatable). Built-ins:
+                      echo, echo-lines, at, firehose, firehose-ansi
+  -h, --help          Print this help
+  -V, --version       Print the version
 
 Logging follows RUST_LOG, for example RUST_LOG=serialist=debug.";
 
@@ -20,7 +22,10 @@ Logging follows RUST_LOG, for example RUST_LOG=serialist=debug.";
 pub struct Args {
     pub port: Option<String>,
     pub baud: Option<u32>,
+    /// Simulated devices named with `--virtual NAME`, in order.
     pub virtual_devices: Vec<String>,
+    /// `--virtual` was given at all, with or without a name.
+    pub simulator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,8 +37,16 @@ pub enum Command {
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> {
     let mut parsed = Args::default();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
+        if arg == "--virtual" {
+            // The name is optional, so only a following non-flag argument is taken.
+            parsed.simulator = true;
+            if let Some(name) = args.next_if(|next| !next.starts_with('-')) {
+                parsed.virtual_devices.push(name);
+            }
+            continue;
+        }
         // Accept both `--flag value` and `--flag=value`.
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => {
@@ -57,7 +70,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
                     .with_context(|| format!("invalid --baud {text:?}"))?;
                 parsed.baud = Some(baud);
             }
-            "--virtual" => parsed.virtual_devices.push(value("--virtual")?),
+            "--virtual" => {
+                // Only the `--virtual=NAME` spelling reaches here.
+                parsed.simulator = true;
+                parsed
+                    .virtual_devices
+                    .extend(inline.filter(|name| !name.is_empty()));
+            }
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -83,6 +102,7 @@ mod tests {
             port: Some("/dev/cu.usbserial-1420".into()),
             baud: Some(921_600),
             virtual_devices: vec!["echo".into(), "at".into()],
+            simulator: true,
         });
         let spaced = run(&[
             "--port",
@@ -102,6 +122,25 @@ mod tests {
         ]);
         assert_eq!(spaced.unwrap(), expected);
         assert_eq!(joined.unwrap(), expected);
+    }
+
+    #[test]
+    fn virtual_without_a_name_just_enables_the_simulator() {
+        let bare = Command::Run(Args {
+            simulator: true,
+            ..Args::default()
+        });
+        assert_eq!(run(&["--virtual"]).unwrap(), bare);
+        assert_eq!(run(&["--virtual="]).unwrap(), bare);
+        let Command::Run(args) = run(&["--virtual", "--baud", "9600"]).unwrap() else {
+            panic!("expected run");
+        };
+        assert!(args.simulator);
+        assert!(
+            args.virtual_devices.is_empty(),
+            "a flag is not a device name"
+        );
+        assert_eq!(args.baud, Some(9600));
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub mod session_view;
 pub mod workspace;
 
 #[cfg(test)]
+mod gate;
+#[cfg(test)]
 mod test_support;
 
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding};
@@ -23,7 +25,7 @@ pub use devices_panel::{
 };
 pub use line_buffer::{Line, LineBuffer, LineKind, LineSplitter, RxText};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-pub use session_view::{ConnectionState, SessionModel, SessionUpdate, SessionView};
+pub use session_view::{ConnectionState, SessionModel, SessionUpdate, SessionView, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {
