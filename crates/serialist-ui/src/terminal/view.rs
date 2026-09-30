@@ -789,7 +789,7 @@ impl TerminalView {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(theme.background.opacity(0.85))
+            .bg(self.palette.background)
             .border_1()
             .border_color(theme.border)
             .font_family(theme.mono_font_family.clone())

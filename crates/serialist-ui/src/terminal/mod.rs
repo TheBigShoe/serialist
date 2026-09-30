@@ -8,6 +8,7 @@
 //! [`LineSource`]: serialist_core::LineSource
 
 pub mod cache;
+pub mod demo;
 pub mod double;
 pub mod element;
 pub mod layout;
@@ -22,6 +23,7 @@ pub mod view;
 #[cfg(test)]
 mod tests;
 
+pub use demo::open_terminal_demo;
 pub use element::{CellMetrics, Highlights, TerminalElement, TerminalInputs};
 pub use layout::{ScrollPosition, Span};
 pub use palette::TerminalPalette;
