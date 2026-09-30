@@ -1,0 +1,225 @@
+---
+source: crates/serialist-plugins/tests/snapshots.rs
+---
+     0..6      command    info type=90 cmd_id=7168 cmd_id_hex="0x1C00" payload=[] payload_len=0
+              | command 0x1C00 len 0
+     6..34     response   info type=91 cmd_id=3861 cmd_id_hex="0x0F15" payload=[7F 23 72 96 5A F4 8F B1 4C 2E 8B AB A4 A2 78 56 D8 65 30 FE 51 86] payload_len=22
+              | response 0x0F15 len 22: 7F 23 72 96 5A F4 8F B1 4C 2E 8B AB A4 A2 78 56 ...
+    34..71     indication info type=92 cmd_id=1 cmd_id_hex="0x0001" payload=[3F D0 3B 08 63 E3 BD 7A 11 D0 8C 91 F1 2F 2B B4 82 F9 CE 7B 2F FF 2A B8 ..+7] payload_len=31
+              | indication 0x0001 len 31: 3F D0 3B 08 63 E3 BD 7A 11 D0 8C 91 F1 2F 2B B4 ...
+    71..108    log        info type=93 cmd_id=3904 cmd_id_hex="0x0F40" payload=[24 40 8C F4 3F B0 0F ED D8 CA 4F 25 D5 74 7A FE 31 6A DA 05 C9 7A F8 85 ..+7] payload_len=31
+              | log 0x0F40 len 31: 24 40 8C F4 3F B0 0F ED D8 CA 4F 25 D5 74 7A FE ...
+   108..146    text       info text="a2dp heap a2dp boot ready> link link"
+   146..181    text       info text="ready> boot link a2dp ready> 0x0F15"
+   181..183    malformed  warning type=91 len=19947 reason="length 19947 is outside 2..=4096"
+              | malformed 0x5B header: length 19947 is outside 2..=4096
+   183..1207   text       info text="\\xEBM\\x05\\x05\\x94\\x08\\x97\\x05P\\x91\\xD7gQA2vmXiu%~+)DB6D47o+K^F)|&YMZv'PC" ..+992
+  1207..1964   text       info text="C};}T<RE\"w_u@PLsBkrPW/7]d}vR?].w3[x*lsqz[6]aq't(&(hM0^A} $y)T(m_}nw;9/A6" ..+696
+  1964..1991   command    info type=90 cmd_id=32671 cmd_id_hex="0x7F9F" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 5C] payload_len=21
+              | command 0x7F9F len 21: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  1991..1999   text       info text="ok [I]"
+  1999..2017   indication info type=92 cmd_id=7168 cmd_id_hex="0x1C00" payload=[EE 64 CF E1 35 A7 A2 42 83 1D 01 B9] payload_len=12
+              | indication 0x1C00 len 12: EE 64 CF E1 35 A7 A2 42 83 1D 01 B9
+  2017..2043   text       info text="[I] volume=7 0x0F15 heap"
+  2043..2049   indication info type=92 cmd_id=3904 cmd_id_hex="0x0F40" payload=[] payload_len=0
+              | indication 0x0F40 len 0
+  2049..2076   text       info text="err=0 bt: heap ready>\\x80\\x00\\x00\\x00"
+  2076..2094   text       info text="boot heap 0x0F15"
+  2094..2121   text       info text="link heap rssi=-52 0x0F15"
+  2121..2128   command    info type=90 cmd_id=7168 cmd_id_hex="0x1C00" payload=[4D] payload_len=1
+              | command 0x1C00 len 1: 4D
+  2128..2144   text       info text="err=0 volume=7"
+  2144..2158   command    info type=90 cmd_id=3861 cmd_id_hex="0x0F15" payload=[BB 24 64 1F 14 1C 54 A9] payload_len=8
+              | command 0x0F15 len 8: BB 24 64 1F 14 1C 54 A9
+  2158..2191   command    info type=90 cmd_id=1 cmd_id_hex="0x0001" payload=[6C AE F3 47 69 04 69 58 79 86 E4 B2 B2 5B C6 9F 7C 93 DC 73 A8 EC 7A 9E ..+3] payload_len=27
+              | command 0x0001 len 27: 6C AE F3 47 69 04 69 58 79 86 E4 B2 B2 5B C6 9F ...
+  2191..2224   response   info type=91 cmd_id=24726 cmd_id_hex="0x6096" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 05 5B 0B 00 00 1C D2 E5 CC 63 FE E1 75 FD BD ..+3] payload_len=27
+              | response 0x6096 len 27: A5 A5 A5 A5 A5 A5 A5 A5 A5 05 5B 0B 00 00 1C D2 ...
+  2224..2233   text       info text="\\x00_\\x14\\x00\\x80\\xFF\\x7F"
+  2233..2235   text       info text="\\x05\\x98"
+  2235..2291   response   info type=91 cmd_id=3904 cmd_id_hex="0x0F40" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 05 0A 05 5A ..+26] payload_len=50
+              | response 0x0F40 len 50: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  2291..2320   text       info text="\\x86\\x19\\xC0T4\\xE1*u\\xD0?\\xA1\\x95,r7\\xB6\\x13L<J\\xF7g\\xADJ\\x9A\\x9EGn\\x89"
+  2320..2518   log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[81 39 FB AF AB 92 1B 18 DC CE DF 88 9C 95 2C 51 DE 59 33 9F D7 FA 9C BD ..+168] payload_len=192
+              | log 0x0001 len 192: 81 39 FB AF AB 92 1B 18 DC CE DF 88 9C 95 2C 51 ...
+  2518..2567   text       info text="\\x80link ready> link rssi=-52 heap link [I]link\\x7F\\xC3\\xA9"
+  2567..2590   text       info text="[I] rssi=-52 boot [I]"
+  2590..3614   text       info text="\\x0B\\xA4\\x0B\\x11\\x94fn\\x8F\\xA0\\xF1\\xBC($]'q8+cM!^k,1.Y_)1|\"uDj#uZsVdjp_6" ..+988
+  3614..4638   text       info text="c6hicM]IRq:(G7f8}hTkB0c_,!k`>b1#F&!}He|ItbzCCX\"xMHp,G=Fc3+.O5ys!Ob+k`Y{/" ..+969
+  4638..4786   text       info text="Z7[\"Z>Kfb3gSX7Uw2~[4/%EuvtTWesLagG9SrP=XdW<i&|:BrtOB*au&5lkev,3/Sm-:c IE" ..+77
+  4786..4797   indication info type=92 cmd_id=18519 cmd_id_hex="0x4857" payload=[4B A6 3F 28 EE] payload_len=5
+              | indication 0x4857 len 5: 4B A6 3F 28 EE
+  4797..4815   response   info type=91 cmd_id=24279 cmd_id_hex="0x5ED7" payload=[63 3B FF 20 BE B2 B1 0C AC 3B C3 2A] payload_len=12
+              | response 0x5ED7 len 12: 63 3B FF 20 BE B2 B1 0C AC 3B C3 2A
+  4815..4828   text       info text="ok volume=7\\x05\\x05"
+  4828..4841   response   info type=91 cmd_id=3861 cmd_id_hex="0x0F15" payload=[D1 91 CE 3F CD AD 31] payload_len=7
+              | response 0x0F15 len 7: D1 91 CE 3F CD AD 31
+  4841..4870   log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 30 78 30 46] payload_len=23
+              | log 0x0001 len 23: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  4870..4880   text       info text="15 ready>"
+  4880..4908   text       info text="\\x05\\x05ready> rssi=-52 volume=7"
+  4908..5932   text       info text="yBp{Q[K)^eBI9{Tc*_Kh(8{wRQh!Tu*xD1/j.;#~pJv{OM/{a\"1mA>E0MFZ_s&eNS;p\\\\F]Z" ..+960
+  5932..6956   text       info text="w8e&Ig\"v{4uiy`s*mNF%ak?OGx=0}Glqo=-LepXl=eKbp!Gh#/QgNGks1UYp@UL;<^H@KcVT" ..+957
+  6956..6958   text       info text="1"
+  6958..6996   response   info type=91 cmd_id=57689 cmd_id_hex="0xE159" payload=[00 C5 53 30 07 4D DE D0 00 78 BD 40 23 13 E2 CD CE B8 8C D5 9B D9 EF 27 ..+8] payload_len=32
+              | response 0xE159 len 32: 00 C5 53 30 07 4D DE D0 00 78 BD 40 23 13 E2 CD ...
+  6996..7282   command    info type=90 cmd_id=4074 cmd_id_hex="0x0FEA" payload=[A3 99 B2 4C 5A AE BA DD 96 C3 1D 60 46 05 8C 05 E1 CA C2 FB F4 40 74 AB ..+256] payload_len=280
+              | command 0x0FEA len 280: A3 99 B2 4C 5A AE BA DD 96 C3 1D 60 46 05 8C 05 ...
+  7282..7306   command    info type=90 cmd_id=3904 cmd_id_hex="0x0F40" payload=[0B D0 9F 66 15 B6 DF 60 C2 9F EC 80 34 06 1D 2A 10 41] payload_len=18
+              | command 0x0F40 len 18: 0B D0 9F 66 15 B6 DF 60 C2 9F EC 80 34 06 1D 2A ...
+  7306..7335   text       info text="a2dp a2dp volume=7 heap link"
+  7335..7345   command    info type=90 cmd_id=7168 cmd_id_hex="0x1C00" payload=[2A 71 0E 8F] payload_len=4
+              | command 0x1C00 len 4: 2A 71 0E 8F
+  7345..7373   response   info type=91 cmd_id=1 cmd_id_hex="0x0001" payload=[89 B2 56 A7 3B 7C BB 5C A7 85 A6 EB E5 C9 60 68 3F CB 1A 5A 24 37] payload_len=22
+              | response 0x0001 len 22: 89 B2 56 A7 3B 7C BB 5C A7 85 A6 EB E5 C9 60 68 ...
+  7373..7375   text       info text="\\x05A"
+  7375..7396   log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[6D 8E 76 A0 1A 11 58 BE 03 20 87 78 4E FE 08] payload_len=15
+              | log 0x0001 len 15: 6D 8E 76 A0 1A 11 58 BE 03 20 87 78 4E FE 08
+  7396..7448   indication info type=92 cmd_id=7168 cmd_id_hex="0x1C00" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ..+22] payload_len=46
+              | indication 0x1C00 len 46: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  7448..7834   text       info text="\\x1C\\xE7\\xF9e\\x07\\xBA\\x10\\x86\\x7F',\\x1FojF\\x81/I\\xEB\\xA0\\x01\\x16\\x8A\\x15" ..+1044
+  7834..7884   text       info text="\\x04\\xEBn\\xF8\\xD1\\x94\\xEBy\\x98+\\xBAY=\\xDB\\xE0\\x12\\x9C\\x9Cb\\xB9\\xC9UM\\xD8" ..+43
+  7884..7938   text       info text="rssi=-52 ready> rssi=-52 heap boot 0x0F15 0x0F15heap"
+  7938..8004   log        info type=93 cmd_id=3904 cmd_id_hex="0x0F40" payload=[A5 A5 A5 A5 A5 05 5B 00 00 72 73 73 69 3D 2D 35 32 20 76 6F 6C 75 6D 65 ..+36] payload_len=60
+              | log 0x0F40 len 60: A5 A5 A5 A5 A5 05 5B 00 00 72 73 73 69 3D 2D 35 ...
+  8004..8009   text       info text="\\x9A!a\\xD7\\xA3"
+  8009..8046   command    info type=90 cmd_id=3861 cmd_id_hex="0x0F15" payload=[55 4F 38 2C 1D 73 21 9B E5 C4 E1 94 89 3F 49 8B C4 9E 20 EB 1E 25 06 4D ..+7] payload_len=31
+              | command 0x0F15 len 31: 55 4F 38 2C 1D 73 21 9B E5 C4 E1 94 89 3F 49 8B ...
+  8046..8156   text       info text="err=0 0x0F15 link err=0 [I] heap heap linkbt:\\x7Fready> bt: volume=7 vol" ..+39
+  8156..8160   text       info text="bt:"
+  8160..8174   indication info type=92 cmd_id=3861 cmd_id_hex="0x0F15" payload=[31 22 90 09 CE 2C 25 3F] payload_len=8
+              | indication 0x0F15 len 8: 31 22 90 09 CE 2C 25 3F
+  8174..8235   text       info text="\\\\volume=7 ready> ready> boot ok\\t\\r[I] heap ok bt: rssi=-52\\x00\\\\"
+  8235..8313   log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[F7 78 4B 04 65 4A 73 CF D4 1A 07 7E BF A6 CE 38 72 E6 51 17 3C 32 6B 1D ..+48] payload_len=72
+              | log 0x0001 len 72: F7 78 4B 04 65 4A 73 CF D4 1A 07 7E BF A6 CE 38 ...
+  8313..8407   command    info type=90 cmd_id=3861 cmd_id_hex="0x0F15" payload=[C0 F8 51 9E 59 AE DA 88 12 C3 8D 1D 98 A6 6C 72 C2 61 1F CD 87 7A C6 A8 ..+64] payload_len=88
+              | command 0x0F15 len 88: C0 F8 51 9E 59 AE DA 88 12 C3 8D 1D 98 A6 6C 72 ...
+  8407..8439   command    info type=90 cmd_id=41887 cmd_id_hex="0xA39F" payload=[62 E8 41 E3 B8 1C 0D 60 32 97 F5 63 57 E9 E8 5D 05 A6 6A C5 1C 4D 73 34 ..+2] payload_len=26
+              | command 0xA39F len 26: 62 E8 41 E3 B8 1C 0D 60 32 97 F5 63 57 E9 E8 5D ...
+  8439..8464   log        info type=93 cmd_id=7168 cmd_id_hex="0x1C00" payload=[5A D1 1B 27 8F 77 51 25 5F 4A 2C 75 7B 12 95 97 0E A6 D4] payload_len=19
+              | log 0x1C00 len 19: 5A D1 1B 27 8F 77 51 25 5F 4A 2C 75 7B 12 95 97 ...
+  8464..8485   text       info text="link heap heap boot"
+  8485..8516   log        info type=93 cmd_id=7168 cmd_id_hex="0x1C00" payload=[00 53 13 54 58 D7 29 92 86 24 FF 37 7A 18 1D 47 76 2A 5E 1C FC C9 53 4A ..+1] payload_len=25
+              | log 0x1C00 len 25: 00 53 13 54 58 D7 29 92 86 24 FF 37 7A 18 1D 47 ...
+  8516..8551   log        info type=93 cmd_id=3861 cmd_id_hex="0x0F15" payload=[07 76 EE BB CF B1 88 5E 6F 65 73 37 DD B2 A9 8E CD 71 6E B6 C1 84 B7 6D ..+5] payload_len=29
+              | log 0x0F15 len 29: 07 76 EE BB CF B1 88 5E 6F 65 73 37 DD B2 A9 8E ...
+  8551..8576   text       info text="err=0 ok link ok rssi=-52"
+  8576..8607   command    info type=90 cmd_id=1 cmd_id_hex="0x0001" payload=[F9 7B 82 EB E0 61 7B C0 97 4E FC 3B 9F 96 8F B5 B2 0F A9 23 2C B5 AF A0 ..+1] payload_len=25
+              | command 0x0001 len 25: F9 7B 82 EB E0 61 7B C0 97 4E FC 3B 9F 96 8F B5 ...
+  8607..8616   log        info type=93 cmd_id=3861 cmd_id_hex="0x0F15" payload=[9A C5 B3] payload_len=3
+              | log 0x0F15 len 3: 9A C5 B3
+  8616..8652   response   info type=91 cmd_id=3861 cmd_id_hex="0x0F15" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 72 73 73 69 3D ..+6] payload_len=30
+              | response 0x0F15 len 30: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  8652..8660   text       info text="ot bt:"
+  8660..8691   text       info text="-$\\x028\\x7F\\x0B\\xDB*\\x8D\\xB8\\x97\\xE3\\xB3\\x84zV\\x05\\xA5i'\\xF4\\xE7\\xE1m%8$" ..+10
+  8691..8724   command    info type=90 cmd_id=3904 cmd_id_hex="0x0F40" payload=[A5 7A 6A 87 42 E7 C4 DD F0 9E 75 0B 97 1A 20 E9 6C FE 87 08 E8 6E 66 E5 ..+3] payload_len=27
+              | command 0x0F40 len 27: A5 7A 6A 87 42 E7 C4 DD F0 9E 75 0B 97 1A 20 E9 ...
+  8724..8756   response   info type=91 cmd_id=41348 cmd_id_hex="0xA184" payload=[DC E3 75 06 88 8C 12 C2 15 A2 1A C9 DE AD 45 0D E1 5C 20 62 EF 97 40 E6 ..+2] payload_len=26
+              | response 0xA184 len 26: DC E3 75 06 88 8C 12 C2 15 A2 1A C9 DE AD 45 0D ...
+  8756..8812   command    info type=90 cmd_id=3861 cmd_id_hex="0x0F15" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ..+26] payload_len=50
+              | command 0x0F15 len 50: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+  8812..8818   text       info text="\\xA4\\x8C\\xD0g2C"
+  8818..8839   log        info type=93 cmd_id=3861 cmd_id_hex="0x0F15" payload=[94 5A 59 7C 10 FD 96 C2 A9 AF 6F 77 9C 72 D5] payload_len=15
+              | log 0x0F15 len 15: 94 5A 59 7C 10 FD 96 C2 A9 AF 6F 77 9C 72 D5
+  8839..8859   text       info text="link link rssi=-52"
+  8859..8918   text       info text="\\xFF\\x7F0x0F15 a2dp heap a2dp[I] err=0 0x0F15volume=7 boot boot"
+  8918..8920   malformed  warning type=92 len=0 reason="length 0 is outside 2..=4096"
+              | malformed 0x5C header: length 0 is outside 2..=4096
+  8920..8948   text       info text="\\x00\\x00ok ok bt: ready> volume=7"
+  8948..9065   text       info text="bootlink heapheap ok ok rssi=-52 volume=7 [I]\\\\0x0F15 link rssi=-52rssi=" ..+44
+  9065..9088   text       info text="0x0F15 heap a2dp heap"
+  9088..9090   text       info text="\\x05"
+  9090..9103   text       info text="rssi=-52 bt:"
+  9103..9216   text       info text="\\xA9\\x04\\xF1S&t\\xFAS\\xF9ok 0x0F15 bt: rssi=-52 ok [I]err=0 bt: [I] boot " ..+54
+  9216..9274   indication info type=92 cmd_id=3904 cmd_id_hex="0x0F40" payload=[26 89 DA 7C D6 AF 34 E8 8B 9F F6 74 02 37 52 A3 67 02 FE B1 51 F0 1A 44 ..+28] payload_len=52
+              | indication 0x0F40 len 52: 26 89 DA 7C D6 AF 34 E8 8B 9F F6 74 02 37 52 A3 ...
+  9274..9284   text       info text="volume=7"
+  9284..9431   indication info type=92 cmd_id=3861 cmd_id_hex="0x0F15" payload=[8E 40 54 F3 24 FE D2 00 F1 92 57 A9 DC F7 4D A3 88 B3 56 23 61 7E 94 37 ..+117] payload_len=141
+              | indication 0x0F15 len 141: 8E 40 54 F3 24 FE D2 00 F1 92 57 A9 DC F7 4D A3 ...
+  9431..9437   log        info type=93 cmd_id=3861 cmd_id_hex="0x0F15" payload=[] payload_len=0
+              | log 0x0F15 len 0
+  9437..9542   text       info text="\\xC3\\xA9\\x80link heap link link [I] volume=7 heap\\x00a2dp a2dp ok bt: bo" ..+44
+  9542..9554   response   info type=91 cmd_id=21514 cmd_id_hex="0x540A" payload=[B4 4E 53 1C 60 0D] payload_len=6
+              | response 0x540A len 6: B4 4E 53 1C 60 0D
+  9554..9573   log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[80 FD 90 80 10 5C F2 36 0F EF 93 D9 2B] payload_len=13
+              | log 0x0001 len 13: 80 FD 90 80 10 5C F2 36 0F EF 93 D9 2B
+  9573..9677   text       info text="bt: boot a2dp bt: ok link\\r\\\\\\x7F\\x7F0x0F15 rssi=-52 boot volume=7 ok[I]" ..+38
+  9677..9679   malformed  warning type=91 len=1 reason="length 1 is outside 2..=4096"
+              | malformed 0x5B header: length 1 is outside 2..=4096
+  9679..9681   text       info text="\\x01\\x00"
+  9681..9683   malformed  warning type=91 len=1 reason="length 1 is outside 2..=4096"
+              | malformed 0x5B header: length 1 is outside 2..=4096
+  9683..9685   text       info text="\\x01\\x00"
+  9685..9695   indication info type=92 cmd_id=1 cmd_id_hex="0x0001" payload=[35 76 5D 21] payload_len=4
+              | indication 0x0001 len 4: 35 76 5D 21
+  9695..9713   command    info type=90 cmd_id=3904 cmd_id_hex="0x0F40" payload=[94 61 15 3A A3 89 5C 72 98 64 A7 B4] payload_len=12
+              | command 0x0F40 len 12: 94 61 15 3A A3 89 5C 72 98 64 A7 B4
+  9713..9725   text       info text="[I] 0x0F15"
+  9725..10749  text       info text="[&xT;EbqB#4}a=;n\\\\B'O*60Ozko=nu*-Rc_;.|-`TGQ{\\\\(-sBHSDa_lsN:C,LUe2uFZkt6" ..+968
+ 10749..11005  text       info text="3g4  tuCPe$-|M&-G:'/O.PxNUED,q&Ux9pU#AN4xe3#fA:qX}kdzJ6vCIYUtI,{L,o>4EPX" ..+184
+ 11005..11007  text       info text="\\x05"
+ 11007..11021  text       info text="heap err=0 ok"
+ 11021..11027  indication info type=92 cmd_id=7168 cmd_id_hex="0x1C00" payload=[] payload_len=0
+              | indication 0x1C00 len 0
+ 11027..11032  text       info text="a2dp"
+ 11032..11067  log        info type=93 cmd_id=23475 cmd_id_hex="0x5BB3" payload=[9B 70 33 A0 60 40 52 FD 90 E2 70 66 3B EE A0 01 D3 AD 0A 72 27 CF 8F 35 ..+5] payload_len=29
+              | log 0x5BB3 len 29: 9B 70 33 A0 60 40 52 FD 90 E2 70 66 3B EE A0 01 ...
+ 11067..11125  text       info text="\\xC3\\xA9heap a2dp err=0 bt: link a2dp [I] heaprssi=-52 link\\r\\x7F\\x00"
+ 11125..11232  log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[92 DB 5C AC C7 04 E1 4B E7 16 BE D9 C1 A7 DF C6 33 F7 DC 49 94 3C 58 78 ..+77] payload_len=101
+              | log 0x0001 len 101: 92 DB 5C AC C7 04 E1 4B E7 16 BE D9 C1 A7 DF C6 ...
+ 11232..11289  indication info type=92 cmd_id=3861 cmd_id_hex="0x0F15" payload=[A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 6C 69 6E ..+27] payload_len=51
+              | indication 0x0F15 len 51: A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 A5 ...
+ 11289..11309  text       info text="x0F15 ready>0x0F15"
+ 11309..11327  text       info text="[I] ok bt: bt: ok"
+ 11327..11357  text       info text="okvolume=7 a2dp boot [I] a2dp"
+ 11357..11604  log        info type=93 cmd_id=3861 cmd_id_hex="0x0F15" payload=[6E FD 83 93 38 4E AE 1B E9 21 C9 45 E0 2E B4 B6 E6 89 C0 2D B8 A4 27 F0 ..+217] payload_len=241
+              | log 0x0F15 len 241: 6E FD 83 93 38 4E AE 1B E9 21 C9 45 E0 2E B4 B6 ...
+ 11604..11635  response   info type=91 cmd_id=3904 cmd_id_hex="0x0F40" payload=[92 30 15 FB 3C 4D 9B 26 68 27 7D D2 53 54 ED AF 8E B4 3F B7 98 AF F9 0F ..+1] payload_len=25
+              | response 0x0F40 len 25: 92 30 15 FB 3C 4D 9B 26 68 27 7D D2 53 54 ED AF ...
+ 11635..11655  log        info type=93 cmd_id=1 cmd_id_hex="0x0001" payload=[2A 80 4A BB 4D 39 4C 9C F3 0D A3 7F E9 32] payload_len=14
+              | log 0x0001 len 14: 2A 80 4A BB 4D 39 4C 9C F3 0D A3 7F E9 32
+ 11655..11667  log        info type=93 cmd_id=7168 cmd_id_hex="0x1C00" payload=[18 E5 2C 1D 49 70] payload_len=6
+              | log 0x1C00 len 6: 18 E5 2C 1D 49 70
+ 11667..11685  text       info text="\\ta2dp rssi=-52\\t\\t"
+ 11685..11724  text       info text="err=0 bt: 0x0F15 rssi=-52 volume=7 a2dp"
+ 11724..11726  malformed  warning type=91 len=13634 reason="length 13634 is outside 2..=4096"
+              | malformed 0x5B header: length 13634 is outside 2..=4096
+ 11726..11728  text       info text="B5"
+ 11728..14680  response   info type=91 cmd_id=1 cmd_id_hex="0x0001" payload=[A7 DC 56 E0 1D E6 87 CB E6 EE AB BC 55 57 5C BC C8 95 6F D7 A9 5F C0 06 ..+2922] payload_len=2946
+              | response 0x0001 len 2946: A7 DC 56 E0 1D E6 87 CB E6 EE AB BC 55 57 5C BC ...
+ 14680..14691  text       info text="\\x7F\\x7F[I]\\x00\\x00\\x80\\x7F"
+ 14691..14693  malformed  warning type=93 len=31358 reason="length 31358 is outside 2..=4096"
+              | malformed 0x5D header: length 31358 is outside 2..=4096
+ 14693..14695  text       info text="~z"
+ 14695..14697  malformed  warning type=92 len=65535 reason="length 65535 is outside 2..=4096"
+              | malformed 0x5C header: length 65535 is outside 2..=4096
+ 14697..14726  text       info text="\\xFF\\xFFheap boot ok link rssi=-52"
+ 14726..14752  response   info type=91 cmd_id=7168 cmd_id_hex="0x1C00" payload=[F6 92 12 DF AC F3 19 E8 9F F8 1A F1 A3 54 F6 42 22 25 7A FE] payload_len=20
+              | response 0x1C00 len 20: F6 92 12 DF AC F3 19 E8 9F F8 1A F1 A3 54 F6 42 ...
+ 14752..14766  text       info text="\\xD8\\xBB\\x12{\\xE4S\\xA4\\xD3\\xBD\\x8E{\\xB1q("
+ 14766..14772  log        info type=93 cmd_id=3904 cmd_id_hex="0x0F40" payload=[] payload_len=0
+              | log 0x0F40 len 0
+ 14772..14815  text       info text="[I] 0x0F15 0x0F15 a2dp link link volume=7"
+ 14815..14838  text       info text="\\x13m\"\\x00?a2dp 0x0F15 heap"
+ 14838..14870  command    info type=90 cmd_id=1 cmd_id_hex="0x0001" payload=[39 7D B6 DD 00 E9 B7 6A DC 58 AA E6 98 51 8B 15 AB 97 DA 4D 98 97 39 D4 ..+2] payload_len=26
+              | command 0x0001 len 26: 39 7D B6 DD 00 E9 B7 6A DC 58 AA E6 98 51 8B 15 ...
+ 14870..14895  text       info text="0x0F15 ok a2dp rssi=-52\\x05\\xC1"
+ 14895..14916  response   info type=91 cmd_id=3904 cmd_id_hex="0x0F40" payload=[A5 A5 A5 A5 A5 05 5D 1B 00 01 00 C7 B8 9F 09] payload_len=15
+              | response 0x0F40 len 15: A5 A5 A5 A5 A5 05 5D 1B 00 01 00 C7 B8 9F 09
+ 14916..14937  text       info text="\\xDAZ?\\xA1\\xB0\\x97\\x17/B\\xBE\\x9C\\x968\\xC7\\xFEz\\xDF3\\xBD\\xC6\\xA4"
+ 14937..14961  command    info type=90 cmd_id=3904 cmd_id_hex="0x0F40" payload=[02 2D 5B 0B 18 C5 20 81 4C F3 48 3B EE C8 76 1E 83 B0] payload_len=18
+              | command 0x0F40 len 18: 02 2D 5B 0B 18 C5 20 81 4C F3 48 3B EE C8 76 1E ...
+ 14961..15985  text       info text="Ew@50N;5^S3~j` SOq'b0p`#5|/b,$mbx2yN'akst~5uvs8n>3PH#8PIQd(L=j}y#>Gpq0$~" ..+965
+ 15985..17009  text       info text="u_st.:.S)'Pcn_aK_MH`B(aO+^+f1Dc]AJMvus&C{\"9_D[:K.;nIM^<(hGJ8!1k X|9:/u t" ..+964
+ 17009..17701  text       info text="[([_;]NR(\\\\rkAQt7^AaiDEY~=@VUeB%42cJ%_BzW{|';n2/9d%m15,@%W<>rB%-ru JqJv&" ..+625
+ 17701..17716  text       info text="link rssi=-52"
+ 17716..17728  log        info type=93 cmd_id=3904 cmd_id_hex="0x0F40" payload=[40 44 A9 9D 1F 0A] payload_len=6
+              | log 0x0F40 len 6: 40 44 A9 9D 1F 0A
+ 17728..17755  indication info type=92 cmd_id=1 cmd_id_hex="0x0001" payload=[9F A0 DE DE 5D EE C6 E5 6B F5 77 7E 4A AF 0A 1D 07 E3 95 21 A2] payload_len=21
+              | indication 0x0001 len 21: 9F A0 DE DE 5D EE C6 E5 6B F5 77 7E 4A AF 0A 1D ...
+ 17755..17803  text       info text="\\xFFheap boot\\x7F\\x80\\r\\xFF\\x00ready> volume=7 rssi=-52 ok bt:"
+ 17803..17830  indication info type=92 cmd_id=3861 cmd_id_hex="0x0F15" payload=[90 DE 75 90 5F FF 74 53 5F AD 27 90 BF A7 B5 6C E7 99 4B BA 87] payload_len=21
+              | indication 0x0F15 len 21: 90 DE 75 90 5F FF 74 53 5F AD 27 90 BF A7 B5 6C ...
+ 17830..17880  response   info type=91 cmd_id=3904 cmd_id_hex="0x0F40" payload=[A5 A5 A5 A5 A5 A5 A5 A5 00 C3 A9 5C 0D 62 74 3A 20 30 78 30 46 31 35 20 ..+20] payload_len=44
+              | response 0x0F40 len 44: A5 A5 A5 A5 A5 A5 A5 A5 00 C3 A9 5C 0D 62 74 3A ...
+ 17880..17895  text       info text="nk a2dp err=0"
