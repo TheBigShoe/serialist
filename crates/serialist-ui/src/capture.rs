@@ -175,8 +175,9 @@ impl RecordingSlot {
         }
     }
 
-    /// Flush if one is due. The session view calls this from the background executor on
-    /// a timer, so the flush cadence holds when data stops and no chunk calls the sink.
+    /// Flush if one is due. The recording sink calls this from the ingest thread when
+    /// the stream goes quiet ([`ChunkSink::on_idle`]), so the flush cadence holds when
+    /// data stops and no chunk calls the sink.
     pub fn tick(&self, now: Instant) {
         self.record(std::iter::empty(), now);
     }
@@ -206,6 +207,12 @@ impl RecordingSink {
 impl ChunkSink for RecordingSink {
     fn on_chunk(&mut self, bytes: &[u8], _at: Instant) {
         self.slot.record([bytes], Instant::now());
+    }
+
+    /// The stream went quiet: flush a recording that is due, so what arrived last
+    /// reaches the disk without a chunk to carry it.
+    fn on_idle(&mut self, now: Instant) {
+        self.slot.tick(now);
     }
 
     /// Nothing more will arrive: get what is buffered onto the disk. The session view

@@ -6,8 +6,10 @@
 //! Received bytes never reach this thread. Opening the view spawns the session's ingest
 //! thread ([`Ingest::spawn`]), which owns the page store: it appends every chunk, turns
 //! the session's connect, disconnect and write-failure events into notice lines, and
-//! hands every chunk to the [`RecordingSink`]. The view holds a [`Snapshot`] of the
-//! store (an `Arc`), and the terminal draws from it.
+//! hands every chunk to the [`RecordingSink`], which also flushes a recording when the
+//! stream goes quiet ([`ChunkSink::on_idle`]). The view holds a [`Snapshot`] of the
+//! store (an `Arc`), and the terminal draws from it. Where the link stands, and what the
+//! transport calls it, come from [`IngestHandle::connection`].
 //!
 //! # Waking
 //!
@@ -23,12 +25,31 @@
 //!    ([`TerminalView::update_sources`]) and the changed lines
 //!    ([`TerminalView::lines_appended`]), which keeps scroll, selection and pause, and
 //!    lets the terminal follow the tail and refresh an open search;
-//! 4. reads the session's counters and repaints the status line;
+//! 4. reads the session's counters and the link state and repaints the status line;
 //! 5. waits a frame before answering the next ring.
 //!
 //! However fast the port, that is at most one snapshot and one repaint per frame, and
 //! none while idle. A slow timer ([`HOUSEKEEPING`]) covers what moves without new lines:
-//! TX counters, a recording's byte count and its flush when data stops.
+//! TX counters and a recording's byte count.
+//!
+//! # Two modes
+//!
+//! In command mode the compose bar sends a line at a time. In inline mode (see
+//! [`inline`](crate::inline)) the compose bar is hidden and the terminal takes the
+//! keyboard: a keystroke interceptor encodes every key the terminal has focus for and
+//! writes it at once, except keys bound in the `TerminalInline` context, which stay
+//! actions. Paste goes out in paced chunks from an async task that leaving inline mode
+//! cancels.
+//!
+//! # Saved commands
+//!
+//! [`SessionView::send_command`] encodes a saved command with the session's line
+//! ending, echoes it as a `Tx` line (whatever the local echo setting), registers its
+//! `expect` with the ingest thread's matchers *before* writing, then writes. A task
+//! polls the expectation each frame: a match highlights the matched text in the
+//! terminal and says `Version: OK in 12 ms` in the status line; a timeout adds a notice
+//! line and says so in the status line too. Parameter values sent are remembered for
+//! the session.
 //!
 //! # Pause, clear, export, record
 //!
@@ -40,21 +61,29 @@
 //! from a snapshot on a background thread. Recording is a sink installed with the ingest
 //! thread and switched through a [`RecordingSlot`], so it starts and stops mid-session.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serialist_core::{
-    ChunkSink, Direction, Ingest, IngestHandle, IngestPanicked, IngestStats, LineId, LineSource,
-    PortId, SerialConfig, SessionStats, Snapshot, Store, TextOptions, Timestamps,
+    ChunkSink, Command, CommandRef, ConnectionInfo, Direction, ExpectResult, Expectation, Ingest,
+    IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId, LineSource, LinkState,
+    ParamValues, Payload, PortId, SearchMatch, SerialConfig, SessionStats, Snapshot, Store,
+    TextOptions, Timestamps,
 };
 
-use crate::actions::context;
+use crate::actions::{self, context};
 use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
 use crate::compose::{ComposeBar, ComposeEvent};
+use crate::config::Config;
 use crate::export::{ExportFormat, ExportJob};
+use crate::history::PersistentHistory;
+use crate::inline::{
+    EchoLine, EncodedKey, EscapeChord, InlineSettings, KeyEncoder, Mode, PasteProgress, is_chord,
+    paste_bytes,
+};
 use crate::prelude::*;
 use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
@@ -69,22 +98,84 @@ use crate::terminal::{DisplayMode, TerminalView, TimestampMode};
 pub const FRAME: Duration = Duration::from_millis(8);
 
 /// How often the view reads counters that move without new lines (TX, a recording's
-/// bytes) and flushes a recording whose data stopped.
+/// bytes).
 pub const HOUSEKEEPING: Duration = Duration::from_millis(250);
 
-/// How far back from the newest line the disconnect notice is looked for.
-const NOTICE_LOOKBACK: u64 = 64;
+/// How often a pending expectation is looked at: about a frame.
+pub const EXPECT_POLL: Duration = FRAME;
 
-/// Set once the ingest thread has handled the session's `Disconnected`, which is after
-/// it stored the notice line and before it rings the doorbell.
-struct DisconnectWatch(Arc<AtomicBool>);
+/// What the session view tells the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionViewEvent {
+    /// "Save as command" in the compose bar: open the editor on `text`.
+    SaveAsCommand { text: String },
+}
 
-impl ChunkSink for DisconnectWatch {
-    fn on_chunk(&mut self, _: &[u8], _: Instant) {}
-
-    fn on_disconnect(&mut self) {
-        self.0.store(true, Ordering::Release);
+/// What a sent command's echo line says: text payloads as sent without the line ending,
+/// hex and codec payloads as the bytes in hex.
+fn command_echo(command: &Command, bytes: &[u8], session_eol: LineEnding) -> String {
+    match &command.payload {
+        Payload::Text(_) => {
+            let eol = command.eol.unwrap_or(session_eol).bytes();
+            let body = bytes.strip_suffix(eol).unwrap_or(bytes);
+            String::from_utf8_lossy(body).into_owned()
+        }
+        Payload::Hex(_) | Payload::Codec { .. } => bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
     }
+}
+
+/// Where in `text` the pattern matched, for the highlight: the first match of the
+/// expectation's regex (compiled the same way the matcher does), else the whole line.
+fn match_range(pattern: &str, text: &str) -> Range<usize> {
+    serialist_core::matcher::compile_pattern(pattern)
+        .ok()
+        .and_then(|regex| regex.find(text).map(|found| found.range()))
+        .filter(|range| !range.is_empty())
+        .unwrap_or(0..text.len())
+}
+
+/// The `inline.*` settings in force, or the defaults without the app's configuration.
+fn inline_settings(cx: &App) -> InlineSettings {
+    cx.try_global::<Config>()
+        .map(|config| config.inline().clone())
+        .unwrap_or_default()
+}
+
+/// Whether `keystroke` is bound in the innermost context of `stack` (the terminal's
+/// `TerminalInline`), which makes it an action rather than a key for the port.
+fn bound_in_innermost_context(keystroke: &Keystroke, stack: &[KeyContext], cx: &App) -> bool {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    keymap
+        .all_bindings_for_input(std::slice::from_ref(keystroke))
+        .iter()
+        .any(|binding| {
+            binding
+                .predicate()
+                .is_some_and(|predicate| predicate.depth_of(stack) == Some(stack.len()))
+        })
+}
+
+/// A paste going out in chunks.
+struct PasteJob {
+    id: u64,
+    progress: PasteProgress,
+    /// Dropping it stops the paste.
+    _task: Task<()>,
+}
+
+/// Inline mode's state.
+#[derive(Default)]
+struct InlineState {
+    /// Typed since the last Enter, for local echo.
+    echo: EchoLine,
+    chord: EscapeChord,
+    paste: Option<PasteJob>,
+    next_paste: u64,
 }
 
 /// Where the save dialog starts.
@@ -121,41 +212,18 @@ fn raw_under(source: &dyn LineSource, lines: Range<LineId>) -> Range<u64> {
     }
 }
 
-/// What ingest wrote when the session ended: `Some(None)` for an orderly
-/// `Disconnected`, `Some(Some(error))` for `Disconnected: error`, `None` if no such
-/// notice is among the newest lines.
-fn disconnect_notice(snapshot: &Snapshot) -> Option<Option<String>> {
-    let end = snapshot.end();
-    let from = LineId(end.0.saturating_sub(NOTICE_LOOKBACK)).max(snapshot.first_line());
-    let mut lines = Vec::new();
-    snapshot.lines(from..end, &mut lines);
-    lines
-        .iter()
-        .rev()
-        .filter(|line| line.direction == Direction::Notice)
-        .find_map(|line| {
-            if line.text == "Disconnected" {
-                Some(None)
-            } else {
-                line.text
-                    .strip_prefix("Disconnected: ")
-                    .map(|error| Some(error.to_owned()))
-            }
-        })
-}
-
 pub struct SessionView {
     port: PortId,
     serial: SerialConfig,
-    /// The transport's own name for the link, from ingest's `Connected to …` notice.
-    description: Option<String>,
+    /// Where the link stands and the transport's own name for it, as ingest last
+    /// reported.
+    connection: ConnectionInfo,
     state: ConnectionState,
     stats: SessionStats,
     /// `None` once disconnected; the scrollback stays readable.
     session: Option<Box<dyn SessionHandle>>,
     /// `None` only while the view is being released.
     ingest: Option<IngestHandle>,
-    disconnected: Arc<AtomicBool>,
     /// The newest snapshot, as the terminal's sources.
     scrollback: Scrollback,
     floors: Floors,
@@ -174,11 +242,19 @@ pub struct SessionView {
     options: SessionOptions,
     terminal: Entity<TerminalView>,
     compose: Entity<ComposeBar>,
+    mode: Mode,
+    inline: InlineState,
+    /// Parameter values last sent per command, to prefill the next prompt.
+    remembered: HashMap<CommandRef, ParamValues>,
+    /// The workspace's persisted compose history, which sent lines are added to.
+    history: Option<Entity<PersistentHistory>>,
     focus_handle: FocusHandle,
     _wake: Task<()>,
     _housekeeping: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<SessionViewEvent> for SessionView {}
 
 impl Focusable for SessionView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -219,7 +295,15 @@ impl SessionView {
         });
         let compose_events =
             cx.subscribe_in(&compose, window, |this, _, event, _, cx| match event {
-                ComposeEvent::Submit { text, bytes } => this.send(text, bytes.clone(), cx),
+                ComposeEvent::Submit { text, bytes } => {
+                    if let Some(history) = &this.history {
+                        history.update(cx, |history, cx| history.push(text, cx));
+                    }
+                    this.send(text, bytes.clone(), cx);
+                }
+                ComposeEvent::SaveAsCommand { text } => {
+                    cx.emit(SessionViewEvent::SaveAsCommand { text: text.clone() });
+                }
             });
         // Joining the session's and the ingest thread can take a read timeout's worth of
         // time, and a recording needs its final flush, so a dropped view hands all three
@@ -243,12 +327,9 @@ impl SessionView {
         });
 
         let recording = RecordingSlot::default();
-        let disconnected = Arc::new(AtomicBool::new(false));
         let (doorbell, rings) = async_channel::bounded::<()>(1);
-        let mut sinks: Vec<Box<dyn ChunkSink>> = vec![
-            Box::new(RecordingSink::new(recording.clone())),
-            Box::new(DisconnectWatch(disconnected.clone())),
-        ];
+        let mut sinks: Vec<Box<dyn ChunkSink>> =
+            vec![Box::new(RecordingSink::new(recording.clone()))];
         sinks.extend(extra_sinks);
         let ingest = Ingest::spawn(
             session.events(),
@@ -296,17 +377,22 @@ impl SessionView {
             terminal.set_display_mode(display.view, cx);
             terminal
         });
+        // Inline mode takes keys before the keymap sees them (see `intercept_key`).
+        let view = cx.entity().downgrade();
+        let interceptor = cx.intercept_keystrokes(move |event, window, cx| {
+            view.update(cx, |view, cx| view.intercept_key(event, window, cx))
+                .ok();
+        });
         tracing::info!(%port, serial = %serial.summary(), "session open");
 
         Self {
             port,
             serial,
-            description: None,
+            connection: ConnectionInfo::default(),
             state: ConnectionState::Connected,
             stats: session.stats(),
             session: Some(session),
             ingest: Some(ingest),
-            disconnected,
             scrollback,
             floors,
             pause: None,
@@ -319,10 +405,14 @@ impl SessionView {
             options,
             terminal,
             compose,
+            mode: Mode::Command,
+            inline: InlineState::default(),
+            remembered: HashMap::new(),
+            history: None,
             focus_handle: cx.focus_handle(),
             _wake: wake,
             _housekeeping: housekeeping,
-            _subscriptions: vec![compose_events, release],
+            _subscriptions: vec![compose_events, release, interceptor],
         }
     }
 
@@ -395,12 +485,27 @@ impl SessionView {
     }
 
     /// What the status line names the session by: the transport's description once
-    /// ingest has stored it, else the port and its settings (which is what every
-    /// transport describes itself as today).
+    /// ingest has seen the link connect, else the port and its settings (which is what
+    /// every transport describes itself as today).
     pub fn title(&self) -> String {
-        self.description
+        self.connection
+            .description
             .clone()
             .unwrap_or_else(|| format!("{} @ {}", self.port, self.serial.summary()))
+    }
+
+    /// Where the link stands, as ingest last reported it.
+    pub fn connection(&self) -> &ConnectionInfo {
+        &self.connection
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The paste going out in inline mode, if any.
+    pub fn paste_progress(&self) -> Option<PasteProgress> {
+        self.inline.paste.as_ref().map(|paste| paste.progress)
     }
 
     /// The status line's text for this session.
@@ -414,6 +519,8 @@ impl SessionView {
             paused: self.pause,
             recording: self.recording_status.as_ref(),
             notice: self.notice.as_ref(),
+            mode: self.mode,
+            paste: self.paste_progress(),
         })
     }
 
@@ -479,13 +586,6 @@ impl SessionView {
         if before == after {
             return false;
         }
-        if self.description.is_none()
-            && let Some(first) = snapshot.line(LineId::ZERO)
-            && first.direction == Direction::Notice
-            && let Some(description) = first.text.strip_prefix("Connected to ")
-        {
-            self.description = Some(description.to_owned());
-        }
         // The line that was still arriving may have grown, so it counts as changed.
         let changed =
             LineId(before.end_line.0.saturating_sub(1)).max(after.first_line)..after.end_line;
@@ -513,8 +613,8 @@ impl SessionView {
         });
     }
 
-    /// Read the session's counters and notice a lost device. Returns whether anything
-    /// the status line shows changed.
+    /// Read the session's counters and the link state, and notice a lost device.
+    /// Returns whether anything the status line shows changed.
     fn poll_session(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         if let Some(session) = &self.session {
@@ -524,15 +624,18 @@ impl SessionView {
                 changed = true;
             }
         }
-        if self.disconnected.load(Ordering::Acquire) && !self.state.is_disconnected() {
+        if let Some(ingest) = &self.ingest {
+            let connection = ingest.connection();
+            if connection != self.connection {
+                self.connection = connection;
+                changed = true;
+            }
+        }
+        if let LinkState::Disconnected { error } = &self.connection.state
+            && !self.state.is_disconnected()
+        {
             // The link went away by itself (a local disconnect sets the state first).
-            // The flag is set after the notice is stored, but maybe after this wake's
-            // snapshot, so look in a fresh one.
-            let error = self
-                .ingest
-                .as_ref()
-                .and_then(|ingest| disconnect_notice(&ingest.snapshot()))
-                .unwrap_or_else(|| Some("connection lost".to_owned()));
+            let error = error.clone();
             tracing::info!(port = %self.port, ?error, "session ended");
             self.state = ConnectionState::Disconnected { error };
             self.close_session(cx);
@@ -552,11 +655,6 @@ impl SessionView {
             self.last_recorded = recorded;
             changed = true;
         }
-        if recorded.is_some() {
-            let slot = self.recording.clone();
-            cx.background_spawn(async move { slot.tick(Instant::now()) })
-                .detach();
-        }
         if changed {
             cx.notify();
         }
@@ -568,11 +666,7 @@ impl SessionView {
     /// it causes.
     pub fn send(&mut self, text: &str, bytes: Vec<u8>, cx: &mut Context<Self>) {
         let echo = self.compose.read(cx).local_echo();
-        let session = self
-            .session
-            .as_ref()
-            .filter(|session| session.is_connected() && !self.state.is_disconnected());
-        let (Some(session), Some(ingest)) = (session, &self.ingest) else {
+        let Some((session, ingest)) = self.live() else {
             self.notice = Some(Notice::error(format!("Not connected; not sent: {text}")));
             cx.notify();
             return;
@@ -583,6 +677,402 @@ impl SessionView {
         if session.write(bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
         }
+    }
+
+    /// The session and its ingest thread, while the link is up.
+    fn live(&self) -> Option<(&dyn SessionHandle, &IngestHandle)> {
+        let session = self
+            .session
+            .as_deref()
+            .filter(|session| session.is_connected() && !self.state.is_disconnected())?;
+        Some((session, self.ingest.as_ref()?))
+    }
+
+    /// The line ending the compose bar sends, which inline Enter sends too.
+    pub fn line_ending(&self, cx: &App) -> LineEnding {
+        self.compose.read(cx).line_ending()
+    }
+
+    /// Share the workspace's persisted history: the compose bar starts from it, and
+    /// every line sent is added to it.
+    pub fn set_history(&mut self, history: Entity<PersistentHistory>, cx: &mut Context<Self>) {
+        let entries = history.read(cx).entries_oldest_first();
+        self.compose
+            .update(cx, |compose, cx| compose.set_history_entries(entries, cx));
+        self.history = Some(history);
+    }
+
+    // --- Saved commands --------------------------------------------------------------
+
+    /// The parameter values last sent with `reference` in this session.
+    pub fn remembered_params(&self, reference: &CommandRef) -> Option<&ParamValues> {
+        self.remembered.get(reference)
+    }
+
+    /// Send a saved command: encode it with `params` and the session's line ending,
+    /// echo it as a `Tx` line, register its expectation, then write it. The outcome
+    /// lands in the status line, and a matched reply is highlighted.
+    pub fn send_command(
+        &mut self,
+        reference: &CommandRef,
+        command: &Command,
+        params: &ParamValues,
+        cx: &mut Context<Self>,
+    ) {
+        let name = command.name.clone();
+        if !params.is_empty() {
+            self.remembered.insert(reference.clone(), params.clone());
+        }
+        let session_eol = self.line_ending(cx);
+        let bytes = match command.encode(params, session_eol) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("{name}: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let Some((session, ingest)) = self.live() else {
+            self.notice = Some(Notice::error(format!("Not connected; not sent: {name}")));
+            cx.notify();
+            return;
+        };
+        // A saved command is always echoed: it is the record of what was sent.
+        let _ = ingest.append_local(command_echo(command, &bytes, session_eol), Direction::Tx);
+        // Registered before the write, so the reply cannot arrive unwatched.
+        let expectation = command.expect.as_ref().map(|expect| {
+            ingest
+                .matchers()
+                .expect(&expect.pattern, expect.timeout())
+                .map(|expectation| (expectation, expect.timeout_ms))
+        });
+        if session.write(bytes).is_err() {
+            let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
+        }
+        tracing::debug!(command = %reference, "sent saved command");
+        match expectation {
+            Some(Ok((expectation, timeout_ms))) => {
+                self.await_reply(name, expectation, timeout_ms, cx);
+            }
+            Some(Err(error)) => {
+                self.notice = Some(Notice::error(format!(
+                    "{name}: the expected reply is not a valid pattern: {error}"
+                )));
+            }
+            None => self.notice = Some(Notice::info(format!("Sent {name}"))),
+        }
+        cx.notify();
+    }
+
+    /// Poll `expectation` each frame until it resolves, then report it. The matcher
+    /// resolves it on the ingest thread, so polling never blocks.
+    fn await_reply(
+        &mut self,
+        name: String,
+        expectation: Expectation,
+        timeout_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some(Notice::info(format!("{name}: waiting for a reply…")));
+        cx.spawn(async move |this, cx| {
+            loop {
+                if let Some(result) = expectation.try_wait() {
+                    let pattern = expectation.pattern().to_owned();
+                    this.update(cx, |view, cx| {
+                        view.reply(&name, &pattern, timeout_ms, result, cx);
+                    })
+                    .ok();
+                    return;
+                }
+                if this.upgrade().is_none() {
+                    expectation.cancel();
+                    return;
+                }
+                cx.background_executor().timer(EXPECT_POLL).await;
+            }
+        })
+        .detach();
+    }
+
+    fn reply(
+        &mut self,
+        name: &str,
+        pattern: &str,
+        timeout_ms: u64,
+        result: ExpectResult,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            ExpectResult::Matched {
+                line,
+                text,
+                elapsed,
+                ..
+            } => {
+                let range = match_range(pattern, &text);
+                self.terminal.update(cx, |terminal, cx| {
+                    terminal.add_mark(SearchMatch { line, range }, cx);
+                });
+                self.notice = Some(Notice::info(format!(
+                    "{name}: OK in {} ms",
+                    elapsed.as_millis()
+                )));
+            }
+            ExpectResult::TimedOut { .. } => {
+                let message = format!("{name}: no response within {timeout_ms} ms");
+                if let Some(ingest) = &self.ingest {
+                    let _ = ingest.append_local(message.clone(), Direction::Notice);
+                }
+                self.notice = Some(Notice::error(message));
+            }
+            ExpectResult::Closed => {
+                self.notice = Some(Notice::info(format!(
+                    "{name}: the session ended before a reply"
+                )));
+            }
+        }
+        cx.notify();
+    }
+
+    // --- Inline mode -----------------------------------------------------------------
+
+    /// Switch to `mode`. Inline mode hides the compose bar and gives the terminal the
+    /// keyboard; leaving it cancels a paste, echoes what was typed since the last Enter,
+    /// and gives the compose bar the focus back.
+    pub fn set_mode(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        match mode {
+            Mode::Inline => {
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.set_inline(true, cx));
+                let focus = self.terminal.focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            Mode::Command => {
+                self.inline.paste = None;
+                let typed = self.inline.echo.take();
+                if !typed.is_empty()
+                    && self.compose.read(cx).local_echo()
+                    && let Some((_, ingest)) = self.live()
+                {
+                    let _ = ingest.append_local(typed, Direction::Tx);
+                }
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.set_inline(false, cx));
+                self.focus_compose(window, cx);
+            }
+        }
+        tracing::debug!(port = %self.port, mode = mode.label(), "input mode");
+        cx.notify();
+    }
+
+    /// The mode toggle: the toolbar button and `terminal::ToggleInline`.
+    pub fn toggle_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.inline.chord.reset();
+        self.set_mode(self.mode.toggled(), window, cx);
+    }
+
+    fn key_encoder(&self, cx: &App) -> KeyEncoder {
+        KeyEncoder::new(self.line_ending(cx), inline_settings(cx).backspace)
+    }
+
+    /// The keystroke interceptor, which runs before the keymap. In inline mode, with the
+    /// terminal itself focused, an encodable key that is not bound in the
+    /// `TerminalInline` context goes to the port and no further: not to the keymap, not
+    /// to any key listener. It also handles the escape chord in both modes: in inline
+    /// mode the chord leaves; in command mode, right after leaving, it comes back and
+    /// sends the chord (see [`crate::inline`]).
+    fn intercept_key(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let terminal_focused = self.terminal.focus_handle(cx).is_focused(window);
+        if is_chord(&inline_settings(cx).escape_chord, keystroke) {
+            let now = cx.background_executor().now();
+            match self.mode {
+                Mode::Inline if terminal_focused => {
+                    self.inline.chord.left(now);
+                    self.set_mode(Mode::Command, window, cx);
+                    cx.stop_propagation();
+                }
+                Mode::Command if self.focus_handle.contains_focused(window, cx) => {
+                    if self.inline.chord.is_held() {
+                        // The key that left is still down and repeating.
+                        cx.stop_propagation();
+                    } else if self.inline.chord.pressed_again(now) {
+                        self.set_mode(Mode::Inline, window, cx);
+                        if let Some(encoded) = self.key_encoder(cx).encode(keystroke) {
+                            self.send_key(encoded, cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        self.inline.chord.released();
+        if self.mode != Mode::Inline
+            || !terminal_focused
+            || bound_in_innermost_context(keystroke, &event.context_stack, cx)
+        {
+            return;
+        }
+        let Some(encoded) = self.key_encoder(cx).encode(keystroke) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.send_key(encoded, cx);
+    }
+
+    /// Notices the escape chord's key coming up, so a second press can count.
+    fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let chord = inline_settings(cx).escape_chord;
+        if event.keystroke.key.eq_ignore_ascii_case(&chord.key) {
+            self.inline.chord.released();
+        }
+    }
+
+    /// Write one key's bytes, echoing it first when local echo is on: typed text
+    /// collects until Enter, which echoes the line before the line ending goes out.
+    pub fn send_key(&mut self, key: EncodedKey, cx: &mut Context<Self>) {
+        if self.live().is_none() {
+            self.notice = Some(Notice::error("Not connected; key not sent"));
+            cx.notify();
+            return;
+        }
+        let finished = if self.compose.read(cx).local_echo() {
+            let finished = self.inline.echo.key(&key.echo);
+            self.show_pending_input(cx);
+            finished
+        } else {
+            None
+        };
+        let Some((session, ingest)) = self.live() else {
+            return;
+        };
+        if let Some(line) = finished.filter(|line| !line.is_empty()) {
+            let _ = ingest.append_local(line, Direction::Tx);
+        }
+        if session.write(key.bytes).is_err() {
+            let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
+        }
+    }
+
+    /// Show what was typed since the last Enter at the terminal's foot.
+    fn show_pending_input(&self, cx: &mut Context<Self>) {
+        let pending = SharedString::from(self.inline.echo.text().to_owned());
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_pending_input(Some(pending), cx)
+        });
+    }
+
+    /// Send `text` as a paste: line breaks become what Enter sends, and the bytes go
+    /// out in chunks of `inline.paste_chunk_bytes`, `inline.paste_chunk_delay_ms`
+    /// apart, from an async task. A paste replaces one still going; leaving inline mode
+    /// stops it.
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let settings = inline_settings(cx);
+        let bytes = paste_bytes(text, &self.key_encoder(cx).enter);
+        if bytes.is_empty() {
+            return;
+        }
+        if self.live().is_none() {
+            self.notice = Some(Notice::error("Not connected; nothing pasted"));
+            cx.notify();
+            return;
+        }
+        if self.compose.read(cx).local_echo() {
+            let lines = self.inline.echo.paste(text);
+            self.show_pending_input(cx);
+            if let Some((_, ingest)) = self.live() {
+                for line in lines.into_iter().filter(|line| !line.is_empty()) {
+                    let _ = ingest.append_local(line, Direction::Tx);
+                }
+            }
+        }
+        let chunks: Vec<Vec<u8>> = bytes
+            .chunks(settings.paste_chunk_bytes.max(1))
+            .map(<[u8]>::to_vec)
+            .collect();
+        let delay = settings.paste_chunk_delay;
+        self.inline.next_paste += 1;
+        let id = self.inline.next_paste;
+        let progress = PasteProgress {
+            sent: 0,
+            total: bytes.len(),
+            chunks: chunks.len(),
+        };
+        let task = cx.spawn(async move |this, cx| {
+            for (ix, chunk) in chunks.into_iter().enumerate() {
+                if ix > 0 && !delay.is_zero() {
+                    cx.background_executor().timer(delay).await;
+                }
+                let written = this
+                    .update(cx, |view, cx| view.write_paste_chunk(id, chunk, cx))
+                    .unwrap_or(false);
+                if !written {
+                    break;
+                }
+            }
+            this.update(cx, |view, cx| {
+                if view
+                    .inline
+                    .paste
+                    .as_ref()
+                    .is_some_and(|paste| paste.id == id)
+                {
+                    view.inline.paste = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.inline.paste = Some(PasteJob {
+            id,
+            progress,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    fn write_paste_chunk(&mut self, id: u64, chunk: Vec<u8>, cx: &mut Context<Self>) -> bool {
+        let len = chunk.len();
+        let written = self
+            .live()
+            .is_some_and(|(session, _)| session.write(chunk).is_ok());
+        if let Some(paste) = self.inline.paste.as_mut().filter(|paste| paste.id == id) {
+            paste.progress.sent += len;
+            if paste.progress.label().is_some() {
+                cx.notify();
+            }
+        }
+        written
+    }
+
+    fn paste_action(&mut self, _: &actions::Paste, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::Inline {
+            cx.propagate();
+            return;
+        }
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.paste_text(&text, cx);
+        }
+    }
+
+    fn toggle_inline_action(
+        &mut self,
+        _: &actions::ToggleInline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_mode(window, cx);
     }
 
     /// Hide everything received so far. The store keeps it until its budget says
@@ -954,6 +1444,7 @@ impl SessionView {
         let theme = cx.theme();
         let paused = self.is_paused();
         let recording = self.recording_status.is_some();
+        let inline = self.mode == Mode::Inline;
         h_flex()
             .flex_none()
             .w_full()
@@ -962,6 +1453,18 @@ impl SessionView {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .child(
+                Button::new("inline-mode")
+                    .label(if inline { "Inline" } else { "Command" })
+                    .tooltip(
+                        "Inline: every keystroke goes to the port (the escape chord, ctrl-] by \
+                         default, leaves). Command: the compose bar and saved commands.",
+                    )
+                    .small()
+                    .ghost()
+                    .toggled(inline)
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_mode(window, cx))),
+            )
             .child(
                 Button::new("pause")
                     .label(if paused { "Resume" } else { "Pause" })
@@ -1019,6 +1522,9 @@ impl Render for SessionView {
             .id("session-view")
             .key_context(context::SESSION_VIEW)
             .track_focus(&self.focus_handle)
+            .on_key_up(cx.listener(Self::key_up))
+            .on_action(cx.listener(Self::paste_action))
+            .on_action(cx.listener(Self::toggle_inline_action))
             .size_full()
             .bg(theme.background)
             .child(toolbar)
@@ -1030,7 +1536,9 @@ impl Render for SessionView {
                     .w_full()
                     .child(self.terminal.clone()),
             )
-            .child(self.compose.clone())
+            .when(self.mode == Mode::Command, |view| {
+                view.child(self.compose.clone())
+            })
     }
 }
 
@@ -1038,6 +1546,7 @@ impl Render for SessionView {
 mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::time::Instant;
 
     use serialist_core::TransportError;
 
