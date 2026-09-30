@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# No #[bench] functions; this keeps `cargo bench -- --quick` from reaching libtest,
+# which rejects criterion's flags.
+bench = false
+
 [dependencies]
 crossbeam-channel.workspace = true
 futures-core = "0.3"
