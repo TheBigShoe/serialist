@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serialist_core::{SessionStats, StoreStats};
+use serialist_core::{Emulation, SessionStats, StoreStats};
 
 use crate::capture::RecorderStats;
 use crate::inline::{Mode, PasteProgress};
@@ -271,6 +271,8 @@ pub struct StatusInputs<'a> {
     pub codec: Option<&'a str>,
     /// Bytes per second each way, lately.
     pub rates: Rates,
+    /// Monitor or VT mode.
+    pub emulation: Emulation,
 }
 
 /// The text of the status line for one session, kept apart from rendering so tests can
@@ -307,6 +309,8 @@ pub struct StatusLine {
     pub script: Option<String>,
     /// `Codec: airoha-race` while a codec decodes the session.
     pub codec: Option<String>,
+    /// `VT` while the session shows a terminal screen (VT mode).
+    pub emulation: Option<&'static str>,
 }
 
 impl StatusLine {
@@ -343,6 +347,7 @@ impl StatusLine {
             paste: inputs.paste.and_then(|paste| paste.label()),
             script: inputs.script.map(ScriptStatus::label),
             codec: inputs.codec.map(|codec| format!("Codec: {codec}")),
+            emulation: (inputs.emulation == Emulation::Vt).then(|| inputs.emulation.label()),
         }
     }
 }
@@ -403,7 +408,17 @@ mod tests {
             script: None,
             codec: None,
             rates: Rates::default(),
+            emulation: Emulation::Monitor,
         }
+    }
+
+    #[test]
+    fn vt_mode_has_a_chip() {
+        let state = ConnectionState::Connected;
+        let mut status = inputs(&state, store(0, 3, 0, 20));
+        assert_eq!(StatusLine::new(status.clone()).emulation, None);
+        status.emulation = Emulation::Vt;
+        assert_eq!(StatusLine::new(status).emulation, Some("VT"));
     }
 
     #[test]
