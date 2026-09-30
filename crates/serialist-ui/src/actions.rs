@@ -44,7 +44,7 @@ pub mod context {
 }
 
 #[cfg(target_os = "macos")]
-mod keys {
+pub(crate) mod keys {
     pub const QUIT: &str = "cmd-q";
     pub const CLEAR: &str = "cmd-k";
     pub const DISCONNECT: &str = "cmd-w";
@@ -64,7 +64,7 @@ mod keys {
 // (ctrl-s is XOFF), so the other platforms take shifted chords. Pause is the exception
 // at plain ctrl-p; inline mode will need an escape for it.
 #[cfg(not(target_os = "macos"))]
-mod keys {
+pub(crate) mod keys {
     pub const QUIT: &str = "ctrl-q";
     pub const CLEAR: &str = "ctrl-shift-k";
     pub const DISCONNECT: &str = "ctrl-shift-w";
