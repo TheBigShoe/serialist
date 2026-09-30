@@ -4,13 +4,66 @@
 //! events, appends each `Data` chunk to the store (one parse per chunk), hands the same
 //! chunk unchanged to every [`ChunkSink`] (recording is one), and turns connect,
 //! disconnect and write failures into `Notice` lines. The UI never parses bytes: it gets
-//! a [`StoreReader`] and a waker.
+//! a [`StoreReader`], a waker and the link state.
 //!
-//! **Waking the UI.** After new lines are published the thread sets a dirty flag and
-//! calls the waker only if the flag was clear, so the UI gets at most one wake per
-//! frame however many chunks arrive. The UI calls [`IngestHandle::acknowledge`] when it
-//! renders, before it takes that frame's snapshot, so anything published after the
-//! snapshot wakes it again.
+//! # Waking the UI: doorbell, acknowledge, snapshot
+//!
+//! After new lines are published the thread sets a dirty flag and calls the waker only
+//! if the flag was clear, so the UI gets at most one wake per acknowledge however many
+//! chunks arrive. The waker runs on the ingest thread and must not block. The UI's
+//! session view makes it ring a doorbell of capacity one (`async_channel::bounded(1)`
+//! and `try_send(())`: a full doorbell means a wake is already pending, and that one
+//! will see this publication too). A foreground task waits on the doorbell, and for each
+//! ring it:
+//!
+//! 1. calls [`IngestHandle::acknowledge`], which clears the dirty flag, so anything
+//!    published from now on rings again;
+//! 2. takes [`IngestHandle::snapshot`] (and, if it shows the link, reads
+//!    [`IngestHandle::connection`]), which is therefore never older than the ring;
+//! 3. hands the snapshot to the terminal and repaints;
+//! 4. waits a frame before answering the next ring.
+//!
+//! Acknowledge first, then snapshot, is what makes the protocol lossless. A publication
+//! that lands before the acknowledge is in the snapshot; one that lands after it finds
+//! the flag clear and rings again. The other order could lose a wake: a publication
+//! between the snapshot and the acknowledge would be in neither. The price of the right
+//! order is one spurious ring when a publication lands between the two calls, which
+//! then finds nothing new. However fast the port, that is at most one snapshot and one
+//! repaint per frame, and none while idle. A UI that stops acknowledging stops being
+//! woken; the store keeps filling meanwhile.
+//!
+//! The waker is dropped when the thread ends, so a doorbell whose only sender is the
+//! waker closes then. That is how the UI learns the thread has ended, cleanly or by a
+//! panic, and it then joins the handle (off its own thread) to find out which.
+//!
+//! # Link state
+//!
+//! [`IngestHandle::connection`] reports a [`ConnectionInfo`]: [`LinkState::Connecting`]
+//! until the session's `Connected` is handled, [`LinkState::Connected`] with the
+//! transport's own description of the link, then [`LinkState::Disconnected`] with the
+//! error's message, or `None` for an orderly close. The description of the last
+//! connection is kept after a disconnect. The thread sets the state *before* it stores
+//! the matching notice line, so a snapshot that shows "Connected to …" or
+//! "Disconnected…" can never be newer than the state read after it: the UI reads the
+//! description and the reason from here instead of parsing notice text. A thread that
+//! ends without the session's `Disconnected` (a stop, an event channel dropped early)
+//! reports `Disconnected { error: None }`; one that panics leaves the last state.
+//!
+//! # Sinks
+//!
+//! A [`ChunkSink`] runs on the ingest thread and hears, in this order:
+//!
+//! - `on_connect(description)` once, when the session connects, after the notice line
+//!   is stored;
+//! - `on_chunk(bytes, at)` for every `Data` chunk, exactly as the session delivered it;
+//! - `on_idle(now)` each time [`IDLE_INTERVAL`] (250 ms) passes with no session event
+//!   and no local line, and again every interval while the quiet lasts, so a buffered
+//!   recorder can flush without the UI driving it. The wait is a receive timeout on the
+//!   event channel, not a separate timer. An idle tick publishes nothing and wakes
+//!   nobody;
+//! - `on_disconnect()` exactly once before the thread ends, from the session's
+//!   `Disconnected` or, if the thread stops first, on the way out. No `on_idle` follows
+//!   it.
 //!
 //! **Ordering.** Local lines sent through [`IngestHandle::append_local`] are applied
 //! before the session event the thread is about to handle, so a sent-command echo
@@ -18,10 +71,8 @@
 //!
 //! The thread ends when the session's event channel closes (the session is gone) or on
 //! [`IngestHandle::stop`]; either way the store is handed back by `stop`/`join`, so a
-//! reconnect can keep the same scrollback. Every sink hears `on_disconnect` exactly once
-//! before the thread ends, from the session's `Disconnected` or, if the thread stops
-//! first, on the way out. A panic on the thread (in a sink, say) is logged and reported
-//! as [`IngestPanicked`]; it never reaches the caller's thread.
+//! reconnect can keep the same scrollback. A panic on the thread (in a sink, say) is
+//! logged and reported as [`IngestPanicked`]; it never reaches the caller's thread.
 
 use std::any::Any;
 use std::fmt;
