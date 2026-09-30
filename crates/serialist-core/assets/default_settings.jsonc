@@ -34,16 +34,27 @@
   "ui_font_features": {},
   "ui_font_fallbacks": [],
 
-  // ---- Terminal overrides ----
-  // Any key set here replaces the matching buffer_font_* value for the terminal only.
-  // null means "use the buffer value".
+  // ---- Terminal ----
   "terminal": {
+    // Font overrides: any of these set replaces the matching buffer_font_* value for the
+    // terminal only. null means "use the buffer value".
     "font_family": null,
     "font_size": null,
     "font_weight": null,
     "font_features": null,
     "font_fallbacks": null,
-    "line_height": null
+    "line_height": null,
+    // How a session shows what the device sends: "monitor" or "vt".
+    //   "monitor"  a log of lines, with colors and other escapes applied line by line,
+    //              the way a serial monitor shows them.
+    //   "vt"       a terminal screen the device draws on with cursor addressing, for
+    //              U-Boot menus, Linux consoles and full-screen programs. The log is
+    //              still recorded underneath: search and export read it.
+    // alt-v (the toolbar's terminal button) switches a session between the two. A
+    // device profile's "emulation" wins for its ports.
+    "emulation": "monitor",
+    // Blink the VT cursor when the device asks for a blinking one.
+    "cursor_blink": false
   },
 
   // ---- Theme ----
@@ -141,6 +152,8 @@
   //                    command palette ("Install example plugin: Airoha RACE").
   //   "on_connect"     a Lua script to run once the device has connected, as a path
   //                    relative to the scripts folder.
+  //   "emulation"      how its sessions start: "monitor" | "vt" (see terminal.emulation).
+  //                    Without it: terminal.emulation.
   //
   // Example:
   //   { "match": { "vid": "0x0e8d", "product": "Airoha" },
