@@ -40,6 +40,7 @@ fn store(budget: usize, max_line_bytes: usize, epoch: Epoch) -> Store {
         budget,
         max_line_bytes,
         epoch: Some(epoch),
+        ..StoreConfig::default()
     })
 }
 

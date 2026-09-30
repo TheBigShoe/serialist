@@ -47,6 +47,10 @@ impl StyleFlags {
     pub const INVERSE: StyleFlags = StyleFlags(1 << 4);
     pub const STRIKETHROUGH: StyleFlags = StyleFlags(1 << 5);
     pub const HIDDEN: StyleFlags = StyleFlags(1 << 6);
+    /// A placeholder glyph the parser inserted for a control byte (`␍` for CR), not
+    /// text the device sent. Such runs are also `DIM`, and drawn in the terminal's dim
+    /// color. Only produced when the store's `show_control_chars` is on.
+    pub const CONTROL: StyleFlags = StyleFlags(1 << 7);
 
     pub fn contains(self, other: StyleFlags) -> bool {
         self.0 & other.0 == other.0
@@ -90,7 +94,8 @@ pub enum Direction {
 }
 
 /// One displayable line. `text` is printable content only: control characters and escape
-/// sequences have been applied or removed, tabs expanded, invalid UTF-8 replaced.
+/// sequences have been applied or removed, tabs expanded, invalid UTF-8 replaced. With
+/// `show_control_chars` on, a `CONTROL` run of placeholder glyphs marks where each was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StyledLine {
     pub id: LineId,

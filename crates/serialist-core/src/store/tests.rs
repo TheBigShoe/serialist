@@ -1097,3 +1097,179 @@ fn write_lines_takes_a_dyn_writer_and_reports_io_errors() {
     .unwrap_err();
     assert_eq!(error.to_string(), "disk full");
 }
+
+fn glyph_config() -> StoreConfig {
+    StoreConfig {
+        show_control_chars: true,
+        ..StoreConfig::default()
+    }
+}
+
+#[test]
+fn control_characters_show_as_glyphs_when_the_store_is_told_to() {
+    let input: &[u8] = b"one\r\nx\x1b[31my\x1b[0m\r\nabc\rXY";
+    let mut store = Store::new(glyph_config());
+    let at = t0(&store);
+    store.append(input, at);
+    let snap = store.snapshot();
+    assert_eq!(
+        texts(&snap),
+        [
+            "one\u{240d}\u{240a}",
+            "x\u{241b}y\u{241b}\u{240d}\u{240a}",
+            "XYc\u{240d}"
+        ]
+    );
+    for id in 0..3 {
+        check_line(&snap.line(LineId(id)).unwrap());
+    }
+    // The glyphs are dim control runs after the text; the raw bytes are untouched.
+    let first = snap.line(LineId(0)).unwrap();
+    assert_eq!(first.runs.len(), 2);
+    assert_eq!(first.runs[0].len, 3);
+    assert_eq!(first.runs[1].len, 6);
+    assert_eq!(
+        first.runs[1].style.flags.0,
+        StyleFlags::DIM.0 | StyleFlags::CONTROL.0
+    );
+    assert_eq!((first.raw.clone(), first.complete), (0..5, true));
+    assert_eq!(snap.line(LineId(2)).unwrap().raw, 18..24);
+    assert_eq!(raw_bytes(&snap), input);
+    assert_eq!(snap.hex_view(16).line_count(), 2);
+
+    // The line in progress gains its glyphs as the bytes arrive, and its LF completes it.
+    store.append(b"\n", at);
+    let snap = store.snapshot();
+    let last = snap.line(LineId(2)).unwrap();
+    assert_eq!(last.text, "XYc\u{240d}\u{240a}");
+    assert!(last.complete);
+
+    // The same bytes with the flag off: no glyphs anywhere.
+    let mut plain = Store::default();
+    plain.append(input, at);
+    assert_eq!(texts(&plain.snapshot()), ["one", "xy", "XYc"]);
+}
+
+#[test]
+fn a_line_in_progress_gains_glyphs_byte_by_byte() {
+    let mut store = Store::new(glyph_config());
+    let at = t0(&store);
+    let shown = |store: &Store| store.snapshot().line(LineId(0)).unwrap().text;
+    store.append(b"abc", at);
+    assert_eq!(shown(&store), "abc", "no control byte yet");
+    store.append(b"\r", at);
+    assert_eq!(shown(&store), "abc\u{240d}");
+    store.append(b"XY", at);
+    assert_eq!(shown(&store), "XYc\u{240d}");
+    store.append(b"\x1b", at);
+    assert_eq!(
+        shown(&store),
+        "XYc\u{240d}",
+        "an escape that is not over shows nothing yet"
+    );
+    store.append(b"[2K", at);
+    assert_eq!(shown(&store), "\u{241b}\u{240d}");
+    store.append(b"\r\n", at);
+    assert_eq!(shown(&store), "\u{241b}\u{240d}\u{240d}\u{240a}");
+}
+
+#[test]
+fn glyph_lines_do_not_depend_on_how_the_bytes_arrive() {
+    let input: &[u8] =
+        b"a\r\nb\x1b[1mc\x08d\x00\r\nlong\x1b]0;t\x07 line\rXY\n\xe2\x82\xac\x1b[K\n\x1b[2Kp";
+    // One epoch for every store, so the arrival times compare equal.
+    let epoch = Epoch::now();
+    let lines = |chunks: &[&[u8]]| {
+        let mut store = Store::new(StoreConfig {
+            epoch: Some(epoch),
+            ..glyph_config()
+        });
+        let at = epoch.instant;
+        for chunk in chunks {
+            store.append(chunk, at);
+        }
+        let snap = store.snapshot();
+        let mut out = Vec::new();
+        snap.lines(snap.first_line()..snap.end(), &mut out);
+        out
+    };
+    let whole = lines(&[input]);
+    assert_eq!(whole.len(), 5);
+    for cut in 0..=input.len() {
+        assert_eq!(
+            lines(&[&input[..cut], &input[cut..]]),
+            whole,
+            "cut at {cut}"
+        );
+    }
+    let bytes: Vec<&[u8]> = input.chunks(1).collect();
+    assert_eq!(lines(&bytes), whole, "one byte at a time");
+}
+
+#[test]
+fn glyphs_are_text_to_export_and_search() {
+    let mut store = Store::new(glyph_config());
+    store.append(b"one\r\ntwo\r\n", t0(&store));
+    let snap = store.snapshot();
+    let all = snap.first_line()..snap.end();
+    assert_eq!(
+        snap.text(all.clone(), TextOptions::default()),
+        "one\u{240d}\u{240a}\ntwo\u{240d}\u{240a}\n"
+    );
+    let cancel = AtomicBool::new(false);
+    let find = |pattern: &str| {
+        snap.search(pattern, LineId(0), false, 10, &cancel)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(find("one"), 1);
+    assert_eq!(find("\u{240d}"), 2, "a glyph can be searched for");
+    assert_eq!(find("one$"), 0, "and the line now ends in one");
+    assert_eq!(find("one.*\u{240a}$"), 1);
+}
+
+#[test]
+fn glyphs_stay_within_the_budget() {
+    let mut store = Store::new(StoreConfig {
+        budget: 0,
+        max_line_bytes: MAX_LINE_BYTES_LIMIT,
+        show_control_chars: true,
+        ..StoreConfig::default()
+    });
+    assert!(glyph_config().min_budget() > StoreConfig::default().min_budget());
+    let budget = store.budget();
+    let now = Instant::now();
+    // A line of the largest length that changes style, overwrites and shows a glyph
+    // on almost every byte.
+    let mut line = Vec::new();
+    let mut i = 0;
+    while line.len() < MAX_LINE_BYTES_LIMIT - 64 {
+        line.extend_from_slice(format!("\x1b[3{}m\u{e9}\r\x08\x00", 1 + i % 7).as_bytes());
+        i += 1;
+    }
+    for chunk in line.chunks(4096) {
+        store.append(chunk, now);
+        let stats = store.stats();
+        assert!(
+            stats.memory <= budget,
+            "{} > {budget} mid-line",
+            stats.memory
+        );
+    }
+    store.append(b"\r\n", now);
+    assert!(store.stats().memory <= budget);
+    for i in 0..2000 {
+        store.append(format!("normal {i}\r\n").as_bytes(), now);
+    }
+    let snap = store.snapshot();
+    let stats = snap.stats();
+    assert!(stats.memory <= budget, "{stats:?}");
+    assert!(
+        snap.line_count() > 1000,
+        "later lines must be kept: {stats:?}"
+    );
+    assert_eq!(
+        snap.line(LineId(snap.end().0 - 1)).unwrap().text,
+        "normal 1999\u{240d}\u{240a}"
+    );
+}

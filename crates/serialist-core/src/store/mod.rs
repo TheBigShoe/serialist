@@ -78,6 +78,12 @@
 //! | `MixedEol` (bare CRs overwrite) | 100 | 32% |
 //! | `Ansi` (SGR on every word) | 155 | 98% |
 //! | `Binary` (invalid UTF-8 becomes 3-byte U+FFFD) | 264 | 122% |
+//! | `Text` with [`StoreConfig::show_control_chars`] (47-byte log lines) | 80 | 169% |
+//!
+//! Showing control characters puts a glyph on the end of every complete line, so no line
+//! is plain and each costs its decoded copy: the text with three more bytes, and its runs
+//! (the glyph has one of its own). The measurement is 47-byte log lines, where the same
+//! lines cost 5 bytes each with the flag off.
 //!
 //! The budget bounds the total whatever the content: a heavier stream simply retains
 //! fewer raw bytes.
@@ -113,8 +119,8 @@ use std::time::Instant;
 use parking_lot::Mutex;
 
 use crate::ansi::{
-    AnsiParser, DEFAULT_MAX_LINE_BYTES, MAX_LINE_BYTES_LIMIT, MAX_RUNS, MIN_LINE_BYTES,
-    MOTION_WIDTH, ParsedLine, TAB_WIDTH,
+    AnsiParser, DEFAULT_MAX_LINE_BYTES, MAX_CONTROL_GLYPHS, MAX_LINE_BYTES_LIMIT, MAX_RUNS,
+    MIN_LINE_BYTES, MOTION_WIDTH, ParsedLine, TAB_WIDTH,
 };
 use crate::text::{Direction, Epoch, LineId, Style, StyleRun};
 
@@ -151,6 +157,14 @@ pub struct StoreConfig {
     pub max_line_bytes: usize,
     /// Time zero for timestamps. `None` means when the store is created.
     pub epoch: Option<Epoch>,
+    /// Show control bytes as dim placeholder glyphs in the line text (CR, the LF that
+    /// ends a line, escape sequences, BS and other C0 bytes; see
+    /// [`AnsiParser::show_control_chars`]). It is how received bytes are parsed, so it
+    /// is fixed when the store is created: a store's lines are not redone if a setting
+    /// changes, and a new session takes the new value. The raw bytes are unaffected. Every
+    /// line with a glyph, which is every complete line, keeps its decoded text, so the
+    /// store holds about what it holds for ANSI-heavy output (see the memory model).
+    pub show_control_chars: bool,
 }
 
 impl Default for StoreConfig {
@@ -159,6 +173,7 @@ impl Default for StoreConfig {
             budget: DEFAULT_BUDGET,
             max_line_bytes: DEFAULT_MAX_LINE_BYTES,
             epoch: None,
+            show_control_chars: false,
         }
     }
 }
@@ -182,8 +197,13 @@ impl StoreConfig {
             .max_line_bytes
             .clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT);
         let cols = line + MOTION_WIDTH;
-        let parser = AnsiParser::worst_case_heap(line);
-        let tail_copy = 4 * cols + MAX_RUNS * size_of::<StyleRun>() + 64;
+        let mut parser = AnsiParser::worst_case_heap(line);
+        let mut tail_copy = 4 * cols + MAX_RUNS * size_of::<StyleRun>() + 64;
+        if self.show_control_chars {
+            // Glyphs add buffers to the parser and up to three bytes each to a copy.
+            parser += AnsiParser::worst_case_control_heap(line);
+            tail_copy += 3 * MAX_CONTROL_GLYPHS;
+        }
         let line_pages = (line / PAGE_SIZE + 2) * PAGE_SIZE;
         parser
             + tail_copy
@@ -413,7 +433,8 @@ impl fmt::Debug for Store {
 impl Store {
     pub fn new(config: StoreConfig) -> Self {
         let budget = config.budget.max(config.min_budget());
-        let parser = AnsiParser::with_max_line_bytes(config.max_line_bytes);
+        let parser = AnsiParser::with_max_line_bytes(config.max_line_bytes)
+            .show_control_chars(config.show_control_chars);
         let epoch = config.epoch.unwrap_or_else(Epoch::now);
         let w = Writer {
             epoch,
