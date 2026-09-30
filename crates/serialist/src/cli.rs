@@ -15,7 +15,7 @@ Options:
   --virtual [NAME]    List the simulated devices next to the real ports; with a
                       NAME, also open virtual:<NAME> at startup (repeatable; the
                       first is opened unless --port is given). Built-ins: echo,
-                      echo-lines, at, firehose, firehose-ansi
+                      echo-lines, at, firehose, firehose-ansi, race
   --config-dir <DIR>  Read settings.json, keymap.json, themes/, commands/ and
                       scripts/, and keep history.jsonl, in DIR instead of the user
                       config directory (also SERIALIST_CONFIG_DIR)

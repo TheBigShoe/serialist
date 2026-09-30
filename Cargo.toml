@@ -36,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 memchr = "2"
+smol_str = "0.3"
 vte = "0.15"
 notify = "8"
 notify-debouncer-full = "0.7"
