@@ -12,7 +12,8 @@
 //! - [`SimTransportFactory`]: a `TransportFactory` that opens `virtual:<device>` ids.
 //! - [`SimWorld`]: a source and a factory wired together, with the built-in devices plugged in.
 //! - Built-in devices: [`EchoDevice`], [`AtDevice`], [`FirehoseDevice`] (configurable rate
-//!   and content, verified end to end by [`FirehoseVerifier`]).
+//!   and content, verified end to end by [`FirehoseVerifier`]), [`RaceDevice`] (Airoha RACE
+//!   binary frames mixed with text, for the codec plugins).
 //! - [`Clock`]: where a link gets its time. [`SystemClock`] is real time; a
 //!   [`ManualClock`] moves only when a test moves it, so timing assertions are exact.
 //!   [`VirtualLink::connect_with_clock`] and [`SimWorld::with_clock`] take one.
@@ -27,6 +28,7 @@ mod devices;
 mod factory;
 mod firehose;
 mod link;
+mod race;
 mod source;
 mod world;
 
@@ -39,6 +41,10 @@ pub use firehose::{
     FirehoseVerifier, MIN_TICK, SeqGap,
 };
 pub use link::{HOST_BACKLOG_LIMIT, LinkHandle, PACED_LOOKAHEAD, PACKET_INTERVAL, VirtualLink};
+pub use race::{
+    RACE_COMMAND, RACE_INDICATION, RACE_LOG, RACE_MAX_LEN, RACE_RESPONSE, RACE_SYNC, RaceDevice,
+    race_frame,
+};
 pub use source::{SimPortSource, virtual_port, virtual_port_id};
 pub use world::SimWorld;
 

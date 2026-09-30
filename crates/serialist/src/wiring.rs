@@ -170,6 +170,7 @@ mod tests {
                 "virtual:at",
                 "virtual:firehose",
                 "virtual:firehose-ansi",
+                "virtual:race",
             ]
         );
         assert_eq!(options.select_port, Some(PortId::new("virtual:echo")));
@@ -197,7 +198,7 @@ mod tests {
             ..Args::default()
         })
         .unwrap();
-        assert_eq!(listed(&options).len(), 6);
+        assert_eq!(listed(&options).len(), 7);
         assert_eq!(options.select_port, None);
         assert!(!options.connect_on_start);
     }
@@ -223,7 +224,7 @@ mod tests {
         .expect("an error");
         assert_eq!(
             error.to_string(),
-            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi"
+            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi, race"
         );
         assert!(
             options(Args {
