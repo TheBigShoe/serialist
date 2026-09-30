@@ -28,7 +28,10 @@ pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use config_watch::{ConfigEvent, ConfigWatcher};
 pub use discovery::RealPortSource;
-pub use ingest::{ChunkSink, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped};
+pub use ingest::{
+    ChunkSink, ConnectionInfo, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped,
+    LinkState,
+};
 pub use keymap::{ActionRef, KeyBinding, Keymap, KeymapError, load_keymap};
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
 pub use serial::SerialportFactory;
@@ -40,7 +43,7 @@ pub use settings::{
 };
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,
-    TextOptions, Timestamps,
+    TextExportReport, TextOptions, Timestamps,
 };
 pub use text::{
     Color, Direction, Epoch, LineId, LineSource, SearchMatch, Searcher, Style, StyleFlags,

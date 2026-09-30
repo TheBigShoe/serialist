@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvTimeoutError, unbounded};
 use serialist_core::{
-    ChunkSink, Direction, Ingest, LineId, LineSource, SerialConfig, Session, SessionConfig, Store,
-    StoreConfig, StyledLine,
+    ChunkSink, ConnectionInfo, Direction, Ingest, IngestHandle, LineId, LineSource, LinkState,
+    SerialConfig, Session, SessionConfig, Store, StoreConfig, StyledLine,
 };
 use serialist_sim::{
     FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier, LinkConfig, SimWorld,
@@ -206,4 +206,118 @@ fn tx_echo_and_notices_keep_their_order() {
             (Direction::Notice, "Disconnected".to_owned()),
         ]
     );
+}
+
+/// Remembers what `on_connect` was told.
+struct ConnectSink(Arc<Mutex<Vec<String>>>);
+
+impl ChunkSink for ConnectSink {
+    fn on_chunk(&mut self, _bytes: &[u8], _at: Instant) {}
+
+    fn on_connect(&mut self, description: &str) {
+        self.0.lock().unwrap().push(description.to_owned());
+    }
+
+    fn on_disconnect(&mut self) {}
+}
+
+/// Poll `handle.connection()` until `done` accepts it.
+fn wait_for_connection(
+    handle: &IngestHandle,
+    what: &str,
+    done: impl Fn(&ConnectionInfo) -> bool,
+) -> ConnectionInfo {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = handle.connection();
+        if done(&info) {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {info:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn connection_and_on_connect_over_a_session() {
+    let world = SimWorld::new();
+    let id = virtual_port_id(SimWorld::ECHO_LINES);
+    let session =
+        Session::open(world.factory(), SessionConfig::new(id, serial(115_200))).expect("open");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let handle = Ingest::spawn(
+        session.events(),
+        Store::default(),
+        vec![Box::new(ConnectSink(Arc::clone(&heard)))],
+        Box::new(|| {}),
+    );
+
+    let info = wait_for_connection(&handle, "connected", |info| {
+        matches!(info.state, LinkState::Connected { .. })
+    });
+    let LinkState::Connected { description } = &info.state else {
+        unreachable!("checked above")
+    };
+    assert!(
+        description.starts_with("virtual:echo-lines"),
+        "{description}"
+    );
+    assert_eq!(info.description.as_ref(), Some(description));
+    // The state is set before the notice is stored, and the sinks are told after it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while heard.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the sink never heard on_connect");
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(*heard.lock().unwrap(), std::slice::from_ref(description));
+    assert_eq!(
+        handle.snapshot().line(LineId(0)).unwrap().text,
+        format!("Connected to {description}")
+    );
+
+    session.close();
+    let info = wait_for_connection(&handle, "disconnected", |info| {
+        matches!(info.state, LinkState::Disconnected { .. })
+    });
+    assert_eq!(info.state, LinkState::Disconnected { error: None });
+    assert_eq!(info.description.as_ref(), Some(description), "kept");
+    let store = handle.join().expect("the ingest thread ran cleanly");
+    assert_eq!(heard.lock().unwrap().len(), 1, "on_connect is called once");
+    let last = lines(&store).pop().expect("lines");
+    assert_eq!(last.text, "Disconnected");
+}
+
+#[test]
+fn an_unplugged_device_reports_its_error() {
+    let world = SimWorld::new();
+    let id = virtual_port_id(SimWorld::ECHO);
+    let session = Session::open(
+        world.factory(),
+        SessionConfig::new(id.clone(), serial(115_200)),
+    )
+    .expect("open");
+    let handle = Ingest::spawn(
+        session.events(),
+        Store::default(),
+        Vec::new(),
+        Box::new(|| {}),
+    );
+    wait_for_connection(&handle, "connected", |info| {
+        matches!(info.state, LinkState::Connected { .. })
+    });
+    assert!(world.unplug(&id));
+    let info = wait_for_connection(&handle, "disconnected", |info| {
+        matches!(info.state, LinkState::Disconnected { .. })
+    });
+    let LinkState::Disconnected { error: Some(error) } = info.state else {
+        panic!("an unplug is an error, not an orderly close: {info:?}");
+    };
+    let store = handle.join().expect("the ingest thread ran cleanly");
+    let last = lines(&store).pop().expect("lines");
+    assert_eq!(last.direction, Direction::Notice);
+    assert_eq!(last.text, format!("Disconnected: {error}"));
+    drop(session);
 }

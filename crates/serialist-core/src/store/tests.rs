@@ -661,3 +661,435 @@ fn min_budget_scales_with_the_line_limit() {
         StoreConfig::default().min_budget()
     );
 }
+
+/// `count` lines `"{i:06} alpha"`, with `" needle"` added to every 1000th.
+fn numbered_store(count: u64) -> Store {
+    let mut store = Store::default();
+    let now = Instant::now();
+    let mut data = Vec::new();
+    for i in 0..count {
+        let mark = if i % 1000 == 0 { " needle" } else { "" };
+        data.extend_from_slice(format!("{i:06} alpha{mark}\r\n").as_bytes());
+        if data.len() >= 4096 {
+            store.append(&data, now);
+            data.clear();
+        }
+    }
+    store.append(&data, now);
+    store
+}
+
+fn search_in(
+    snap: &Snapshot,
+    pattern: &str,
+    range: Range<u64>,
+    from: u64,
+    backward: bool,
+    limit: usize,
+) -> Vec<SearchMatch> {
+    snap.search_in(
+        pattern,
+        LineId(range.start)..LineId(range.end),
+        LineId(from),
+        backward,
+        limit,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+}
+
+fn hit_lines(hits: &[SearchMatch]) -> Vec<u64> {
+    hits.iter().map(|m| m.line.0).collect()
+}
+
+#[test]
+fn bounded_search_never_returns_a_match_outside_its_range() {
+    let store = numbered_store(20_000);
+    let snap = store.snapshot();
+    let needles: Vec<u64> = (6..=14).map(|k| k * 1000).collect();
+    let mut reversed = needles.clone();
+    reversed.reverse();
+    // Lines 5500..15000: needles at 6000 through 14000; 5000 and 15000 are outside.
+    let range = 5_500..15_000;
+    let go =
+        |from, backward, limit| search_in(&snap, "needle", range.clone(), from, backward, limit);
+    assert_eq!(hit_lines(&go(0, false, usize::MAX)), needles);
+    assert_eq!(hit_lines(&go(u64::MAX, true, usize::MAX)), reversed);
+    // `from` is inclusive and is clamped into the range.
+    assert_eq!(hit_lines(&go(10_000, true, usize::MAX)), reversed[4..]);
+    assert_eq!(hit_lines(&go(10_000, false, usize::MAX)), needles[4..]);
+    assert_eq!(hit_lines(&go(14_999, true, 2)), [14_000, 13_000]);
+    assert_eq!(hit_lines(&go(0, false, 2)), [6_000, 7_000]);
+    // Nothing when `from` lies on the wrong side of the range.
+    assert!(go(5_499, true, 10).is_empty());
+    assert!(go(15_000, false, 10).is_empty());
+    assert!(go(20_000, false, 10).is_empty());
+    assert!(go(0, false, 0).is_empty());
+    // A pattern that matches every line yields exactly the range's lines, both ways,
+    // so the bulk scan is cut at both ends.
+    let all = r"^\d{6} alpha";
+    let forward = search_in(&snap, all, range.clone(), 0, false, usize::MAX);
+    assert_eq!(hit_lines(&forward), (5_500..15_000).collect::<Vec<_>>());
+    let backward = search_in(&snap, all, range.clone(), u64::MAX, true, usize::MAX);
+    assert_eq!(
+        hit_lines(&backward),
+        (5_500..15_000).rev().collect::<Vec<_>>()
+    );
+    // Small, empty and inverted ranges, and ranges past what is retained.
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 6_000..6_001, 0, false, 9)),
+        [6_000]
+    );
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 6_000..6_001, 9_999, true, 9)),
+        [6_000]
+    );
+    assert!(search_in(&snap, "needle", 6_001..6_002, 0, false, 9).is_empty());
+    assert!(search_in(&snap, "needle", 9_000..9_000, 0, false, 9).is_empty());
+    let (later, earlier) = (9_000, 1_000);
+    assert!(search_in(&snap, "needle", later..earlier, 0, true, 9).is_empty());
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 19_000..u64::MAX, 0, false, 9)),
+        [19_000]
+    );
+    assert!(search_in(&snap, "needle", 30_000..40_000, 0, false, 9).is_empty());
+    // The full range is what `search` does.
+    let full = snap
+        .search(
+            "needle",
+            LineId(0),
+            false,
+            usize::MAX,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        full,
+        search_in(&snap, "needle", 0..u64::MAX, 0, false, usize::MAX)
+    );
+    // A bad pattern is an error whatever the range, and a set cancel flag stops the scan.
+    let cancelled = AtomicBool::new(true);
+    let bad = snap.search_in("(", LineId(9)..LineId(9), LineId(0), false, 1, &cancelled);
+    assert!(bad.is_err());
+    let none = snap.search_in(
+        "needle",
+        LineId(0)..LineId(20_000),
+        LineId(0),
+        false,
+        9,
+        &cancelled,
+    );
+    assert!(none.unwrap().is_empty());
+}
+
+/// The reason for `search_in`: a backward search from a clear floor must not scan the
+/// hidden lines below it. Counted in lines visited, not measured in time.
+#[test]
+fn a_bounded_search_scans_no_line_outside_its_range() {
+    use super::search::{reset_scanned, scanned};
+
+    let store = numbered_store(200_000);
+    let snap = store.snapshot();
+    let cancel = AtomicBool::new(false);
+    // "needle" occurs only at multiples of 1000, all below the floor.
+    let floor = 199_500;
+    reset_scanned();
+    let hits = search_in(&snap, "needle", floor..200_000, u64::MAX, true, usize::MAX);
+    assert!(hits.is_empty());
+    assert_eq!(scanned(), 200_000 - floor, "only the lines above the floor");
+    // Unbounded, the same search walks down past the floor to line 199_000.
+    reset_scanned();
+    let hits = snap
+        .search("needle", LineId(u64::MAX), true, 1, &cancel)
+        .unwrap();
+    assert_eq!(hit_lines(&hits), [199_000]);
+    assert!(scanned() >= 1_000, "{}", scanned());
+    // A forward search stops at the end of its range, and starts at its start.
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 100_000..100_500, 0, false, usize::MAX);
+    assert_eq!(hit_lines(&hits), [100_000]);
+    assert_eq!(scanned(), 500);
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 100_001..100_500, 0, false, usize::MAX);
+    assert!(hits.is_empty());
+    assert_eq!(scanned(), 499);
+    // A limit stops a backward search after the window that held the match, which is
+    // still inside the range.
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 150_000..200_000, u64::MAX, true, 1);
+    assert_eq!(hit_lines(&hits), [199_000]);
+    assert!(scanned() < 50_000, "{}", scanned());
+}
+
+/// Eviction moves the store's first line up through the range: the retained part is what
+/// is searched.
+#[test]
+fn a_bounded_search_clips_to_the_retained_lines() {
+    let mut store = Store::new(StoreConfig {
+        budget: 0,
+        max_line_bytes: 4096,
+        ..StoreConfig::default()
+    });
+    let now = Instant::now();
+    let mut i = 0u64;
+    while store.stats().first_line.0 < 3_000 {
+        store.append(format!("{i:08} needle\r\n").as_bytes(), now);
+        i += 1;
+    }
+    let snap = store.snapshot();
+    let (first, end) = (snap.first_line().0, snap.end().0);
+    let hits = search_in(&snap, "needle", 0..end, 0, false, usize::MAX);
+    assert_eq!(hits.len() as u64, end - first);
+    assert_eq!(hits[0].line.0, first);
+    let hits = search_in(&snap, "needle", 0..first + 10, u64::MAX, true, usize::MAX);
+    assert_eq!(
+        hit_lines(&hits),
+        (first..first + 10).rev().collect::<Vec<_>>()
+    );
+    // From below the retained lines, backward finds nothing, as `search` does.
+    assert!(search_in(&snap, "needle", 0..end, first - 1, true, 5).is_empty());
+}
+
+/// Hex rows are rendered one at a time, so the bound saves real work: a backward search
+/// from a floor renders only the rows above it.
+#[test]
+fn a_bounded_hex_search_renders_no_row_outside_its_range() {
+    use super::search::{reset_scanned, scanned};
+
+    let store = numbered_store(5_000);
+    let snap = store.snapshot();
+    let hex = snap.hex_view(16);
+    let rows = hex.end().0;
+    assert!(rows > 4_000, "{rows} rows");
+    let cancel = AtomicBool::new(false);
+    let floor = rows - 100;
+
+    reset_scanned();
+    let none = hex
+        .search_in(
+            "zzz",
+            LineId(floor)..LineId(rows),
+            LineId(u64::MAX),
+            true,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(scanned(), 100, "only the rows above the floor");
+
+    reset_scanned();
+    let none = hex
+        .search("zzz", LineId(u64::MAX), true, 1, &cancel)
+        .unwrap();
+    assert!(none.is_empty());
+    assert_eq!(scanned(), rows, "the unbounded search walks every row");
+
+    // Forward, both ends of the range are respected.
+    reset_scanned();
+    let hits = hex
+        .search_in(
+            "^[0-9a-f]{8} ",
+            LineId(10)..LineId(20),
+            LineId(0),
+            false,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(scanned(), 10);
+    assert_eq!(hit_lines(&hits), (10..20).collect::<Vec<_>>());
+    // A range past the retained rows clips to nothing.
+    let none = hex
+        .search_in(
+            "^[0-9a-f]{8} ",
+            LineId(rows)..LineId(rows + 50),
+            LineId(0),
+            false,
+            usize::MAX,
+            &cancel,
+        )
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+/// A store with one line per 16 bytes, so that each 16-byte hex row is one line.
+fn timed_rows() -> Store {
+    let mut store = Store::default();
+    let base = t0(&store);
+    store.append(b"0123456789abcde\n", base + Duration::from_millis(1000));
+    store.append(b"fghijklmnopqrst\n", base + Duration::from_millis(3000));
+    store.append(b"uvwxyz01234567\r\n", base + Duration::from_millis(3500));
+    store
+}
+
+fn to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes).expect("exports are UTF-8")
+}
+
+#[test]
+fn counted_text_export_reports_lines_and_bytes() {
+    let mut store = Store::default();
+    let base = t0(&store);
+    store.append_local_at("hello", Direction::Notice, base);
+    store.append(b"first\r\n", base + Duration::from_millis(1500));
+    store.append_local_at("sent", Direction::Tx, base + Duration::from_millis(1600));
+    store.append(
+        b"\x1b[32msecond \xc3\xa9\x1b[0m\n",
+        base + Duration::from_secs(2),
+    );
+    let snap = store.snapshot();
+    let all = snap.first_line()..snap.end();
+    for options in [
+        TextOptions::default(),
+        TextOptions::received_only(),
+        TextOptions::default().with_timestamps(Timestamps::Absolute),
+        TextOptions::default().with_timestamps(Timestamps::Relative),
+        TextOptions::received_only().with_timestamps(Timestamps::Delta),
+    ] {
+        let mut out = Vec::new();
+        let report = snap
+            .write_text_counted(all.clone(), options, &mut out)
+            .unwrap();
+        let text = to_string(out);
+        assert_eq!(
+            report.lines,
+            text.matches('\n').count(),
+            "{options:?}: {text}"
+        );
+        assert_eq!(report.bytes, text.len() as u64, "{options:?}");
+        assert_eq!(text, snap.text(all.clone(), options), "{options:?}");
+        // The plain writer is the counting one without the counts.
+        let mut plain = Vec::new();
+        snap.write_text(all.clone(), options, &mut plain).unwrap();
+        assert_eq!(to_string(plain), text);
+    }
+    let mut out = Vec::new();
+    let report = snap
+        .write_text_counted(all.clone(), TextOptions::received_only(), &mut out)
+        .unwrap();
+    assert_eq!(
+        report,
+        TextExportReport {
+            lines: 2,
+            bytes: "first\nsecond \u{e9}\n".len() as u64
+        }
+    );
+    // A range with nothing in it writes nothing.
+    let mut out = Vec::new();
+    let report = snap
+        .write_text_counted(LineId(40)..LineId(50), TextOptions::default(), &mut out)
+        .unwrap();
+    assert_eq!(report, TextExportReport::default());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn write_lines_stamps_hex_rows_like_text_lines() {
+    let store = timed_rows();
+    let snap = store.snapshot();
+    let hex = snap.hex_view(16);
+    assert_eq!(hex.line_count(), 3);
+    let rows: Vec<String> = (0..3).map(|i| hex.line(LineId(i)).unwrap().text).collect();
+    let all = hex.first_line()..hex.end();
+    let export = |timestamps| {
+        let mut out = Vec::new();
+        let options = TextOptions::default().with_timestamps(timestamps);
+        let report = write_lines(&hex, all.clone(), options, &mut out).unwrap();
+        (report, to_string(out))
+    };
+
+    let (report, plain) = export(Timestamps::None);
+    assert_eq!(plain, format!("{}\n{}\n{}\n", rows[0], rows[1], rows[2]));
+    assert_eq!(report.lines, 3);
+    assert_eq!(report.bytes, plain.len() as u64);
+
+    let (_, relative) = export(Timestamps::Relative);
+    assert_eq!(
+        relative,
+        format!(
+            "[+1.000000] {}\n[+3.000000] {}\n[+3.500000] {}\n",
+            rows[0], rows[1], rows[2]
+        )
+    );
+    let (_, delta) = export(Timestamps::Delta);
+    assert_eq!(
+        delta,
+        format!(
+            "[+0.000000] {}\n[+2.000000] {}\n[+0.500000] {}\n",
+            rows[0], rows[1], rows[2]
+        )
+    );
+    let (report, absolute) = export(Timestamps::Absolute);
+    let wall = |ms| format_utc(store.epoch().wall + Duration::from_millis(ms));
+    assert_eq!(
+        absolute,
+        format!(
+            "[{}] {}\n[{}] {}\n[{}] {}\n",
+            wall(1000),
+            rows[0],
+            wall(3000),
+            rows[1],
+            wall(3500),
+            rows[2]
+        )
+    );
+    assert_eq!(report.bytes, absolute.len() as u64);
+
+    // The row range clips, and the store's own lines go through the same function.
+    let mut out = Vec::new();
+    let options = TextOptions::default().with_timestamps(Timestamps::Delta);
+    write_lines(&hex, LineId(1)..LineId(99), options, &mut out).unwrap();
+    assert_eq!(
+        to_string(out),
+        format!("[+0.000000] {}\n[+0.500000] {}\n", rows[1], rows[2])
+    );
+    let mut from_snapshot = Vec::new();
+    let mut from_write_text = Vec::new();
+    let all = snap.first_line()..snap.end();
+    write_lines(&snap, all.clone(), options, &mut from_snapshot).unwrap();
+    snap.write_text(all, options, &mut from_write_text).unwrap();
+    assert_eq!(from_snapshot, from_write_text);
+}
+
+/// The writer may be a trait object, which is what a caller with a boxed sink has.
+#[test]
+fn write_lines_takes_a_dyn_writer_and_reports_io_errors() {
+    struct Full(usize);
+
+    impl std::io::Write for Full {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 < buf.len() {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.0 -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let store = timed_rows();
+    let snap = store.snapshot();
+    let mut sink: Box<dyn std::io::Write> = Box::new(Vec::new());
+    let report = write_lines(
+        &snap,
+        snap.first_line()..snap.end(),
+        TextOptions::default(),
+        &mut *sink,
+    )
+    .unwrap();
+    assert_eq!(report.lines, 3);
+
+    let mut full = Full(20);
+    let error = write_lines(
+        &snap,
+        snap.first_line()..snap.end(),
+        TextOptions::default(),
+        &mut full,
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "disk full");
+}
