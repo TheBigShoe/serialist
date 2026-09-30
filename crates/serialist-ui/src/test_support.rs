@@ -238,17 +238,29 @@ impl SessionOpener for FakeOpener {
     }
 }
 
+/// The size of a test window: a laptop's, wide enough for both docks and the center.
+pub(crate) const TEST_WINDOW: (f32, f32) = (1280., 800.);
+
 /// Open a headless test window whose content is built by `build`, with the app
 /// initialised the way `main` does it.
 pub(crate) fn open_test_window<V: Render>(
     cx: &mut TestAppContext,
     build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
 ) -> (AnyWindowHandle, Entity<V>) {
+    open_test_window_sized(cx, TEST_WINDOW, build)
+}
+
+/// [`open_test_window`] at `width` by `height`.
+pub(crate) fn open_test_window_sized<V: Render>(
+    cx: &mut TestAppContext,
+    (width, height): (f32, f32),
+    build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+) -> (AnyWindowHandle, Entity<V>) {
     cx.update(|cx| {
         crate::workspace::init(cx);
         let bounds = Bounds {
             origin: Point::default(),
-            size: size(px(1000.), px(700.)),
+            size: size(px(width), px(height)),
         };
         kit_open_window(
             WindowOptions {
@@ -497,6 +509,26 @@ pub(crate) fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, t
             .iter()
             .any(|line| line.direction == Direction::Rx && line.text == text)
     })
+}
+
+/// Resize the window to `width` by `height` and draw a frame at the new size.
+pub(crate) fn resize_window(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    (width, height): (f32, f32),
+) {
+    cx.simulate_window_resize(window, size(px(width), px(height)));
+    cx.run_until_parked();
+    draw(cx, window);
+}
+
+/// Draw the window twice, so a layout that depends on the last frame has settled.
+pub(crate) fn draw(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    for _ in 0..2 {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
 }
 
 /// Turn on local echo in the session's compose bar, as its Echo button does. The

@@ -1,21 +1,23 @@
 //! The Commands panel: saved-command collections in the left dock, below Devices.
 //!
 //! The panel lists the [`CommandStore`] of the installed [`Config`]: each collection and
-//! each group is a collapsible section, and each command a row with its name, a badge
-//! for its keybinding and its description as a tooltip. The filter field at the top
-//! narrows the list with [`CommandStore::filter`], best match first. Enter or a click
-//! sends a command ([`CommandsPanelEvent::Send`], which the workspace turns into a send
-//! on the session, asking for parameters first); a right click or the row's Edit button
-//! opens the [`CommandEditor`] in a dialog.
+//! each group is a collapsible section, and each command a 28 px row with its name, a
+//! chip for its keybinding and its description as a tooltip; hovering a row brings up
+//! its send and edit buttons. The filter field at the top narrows the list with
+//! [`CommandStore::filter`], best match first. Enter or a click sends a command
+//! ([`CommandsPanelEvent::Send`], which the workspace turns into a send on the session,
+//! asking for parameters first); a right click or the row's edit button opens the
+//! [`CommandEditor`] in a dialog. The header's + opens a menu with New command and New
+//! collection.
 //!
 //! Edits never change the store in memory: the editor writes the collection's file
 //! through [`CommandStore::save`] (atomically), the config watcher reports the file
 //! ([`ConfigEvent::Commands`](serialist_core::ConfigEvent::Commands)), and the reload
 //! brings the change back here, as a hand edit of the file would.
 //!
-//! The bundled examples are read-only. Their section offers "Copy", which writes them to
-//! a collection of the user's own, and editing one of their commands saves a copy of it
-//! into a user collection.
+//! The bundled examples are read-only, tagged "examples". Their section's copy button
+//! writes them to a collection of the user's own, and editing one of their commands
+//! saves a copy of it into a user collection.
 
 use std::collections::HashSet;
 
@@ -26,12 +28,11 @@ use crate::actions::commands::{
     EditSelected, NewCollection, NewCommand, SelectNext, SelectPrevious, SendSelected,
 };
 use crate::actions::context;
+use crate::chrome;
 use crate::config::Config;
 use crate::dialog_footer::DialogButtons;
 use crate::prelude::*;
 use crate::status::Notice;
-
-const ROW_HEIGHT: Pixels = px(28.);
 
 /// The collection a new command goes to when the user has none.
 pub const DEFAULT_COLLECTION: &str = "My commands";
@@ -582,14 +583,15 @@ impl CommandsPanel {
     }
 
     fn row_element(&self, ix: usize, row: &Row, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme();
         let base = h_flex()
             .id(("command-row", ix))
+            .relative()
             .w_full()
-            .h(ROW_HEIGHT)
-            .px_2()
+            .h(chrome::ROW_HEIGHT)
+            .pr_2()
             .gap_1p5()
-            .text_sm();
+            .items_center()
+            .overflow_hidden();
         match row {
             Row::Collection {
                 name,
@@ -599,33 +601,41 @@ impl CommandsPanel {
             } => {
                 let section = Section::Collection(name.clone());
                 let copy = name.clone();
-                base.text_xs()
-                    .text_color(theme.muted_foreground)
-                    .hover(|style| style.bg(theme.list_hover))
-                    .child(if *collapsed { "▸" } else { "▾" })
+                let theme = cx.theme();
+                let (muted, hover) = (theme.muted_foreground, theme.list_hover);
+                base.pl_3()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(hover))
+                    .child(fold_icon(*collapsed, muted))
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(SharedString::from(name.to_uppercase())),
+                            .child(chrome::section_label(name, cx)),
                     )
                     .when(*read_only, |row| {
-                        row.child(badge("read-only", theme.border, theme.muted_foreground))
-                            .child(
-                                Button::new(("copy-collection", ix))
-                                    .label("Copy")
-                                    .tooltip("Copy these commands to a collection of your own")
-                                    .xsmall()
-                                    .ghost()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        // Not the row's click, which folds the section.
-                                        cx.stop_propagation();
-                                        this.copy_to_user(&copy, cx);
-                                    })),
-                            )
+                        row.child(chrome::quiet_chip("examples", cx))
                     })
-                    .child(SharedString::from(commands.to_string()))
+                    .child(div().flex_1())
+                    .when(*read_only, |row| {
+                        row.child(
+                            chrome::icon_button(("copy-collection", ix), IconName::Copy, cx)
+                                .xsmall()
+                                .tooltip("Copy these commands to a collection of your own")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // Not the row's click, which folds the section.
+                                    cx.stop_propagation();
+                                    this.copy_to_user(&copy, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(chrome::LABEL_SIZE)
+                            .text_color(muted)
+                            .child(SharedString::from(commands.to_string())),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_section(section.clone(), cx);
                     }))
@@ -639,11 +649,13 @@ impl CommandsPanel {
                     collection: collection.clone(),
                     group: name.clone(),
                 };
-                base.pl_4()
+                let theme = cx.theme();
+                base.pl(px(24.))
+                    .cursor_pointer()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .hover(|style| style.bg(theme.list_hover))
-                    .child(if *collapsed { "▸" } else { "▾" })
+                    .child(fold_icon(*collapsed, theme.muted_foreground))
                     .child(div().truncate().child(SharedString::from(name.clone())))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_section(section.clone(), cx);
@@ -658,6 +670,7 @@ impl CommandsPanel {
             } => {
                 let selected = self.selected.as_ref() == Some(reference);
                 let send = reference.clone();
+                let send_button = reference.clone();
                 let edit = reference.clone();
                 let edit_button = reference.clone();
                 let tooltip = SharedString::from(if description.is_empty() {
@@ -665,55 +678,94 @@ impl CommandsPanel {
                 } else {
                     description.clone()
                 });
-                base.pl_6()
-                    .border_l_2()
-                    .map(|row| {
-                        if selected {
-                            row.bg(theme.list_active)
-                                .border_color(theme.list_active_border)
-                        } else {
-                            row.border_color(theme.transparent)
-                                .hover(|style| style.bg(theme.list_hover))
-                        }
-                    })
+                let group = SharedString::from(format!("command-row-{ix}"));
+                let overlay = chrome::overlay_background(selected, cx);
+                let (row_background, active_border, hover, transparent) = {
+                    let theme = cx.theme();
+                    (
+                        theme.list_active,
+                        theme.list_active_border,
+                        theme.list_hover,
+                        theme.transparent,
+                    )
+                };
+                // Send and edit come up over the row's right end while it is hovered
+                // (or selected).
+                let actions = h_flex()
+                    .id(("command-actions", ix))
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .pl_4()
+                    .pr_1()
+                    .gap_0p5()
+                    .items_center()
+                    .bg(overlay)
+                    .opacity(if selected { 1. } else { 0. })
+                    .group_hover(group.clone(), |style| style.opacity(1.))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_color(theme.foreground)
-                                    .child(SharedString::from(reference.name.clone())),
+                        chrome::icon_button(("send-command", ix), IconName::SendHorizontal, cx)
+                            .xsmall()
+                            .tooltip_with_action(
+                                "Send",
+                                &SendSelected,
+                                Some(context::COMMANDS_PANEL),
                             )
-                            .children(location.clone().map(|location| {
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(SharedString::from(location))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&this.focus_handle, cx);
+                                this.send(send_button.clone(), cx);
                             })),
                     )
-                    .children(keybinding.clone().map(|keys| {
-                        badge(keys, theme.border, theme.muted_foreground)
-                            .font_family(theme.mono_font_family.clone())
-                    }))
                     .child(
-                        Button::new(("edit-command", ix))
-                            .label(if *read_only { "Copy…" } else { "Edit" })
+                        chrome::icon_button(("edit-command", ix), IconName::Pencil, cx)
+                            .xsmall()
                             .tooltip(if *read_only {
-                                "Save a copy of this example in a collection of your own"
+                                "Edit a copy in a collection of your own"
                             } else {
                                 "Edit this command"
                             })
-                            .xsmall()
-                            .ghost()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 // Not the row's click, which sends the command.
                                 cx.stop_propagation();
                                 this.edit(&edit_button, window, cx);
                             })),
+                    );
+                let theme = cx.theme();
+                let mono = theme.mono_font_family.clone();
+                base.group(group)
+                    .pl(px(36.))
+                    .border_l_2()
+                    .map(|row| {
+                        if selected {
+                            row.bg(row_background).border_color(active_border)
+                        } else {
+                            row.border_color(transparent).hover(|style| style.bg(hover))
+                        }
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(relative(0.7))
+                            .truncate()
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(SharedString::from(reference.name.clone())),
                     )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .children(location.clone().map(SharedString::from)),
+                    )
+                    .children(keybinding.clone().map(|keys| {
+                        chrome::quiet_chip(keybinding_text(&keys), cx).font_family(mono)
+                    }))
+                    .child(actions)
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.focus_handle, cx);
@@ -730,60 +782,72 @@ impl CommandsPanel {
     }
 }
 
-fn badge(text: impl Into<SharedString>, border: Hsla, color: Hsla) -> Div {
-    div()
-        .flex_none()
-        .px_1()
-        .rounded_sm()
-        .border_1()
-        .border_color(border)
-        .text_xs()
-        .text_color(color)
-        .child(text.into())
+/// A section's fold chevron.
+fn fold_icon(collapsed: bool, color: Hsla) -> Icon {
+    Icon::new(if collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    })
+    .size_3()
+    .text_color(color)
+}
+
+/// A command's keybinding as the platform writes it: `cmd-1` reads `⌘1` on macOS.
+fn keybinding_text(keys: &str) -> String {
+    keys.split_whitespace()
+        .map(|key| Keystroke::parse(key).map_or_else(|_| key.to_owned(), |key| Kbd::format(&key)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 impl Render for CommandsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity().downgrade();
+        let header = chrome::panel_header("Commands", cx).child(
+            div().ml_auto().child(
+                chrome::icon_button("commands-add", IconName::Plus, cx)
+                    .tooltip("New command or collection")
+                    .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                        let (command, collection) = (panel.clone(), panel.clone());
+                        menu.min_w(px(200.))
+                            .item(
+                                PopupMenuItem::new("New command\u{2026}")
+                                    .icon(IconName::Plus)
+                                    .action(Box::new(NewCommand))
+                                    .on_click(move |_, window, cx| {
+                                        command
+                                            .update(cx, |panel, cx| panel.new_command(window, cx))
+                                            .ok();
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new("New collection\u{2026}")
+                                    .icon(IconName::ListPlus)
+                                    .action(Box::new(NewCollection))
+                                    .on_click(move |_, window, cx| {
+                                        collection
+                                            .update(cx, |panel, cx| {
+                                                panel.new_collection(window, cx)
+                                            })
+                                            .ok();
+                                    }),
+                            )
+                    }),
+            ),
+        );
         let theme = cx.theme();
-        let header = h_flex()
-            .justify_between()
-            .px_3()
-            .h(px(32.))
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child("COMMANDS")
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("new-command")
-                            .label("New")
-                            .tooltip("New command")
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_command(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("new-collection")
-                            .label("Collection…")
-                            .tooltip("New collection")
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_collection(window, cx);
-                            })),
-                    ),
-            );
-        let filter = div()
-            .px_2()
-            .pb_1()
-            .child(Input::new(&self.filter).id("commands-filter").small());
+        let filter = div().flex_none().px_2().pb_1().child(
+            Input::new(&self.filter)
+                .id("commands-filter")
+                .small()
+                .prefix(Icon::new(IconName::Search).text_color(theme.muted_foreground)),
+        );
         let body = if self.rows.is_empty() {
             v_flex()
                 .flex_1()
-                .p_3()
+                .px_3()
+                .py_2()
                 .text_sm()
                 .text_color(theme.muted_foreground)
                 .child(if self.filter_text(cx).trim().is_empty() {
@@ -793,21 +857,27 @@ impl Render for CommandsPanel {
                 })
                 .into_any_element()
         } else {
-            uniform_list(
-                "command-list",
-                self.rows.len(),
-                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                    let rows: Vec<Row> = this.rows[range.clone()].to_vec();
-                    range
-                        .zip(rows.iter())
-                        .map(|(ix, row)| this.render_row(ix, row, cx))
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .track_scroll(&self.scroll)
-            .flex_1()
-            .into_any_element()
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    uniform_list(
+                        "command-list",
+                        self.rows.len(),
+                        cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                            let rows: Vec<Row> = this.rows[range.clone()].to_vec();
+                            range
+                                .zip(rows.iter())
+                                .map(|(ix, row)| this.render_row(ix, row, cx))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&self.scroll)
+                    .size_full(),
+                )
+                .into_any_element()
         };
+        let theme = cx.theme();
         v_flex()
             .id("commands-panel")
             .key_context(context::COMMANDS_PANEL)
@@ -821,13 +891,12 @@ impl Render for CommandsPanel {
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .border_t_1()
-            .border_color(theme.border)
             .child(header)
             .child(filter)
             .child(body)
             .children(self.notice.clone().map(|notice| {
                 div()
+                    .flex_none()
                     .px_3()
                     .py_1()
                     .text_xs()

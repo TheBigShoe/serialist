@@ -27,6 +27,7 @@ pub mod history;
 pub mod icons;
 pub mod inline;
 pub mod keymap;
+pub mod palette;
 pub mod param_prompt;
 pub mod port_settings;
 pub mod script_bridge;
@@ -44,6 +45,8 @@ pub mod theme_bridge;
 pub mod toolbar;
 pub mod workspace;
 
+#[cfg(test)]
+mod chrome_tests;
 #[cfg(test)]
 mod commands_tests;
 #[cfg(test)]

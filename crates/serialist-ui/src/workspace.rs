@@ -1,6 +1,19 @@
-//! The window's root view: the Devices and Commands panels on the left, a tab per open
-//! port in the center, the Decoded panel and the Script console on the right, the
-//! status line along the bottom.
+//! The window's root view: the Devices and Commands panels in the left dock, a tab per
+//! open port in the center, the Decoded panel and the Script console in the right dock,
+//! the status line along the bottom.
+//!
+//! # Docks
+//!
+//! Each dock stands next to a rail of icons, one per panel, that opens and closes it;
+//! narrow windows collapse the docks to their rails (see [`docks`](crate::docks)). The
+//! Decoded panel opens when the active session decodes and closes when it stops; the
+//! Script console opens when a script on the active tab prints. The widths are saved in
+//! `state.json` with the tabs.
+//!
+//! # The command palette
+//!
+//! `command_palette::Toggle` opens [`CommandPalette`] in a dialog; what it confirms runs
+//! here (see [`palette`](crate::palette)).
 //!
 //! # Tabs
 //!
@@ -77,19 +90,24 @@ use serialist_core::{
 };
 use serialist_script::ScriptSource;
 
+use crate::actions::command_palette::Toggle as ToggleCommandPalette;
 use crate::actions::scripts::{ClearConsole, Run as RunScript, RunInline, Stop as StopScript};
 use crate::actions::tabs::{
     ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5, ActivateTab6,
     ActivateTab7, ActivateTab8, ActivateTab9, CloseTab, NewTab, NextTab, PreviousTab,
 };
 use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
+use crate::chrome;
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
 use crate::config::{self, Config};
 use crate::decoded_panel::DecodedPanel;
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
+use crate::dialog_footer::DialogButtons;
+use crate::docks::{CENTER_MIN, DockPanel, DockSide, Docks, RAIL_WIDTH};
 use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
 use crate::inline::Mode;
+use crate::palette::{self, CommandPalette, PaletteEvent, PaletteTarget};
 use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
 use crate::port_settings::PortSettings;
 use crate::prelude::*;
@@ -102,8 +120,6 @@ use crate::session_state::{STATE_VERSION, SavedTab, SessionState, state_path};
 use crate::session_view::{SessionView, SessionViewEvent};
 use crate::status::{ConnectionState, Notice, StatusLine};
 use crate::tabs::{TabId, TabLabel, TabState, TabStatus};
-
-const STATUS_LINE_HEIGHT: Pixels = px(26.);
 
 /// The widest a tab grows; longer names are cut with an ellipsis.
 const TAB_MAX_WIDTH: Pixels = px(240.);
@@ -309,6 +325,14 @@ pub struct Workspace {
     next_tab: u64,
     /// The tab a close confirmation is open for.
     pending_close: Option<TabId>,
+    /// The panels open and the dock widths.
+    docks: Docks,
+    /// Whether the active session decoded when last looked at, for the Decoded panel.
+    decoding_seen: Option<bool>,
+    /// The command palette, while it is open.
+    palette: Option<Entity<CommandPalette>>,
+    /// The keystrokes that open the palette, for the empty center to mention.
+    palette_binding: Option<String>,
     /// The window title last set.
     window_title: String,
     opener: Arc<dyn SessionOpener>,
@@ -319,6 +343,7 @@ pub struct Workspace {
     store: Option<StoreConfig>,
     focus_handle: FocusHandle,
     _param_prompt_events: Option<Subscription>,
+    _palette_events: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -344,9 +369,13 @@ impl Workspace {
                 devices.select_port(port, window, cx);
             });
         }
+        let saved = workspace.saved_state(cx);
+        if let Some(docks) = saved.as_ref().and_then(|state| state.docks) {
+            workspace.docks = Docks::restored(&docks);
+        }
         if !options.open_ports.is_empty() {
             workspace.open_ports(options.open_ports, window, cx);
-        } else if let Some(state) = workspace.saved_state(cx) {
+        } else if let Some(state) = saved {
             workspace.restore(state, window, cx);
         }
         workspace
@@ -443,6 +472,10 @@ impl Workspace {
             active: None,
             next_tab: 0,
             pending_close: None,
+            docks: Docks::default(),
+            decoding_seen: None,
+            palette: None,
+            palette_binding: None,
             window_title: APP_TITLE.to_owned(),
             opener,
             port_source,
@@ -450,6 +483,7 @@ impl Workspace {
             store: None,
             focus_handle: cx.focus_handle(),
             _param_prompt_events: None,
+            _palette_events: None,
             _subscriptions: vec![
                 devices_events,
                 commands_events,
@@ -735,6 +769,7 @@ impl Workspace {
             console.show_source(source, cx);
         });
         self.focus_active(window, cx);
+        self.sync_decoded_panel(cx);
         tracing::debug!(tab = ?self.active, "tab shown");
         cx.notify();
     }
@@ -830,11 +865,7 @@ impl Workspace {
                 .title(title.clone())
                 .w(px(420.))
                 .child(div().text_sm().child(message.clone()))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Close Tab")
-                        .show_cancel(true),
-                )
+                .footer(DialogButtons::new("Close Tab"))
                 // Closing the dialog is part of confirming.
                 .on_ok(move |_, window, cx| {
                     confirm
@@ -919,6 +950,7 @@ impl Workspace {
     fn session_notified(&mut self, id: TabId, view: &Entity<SessionView>, cx: &mut Context<Self>) {
         self.sync_connected_ports(cx);
         if self.active == Some(id) {
+            self.sync_decoded_panel(cx);
             cx.notify();
             return;
         }
@@ -1232,6 +1264,7 @@ impl Workspace {
                     this.console.update(cx, |console, cx| {
                         console.push_lines_to(Some(id), lines.iter().cloned(), cx);
                     });
+                    this.reveal_console(Some(id), cx);
                 }
                 SessionViewEvent::Reconnect => this.reconnect_tab(id, window, cx),
             },
@@ -1344,6 +1377,7 @@ impl Workspace {
             version: STATE_VERSION,
             active,
             tabs,
+            docks: Some(self.docks.saved()),
         }
     }
 
@@ -1487,12 +1521,7 @@ impl Workspace {
                 .title(title.clone())
                 .w(px(420.))
                 .child(prompt.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text("Send")
-                        .show_cancel(true),
-                )
-                // Confirming emits the values; the subscription sends and closes.
+                // The prompt ends in its own Send and Cancel buttons. Confirming emits the values; the subscription sends and closes.
                 .on_ok(move |_, _, cx| {
                     confirm.update(cx, |prompt, cx| prompt.confirm(cx));
                     false
@@ -1623,6 +1652,7 @@ impl Workspace {
         self.console.update(cx, |console, cx| {
             console.push_lines_to(tab, [ConsoleLine::new(ConsoleKind::Error, message)], cx);
         });
+        self.reveal_console(tab, cx);
     }
 
     fn run_script_action(
@@ -1689,6 +1719,125 @@ impl Workspace {
         }
     }
 
+    // --- The command palette -------------------------------------------------------------
+
+    /// The command palette, while it is open.
+    pub fn palette(&self) -> Option<&Entity<CommandPalette>> {
+        self.palette.as_ref()
+    }
+
+    /// Where the palette's actions may run from, best first: `previous` (what had the
+    /// focus before it opened), then the active session's terminal, compose bar and view,
+    /// the panels, and the workspace.
+    fn palette_targets(&self, previous: Option<FocusHandle>, cx: &App) -> Vec<FocusHandle> {
+        let mut handles: Vec<FocusHandle> = previous.into_iter().collect();
+        if let Some(session) = self.session() {
+            let view = session.read(cx);
+            handles.push(view.terminal().focus_handle(cx));
+            handles.push(view.compose().read(cx).input().focus_handle(cx));
+            handles.push(view.focus_handle(cx));
+        }
+        handles.push(self.devices.focus_handle(cx));
+        handles.push(self.commands.focus_handle(cx));
+        handles.push(self.console.focus_handle(cx));
+        handles.push(self.decoded.focus_handle(cx));
+        handles.push(self.focus_handle.clone());
+        handles
+    }
+
+    /// Open the command palette in a dialog, or close it if it is open.
+    pub fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            window.close_dialog(cx);
+            cx.notify();
+            return;
+        }
+        let previous = window.focused(cx);
+        let targets = self.palette_targets(previous, cx);
+        let entries = palette::entries(&targets, window, cx);
+        let palette = cx.new(|cx| CommandPalette::new(entries, window, cx));
+        self._palette_events = Some(cx.subscribe_in(
+            &palette,
+            window,
+            move |this, _, event, window, cx| match event {
+                PaletteEvent::Confirmed(target) => {
+                    this.palette = None;
+                    window.close_dialog(cx);
+                    let target = target.clone();
+                    let targets = targets.clone();
+                    let workspace = cx.entity().downgrade();
+                    // Once the dialog is gone, from where the action would run.
+                    window.defer(cx, move |window, cx| {
+                        workspace
+                            .update(cx, |this, cx| {
+                                this.run_palette_target(target, &targets, window, cx);
+                            })
+                            .ok();
+                    });
+                }
+            },
+        ));
+        self.palette = Some(palette.clone());
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm = palette.clone();
+            let closed = this.clone();
+            dialog
+                .w(px(600.))
+                .margin_top(px(72.))
+                .close_button(false)
+                .child(palette.clone())
+                // Enter: the palette runs its selection and the workspace closes it.
+                .on_ok(move |_, _, cx| {
+                    confirm.update(cx, |palette, cx| palette.confirm(cx));
+                    false
+                })
+                .on_close(move |_, _, cx| {
+                    closed
+                        .update(cx, |workspace, _| workspace.palette = None)
+                        .ok();
+                })
+        });
+        if let Some(palette) = &self.palette {
+            palette.update(cx, |palette, cx| palette.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Run what the palette confirmed.
+    fn run_palette_target(
+        &mut self,
+        target: PaletteTarget,
+        targets: &[FocusHandle],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        tracing::info!(?target, "from the command palette");
+        match target {
+            PaletteTarget::Command(reference) => self.send_command(reference, window, cx),
+            PaletteTarget::Script(path) => {
+                self.run_script_path(Path::new(&path), "palette", window, cx);
+            }
+            PaletteTarget::Action(action) => {
+                let handle = palette::target_for(action.as_ref(), targets, window).cloned();
+                // Its handler may be the workspace's own, which is busy now.
+                window.defer(cx, move |window, cx| match handle {
+                    Some(handle) => handle.dispatch_action(action.as_ref(), window, cx),
+                    None => window.dispatch_action(action, cx),
+                });
+            }
+        }
+    }
+
+    fn toggle_command_palette(
+        &mut self,
+        _: &ToggleCommandPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_palette(window, cx);
+    }
+
     fn new_tab_action(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         self.new_tab(window, cx);
     }
@@ -1710,6 +1859,79 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.activate_next(false, window, cx);
+    }
+
+    // --- Docks --------------------------------------------------------------------------
+
+    /// Which panels are open, and the dock widths.
+    pub fn docks(&self) -> &Docks {
+        &self.docks
+    }
+
+    /// Whether `panel` is on screen: open, in a dock the window width leaves room for.
+    pub fn is_panel_shown(&self, panel: DockPanel) -> bool {
+        self.docks.is_shown(panel)
+    }
+
+    /// The rail's click: close `panel` if it shows, else open it (in a narrow window too).
+    pub fn toggle_panel(&mut self, panel: DockPanel, cx: &mut Context<Self>) {
+        self.docks.toggle(panel);
+        tracing::debug!(
+            ?panel,
+            shown = self.docks.is_shown(panel),
+            "dock panel toggled"
+        );
+        cx.notify();
+    }
+
+    /// Open or close `panel` as the user would (opening it in a narrow window too).
+    pub fn set_panel_open(&mut self, panel: DockPanel, open: bool, cx: &mut Context<Self>) {
+        if self.docks.set_open(panel, open) {
+            cx.notify();
+        }
+    }
+
+    /// Drag a dock to `width`.
+    pub fn resize_dock(&mut self, side: DockSide, width: Pixels, cx: &mut Context<Self>) {
+        self.docks.resize(side, width);
+        cx.notify();
+    }
+
+    /// The Decoded panel follows the active session: open while it decodes, closed while
+    /// it does not. Only a change does anything, so the user's own choice stands until the
+    /// codec (or the tab) changes.
+    fn sync_decoded_panel(&mut self, cx: &mut Context<Self>) {
+        let decoding = self
+            .session()
+            .is_some_and(|session| session.read(cx).codec().is_some());
+        if self.decoding_seen != Some(decoding) {
+            self.decoding_seen = Some(decoding);
+            self.docks.show_by_app(DockPanel::Decoded, decoding);
+            cx.notify();
+        }
+    }
+
+    /// Script output for the active tab: open the Script console to show it.
+    fn reveal_console(&mut self, tab: Option<TabId>, cx: &mut Context<Self>) {
+        if tab == self.active && !self.docks.is_open(DockPanel::Scripts) {
+            self.docks.show_by_app(DockPanel::Scripts, true);
+            cx.notify();
+        }
+    }
+
+    fn drag_dock(
+        &mut self,
+        event: &DragMoveEvent<DockDrag>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let x = event.event.position.x;
+        let side = event.drag(cx).0;
+        let width = match side {
+            DockSide::Left => x - RAIL_WIDTH,
+            DockSide::Right => window.viewport_size().width - x - RAIL_WIDTH,
+        };
+        self.resize_dock(side, width, cx);
     }
 
     // --- Rendering -------------------------------------------------------------------
@@ -1734,15 +1956,7 @@ impl Workspace {
         let dot = div()
             .id(("tab-dot", id.0 as usize))
             .flex_none()
-            .size_2()
-            .rounded_full()
-            .map(|dot| {
-                if hollow {
-                    dot.border_1().border_color(color)
-                } else {
-                    dot.bg(color)
-                }
-            })
+            .child(chrome::state_dot(color, hollow))
             .tooltip(move |window, cx| Tooltip::new(state.clone()).build(window, cx));
         let title = SharedString::from(label.title);
         let muted = theme.muted_foreground;
@@ -1758,18 +1972,17 @@ impl Workspace {
                 h_flex()
                     .gap_1()
                     .pr_1()
+                    .items_center()
                     .children(label.unseen.map(|unseen| {
                         div()
-                            .text_xs()
+                            .text_size(chrome::LABEL_SIZE)
                             .text_color(muted)
                             .child(SharedString::from(unseen))
                     }))
                     .child(
-                        Button::new(("close-tab", id.0 as usize))
-                            .label("\u{00d7}")
-                            .tooltip("Close tab")
+                        chrome::icon_button(("close-tab", id.0 as usize), IconName::X, cx)
                             .xsmall()
-                            .ghost()
+                            .tooltip_with_action("Close tab", &CloseTab, Some(context::WORKSPACE))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.request_close(id, window, cx);
@@ -1803,11 +2016,8 @@ impl Workspace {
             .children(tabs)
             .suffix(
                 div().px_1().child(
-                    Button::new("new-tab")
-                        .label("+")
-                        .tooltip("New tab")
-                        .xsmall()
-                        .ghost()
+                    chrome::icon_button("new-tab", IconName::Plus, cx)
+                        .tooltip_with_action("New tab", &NewTab, Some(context::WORKSPACE))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.new_tab(window, cx);
                         })),
@@ -1820,11 +2030,11 @@ impl Workspace {
     fn render_placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
         let (title, message, reconnect) = match self.active_tab() {
             Some(tab) if tab.connecting => (
-                "No session".to_owned(),
                 format!(
                     "Opening {}\u{2026}",
                     tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
                 ),
+                "The port opens in the background.".to_owned(),
                 None,
             ),
             Some(tab) if tab.port.is_some() => (
@@ -1839,24 +2049,54 @@ impl Workspace {
             ),
             _ => (
                 "No session".to_owned(),
-                "Select a port and press Enter, or click Connect.".to_owned(),
+                "Pick a port in Devices and press Enter, or double-click it.".to_owned(),
                 None,
             ),
         };
+        let palette_key = self.palette_binding.clone();
         let theme = cx.theme();
         v_flex()
             .size_full()
             .items_center()
             .justify_center()
-            .gap_1()
+            .gap_2()
             .bg(theme.background)
             .text_color(theme.muted_foreground)
-            .child(div().text_lg().child(SharedString::from(title)))
+            .child(
+                div()
+                    .flex_none()
+                    .size_10()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(theme.muted)
+                    .child(
+                        Icon::new(IconName::Usb)
+                            .size_5()
+                            .text_color(theme.muted_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .text_color(theme.foreground)
+                    .child(SharedString::from(title)),
+            )
             .child(div().text_sm().child(SharedString::from(message)))
+            .when_some(palette_key, |this, key| {
+                this.child(
+                    div()
+                        .pt_1()
+                        .text_size(chrome::LABEL_SIZE)
+                        .child(SharedString::from(format!("{key} for every action"))),
+                )
+            })
             .when_some(reconnect, |this, id| {
                 this.child(
                     div().pt_2().child(
                         Button::new("reconnect-tab")
+                            .icon(IconName::Plug)
                             .label("Connect")
                             .small()
                             .primary()
@@ -1875,8 +2115,11 @@ impl Workspace {
             None => self.render_placeholder(cx),
         };
         v_flex()
-            .size_full()
-            .min_w_0()
+            .id("center")
+            .test_support()
+            .flex_1()
+            .h_full()
+            .min_w(CENTER_MIN)
             .when(self.shows_tab_bar(), |this| {
                 this.child(self.render_tab_bar(cx))
             })
@@ -1884,22 +2127,149 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_status_line(&self, cx: &mut Context<Self>) -> Div {
+    /// A dock's rail: an icon per panel, pressed while the panel shows.
+    fn render_rail(&self, side: DockSide, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let (border, background) = (theme.border, theme.sidebar);
+        let expanded = self.docks.is_expanded(side);
+        let panels = DockPanel::ALL
+            .into_iter()
+            .filter(|panel| panel.side() == side)
+            .map(|panel| {
+                let shown = self.docks.is_shown(panel);
+                chrome::toggle_button(panel.rail_id(), rail_icon(panel), shown, cx)
+                    .tooltip_placement(match side {
+                        DockSide::Left => Placement::Right,
+                        DockSide::Right => Placement::Left,
+                    })
+                    .tooltip(if shown {
+                        format!("Hide {}", panel.title())
+                    } else {
+                        format!("Show {}", panel.title())
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(panel, cx)))
+            })
+            .collect::<Vec<_>>();
+        v_flex()
+            .flex_none()
+            .w(RAIL_WIDTH)
+            .h_full()
+            .pt_1()
+            .gap_1()
+            .items_center()
+            .bg(background)
+            // The edge toward the center, when no panel stands between.
+            .when(!expanded, |rail| match side {
+                DockSide::Left => rail.border_r_1().border_color(border),
+                DockSide::Right => rail.border_l_1().border_color(border),
+            })
+            .children(panels)
+    }
+
+    /// A dock: its panels, stacked, at `width`, with a handle on its inner edge.
+    fn render_dock(&self, side: DockSide, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (border, background, drag_border) = (theme.border, theme.sidebar, theme.drag_border);
+        let (first, second, split, first_size): (AnyView, AnyView, &'static str, Pixels) =
+            match side {
+                DockSide::Left => (
+                    self.devices.clone().into(),
+                    self.commands.clone().into(),
+                    "left-dock-split",
+                    px(280.),
+                ),
+                DockSide::Right => (
+                    self.decoded.clone().into(),
+                    self.console.clone().into(),
+                    "right-dock-split",
+                    px(380.),
+                ),
+            };
+        let (first_panel, second_panel) = match side {
+            DockSide::Left => (DockPanel::Devices, DockPanel::Commands),
+            DockSide::Right => (DockPanel::Decoded, DockPanel::Scripts),
+        };
+        let content = match (
+            self.docks.is_open(first_panel),
+            self.docks.is_open(second_panel),
+        ) {
+            (true, true) => v_resizable(split)
+                .child(
+                    resizable_panel()
+                        .size(first_size)
+                        .size_range(px(120.)..px(1200.))
+                        .child(first),
+                )
+                .child(resizable_panel().child(second))
+                .into_any_element(),
+            (true, false) => first.into_any_element(),
+            _ => second.into_any_element(),
+        };
+        let handle = div()
+            .id(match side {
+                DockSide::Left => "left-dock-handle",
+                DockSide::Right => "right-dock-handle",
+            })
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(px(5.))
+            .map(|handle| match side {
+                DockSide::Left => handle.right(px(-3.)),
+                DockSide::Right => handle.left(px(-3.)),
+            })
+            .cursor_col_resize()
+            .hover(|style| style.bg(drag_border.opacity(0.6)))
+            .on_drag(DockDrag(side), |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            });
+        div()
+            .id(match side {
+                DockSide::Left => "left-dock",
+                DockSide::Right => "right-dock",
+            })
+            .test_support()
+            .flex_none()
+            .relative()
+            .w(width)
+            .h_full()
+            .bg(background)
+            .map(|dock| match side {
+                DockSide::Left => dock.border_r_1().border_color(border),
+                DockSide::Right => dock.border_l_1().border_color(border),
+            })
+            .child(div().size_full().overflow_hidden().child(content))
+            .child(handle)
+            .into_any_element()
+    }
+
+    fn render_status_line(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let line = h_flex()
+            .id("status-line")
             .flex_none()
-            .h(STATUS_LINE_HEIGHT)
-            .px_3()
-            .gap_4()
+            .overflow_hidden()
+            .h(chrome::STATUS_HEIGHT)
+            .pl_1()
+            .pr_2()
+            .gap_2()
+            .items_center()
             .border_t_1()
             .border_color(theme.status_bar_border)
             .bg(theme.status_bar)
-            .text_xs()
+            .text_size(chrome::LABEL_SIZE)
             .text_color(theme.muted_foreground);
+        let config_notice = self.config_notice(cx).map(|notice| {
+            let color = if notice.is_error {
+                theme.danger
+            } else {
+                theme.warning
+            };
+            status_notice("status-config", notice.text, color)
+        });
 
-        let dot = |color: Hsla| div().flex_none().size_2().rounded_full().bg(color);
-
-        let Some(session) = self.session() else {
+        let Some(session) = self.session().cloned() else {
             let label = match self.active_tab() {
                 Some(tab) if tab.connecting => format!(
                     "Opening {}\u{2026}",
@@ -1911,95 +2281,196 @@ impl Workspace {
                 ),
                 _ => "No session".to_owned(),
             };
-            return line.child(
-                h_flex()
-                    .gap_1p5()
-                    .child(dot(theme.muted_foreground))
-                    .child(SharedString::from(label)),
-            );
+            return line
+                .child(
+                    h_flex()
+                        .px_1()
+                        .gap_1p5()
+                        .items_center()
+                        .child(chrome::state_dot(theme.muted_foreground, true))
+                        .child(SharedString::from(label)),
+                )
+                .child(h_flex().flex_1().min_w_0().children(config_notice))
+                .into_any_element();
         };
 
-        let session = session.read(cx);
-        let state_color = match session.state() {
+        let view = session.read(cx);
+        let status = view.status_line();
+        let inline = view.mode() == Mode::Inline;
+        let state_color = match view.state() {
             ConnectionState::Connected => theme.success,
             ConnectionState::Disconnected { error: None } => theme.muted_foreground,
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
         };
-        let status = session.status_line();
-        let inline = session.mode() == Mode::Inline;
-        line.child(
-            h_flex()
-                .gap_1p5()
-                .child(dot(state_color))
-                .child(status.state),
-        )
-        .child(
-            div()
-                .id("status-mode")
-                .flex_none()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(if inline { theme.warning } else { theme.border })
-                .text_color(if inline {
-                    theme.warning
-                } else {
-                    theme.muted_foreground
-                })
-                .child(status.mode),
-        )
-        .child(
-            div()
-                .font_family(theme.mono_font_family.clone())
-                .truncate()
-                .child(SharedString::from(status.title)),
-        )
-        .children(status.settings.map(SharedString::from))
-        .child(SharedString::from(status.rx))
-        .child(SharedString::from(status.tx))
-        .child(SharedString::from(status.retained))
-        .children(status.evicted.map(SharedString::from))
-        .children(status.paused.map(|paused| {
-            div()
-                .text_color(theme.warning)
-                .child(SharedString::from(paused))
-        }))
-        .children(status.paste.map(|paste| {
-            div()
-                .text_color(theme.info)
-                .child(SharedString::from(paste))
-        }))
-        .children(status.script.map(|script| {
-            div()
-                .id("status-script")
-                .flex_none()
-                .text_color(theme.info)
-                .child(SharedString::from(script))
-        }))
-        .children(status.codec.map(|codec| {
-            div()
+        let disconnected = view.state().is_disconnected();
+        let port = view.port().to_string();
+        let settings = view.serial().summary();
+        let form = view.port_form().clone();
+        let (foreground, warning, danger, info, border) = (
+            theme.foreground,
+            theme.warning,
+            theme.danger,
+            theme.info,
+            theme.border,
+        );
+
+        // The connection: state, port and settings, one segment that opens the settings.
+        let sync = session.downgrade();
+        let connection = Popover::new("status-port-popover")
+            .anchor(Anchor::BottomLeft)
+            .trigger(
+                Button::new("status-port")
+                    .ghost()
+                    .xsmall()
+                    .tooltip(format!("{}: port settings", status.state))
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(chrome::state_dot(state_color, disconnected))
+                            .child(div().text_color(foreground).child(SharedString::from(port)))
+                            .child(SharedString::from(settings)),
+                    ),
+            )
+            .content(move |_, _, _| form.clone())
+            .on_open_change(move |open: &bool, window, cx| {
+                if *open {
+                    sync.update(cx, |view, cx| view.sync_port_form(window, cx))
+                        .ok();
+                }
+            });
+
+        // The newest notice, cut to fit, all of it in the tooltip.
+        let notice = status.notice.clone().map(|notice| {
+            let color = if notice.is_error {
+                danger
+            } else {
+                theme.muted_foreground
+            };
+            status_notice("status-notice", notice.text, color)
+        });
+
+        let mode = div()
+            .id("status-mode")
+            .flex_none()
+            .h(px(16.))
+            .px_1p5()
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if inline { warning } else { border })
+            .text_color(if inline {
+                warning
+            } else {
+                theme.muted_foreground
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.list_hover))
+            .child(status.mode)
+            .tooltip(|window, cx| {
+                Tooltip::new("Switch between command and inline mode")
+                    .action(&ToggleInline, Some(context::WORKSPACE))
+                    .build(window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_inline(&ToggleInline, window, cx);
+            }));
+
+        // RX with its rate, and what the scrollback keeps in the tooltip.
+        let mut details = vec![status.retained.clone()];
+        details.extend(status.evicted.clone());
+        details.extend(status.paste.clone());
+        let details = SharedString::from(details.join("\n"));
+        let rx = h_flex()
+            .id("status-rx")
+            .flex_none()
+            .gap_1()
+            .child(SharedString::from(status.rx.clone()))
+            .children(
+                status
+                    .rx_rate
+                    .clone()
+                    .map(|rate| div().text_color(info).child(SharedString::from(rate))),
+            )
+            .children(
+                status
+                    .paste
+                    .clone()
+                    .map(|_| div().text_color(info).child("pasting")),
+            )
+            .tooltip(move |window, cx| Tooltip::new(details.clone()).build(window, cx));
+        let tx = h_flex()
+            .id("status-tx")
+            .flex_none()
+            .gap_1()
+            .child(SharedString::from(status.tx.clone()))
+            .children(
+                status
+                    .tx_rate
+                    .clone()
+                    .map(|rate| div().text_color(info).child(SharedString::from(rate))),
+            );
+
+        let codec = view.codec_name().map(|codec| {
+            chrome::chip(info)
                 .id("status-codec")
-                .flex_none()
-                .text_color(theme.info)
-                .child(SharedString::from(codec))
-        }))
-        .children(status.recording.map(|recording| {
-            h_flex()
-                .gap_1p5()
-                .text_color(theme.danger)
-                .child(dot(theme.danger))
-                .child(SharedString::from(recording))
-        }))
-        .children(status.notice.map(|notice| {
-            div()
-                .truncate()
-                .text_color(if notice.is_error {
-                    theme.danger
-                } else {
-                    theme.muted_foreground
+                .child(Icon::new(IconName::Braces).size_3())
+                .child(SharedString::from(codec.to_owned()))
+                .cursor_pointer()
+                .tooltip(|window, cx| {
+                    Tooltip::new("Decoding: show the Decoded panel").build(window, cx)
                 })
-                .child(SharedString::from(notice.text))
-        }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_panel_open(DockPanel::Decoded, true, cx);
+                }))
+        });
+        let paused = status.paused.clone().map(|paused| {
+            let short = paused
+                .split(", ")
+                .nth(1)
+                .map_or_else(|| "Paused".to_owned(), |since| format!("Paused {since}"));
+            let full = SharedString::from(paused);
+            chrome::chip(warning)
+                .id("status-paused")
+                .child(Icon::new(IconName::Pause).size_3())
+                .child(SharedString::from(short))
+                .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        });
+        let recording = status.recording.clone().map(|recording| {
+            chrome::chip(danger)
+                .id("status-recording")
+                .child(chrome::state_dot(danger, false))
+                .child(SharedString::from(recording))
+        });
+        let script = status.script.clone().map(|script| {
+            chrome::chip(info)
+                .id("status-script")
+                .child(Icon::new(IconName::ScrollText).size_3())
+                .child(SharedString::from(script))
+                .cursor_pointer()
+                .tooltip(|window, cx| Tooltip::new("Show the Script console").build(window, cx))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_panel_open(DockPanel::Scripts, true, cx);
+                }))
+        });
+        line.child(connection)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2()
+                    .children(notice)
+                    .children(config_notice),
+            )
+            .children(script)
+            .children(recording)
+            .children(paused)
+            .children(codec)
+            .child(mode)
+            .child(rx)
+            .child(tx)
+            .into_any_element()
     }
 
     /// The status line's text for the active tab's session, as rendered.
@@ -2012,23 +2483,38 @@ impl Workspace {
     pub fn config_notice(&self, cx: &App) -> Option<Notice> {
         cx.try_global::<Config>().and_then(Config::notice)
     }
+}
 
-    fn render_config_notice(&self, cx: &Context<Self>) -> Option<Div> {
-        let notice = self.config_notice(cx)?;
-        let theme = cx.theme();
-        let color = if notice.is_error {
-            theme.danger
-        } else {
-            theme.warning
-        };
-        Some(
-            div()
-                .ml_auto()
-                .min_w_0()
-                .truncate()
-                .text_color(color)
-                .child(SharedString::from(notice.text)),
-        )
+/// A notice in the status line: one line, cut with an ellipsis, whole in its tooltip.
+fn status_notice(id: &'static str, text: String, color: Hsla) -> Stateful<Div> {
+    let text = SharedString::from(text);
+    let tip = text.clone();
+    div()
+        .id(id)
+        .min_w_0()
+        .truncate()
+        .text_color(color)
+        .child(text)
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+}
+
+/// The icon of a panel on its rail.
+fn rail_icon(panel: DockPanel) -> IconName {
+    match panel {
+        DockPanel::Devices => IconName::Usb,
+        DockPanel::Commands => IconName::SquareTerminal,
+        DockPanel::Decoded => IconName::Braces,
+        DockPanel::Scripts => IconName::ScrollText,
+    }
+}
+
+/// A dock edge being dragged.
+#[derive(Clone)]
+struct DockDrag(DockSide);
+
+impl Render for DockDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
     }
 }
 
@@ -2039,6 +2525,29 @@ impl Render for Workspace {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        let viewport = window.viewport_size().width;
+        self.docks.observe_window_width(viewport);
+        let widths = self.docks.widths(viewport);
+        // The session's toolbar is laid out for the width the center gets.
+        let center = viewport
+            - RAIL_WIDTH * 2.
+            - widths.left.unwrap_or_default()
+            - widths.right.unwrap_or_default();
+        if let Some(session) = self.session().cloned() {
+            let hint = if center < CENTER_MIN {
+                CENTER_MIN
+            } else {
+                center
+            };
+            session.update(cx, |view, _| view.set_width_hint(Some(hint)));
+        }
+        if self.palette_binding.is_none() {
+            self.palette_binding = window
+                .highest_precedence_binding_for_action_in(&ToggleCommandPalette, &self.focus_handle)
+                .as_ref()
+                .and_then(chrome::keystroke_text);
+        }
+
         let theme = cx.theme();
         let background = theme.background;
         let foreground = theme.foreground;
@@ -2047,10 +2556,16 @@ impl Render for Workspace {
         let ui_font = cx
             .try_global::<Config>()
             .map(|config| config.ui_font().font.clone());
+        let left_rail = self.render_rail(DockSide::Left, cx);
+        let right_rail = self.render_rail(DockSide::Right, cx);
+        let left = widths
+            .left
+            .map(|width| self.render_dock(DockSide::Left, width, cx));
+        let right = widths
+            .right
+            .map(|width| self.render_dock(DockSide::Right, width, cx));
         let center = self.render_center(cx);
-        let status_line = self
-            .render_status_line(cx)
-            .children(self.render_config_notice(cx));
+        let status_line = self.render_status_line(cx);
 
         v_flex()
             .id("workspace")
@@ -2071,6 +2586,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_tab_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
+            .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(|this, _: &ActivateTab1, window, cx| {
                 this.activate_index(0, window, cx);
             }))
@@ -2098,45 +2614,21 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ActivateTab9, window, cx| {
                 this.activate_index(8, window, cx);
             }))
+            .on_drag_move(cx.listener(Self::drag_dock))
             .size_full()
             .when_some(ui_font, |this, font| this.font(font))
             .bg(background)
             .text_color(foreground)
             .child(
-                div().flex_1().min_h_0().w_full().child(
-                    h_resizable("workspace-columns")
-                        .child(
-                            resizable_panel()
-                                .size(px(280.))
-                                .size_range(px(200.)..px(520.))
-                                .child(
-                                    v_resizable("left-dock")
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(300.))
-                                                .size_range(px(120.)..px(900.))
-                                                .child(self.devices.clone()),
-                                        )
-                                        .child(resizable_panel().child(self.commands.clone())),
-                                ),
-                        )
-                        .child(resizable_panel().child(center))
-                        .child(
-                            resizable_panel()
-                                .size(px(400.))
-                                .size_range(px(220.)..px(960.))
-                                .child(
-                                    v_resizable("right-dock")
-                                        .child(
-                                            resizable_panel()
-                                                .size(px(380.))
-                                                .size_range(px(120.)..px(1200.))
-                                                .child(self.decoded.clone()),
-                                        )
-                                        .child(resizable_panel().child(self.console.clone())),
-                                ),
-                        ),
-                ),
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(left_rail)
+                    .children(left)
+                    .child(center)
+                    .children(right)
+                    .child(right_rail),
             )
             .child(status_line)
     }

@@ -6,7 +6,8 @@
 // (ctrl-s is XOFF), so most bindings here use shifted chords. Pause is the exception at
 // plain ctrl-p, which inline mode sends to the device; there it is ctrl-shift-p. So are
 // the tab numbers, ctrl-1 to ctrl-9, and ctrl-pageup/ctrl-pagedown, which inline mode
-// sends to the device too; there ctrl-shift-[ and ctrl-shift-] switch tabs.
+// sends to the device too; there ctrl-shift-[ and ctrl-shift-] switch tabs. ctrl-shift-p
+// opens the command palette, except in inline mode, where it is Pause.
 //
 // In inline mode (TerminalInline) the terminal sends every key it can encode to the
 // port, plain ctrl chords included; the bindings in that section are the exceptions,
@@ -20,6 +21,7 @@
   {
     "context": "Workspace",
     "bindings": {
+      "ctrl-shift-p": "command_palette::Toggle",
       "ctrl-shift-k": "terminal::Clear",
       "ctrl-shift-w": "tabs::CloseTab",
       "ctrl-alt-w": "serial::Disconnect",
@@ -64,6 +66,13 @@
     "bindings": {
       "up": "commands::SelectPrevious",
       "down": "commands::SelectNext"
+    }
+  },
+  {
+    "context": "CommandPalette > Input",
+    "bindings": {
+      "up": "command_palette::SelectPrevious",
+      "down": "command_palette::SelectNext"
     }
   },
   {
