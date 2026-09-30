@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 serialist-core.workspace = true
+serialist-script.workspace = true
 serialist-sim.workspace = true
 # gpui-kit re-exports GPUI and its platform crate, and GPUI's macros resolve through it,
 # so GPUI is not listed separately. Code reaches all of it through `prelude`.

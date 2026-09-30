@@ -60,6 +60,21 @@
 //! Export writes the selection, else what a paused view shows, else everything retained,
 //! from a snapshot on a background thread. Recording is a sink installed with the ingest
 //! thread and switched through a [`RecordingSlot`], so it starts and stops mid-session.
+//!
+//! # Scripts
+//!
+//! The ingest thread also rings a [`LineBell`](serialist_script::LineBell) through a
+//! [`ScriptLink`](crate::script_bridge::ScriptLink) sink, from the moment the session
+//! opens. Once the workspace calls [`SessionView::attach_scripts`], the view owns a
+//! [`SessionScripts`]: a script thread whose `serial.current()` writes through the
+//! session's [`SessionControl`](crate::session_handle::SessionControl) and reads this
+//! store. [`SessionView::run_script`] queues a run (one runs at a time; the others wait
+//! and the console says so); while any is queued a foreground task polls the runs once a
+//! frame, turns their events into console lines ([`SessionViewEvent::Script`]), opens the
+//! dialog a `ui.prompt` asks for, shows `ui.notify` in the status line and sends the
+//! saved commands `commands.send` names. The status line says what runs and for how
+//! long. Disconnecting stops every run and lets the script thread go, off the main
+//! thread.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -73,6 +88,7 @@ use serialist_core::{
     ParamValues, Payload, PortId, SearchMatch, SerialConfig, SessionStats, Snapshot, Store,
     TextOptions, Timestamps,
 };
+use serialist_script::{ScriptOutcome, ScriptSource};
 
 use crate::actions::{self, context};
 use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
@@ -85,12 +101,17 @@ use crate::inline::{
     paste_bytes, paste_echo,
 };
 use crate::prelude::*;
+use crate::script_bridge::{
+    ConsoleKind, ConsoleLine, GuiScriptSession, ScriptEffect, ScriptEnv, ScriptLinkParts,
+    SessionScripts, drop_host,
+};
+use crate::script_console::ScriptPrompt;
 use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
 use crate::session_options::SessionOptions;
 use crate::status::{
-    ConnectionState, Notice, PauseMark, RecordingStatus, StatusInputs, StatusLine, file_name,
-    format_bytes,
+    ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusInputs, StatusLine,
+    file_name, format_bytes,
 };
 use crate::terminal::{DisplayMode, TerminalView, TimestampMode};
 
@@ -109,6 +130,9 @@ pub const EXPECT_POLL: Duration = FRAME;
 pub enum SessionViewEvent {
     /// "Save as command" in the compose bar: open the editor on `text`.
     SaveAsCommand { text: String },
+    /// Lines for the Script console: what the session's scripts printed, logged and
+    /// asked, and how their runs went.
+    Script(Vec<ConsoleLine>),
 }
 
 /// What a sent command's echo line says: text payloads as sent without the line ending,
@@ -259,6 +283,15 @@ pub struct SessionView {
     remembered: HashMap<CommandRef, ParamValues>,
     /// The workspace's persisted compose history, which sent lines are added to.
     history: Option<Entity<PersistentHistory>>,
+    /// The bell and name scripts wait on, fed by one of the ingest thread's sinks.
+    script_link: ScriptLinkParts,
+    /// This session's scripts, once the workspace has attached them.
+    scripts: Option<SessionScripts>,
+    /// The dialog a script's `ui.prompt` opened, while it is open.
+    script_prompt: Option<Entity<ScriptPrompt>>,
+    /// The task polling the runs is alive.
+    script_polling: bool,
+    _script_poll: Option<Task<()>>,
     focus_handle: FocusHandle,
     _wake: Task<()>,
     _housekeeping: Task<()>,
@@ -335,12 +368,21 @@ impl SessionView {
                 })
                 .detach();
             }
+            // Dropping a script host joins its thread once the script has stopped.
+            if let Some(mut scripts) = this.scripts.take()
+                && let (Some(host), _) = scripts.detach("the session closed")
+            {
+                cx.background_spawn(async move { drop_host(host) }).detach();
+            }
         });
 
         let recording = RecordingSlot::default();
+        let script_link = ScriptLinkParts::default();
         let (doorbell, rings) = async_channel::bounded::<()>(1);
-        let mut sinks: Vec<Box<dyn ChunkSink>> =
-            vec![Box::new(RecordingSink::new(recording.clone()))];
+        let mut sinks: Vec<Box<dyn ChunkSink>> = vec![
+            Box::new(RecordingSink::new(recording.clone())),
+            Box::new(script_link.sink()),
+        ];
         sinks.extend(extra_sinks);
         let ingest = Ingest::spawn(
             session.events(),
@@ -420,6 +462,11 @@ impl SessionView {
             inline: InlineState::default(),
             remembered: HashMap::new(),
             history: None,
+            script_link,
+            scripts: None,
+            script_prompt: None,
+            script_polling: false,
+            _script_poll: None,
             focus_handle: cx.focus_handle(),
             _wake: wake,
             _housekeeping: housekeeping,
@@ -521,6 +568,7 @@ impl SessionView {
 
     /// The status line's text for this session.
     pub fn status_line(&self) -> StatusLine {
+        let script = self.script_status();
         StatusLine::new(StatusInputs {
             state: &self.state,
             title: self.title(),
@@ -532,6 +580,7 @@ impl SessionView {
             notice: self.notice.as_ref(),
             mode: self.mode,
             paste: self.paste_progress(),
+            script: script.as_ref(),
         })
     }
 
@@ -657,7 +706,8 @@ impl SessionView {
     }
 
     fn housekeeping(&mut self, cx: &mut Context<Self>) {
-        let mut changed = self.poll_session(cx);
+        // A running script's time in the status line moves on its own.
+        let mut changed = self.poll_session(cx) | self.script_status().is_some();
         let recorded = self
             .recording_status
             .as_ref()
@@ -835,6 +885,270 @@ impl SessionView {
                     "{name}: the session ended before a reply"
                 )));
             }
+        }
+        cx.notify();
+    }
+
+    // --- Scripts ---------------------------------------------------------------------
+
+    /// Give this session a script thread, whose `serial.current()` is this session. The
+    /// workspace calls it right after connecting; a disconnected view takes none.
+    pub fn attach_scripts(&mut self, env: ScriptEnv) {
+        if self.scripts.is_some() || self.state.is_disconnected() {
+            return;
+        }
+        let Some(ingest) = &self.ingest else {
+            return;
+        };
+        let session = GuiScriptSession {
+            port: self.port.clone(),
+            serial: self.serial.clone(),
+            control: self.session.as_ref().and_then(|session| session.control()),
+            reader: ingest.reader(),
+            link: self.script_link.clone(),
+        };
+        self.scripts = Some(SessionScripts::new(Arc::new(session), env));
+    }
+
+    /// Whether scripts can run on this session now.
+    pub fn scripts_attached(&self) -> bool {
+        self.scripts
+            .as_ref()
+            .is_some_and(SessionScripts::is_attached)
+    }
+
+    /// Queue `source` on this session's script thread; `origin` says what started it
+    /// (`console`, `key binding`, `on_connect`...). Returns whether it was queued: a
+    /// disconnected session says why in the console and the status line instead.
+    pub fn run_script(
+        &mut self,
+        source: ScriptSource,
+        origin: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let name = source.name.clone();
+        let queued = self
+            .scripts
+            .as_mut()
+            .and_then(|scripts| scripts.run(source, origin));
+        match queued {
+            Some(lines) => {
+                tracing::debug!(port = %self.port, %name, origin, "script queued");
+                self.emit_script_lines(lines, cx);
+                self.ensure_script_poll(window, cx);
+                cx.notify();
+                true
+            }
+            None => {
+                let message = format!("Not connected; {name} did not run");
+                self.emit_script_lines(vec![ConsoleLine::new(ConsoleKind::Error, &message)], cx);
+                self.notice = Some(Notice::error(message));
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// Stop the running script. Returns whether one was running.
+    pub fn stop_script(&mut self, cx: &mut Context<Self>) -> bool {
+        let stopped = self.scripts.as_mut().and_then(SessionScripts::stop_current);
+        if let Some(name) = &stopped {
+            tracing::debug!(port = %self.port, %name, "stopping script");
+        }
+        cx.notify();
+        stopped.is_some()
+    }
+
+    /// The script running on this session, for the status line.
+    pub fn script_status(&self) -> Option<ScriptStatus> {
+        self.scripts.as_ref()?.status()
+    }
+
+    /// The dialog a script's `ui.prompt` opened, while it is open.
+    pub fn script_prompt(&self) -> Option<&Entity<ScriptPrompt>> {
+        self.script_prompt.as_ref()
+    }
+
+    fn emit_script_lines(&mut self, lines: Vec<ConsoleLine>, cx: &mut Context<Self>) {
+        if !lines.is_empty() {
+            cx.emit(SessionViewEvent::Script(lines));
+        }
+    }
+
+    /// Stop every run and let the script thread go (joined off the main thread). The
+    /// runs' last lines still arrive: polling goes on until each has finished.
+    fn detach_scripts(&mut self, cx: &mut Context<Self>) {
+        let reason = match &self.state {
+            ConnectionState::Disconnected { error: Some(error) } => {
+                format!("the connection was lost: {error}")
+            }
+            _ => "the session was disconnected".to_owned(),
+        };
+        let Some(scripts) = self.scripts.as_mut() else {
+            return;
+        };
+        let (host, lines) = scripts.detach(&reason);
+        if let Some(host) = host {
+            cx.background_spawn(async move { drop_host(host) }).detach();
+        }
+        self.emit_script_lines(lines, cx);
+    }
+
+    /// Poll the runs once a frame while any is queued.
+    fn ensure_script_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_polling {
+            return;
+        }
+        self.script_polling = true;
+        self._script_poll = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FRAME).await;
+                let active = this
+                    .update_in(cx, |view, window, cx| view.poll_scripts(window, cx))
+                    .unwrap_or(false);
+                if !active {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Act on what the runs reported since the last look. Returns whether any run is
+    /// still queued, so polling should go on.
+    fn poll_scripts(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(scripts) = self.scripts.as_mut() else {
+            self.script_polling = false;
+            return false;
+        };
+        let effects = scripts.poll();
+        let active = scripts.is_active();
+        if !active {
+            self.script_polling = false;
+        }
+        if effects.is_empty() {
+            return active;
+        }
+        let mut lines = Vec::new();
+        for effect in effects {
+            match effect {
+                ScriptEffect::Line(line) => lines.push(line),
+                ScriptEffect::Prompt {
+                    label,
+                    default,
+                    answer,
+                } => self.open_script_prompt(label, default, answer, window, cx),
+                ScriptEffect::Notify(text) => self.notice = Some(Notice::info(text)),
+                ScriptEffect::SendCommand { reference, params } => {
+                    // What the script printed before the send shows before its echo.
+                    self.emit_script_lines(std::mem::take(&mut lines), cx);
+                    self.send_command_for_script(&reference, &params, cx);
+                }
+                ScriptEffect::Finished { name, outcome } => {
+                    if let Some(prompt) = self.script_prompt.take() {
+                        prompt.update(cx, |prompt, _| prompt.answer(None));
+                        window.close_dialog(cx);
+                        lines.push(ConsoleLine::new(
+                            ConsoleKind::Answer,
+                            "\u{2192} (closed: the script ended)",
+                        ));
+                    }
+                    self.notice = Some(match outcome {
+                        ScriptOutcome::Ok => Notice::info(format!("{name} finished")),
+                        ScriptOutcome::Error(message) => Notice::error(format!(
+                            "{name} failed: {}",
+                            message.lines().next().unwrap_or_default()
+                        )),
+                        ScriptOutcome::Stopped => Notice::info(format!("{name} stopped")),
+                    });
+                }
+            }
+        }
+        self.emit_script_lines(lines, cx);
+        cx.notify();
+        active
+    }
+
+    /// `commands.send` from a script: the command as the configuration has it now.
+    fn send_command_for_script(
+        &mut self,
+        reference: &CommandRef,
+        params: &ParamValues,
+        cx: &mut Context<Self>,
+    ) {
+        let command = cx
+            .try_global::<Config>()
+            .and_then(|config| config.commands().get(reference).cloned());
+        match command {
+            Some(command) => self.send_command(reference, &command, params, cx),
+            None => self.emit_script_lines(
+                vec![ConsoleLine::new(
+                    ConsoleKind::Error,
+                    format!("commands.send: {reference} is no longer saved"),
+                )],
+                cx,
+            ),
+        }
+    }
+
+    /// Open the dialog for a script's `ui.prompt`. Its answer goes to `answer`; a
+    /// second prompt while one is open (which a script cannot ask for) answers `nil`.
+    fn open_script_prompt(
+        &mut self,
+        label: String,
+        default: Option<String>,
+        answer: async_channel::Sender<Option<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.script_prompt.is_some() {
+            return;
+        }
+        let title = SharedString::from(match self.script_status() {
+            Some(status) => format!("{} asks", status.name),
+            None => "A script asks".to_owned(),
+        });
+        let prompt = cx.new(|cx| ScriptPrompt::new(label, default, answer, window, cx));
+        self.script_prompt = Some(prompt.clone());
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm = view.clone();
+            let closed = view.clone();
+            dialog
+                .title(title.clone())
+                .w(px(420.))
+                .child(prompt.clone())
+                .button_props(DialogButtonProps::default().ok_text("OK").show_cancel(true))
+                .on_ok(move |_, _, cx| {
+                    confirm
+                        .update(cx, |view, cx| view.answer_script_prompt(true, cx))
+                        .ok();
+                    true
+                })
+                // Cancel, Escape and the close button; after OK it finds nothing to do.
+                .on_close(move |_, _, cx| {
+                    closed
+                        .update(cx, |view, cx| view.answer_script_prompt(false, cx))
+                        .ok();
+                })
+        });
+        cx.notify();
+    }
+
+    /// Answer the open prompt with its text (`confirm`) or `nil`, and echo the answer in
+    /// the console.
+    pub fn answer_script_prompt(&mut self, confirm: bool, cx: &mut Context<Self>) {
+        let Some(prompt) = self.script_prompt.take() else {
+            return;
+        };
+        let answer = confirm.then(|| prompt.read(cx).value(cx));
+        let waiting = prompt.update(cx, |prompt, _| prompt.answer(answer.clone()));
+        if waiting {
+            let echo = match answer {
+                Some(text) => format!("\u{2192} {text}"),
+                None => "\u{2192} (dismissed)".to_owned(),
+            };
+            self.emit_script_lines(vec![ConsoleLine::new(ConsoleKind::Answer, echo)], cx);
         }
         cx.notify();
     }
@@ -1144,8 +1458,10 @@ impl SessionView {
     }
 
     /// Close the session off the main thread; ingest stores its `Disconnected` notice.
+    /// Scripts running on it are stopped.
     fn close_session(&mut self, cx: &mut Context<Self>) {
         self.stop_recording(cx);
+        self.detach_scripts(cx);
         if let Some(session) = self.session.take() {
             self.stats = session.stats();
             cx.background_spawn(async move { session.close() }).detach();

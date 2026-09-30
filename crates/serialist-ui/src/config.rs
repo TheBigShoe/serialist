@@ -596,6 +596,7 @@ pub fn install(mut config: Config, cx: &mut App) {
         !Arc::ptr_eq(&previous.keymap, &config.keymap)
             || !Arc::ptr_eq(&previous.commands, &config.commands)
     });
+    let new_scripts = previous.is_none_or(|previous| previous.scripts != config.scripts);
     config.check_fonts(cx);
     theme_bridge::apply_kit_theme(config.kit_theme(), cx);
     if rebind {
@@ -610,6 +611,10 @@ pub fn install(mut config: Config, cx: &mut App) {
         config.set_problems(ConfigPiece::Bindings, problems);
     }
     cx.set_global(config);
+    // The Scripts menu lists them.
+    if new_scripts {
+        crate::actions::set_menus(cx);
+    }
 }
 
 /// Change the installed configuration with `edit`, then install the result.
