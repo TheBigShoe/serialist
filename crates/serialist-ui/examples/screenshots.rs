@@ -157,6 +157,22 @@ const SHOTS: &[Shot] = &[
         connect: Some("virtual:at"),
         drive: param_prompt,
     },
+    Shot {
+        file: "12-palette.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: Some("virtual:at"),
+        drive: palette,
+    },
+    Shot {
+        file: "13-narrow-overflow.png",
+        size: NARROW,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: Some("virtual:race"),
+        drive: overflow_menu,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -272,6 +288,36 @@ fn param_prompt(stage: &mut Stage) {
     run_until(&mut stage.cx, "the parameter prompt", |cx| {
         workspace.read_with(cx, |w, _| w.param_prompt().is_some())
     });
+}
+
+/// The command palette, opened with its key and narrowed to the toggles.
+fn palette(stage: &mut Stage) {
+    stage.session();
+    stage.press("cmd-shift-p");
+    stage
+        .cx
+        .update_window(stage.window, |_, window, cx| window.input("toggle", cx))
+        .expect("the window is open");
+    stage.cx.run_until_parked();
+}
+
+/// `virtual:race`, decoded, in a 1024 px window: the right dock on its rail, and the
+/// toolbar's overflow menu open on what did not fit.
+fn overflow_menu(stage: &mut Stage) {
+    stage.session();
+    stage
+        .cx
+        .update_window(stage.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            if window.try_find("toolbar-overflow").is_some() {
+                window.click("toolbar-overflow", cx);
+            } else {
+                eprintln!("  note: everything fits; there is no overflow menu");
+            }
+        })
+        .expect("the window is open");
+    stage.cx.run_until_parked();
 }
 
 /// Inline mode on `virtual:at`: `ati` and Enter typed key by key, and the reply.

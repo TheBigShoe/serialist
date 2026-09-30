@@ -4,7 +4,7 @@
 //! buttons; the scripts in the config directory's `scripts/` folder (`*.lua` at any
 //! depth, relisted when a file there changes, see
 //! [`ConfigEvent::Scripts`](serialist_core::ConfigEvent::Scripts)), each with a Run
-//! button; the output of every run on the session (printed lines, log lines in their
+//! button that hovering its row brings up (a double click runs it too); the output of every run on the session (printed lines, log lines in their
 //! level's color, prompts and their answers, and how each run ended, with the error and
 //! its Lua traceback); and a one-line REPL whose text runs as a script, with `=expr`
 //! printing `expr`.
@@ -28,6 +28,8 @@ use std::sync::Arc;
 use serialist_script::LogLevel;
 
 use crate::actions::context;
+use crate::actions::scripts::Stop as StopScript;
+use crate::chrome;
 use crate::config::Config;
 use crate::prelude::*;
 use crate::script_bridge::{ConsoleKind, ConsoleLine};
@@ -37,7 +39,6 @@ use crate::status::ScriptStatus;
 use crate::tabs::TabId;
 
 const ROW_HEIGHT: Pixels = px(20.);
-const SCRIPT_ROW_HEIGHT: Pixels = px(26.);
 
 /// Output lines the console keeps; older ones go first.
 pub const MAX_LINES: usize = 5000;
@@ -289,53 +290,43 @@ impl ScriptConsole {
     }
 
     fn render_header(&self, status: Option<&ScriptStatus>, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        h_flex()
-            .flex_none()
-            .justify_between()
-            .gap_1()
-            .px_3()
-            .h(px(32.))
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(
-                h_flex()
+        let info = cx.theme().info;
+        chrome::panel_header("Scripts", cx)
+            .children(status.map(|status| {
+                chrome::chip(info)
                     .min_w_0()
-                    .gap_2()
-                    .child("SCRIPTS")
-                    .children(status.map(|status| {
+                    .child(Icon::new(IconName::Play).size_3())
+                    .child(
                         div()
                             .truncate()
-                            .text_color(theme.info)
-                            .child(SharedString::from(status.name.clone()))
-                    })),
-            )
+                            .child(SharedString::from(status.name.clone())),
+                    )
+            }))
             .child(
                 h_flex()
-                    .gap_1()
+                    .ml_auto()
+                    .gap_0p5()
                     .child(
-                        Button::new("script-stop")
-                            .label("Stop")
-                            .tooltip("Stop the running script")
+                        chrome::icon_button("script-stop", IconName::CircleStop, cx)
                             .xsmall()
-                            .ghost()
+                            .tooltip_with_action(
+                                "Stop the running script",
+                                &StopScript,
+                                Some(context::WORKSPACE),
+                            )
                             .disabled(status.is_none())
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                     )
                     .child(
-                        Button::new("script-clear")
-                            .label("Clear")
-                            .tooltip("Clear the output")
+                        chrome::icon_button("script-clear", IconName::Eraser, cx)
                             .xsmall()
-                            .ghost()
+                            .tooltip("Clear the output")
                             .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                     )
                     .child(
-                        Button::new("script-folder")
-                            .label("Folder")
-                            .tooltip("Open the scripts folder (it gets the examples if empty)")
+                        chrome::icon_button("script-folder", IconName::FolderOpen, cx)
                             .xsmall()
-                            .ghost()
+                            .tooltip("Open the scripts folder (it gets the examples if empty)")
                             .on_click(|_, _, cx| crate::actions::open_scripts_folder(cx)),
                     ),
             )
@@ -349,41 +340,67 @@ impl ScriptConsole {
                 .pb_2()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("No scripts yet. Folder opens the scripts folder and adds two examples.")
+                .child("No scripts yet. The folder button opens the scripts folder and adds two examples.")
                 .into_any_element();
         }
-        let rows = self.scripts.iter().enumerate().map(|(ix, entry)| {
-            let relative = entry.relative.clone();
-            h_flex()
-                .id(("script-row", ix))
-                .w_full()
-                .h(SCRIPT_ROW_HEIGHT)
-                .flex_none()
-                .px_3()
-                .gap_1()
-                .text_sm()
-                .hover(|style| style.bg(theme.list_hover))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_family(theme.mono_font_family.clone())
-                        .child(SharedString::from(entry.relative.clone())),
-                )
-                .child(
-                    Button::new(("run-script", ix))
-                        .label("Run")
-                        .tooltip("Run on the session")
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(move |this, _, _, cx| this.run(&relative, cx))),
-                )
-        });
+        let (hover, mono) = (theme.list_hover, theme.mono_font_family.clone());
+        let rows: Vec<AnyElement> = self
+            .scripts
+            .iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let relative = entry.relative.clone();
+                let run = relative.clone();
+                let group = SharedString::from(format!("script-row-{ix}"));
+                h_flex()
+                    .id(("script-row", ix))
+                    .group(group.clone())
+                    .w_full()
+                    .h(chrome::ROW_HEIGHT)
+                    .flex_none()
+                    .pl_3()
+                    .pr_1()
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .hover(|style| style.bg(hover))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(mono.clone())
+                            .child(SharedString::from(relative)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                            .child(
+                                chrome::icon_button(("run-script", ix), IconName::Play, cx)
+                                    .xsmall()
+                                    .tooltip("Run on the session")
+                                    .on_click(
+                                        cx.listener(move |this, _, _, cx| this.run(&run, cx)),
+                                    ),
+                            ),
+                    )
+                    .on_click(cx.listener({
+                        let relative = entry.relative.clone();
+                        move |this, event: &ClickEvent, _, cx| {
+                            if event.click_count() >= 2 {
+                                this.run(&relative, cx);
+                            }
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .collect();
         v_flex()
             .id("script-list")
             .flex_none()
-            .max_h(px(180.))
+            .max_h(chrome::ROW_HEIGHT * 6.)
             .overflow_y_scroll()
             .pb_1()
             .children(rows)
@@ -448,8 +465,6 @@ impl Render for ScriptConsole {
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.sidebar_foreground)
-            .border_l_1()
-            .border_color(theme.border)
             .child(header)
             .child(scripts)
             .child(div().flex_none().h(px(1.)).w_full().bg(theme.border))

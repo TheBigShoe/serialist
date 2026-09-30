@@ -11,6 +11,7 @@
 
 pub mod actions;
 pub mod capture;
+pub mod chrome;
 pub mod codecs;
 pub mod commands_panel;
 pub mod compose;
@@ -18,12 +19,15 @@ pub mod config;
 pub mod decoded_panel;
 pub mod devices_panel;
 pub mod dialog_footer;
+pub mod docks;
 pub mod export;
 pub mod fonts;
 pub mod framed;
 pub mod history;
+pub mod icons;
 pub mod inline;
 pub mod keymap;
+pub mod palette;
 pub mod param_prompt;
 pub mod port_settings;
 pub mod script_bridge;
@@ -38,8 +42,11 @@ pub mod status;
 pub mod tabs;
 pub mod terminal;
 pub mod theme_bridge;
+pub mod toolbar;
 pub mod workspace;
 
+#[cfg(test)]
+mod chrome_tests;
 #[cfg(test)]
 mod commands_tests;
 #[cfg(test)]
@@ -102,9 +109,12 @@ pub mod prelude {
     pub use gpui_kit::prelude::*;
     pub use gpui_kit::*;
     pub use gpui_kit::{init as kit_init, open_window as kit_open_window};
-    // The bundled icon set (chevrons, the dialog's close X, ...). An app registers it with
+    // The app's icon set: gpui-kit's bundled icons (chevrons, the dialog's close X, ...)
+    // and the Lucide icons the chrome adds (see `icons`). An app registers it with
     // `Application::with_assets`; without one every SVG icon renders as nothing.
-    pub use gpui_kit::assets::Assets;
+    pub use crate::icons::Assets;
+    // The whole Lucide catalog's names; `icons::Assets` embeds only the ones the app uses.
+    pub use gpui_kit::assets::{Assets as KitAssets, IconName, icon_assets};
 
     // Headless UI-test helpers; they exist only with gpui-kit's `test-support` feature,
     // which the dev-dependency turns on.
@@ -122,10 +132,14 @@ pub mod prelude {
     pub use ::core::prelude::v1::test;
     pub use gpui_kit::test as gpui_test;
 
-    pub use gpui_kit::component::button::{Button, ButtonVariants};
+    pub use gpui_kit::component::button::{
+        Button, ButtonCustomVariant, ButtonGroup, ButtonVariant, ButtonVariants,
+    };
     pub use gpui_kit::component::dialog::{
         Cancel, Confirm, Dialog, DialogButtonProps, DialogFooter,
     };
+    pub use gpui_kit::component::kbd::Kbd;
+    pub use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
     pub use gpui_kit::component::tooltip::Tooltip;
     pub use gpui_kit::component::{WindowExt, v_resizable};
     // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait
@@ -142,8 +156,9 @@ pub mod prelude {
         Column, DataTable, TableDelegate, TableEvent, TableState,
     };
     pub use gpui_kit::component::{
-        ActiveTheme, Disableable, Selectable, Sizable, StyledExt, Theme, ThemeConfig,
-        ThemeConfigColors, ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,
+        ActiveTheme, Disableable, ElementExt, Icon, Placement, Selectable, Sizable, StyledExt,
+        Theme, ThemeConfig, ThemeConfigColors, ThemeMode, h_flex, h_resizable, resizable_panel,
+        v_flex,
     };
     pub use gpui_kit::private::schemars::{self, JsonSchema};
 }

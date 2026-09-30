@@ -28,7 +28,7 @@ WebAssembly folders load only in a build with the `wasm` feature
 > Lua and WebAssembly adapters, plugin folder discovery and codec-payload encoding in
 > `serialist-plugins`; the guest crate `serialist-plugin-sdk`; and in `serialist-ui` the
 > `plugins/` folder (loaded at startup, reloaded on save), a device profile's `plugin`, the
-> session toolbar's codec picker, the Decoded panel, summaries and hidden frames in the
+> session toolbar's codec menu, the Decoded panel, summaries and hidden frames in the
 > terminal, codec payloads and frame predicates in saved commands, and CSV and JSON export
 > of decoded frames. "Using plugins in the app" below describes that UI.
 
@@ -397,9 +397,9 @@ or `none`).
   matching port decodes with it from its first byte:
   `{ "match": { "vid": "0x0e8d", "product": "Airoha" }, "baud": 921600, "plugin": "airoha-race", "eol": "crlf" }`.
   The Devices panel shows the profile's plugin as a badge on the port's row. The session
-  toolbar's Codec picker lists `none`, the built-ins and the loaded plugins; picking one
-  switches at the next received chunk, and the frames decoded so far stay. The status line
-  shows `Codec: <name>`.
+  toolbar's codec menu lists `none`, the built-ins and the loaded plugins; picking one
+  switches at the next received chunk, and the frames decoded so far stay. The status bar
+  shows the codec's name in a chip, and the Decoded panel opens.
 - **The Decoded panel** is a table in the right dock (above the Script console) of the
   session's frames: time (stamped like the terminal's gutter), direction, kind, summary,
   fields and raw hex. The kind filter lists the codec's kinds and shows the chosen kind's
@@ -412,10 +412,11 @@ or `none`).
   scrollback rather than a copy of the bytes.
 - **In the terminal**, `display.decoded_inline` (on by default) adds a one-line summary of
   each decoded frame as a notice line in the plugin color (the theme's `syntax.keyword`);
-  text frames get none, since their text is on screen. `display.hide_framed_bytes` (off by
-  default) leaves out received lines whose bytes all belong to binary frames; lines with
-  any text stay. Both are also toggles in the session toolbar.
-- **Export.** "Export frames…" in the session toolbar (shown while a codec decodes) saves
+  text frames get none, since their text is on screen. `display.hide_framed_bytes` (on by
+  default, since the Decoded panel shows those frames) leaves out received lines whose
+  bytes all belong to binary frames; lines with any text stay. Both are also toggles in
+  the codec menu of the session toolbar.
+- **Export.** "Decoded frames…" in the toolbar's Export menu (enabled while a codec decodes) saves
   every retained frame as `.csv` (time, direction, kind, summary, one column per field
   name, raw hex) or `.json` (an array of frame objects with fields and the raw bytes as
   hex), chosen by the file's extension.
