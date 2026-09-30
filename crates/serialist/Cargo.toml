@@ -11,12 +11,14 @@ authors.workspace = true
 name = "serialist"
 path = "src/main.rs"
 
+# GPUI and its platform layer arrive through `serialist-ui` (gpui-kit depends on
+# `gpui-pre-platform` with `font-kit`), and the binary reaches them through
+# `serialist_ui::prelude`, so neither is listed here.
 [dependencies]
 serialist-core.workspace = true
 serialist-sim.workspace = true
 serialist-ui.workspace = true
-gpui.workspace = true
-gpui_platform.workspace = true
 anyhow.workspace = true
+crossbeam-channel.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
