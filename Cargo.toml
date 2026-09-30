@@ -47,7 +47,7 @@ vte = "0.15"
 # Full terminal emulation (milestone 6): Alacritty's grid and escape handler, fed without
 # a PTY. It re-exports the vte it is built on as `alacritty_terminal::vte`, the same 0.15
 # as above. The default feature only adds serde derives.
-alacritty_terminal = { version = "0.26", default-features = false }
+alacritty_terminal = { version = "=0.26.0", default-features = false }
 notify = "8"
 notify-debouncer-full = "0.7"
 rand = "0.9"
