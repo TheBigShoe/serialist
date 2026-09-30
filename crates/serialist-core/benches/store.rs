@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use serialist_core::{LineId, LineSource, Searcher, Store, StoreConfig};
+use serialist_core::{AnsiParser, LineId, LineSource, Searcher, Store, StoreConfig};
 use serialist_sim::{FirehoseContent, FirehoseGenerator};
 
 const APPEND_BYTES: usize = 4 * 1024 * 1024;
@@ -110,5 +110,25 @@ fn reads(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, append, reads);
+/// CR overwrite of a long line of multi-byte characters: the cell-mode path.
+fn overwrite(c: &mut Criterion) {
+    let n = 15 * 1024;
+    let mut input = "\u{e9}".repeat(n).into_bytes();
+    input.push(b'\r');
+    input.extend_from_slice("\u{e8}".repeat(n).as_bytes());
+    input.push(b'\n');
+    let mut group = c.benchmark_group("parse");
+    group.throughput(Throughput::Bytes(input.len() as u64));
+    group.bench_function("overwrite_non_ascii", |b| {
+        b.iter(|| {
+            let mut parser = AnsiParser::new();
+            parser.feed(&input, |line| {
+                black_box(line.text.len());
+            });
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, append, overwrite, reads);
 criterion_main!(benches);
