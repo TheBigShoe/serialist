@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
 
+use crate::actions::keys;
 use crate::prelude::*;
 use crate::terminal::double::{HexLines, MemoryLines, SyntheticLines};
 use crate::terminal::element::{CellMetrics, PADDING_LEFT};
@@ -283,7 +284,7 @@ fn drag_selects_across_lines_and_copy_puts_it_on_the_clipboard(cx: &mut TestAppC
         .unwrap();
     assert_eq!(painted, 3, "one rectangle per selected row");
 
-    press(cx, window, "cmd-c");
+    press(cx, window, keys::COPY);
     cx.run_until_parked();
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
@@ -324,7 +325,7 @@ fn select_all_takes_every_retained_line(cx: &mut TestAppContext) {
     let (window, view) = open(cx, source.clone());
     source.evict(2);
     focus(cx, window, &view);
-    press(cx, window, "cmd-a");
+    press(cx, window, keys::SELECT_ALL);
     assert_eq!(
         view.read_with(cx, |view, _| view.selection_text()),
         Some("line 2\nline 3\nline 4".into())
@@ -476,7 +477,7 @@ fn painted_with(cx: &mut TestAppContext, window: AnyWindowHandle, color: Hsla) -
 #[gpui_test]
 fn search_runs_in_the_background_and_highlights_the_active_match(cx: &mut TestAppContext) {
     let (window, view, searcher) = searchable(cx);
-    press(cx, window, "cmd-f");
+    press(cx, window, keys::SEARCH);
     assert!(view.read_with(cx, |view, _| view.is_search_open()));
     cx.update_window(window, |_, window, cx| window.input("error", cx))
         .unwrap();
@@ -540,7 +541,7 @@ fn search_runs_in_the_background_and_highlights_the_active_match(cx: &mut TestAp
 #[gpui_test]
 fn escape_cancels_an_in_flight_search(cx: &mut TestAppContext) {
     let (window, view, searcher) = searchable(cx);
-    press(cx, window, "cmd-f");
+    press(cx, window, keys::SEARCH);
     cx.update_window(window, |_, window, cx| window.input("timeout", cx))
         .unwrap();
     let flag = view
@@ -562,8 +563,8 @@ fn escape_cancels_an_in_flight_search(cx: &mut TestAppContext) {
     });
 
     // Typing a new query cancels the old one the same way.
-    press(cx, window, "cmd-f");
-    press(cx, window, "cmd-a");
+    press(cx, window, keys::SEARCH);
+    press(cx, window, keys::SELECT_ALL);
     cx.update_window(window, |_, window, cx| window.input("err", cx))
         .unwrap();
     let first = view
@@ -678,13 +679,13 @@ fn pause_freezes_the_end_and_resume_follows_the_live_tail(cx: &mut TestAppContex
 fn the_frame_stats_overlay_toggles_and_reports(cx: &mut TestAppContext) {
     let (window, view) = open(cx, numbered(100));
     focus(cx, window, &view);
-    press(cx, window, "cmd-alt-i");
+    press(cx, window, keys::TOGGLE_FRAME_STATS);
     assert!(view.read_with(cx, |view, _| view.shows_frame_stats()));
     draw(cx, window);
     let summary = view.read_with(cx, |view, _| view.frame_summary());
     assert!(summary.frames >= 2);
     assert!(summary.lines()[0].starts_with("prepaint "));
-    press(cx, window, "cmd-alt-i");
+    press(cx, window, keys::TOGGLE_FRAME_STATS);
     assert!(!view.read_with(cx, |view, _| view.shows_frame_stats()));
 }
 
