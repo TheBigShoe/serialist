@@ -149,6 +149,14 @@ const SHOTS: &[Shot] = &[
         connect: Some("virtual:race"),
         drive: decoded_race,
     },
+    Shot {
+        file: "11-param-prompt.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: Some("virtual:at"),
+        drive: param_prompt,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -245,6 +253,24 @@ fn commands(stage: &mut Stage) {
         .expect("the window is open");
     run_until(&mut stage.cx, "the command form", |cx| {
         commands.read_with(cx, |panel, _| panel.editor().is_some())
+    });
+}
+
+/// The parameter prompt a saved command with a parameter (the Echo example) opens when
+/// it is sent from the Commands panel.
+fn param_prompt(stage: &mut Stage) {
+    stage.session();
+    let (commands, workspace) = (
+        stage
+            .workspace
+            .read_with(&stage.cx, |w, _| w.commands().clone()),
+        stage.workspace.clone(),
+    );
+    commands.update(&mut stage.cx, |panel, cx| {
+        panel.send(CommandRef::new("AT basics", "With parameters", "Echo"), cx);
+    });
+    run_until(&mut stage.cx, "the parameter prompt", |cx| {
+        workspace.read_with(cx, |w, _| w.param_prompt().is_some())
     });
 }
 
