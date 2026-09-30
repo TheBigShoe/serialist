@@ -6501,6 +6501,7 @@ dependencies = [
 name = "serialist-ui"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "chrono",
  "crossbeam-channel",
  "gpui-kit",

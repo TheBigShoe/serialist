@@ -1,0 +1,313 @@
+//! The session's scrollback as the terminal sees it: a store [`Snapshot`] (text) and
+//! its [`HexView`] (hex rows), each behind a floor that Clear raises.
+//!
+//! The store has no way to forget lines on request, and should not: its raw pages are
+//! also the record raw export reads. Clear is therefore a view concern like pause: the
+//! floor hides every line (or hex row) below it, and the store evicts them when its
+//! budget says so. A floor of zero hides nothing.
+//!
+//! [`Scrollback`] bundles both sources for one snapshot and is what the session view
+//! hands the terminal after every wake.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use regex::RegexBuilder;
+use serialist_core::store::smart_case_insensitive;
+use serialist_core::{
+    Epoch, HexView, LineId, LineSource, SearchMatch, Searcher, Snapshot, StyledLine,
+};
+
+/// Bytes per hex row.
+pub const HEX_BYTES_PER_ROW: usize = 16;
+
+/// A source with everything below `floor` hidden.
+#[derive(Clone, Debug)]
+pub struct Floored<S> {
+    pub inner: S,
+    pub floor: LineId,
+}
+
+impl<S: LineSource> Floored<S> {
+    pub fn new(inner: S, floor: LineId) -> Self {
+        Self { inner, floor }
+    }
+}
+
+impl<S: LineSource> LineSource for Floored<S> {
+    fn first_line(&self) -> LineId {
+        self.inner
+            .first_line()
+            .max(self.floor)
+            .min(self.inner.end())
+    }
+
+    fn line_count(&self) -> usize {
+        (self.end().0 - self.first_line().0) as usize
+    }
+
+    fn end(&self) -> LineId {
+        self.inner.end()
+    }
+
+    fn line(&self, id: LineId) -> Option<StyledLine> {
+        if id < self.floor {
+            return None;
+        }
+        self.inner.line(id)
+    }
+
+    fn lines(&self, range: std::ops::Range<LineId>, out: &mut Vec<StyledLine>) {
+        self.inner
+            .lines(range.start.max(self.floor)..range.end, out);
+    }
+
+    fn epoch(&self) -> Epoch {
+        self.inner.epoch()
+    }
+}
+
+/// The store's own search (bulk regex over pages), with matches below the floor
+/// dropped. A backward search that finds too few matches above the floor still scans
+/// the hidden lines before it stops; they are bounded by the store's budget.
+impl Searcher for Floored<Snapshot> {
+    fn search(
+        &self,
+        pattern: &str,
+        from: LineId,
+        backward: bool,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SearchMatch>, String> {
+        let from = from.max(self.floor);
+        let mut found = self.inner.search(pattern, from, backward, limit, cancel)?;
+        found.retain(|m| m.line >= self.floor);
+        Ok(found)
+    }
+}
+
+/// Hex rows have no search of their own in the store, so this searches the rows' text
+/// one row at a time, with the store's smart-case rule. A pattern can match the hex
+/// column (`0d 0a`) or the ASCII column (`OK`), within one row.
+impl Searcher for Floored<HexView> {
+    fn search(
+        &self,
+        pattern: &str,
+        from: LineId,
+        backward: bool,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SearchMatch>, String> {
+        let regex = RegexBuilder::new(pattern)
+            .case_insensitive(smart_case_insensitive(pattern))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let (first, end) = (self.first_line(), self.end());
+        let mut out = Vec::new();
+        if first >= end || limit == 0 {
+            return Ok(out);
+        }
+        let mut id = from.max(first).min(LineId(end.0 - 1));
+        let mut visited = 0usize;
+        loop {
+            // Poll the flag every 1024 rows, starting before the first.
+            if visited.is_multiple_of(1024) && cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            visited += 1;
+            if let Some(row) = self.inner.line(id) {
+                let mut found: Vec<SearchMatch> = regex
+                    .find_iter(&row.text)
+                    .filter(|m| !m.range().is_empty())
+                    .map(|m| SearchMatch {
+                        line: id,
+                        range: m.range(),
+                    })
+                    .collect();
+                if backward {
+                    found.reverse();
+                }
+                for m in found {
+                    out.push(m);
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            if backward {
+                if id <= first {
+                    break;
+                }
+                id = LineId(id.0 - 1);
+            } else {
+                id = id.next();
+                if id >= end {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Where Clear put the floors: a text line id and a hex row id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Floors {
+    pub text: LineId,
+    pub hex: LineId,
+}
+
+impl Default for Floors {
+    /// Nothing hidden.
+    fn default() -> Self {
+        Self {
+            text: LineId::ZERO,
+            hex: LineId::ZERO,
+        }
+    }
+}
+
+impl Floors {
+    /// Floors that hide everything `snapshot` holds: its lines, and every hex row that
+    /// starts before its last byte. A row the clear cut through stays, so no byte after
+    /// the clear is ever hidden.
+    pub fn above(snapshot: &Snapshot) -> Self {
+        let raw_end = snapshot.raw_range().end;
+        Self {
+            text: snapshot.end(),
+            hex: LineId(raw_end / HEX_BYTES_PER_ROW as u64),
+        }
+    }
+}
+
+/// One snapshot as the terminal's text and hex sources and searchers.
+#[derive(Clone)]
+pub struct Scrollback {
+    pub text: Arc<Floored<Snapshot>>,
+    pub hex: Arc<Floored<HexView>>,
+}
+
+impl Scrollback {
+    pub fn new(snapshot: &Snapshot, floors: Floors) -> Self {
+        Self {
+            text: Arc::new(Floored::new(snapshot.clone(), floors.text)),
+            hex: Arc::new(Floored::new(
+                snapshot.hex_view(HEX_BYTES_PER_ROW),
+                floors.hex,
+            )),
+        }
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.text.inner
+    }
+
+    pub fn text_source(&self) -> Arc<dyn LineSource> {
+        self.text.clone()
+    }
+
+    pub fn text_searcher(&self) -> Arc<dyn Searcher> {
+        self.text.clone()
+    }
+
+    pub fn hex_source(&self) -> Arc<dyn LineSource> {
+        self.hex.clone()
+    }
+
+    pub fn hex_searcher(&self) -> Arc<dyn Searcher> {
+        self.hex.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use serialist_core::{Direction, Store};
+
+    use super::*;
+
+    fn store_with(lines: &[&str]) -> Store {
+        let mut store = Store::default();
+        for line in lines {
+            store.append(format!("{line}\r\n").as_bytes(), Instant::now());
+        }
+        store
+    }
+
+    fn texts(source: &dyn LineSource) -> Vec<String> {
+        let mut out = Vec::new();
+        source.lines(source.first_line()..source.end(), &mut out);
+        out.into_iter().map(|line| line.text).collect()
+    }
+
+    fn search(searcher: &dyn Searcher, pattern: &str, backward: bool) -> Vec<(u64, usize)> {
+        let from = if backward {
+            LineId(u64::MAX)
+        } else {
+            LineId(0)
+        };
+        searcher
+            .search(pattern, from, backward, 100, &AtomicBool::new(false))
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.line.0, m.range.start))
+            .collect()
+    }
+
+    #[test]
+    fn a_floor_hides_the_lines_below_it_and_their_matches() {
+        let mut store = store_with(&["error one", "fine", "error two"]);
+        let floors = Floors::above(&store.snapshot());
+        assert_eq!(floors.text, LineId(3));
+        store.append(b"error three\r\n", Instant::now());
+        store.append_local("sent error", Direction::Tx);
+
+        let scrollback = Scrollback::new(&store.snapshot(), floors);
+        let text = scrollback.text_source();
+        assert_eq!(text.first_line(), LineId(3));
+        assert_eq!(text.line_count(), 2);
+        assert_eq!(texts(text.as_ref()), ["error three", "sent error"]);
+        assert_eq!(text.line(LineId(0)), None);
+
+        let searcher = scrollback.text_searcher();
+        assert_eq!(search(searcher.as_ref(), "error", true), [(4, 5), (3, 0)]);
+        assert_eq!(search(searcher.as_ref(), "error", false), [(3, 0), (4, 5)]);
+
+        let unfloored = Scrollback::new(&store.snapshot(), Floors::default());
+        assert_eq!(unfloored.text_source().line_count(), 5);
+    }
+
+    #[test]
+    fn hex_rows_follow_the_raw_bytes_and_search_row_by_row() {
+        let mut store = store_with(&["AT", "OK"]);
+        store.append(&[0u8; 20], Instant::now());
+        let scrollback = Scrollback::new(&store.snapshot(), Floors::default());
+        let hex = scrollback.hex_source();
+        // 8 bytes of text and 20 zeros: two rows.
+        assert_eq!(hex.line_count(), 2);
+        let row = hex.line(LineId(0)).unwrap();
+        assert!(
+            row.text
+                .starts_with("00000000  41 54 0d 0a 4f 4b 0d 0a  00 00")
+        );
+        assert!(row.text.ends_with("|AT..OK..........|"));
+
+        let searcher = scrollback.hex_searcher();
+        assert_eq!(search(searcher.as_ref(), "ok", false), [(0, 65)]);
+        assert_eq!(search(searcher.as_ref(), "0d 0a", true), [(0, 28), (0, 16)]);
+        assert!(
+            searcher
+                .search("(", LineId(0), false, 10, &AtomicBool::new(false))
+                .is_err()
+        );
+
+        // A clear hides the rows before the last byte, but not a row it cut through.
+        let floors = Floors::above(&store.snapshot());
+        assert_eq!(floors.hex, LineId(1));
+        store.append(b"more", Instant::now());
+        let cleared = Scrollback::new(&store.snapshot(), floors);
+        assert_eq!(cleared.hex_source().first_line(), LineId(1));
+        assert_eq!(search(cleared.hex_searcher().as_ref(), "41 54", false), []);
+    }
+}

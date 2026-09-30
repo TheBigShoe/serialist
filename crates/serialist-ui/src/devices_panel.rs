@@ -6,14 +6,61 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use serialist_core::{PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig};
 
 use crate::actions::{Connect, SelectNext, SelectPrevious, context};
-use crate::drain::{drain_into, pass_through};
 use crate::prelude::*;
 
 const ROW_HEIGHT: Pixels = px(44.);
+
+/// Longest the port-event worker blocks waiting for an event, so it notices a dropped
+/// panel.
+const PORT_EVENT_WAIT: Duration = Duration::from_millis(50);
+
+/// Pause between batches of port events, about a frame: a burst of hotplug events
+/// costs one repaint.
+pub(crate) const PORT_EVENT_FRAME: Duration = Duration::from_millis(8);
+
+/// Apply `events` to the panel's list until the source or the panel goes away. The
+/// wait happens on the background executor (crossbeam channels have no async receive),
+/// never on the main thread, and each wake applies everything queued at once.
+fn follow_port_events(events: Receiver<PortEvent>, cx: &mut Context<DevicesPanel>) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        loop {
+            let rx = events.clone();
+            let (batch, closed) = cx
+                .background_spawn(async move {
+                    match rx.recv_timeout(PORT_EVENT_WAIT) {
+                        Ok(first) => {
+                            let mut batch = vec![first];
+                            batch.extend(rx.try_iter());
+                            (batch, false)
+                        }
+                        Err(RecvTimeoutError::Timeout) => (Vec::new(), false),
+                        Err(RecvTimeoutError::Disconnected) => (Vec::new(), true),
+                    }
+                })
+                .await;
+            let alive = this
+                .update(cx, |panel, cx| {
+                    if !batch.is_empty() {
+                        for event in batch {
+                            panel.list.apply(event);
+                        }
+                        cx.notify();
+                    }
+                })
+                .is_ok();
+            if !alive || closed {
+                break;
+            }
+            cx.background_executor().timer(PORT_EVENT_FRAME).await;
+        }
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceEntry {
@@ -197,7 +244,7 @@ pub struct DevicesPanel {
     /// Held for the panel's lifetime: a source may stop reporting once dropped
     /// (`RealPortSource` stops its hotplug monitor), even with a subscription open.
     _source: Arc<dyn PortSource>,
-    _drain: Task<()>,
+    _port_events: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -232,21 +279,7 @@ impl DevicesPanel {
             _ => {}
         });
 
-        let drain = drain_into(
-            source.subscribe(),
-            (),
-            pass_through,
-            cx,
-            |this: &mut Self, events: Vec<PortEvent>, cx| {
-                if events.is_empty() {
-                    return;
-                }
-                for event in events {
-                    this.list.apply(event);
-                }
-                cx.notify();
-            },
-        );
+        let port_events = follow_port_events(source.subscribe(), cx);
 
         Self {
             list: DeviceList::default(),
@@ -257,7 +290,7 @@ impl DevicesPanel {
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             _source: source,
-            _drain: drain,
+            _port_events: port_events,
             _subscriptions: vec![baud_events],
         }
     }
@@ -663,7 +696,7 @@ mod tests {
 
         source.plug(usb_port("/dev/b", "Board", 0x10c4, 0xea60));
         source.unplug(&PortId::new("/dev/a"));
-        cx.executor().advance_clock(crate::drain::FRAME);
+        cx.executor().advance_clock(PORT_EVENT_FRAME);
         cx.run_until_parked();
         assert_eq!(
             read(cx),
@@ -738,7 +771,7 @@ mod tests {
         });
         cx.run_until_parked();
         source.unplug(&PortId::new("/dev/a"));
-        cx.executor().advance_clock(crate::drain::FRAME);
+        cx.executor().advance_clock(PORT_EVENT_FRAME);
         cx.run_until_parked();
         let connected = panel.update(cx, |panel, cx| panel.connect_selected(cx));
         assert!(!connected);

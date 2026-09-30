@@ -55,6 +55,22 @@ struct SearchBar {
     results: SearchResults,
     in_flight: Option<InFlight>,
     generation: u64,
+    /// End of the displayed lines the matches account for; lines from here on (and the
+    /// last one before, which may still have been arriving) are not searched yet.
+    covered: LineId,
+    /// Lines arrived while a search was in flight; search them when it finishes.
+    stale: bool,
+}
+
+/// What a search run is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchKind {
+    /// A new query: everything displayed, newest first, then reveal the active match.
+    New,
+    /// The same query over everything displayed again, keeping the active match.
+    Rescan,
+    /// The same query over the lines from `from` on, merged into the matches.
+    Extend { from: LineId },
 }
 
 pub struct TerminalView {
@@ -126,6 +142,8 @@ impl TerminalView {
                 results: SearchResults::default(),
                 in_flight: None,
                 generation: 0,
+                covered: LineId::ZERO,
+                stale: false,
             },
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![input_events],
@@ -146,6 +164,30 @@ impl TerminalView {
         match self.display {
             DisplayMode::Text => self.text_searcher.as_ref(),
             DisplayMode::Hex => self.hex_searcher.as_ref(),
+        }
+    }
+
+    /// Swap in a newer view of the same stream, such as the store's next snapshot. Line
+    /// ids keep their meaning across it, so the scroll position, the selection, a pause
+    /// and the search results all stand; call [`Self::lines_appended`] after to repaint
+    /// and bring an open search up to date. Hex sources are optional as in
+    /// [`Self::set_hex_source`]; losing the hex source in hex view goes back to text.
+    pub fn update_sources(
+        &mut self,
+        text: Arc<dyn LineSource>,
+        text_searcher: Option<Arc<dyn Searcher>>,
+        hex: Option<Arc<dyn LineSource>>,
+        hex_searcher: Option<Arc<dyn Searcher>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_source = text;
+        self.text_searcher = text_searcher;
+        let lost_hex = hex.is_none() && self.display == DisplayMode::Hex;
+        self.hex_source = hex;
+        self.hex_searcher = hex_searcher;
+        if lost_hex {
+            self.display = DisplayMode::Text;
+            self.source_changed(cx);
         }
     }
 
@@ -217,8 +259,15 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// The store appended lines: repaint. Following the tail happens in layout.
-    pub fn lines_appended(&mut self, cx: &mut Context<Self>) {
+    /// The source grew: text lines `changed` are new, or were rewritten (the line that
+    /// was still arriving). Repaints; following the tail happens in layout, against the
+    /// source's new end. An open search takes in the new lines (see
+    /// [`Self::refresh_search`]).
+    pub fn lines_appended(&mut self, changed: std::ops::Range<LineId>, cx: &mut Context<Self>) {
+        if self.search.open && !changed.is_empty() {
+            let from = (self.display == DisplayMode::Text).then_some(changed.start);
+            self.refresh_search(from, cx);
+        }
         cx.notify();
     }
 
@@ -340,6 +389,10 @@ impl TerminalView {
             text: self.text_source.end(),
             hex: self.hex_source.as_ref().map(|hex| hex.end()),
         });
+        // Matches found past the frozen end are not on display any more.
+        let span = self.displayed_span();
+        self.search.results.retain_lines(span.range());
+        self.search.covered = self.search.covered.min(span.end);
         cx.notify();
         true
     }
@@ -350,6 +403,8 @@ impl TerminalView {
             return false;
         }
         self.scroll.scroll_to_bottom();
+        // What arrived while paused is on display again.
+        self.refresh_search(None, cx);
         cx.notify();
         true
     }
@@ -540,6 +595,7 @@ impl TerminalView {
             in_flight.cancel.store(true, Ordering::Relaxed);
         }
         self.search.results.pending = false;
+        self.search.stale = false;
     }
 
     /// The cancel flag of the search in flight, if any.
@@ -557,29 +613,83 @@ impl TerminalView {
         self.cancel_search();
         self.search.generation += 1;
         self.search.results.clear();
-        self.search.results.query = query.clone();
+        self.search.results.query = query;
+        self.start_search(SearchKind::New, cx);
+    }
+
+    /// Bring the open search up to date with the source: drop matches that left the
+    /// display (evicted, or past a pause), then search what arrived since the matches
+    /// were found, from `changed_from` (or the last line covered, which may have grown)
+    /// on, and merge. Runs at most once per call and never cancels a search in flight:
+    /// if one is running, this one waits for it, so a stream faster than the search
+    /// cannot starve it. A search of new lines that hits [`MAX_MATCHES`] rescans
+    /// everything displayed instead, to keep the newest matches.
+    pub fn refresh_search(&mut self, changed_from: Option<LineId>, cx: &mut Context<Self>) {
+        let search = &mut self.search;
+        if !search.open || search.results.query.is_empty() || search.results.error.is_some() {
+            return;
+        }
+        if search.in_flight.is_some() {
+            search.stale = true;
+            return;
+        }
+        let span = self.displayed_span();
+        self.search.results.retain_lines(span.range());
+        let covered = self.search.covered.min(span.end);
+        if covered >= span.end && self.frozen.is_some() {
+            // Paused, and everything on display was searched.
+            return;
+        }
+        let mut from = LineId(covered.0.saturating_sub(1));
+        if let Some(changed) = changed_from {
+            from = from.min(changed);
+        }
+        let from = from.max(span.first);
+        if from >= span.end {
+            return;
+        }
+        self.search.generation += 1;
+        self.start_search(SearchKind::Extend { from }, cx);
+    }
+
+    /// Run the current query on the background executor.
+    fn start_search(&mut self, kind: SearchKind, cx: &mut Context<Self>) {
+        let query = self.search.results.query.clone();
         let span = self.displayed_span();
         let Some(searcher) = self.searcher().cloned() else {
             cx.notify();
             return;
         };
         if query.is_empty() || span.is_empty() {
+            self.search.covered = span.end;
             cx.notify();
             return;
         }
         let generation = self.search.generation;
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
-        let from = LineId(span.end.0 - 1);
+        let (from, backward) = match kind {
+            SearchKind::New | SearchKind::Rescan => (LineId(span.end.0 - 1), true),
+            SearchKind::Extend { from } => (from, false),
+        };
         let task = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_spawn(async move {
-                    let found = searcher.search(&query, from, true, MAX_MATCHES, &flag);
+                    let found = searcher
+                        .search(&query, from, backward, MAX_MATCHES, &flag)
+                        .map(|mut found| {
+                            // A forward search runs to the source's end; a paused view
+                            // shows less.
+                            found.retain(|m| m.line < span.end);
+                            found
+                        });
                     (found, flag.load(Ordering::Relaxed))
                 })
                 .await;
-            this.update(cx, |view, cx| view.search_finished(generation, found, cx))
-                .ok();
+            this.update(cx, |view, cx| {
+                view.search_finished(generation, kind, span, found, cx)
+            })
+            .ok();
         });
         self.search.results.pending = true;
         self.search.in_flight = Some(InFlight {
@@ -592,6 +702,8 @@ impl TerminalView {
     fn search_finished(
         &mut self,
         generation: u64,
+        kind: SearchKind,
+        span: Span,
         (found, cancelled): (Result<Vec<SearchMatch>, String>, bool),
         cx: &mut Context<Self>,
     ) {
@@ -599,13 +711,30 @@ impl TerminalView {
             return;
         }
         self.search.in_flight = None;
-        match found {
-            Ok(matches) => {
+        match (kind, found) {
+            (_, Err(error)) => self.search.results.fail(error),
+            (SearchKind::New, Ok(matches)) => {
                 let top = self.scroll.position().line;
                 self.search.results.finish(matches, top);
+                self.search.covered = span.end;
                 self.reveal_active();
             }
-            Err(error) => self.search.results.fail(error),
+            (SearchKind::Rescan, Ok(matches)) => {
+                self.search.results.rescanned(matches);
+                self.search.covered = span.end;
+            }
+            (SearchKind::Extend { .. }, Ok(found)) if found.len() >= MAX_MATCHES => {
+                self.search.generation += 1;
+                self.start_search(SearchKind::Rescan, cx);
+                return;
+            }
+            (SearchKind::Extend { from }, Ok(found)) => {
+                self.search.results.extend(from, found);
+                self.search.covered = span.end;
+            }
+        }
+        if std::mem::take(&mut self.search.stale) {
+            self.refresh_search(None, cx);
         }
         cx.notify();
     }

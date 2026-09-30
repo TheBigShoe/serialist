@@ -3,15 +3,17 @@
 
 use std::sync::Arc;
 
-use serialist_core::{PortId, PortSource, SerialConfig, TransportError, TransportFactory};
+use serialist_core::{
+    PortId, PortSource, SerialConfig, StoreConfig, TransportError, TransportFactory,
+};
 
 use crate::actions::{self, Clear, Disconnect, Export, Pause, Quit, ToggleRecord, context};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::export::ExportFormat;
 use crate::prelude::*;
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-use crate::session_model::{ConnectionState, StatusLine};
 use crate::session_view::SessionView;
+use crate::status::{ConnectionState, StatusLine};
 
 const STATUS_LINE_HEIGHT: Pixels = px(26.);
 
@@ -25,6 +27,8 @@ pub struct AppOptions {
     pub select_port: Option<PortId>,
     /// Open `select_port` right away (the `--port` flag).
     pub connect_on_start: bool,
+    /// How each session's scrollback store is sized.
+    pub store: StoreConfig,
 }
 
 /// Global setup: gpui-kit's components and theme, the dark default, key bindings and
@@ -69,6 +73,7 @@ pub struct Workspace {
     devices: Entity<DevicesPanel>,
     session: Option<Entity<SessionView>>,
     opener: Arc<dyn SessionOpener>,
+    store: StoreConfig,
     /// Port being opened on the background executor, for the placeholder and status line.
     connecting: Option<PortId>,
     focus_handle: FocusHandle,
@@ -93,6 +98,7 @@ impl Workspace {
             window,
             cx,
         );
+        workspace.store = options.store;
         if let Some(port) = options.select_port {
             workspace
                 .devices
@@ -127,6 +133,7 @@ impl Workspace {
             devices,
             session: None,
             opener,
+            store: StoreConfig::default(),
             connecting: None,
             focus_handle: cx.focus_handle(),
             _connect_task: None,
@@ -187,7 +194,9 @@ impl Workspace {
                 if let Some(previous) = self.session.take() {
                     previous.update(cx, |view, cx| view.disconnect(cx));
                 }
-                let view = cx.new(|cx| SessionView::new(port.clone(), serial, session, window, cx));
+                let store = self.store.clone();
+                let view =
+                    cx.new(|cx| SessionView::new(port.clone(), serial, session, store, window, cx));
                 // The status line and the Devices panel's "open" dot follow the session.
                 self._session_observer = Some(cx.observe(&view, |this, view, cx| {
                     let open = view.read(cx).open_port().cloned();
@@ -290,14 +299,13 @@ impl Workspace {
             );
         };
 
-        let model = session.read(cx).model();
-        let state_color = match model.state {
-            ConnectionState::Connecting => theme.warning,
+        let session = session.read(cx);
+        let state_color = match session.state() {
             ConnectionState::Connected => theme.success,
             ConnectionState::Disconnected { error: None } => theme.muted_foreground,
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
         };
-        let status = model.status_line();
+        let status = session.status_line();
         line.child(
             h_flex()
                 .gap_1p5()
@@ -313,6 +321,8 @@ impl Workspace {
         .children(status.settings.map(SharedString::from))
         .child(SharedString::from(status.rx))
         .child(SharedString::from(status.tx))
+        .child(SharedString::from(status.retained))
+        .children(status.evicted.map(SharedString::from))
         .children(status.paused.map(|paused| {
             div()
                 .text_color(theme.warning)
@@ -341,7 +351,7 @@ impl Workspace {
     pub fn status_line(&self, cx: &App) -> Option<StatusLine> {
         self.session
             .as_ref()
-            .map(|session| session.read(cx).model().status_line())
+            .map(|session| session.read(cx).status_line())
     }
 }
 
@@ -384,12 +394,15 @@ impl Render for Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drain::FRAME;
-    use crate::test_support::{FakeOpener, FakePortSource, open_test_window, port};
+    use crate::test_support::{
+        FakeOpener, FakePortSource, allow_engine_threads, displayed, open_test_window, port,
+        run_until,
+    };
 
     fn open_workspace(
         cx: &mut TestAppContext,
     ) -> (AnyWindowHandle, Entity<Workspace>, Arc<FakeOpener>) {
+        allow_engine_threads(cx);
         let source = FakePortSource::new([port("/dev/a"), port("virtual:echo")]);
         let opener = Arc::new(FakeOpener::default());
         let for_window = opener.clone();
@@ -414,17 +427,17 @@ mod tests {
         assert_eq!(opened[0].0, PortId::new("/dev/a"));
         opened[0].2.connected("/dev/a @ 115200 8N1");
         opened[0].2.data(b"boot ok\n");
-        cx.executor().advance_clock(FRAME);
-        cx.run_until_parked();
+        let session = workspace.read_with(cx, |w, _| w.session().expect("session view").clone());
+        run_until(cx, "the boot line", |cx| displayed(cx, &session).len() == 2);
 
+        assert_eq!(displayed(cx, &session)[1].text, "boot ok");
         workspace.read_with(cx, |workspace, cx| {
             let session = workspace.session().expect("session view").read(cx);
-            assert_eq!(session.model().state, ConnectionState::Connected);
-            assert_eq!(
-                session.model().buffer.rows().last().unwrap().text,
-                "boot ok"
-            );
+            assert_eq!(session.state(), &ConnectionState::Connected);
             assert_eq!(workspace.connecting(), None);
+            let status = workspace.status_line(cx).expect("a status line");
+            assert_eq!(status.title, "/dev/a @ 115200 8N1");
+            assert_eq!(status.retained, "2 lines, 8 B kept");
         });
     }
 
@@ -459,8 +472,8 @@ mod tests {
         let feed = opener.opened()[0].2.clone();
         feed.connected("dev");
         feed.data(b"one\ntwo\n");
-        cx.executor().advance_clock(FRAME);
-        cx.run_until_parked();
+        let session = workspace.read_with(cx, |w, _| w.session().unwrap().clone());
+        run_until(cx, "two lines", |cx| displayed(cx, &session).len() == 3);
 
         let (clear, disconnect) = if cfg!(target_os = "macos") {
             ("cmd-k", "cmd-w")
@@ -469,14 +482,13 @@ mod tests {
         };
         cx.update_window(window, |_, window, cx| window.press(clear, cx))
             .unwrap();
-        let session = workspace.read_with(cx, |w, _| w.session().unwrap().clone());
-        session.read_with(cx, |view, _| assert!(view.model().buffer.is_empty()));
+        assert!(displayed(cx, &session).is_empty());
 
         cx.update_window(window, |_, window, cx| window.press(disconnect, cx))
             .unwrap();
         cx.run_until_parked();
         assert!(feed.was_closed());
-        session.read_with(cx, |view, _| assert!(view.model().state.is_disconnected()));
+        session.read_with(cx, |view, _| assert!(view.state().is_disconnected()));
     }
 
     #[gpui_test]
