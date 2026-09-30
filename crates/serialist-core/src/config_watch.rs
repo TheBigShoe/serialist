@@ -13,8 +13,9 @@
 //! event as "reload this", never as "exactly one change happened".
 //!
 //! The event says what to reload, not what changed; the receiver re-reads the file with
-//! [`load_settings`](crate::load_settings), [`load_keymap`](crate::load_keymap) or
-//! [`ThemeRegistry::load`](crate::ThemeRegistry::load).
+//! [`load_settings`](crate::load_settings), [`load_keymap`](crate::load_keymap),
+//! [`ThemeRegistry::load`](crate::ThemeRegistry::load) or
+//! [`CommandStore::load`](crate::CommandStore::load).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +47,8 @@ pub enum ConfigEvent {
     Keymap,
     /// A `*.json` file under the `themes/` folder, at any depth.
     Themes,
+    /// A `*.json` file directly in the `commands/` folder, or the project commands file.
+    Commands,
 }
 
 /// The files the watcher cares about, in the form the OS reports them.
@@ -54,6 +57,8 @@ struct Targets {
     settings: Vec<PathBuf>,
     keymap: PathBuf,
     themes: PathBuf,
+    commands: PathBuf,
+    project_commands: Option<PathBuf>,
 }
 
 impl Targets {
@@ -64,6 +69,8 @@ impl Targets {
             settings,
             keymap: canonical(&paths.keymap),
             themes: canonical(&paths.themes),
+            commands: canonical(&paths.commands_dir()),
+            project_commands: paths.project_commands.as_deref().map(canonical),
         }
     }
 
@@ -81,6 +88,13 @@ impl Targets {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
         {
             ConfigEvent::Themes
+        } else if self.project_commands.as_deref() == Some(path)
+            || (path.parent() == Some(self.commands.as_path())
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+        {
+            ConfigEvent::Commands
         } else {
             return None;
         };
@@ -142,9 +156,10 @@ pub struct ConfigWatcher {
 impl ConfigWatcher {
     /// Starts watching and sends a [`ConfigEvent`] on `tx` for each change.
     ///
-    /// Watches the config directory non-recursively and `themes/` recursively, creating
-    /// either if it is missing so files added later are noticed, plus the directory of
-    /// the project settings file when `paths` has one. Creating those directories
+    /// Watches the config directory non-recursively, `themes/` recursively and
+    /// `commands/` non-recursively, creating each if it is missing so files added later
+    /// are noticed, plus the directories of the project settings and commands files when
+    /// `paths` has them. Creating those directories
     /// produces no event. If the OS watcher cannot be started the problem is logged and
     /// the returned watcher is inert ([`is_active`](Self::is_active) is false); the app
     /// still runs, just without hot reload.
@@ -237,7 +252,8 @@ fn forward(
 
 fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, notify::Error> {
     // The directories have to exist to be watched.
-    for dir in [&paths.dir, &paths.themes] {
+    let commands_path = paths.commands_dir();
+    for dir in [&paths.dir, &paths.themes, &commands_path] {
         if let Err(err) = std::fs::create_dir_all(dir) {
             tracing::warn!(%err, dir = %dir.display(), "cannot create the config directory");
         }
@@ -265,13 +281,26 @@ fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, 
     {
         tracing::warn!(%err, dir = %themes_dir.display(), "cannot watch the themes folder");
     }
-    // A project settings file usually lives outside the config directory.
-    if let Some(project) = &paths.project_settings
-        && let Some(parent) = project.parent().map(canonical)
-        && parent != config_dir
-        && let Err(err) = debouncer.watch(&parent, RecursiveMode::NonRecursive)
+    let commands_dir = canonical(&commands_path);
+    if commands_dir != config_dir
+        && let Err(err) = debouncer.watch(&commands_dir, RecursiveMode::NonRecursive)
     {
-        tracing::warn!(%err, dir = %parent.display(), "cannot watch the project settings");
+        tracing::warn!(%err, dir = %commands_dir.display(), "cannot watch the commands folder");
+    }
+    // Project files usually live outside the config directory, and both in one folder.
+    let mut watched = vec![config_dir.clone(), themes_dir, commands_dir];
+    for project in [&paths.project_settings, &paths.project_commands]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(parent) = project.parent().map(canonical)
+            && !watched.contains(&parent)
+        {
+            if let Err(err) = debouncer.watch(&parent, RecursiveMode::NonRecursive) {
+                tracing::warn!(%err, dir = %parent.display(), "cannot watch the project settings");
+            }
+            watched.push(parent);
+        }
     }
 
     let alive = Arc::new(AtomicBool::new(true));
