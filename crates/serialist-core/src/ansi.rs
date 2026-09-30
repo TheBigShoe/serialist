@@ -87,6 +87,12 @@ pub struct AnsiParser {
     vte: vte::Parser,
     line: LineState,
     max_line_bytes: usize,
+    /// An incomplete UTF-8 sequence at the end of the last chunk, held back so vte
+    /// never sees a character split across two `advance` calls (see [`AnsiParser::feed`]).
+    held: [u8; 4],
+    held_len: usize,
+    /// Reused to join held bytes to the next chunk.
+    joined: Vec<u8>,
 }
 
 impl Default for AnsiParser {
@@ -119,6 +125,9 @@ impl AnsiParser {
             vte: vte::Parser::new(),
             line: LineState::new(max_line_bytes),
             max_line_bytes,
+            held: [0; 4],
+            held_len: 0,
+            joined: Vec::new(),
         }
     }
 
@@ -132,7 +141,52 @@ impl AnsiParser {
     }
 
     /// Parse `bytes`, calling `on_line` for every line that ends in them, in order.
+    ///
+    /// A UTF-8 sequence cut off at the end of `bytes` is held back and parsed with the
+    /// next call. vte 0.15.0 buffers such a sequence itself, but when the next call
+    /// completes it and the following bytes hold another character and then an
+    /// incomplete one, `advance_partial_utf8` skips a byte; holding the sequence back
+    /// keeps the parse independent of chunking. Held bytes count towards the line in
+    /// progress.
     pub fn feed(&mut self, bytes: &[u8], mut on_line: impl FnMut(ParsedLine<'_>)) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.held_len == 0 {
+            let keep = incomplete_utf8_suffix(bytes);
+            self.feed_whole(&bytes[..bytes.len() - keep], &mut on_line);
+            self.hold(&bytes[bytes.len() - keep..], &mut on_line);
+        } else {
+            let mut joined = std::mem::take(&mut self.joined);
+            joined.clear();
+            joined.extend_from_slice(&self.held[..self.held_len]);
+            joined.extend_from_slice(bytes);
+            // Already counted when they were held.
+            self.line.raw_len -= self.held_len;
+            self.held_len = 0;
+            let keep = incomplete_utf8_suffix(&joined);
+            self.feed_whole(&joined[..joined.len() - keep], &mut on_line);
+            self.hold(&joined[joined.len() - keep..], &mut on_line);
+            self.joined = joined;
+        }
+    }
+
+    /// Hold back `tail`, unless that would reach the line limit: then the limit breaks
+    /// the line inside it exactly as it would in one chunk, so feed it now.
+    fn hold(&mut self, tail: &[u8], on_line: &mut impl FnMut(ParsedLine<'_>)) {
+        if tail.is_empty() {
+            return;
+        }
+        if self.line.raw_len + tail.len() >= self.max_line_bytes {
+            self.feed_whole(tail, on_line);
+            return;
+        }
+        self.held[..tail.len()].copy_from_slice(tail);
+        self.held_len = tail.len();
+        self.line.raw_len += tail.len();
+    }
+
+    fn feed_whole(&mut self, bytes: &[u8], on_line: &mut impl FnMut(ParsedLine<'_>)) {
         let mut rest = bytes;
         while !rest.is_empty() {
             let room = self.max_line_bytes - self.line.raw_len;
@@ -174,7 +228,10 @@ impl AnsiParser {
 
     /// End the line in progress (marked incomplete) so that what follows starts a new
     /// line. The escape state and pen carry over. Used when a local line is inserted.
+    /// A UTF-8 sequence held back at the end of the last chunk is dropped: its bytes stay
+    /// in the ended line's raw range, and a continuation arriving later shows as U+FFFD.
     pub fn break_line(&mut self, on_line: impl FnOnce(ParsedLine<'_>)) {
+        self.held_len = 0;
         if self.line.raw_len > 0 {
             on_line(self.line.view(false));
             self.line.reset();
@@ -183,7 +240,8 @@ impl AnsiParser {
 
     /// Bytes of heap this parser holds, for memory accounting.
     pub fn heap_bytes(&self) -> usize {
-        self.line.text.capacity()
+        self.joined.capacity()
+            + self.line.text.capacity()
             + (self.line.runs.capacity() + self.line.scratch.capacity())
                 * std::mem::size_of::<StyleRun>()
     }
@@ -491,6 +549,26 @@ fn indexed(n: u8) -> Color {
     } else {
         Color::Indexed(n)
     }
+}
+
+/// Length of an incomplete UTF-8 sequence at the end of `bytes` (0 if there is none):
+/// a lead byte followed by fewer continuation bytes than it announces.
+fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    for back in 1..=n.min(3) {
+        let b = bytes[n - back];
+        if b & 0xC0 == 0x80 {
+            continue;
+        }
+        let need = match b {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return 0,
+        };
+        return if back < need { back } else { 0 };
+    }
+    0
 }
 
 /// Append a run, merging it into the last one when the style matches.
@@ -965,6 +1043,23 @@ mod tests {
             }
             assert_eq!(lines, whole, "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn utf8_split_before_more_text() {
+        // vte 0.15.0 alone drops the space here when the chunks split after 0xC3.
+        let chunks: [&[u8]; 3] = [b"caf\xc3", b"\xa9 \xe2\x82", b"\xac\n"];
+        let mut parser = AnsiParser::new();
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        for c in chunks {
+            parser.feed(c, |l| lines.push(l.into()));
+        }
+        assert_eq!(lines[0].text, "café €");
+        assert_eq!(lines[0].raw_len, 10);
+        assert_eq!(incomplete_utf8_suffix(b"ab\xf0\x9f\x98"), 3);
+        assert_eq!(incomplete_utf8_suffix(b"ab\xf0\x9f\x98\x80"), 0);
+        assert_eq!(incomplete_utf8_suffix(b"\xff"), 0);
+        assert_eq!(incomplete_utf8_suffix(b"\x80\x80\x80"), 0);
     }
 
     #[test]
