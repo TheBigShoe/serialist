@@ -258,9 +258,12 @@ mod tests {
 
     #[test]
     fn a_missing_family_falls_to_an_installed_fallback_then_the_default() {
+        // The platform default is part of the fake installed set so the second half of
+        // the test means the same thing on every OS (Windows CI has no Cascadia Mono).
         let installed: Vec<String> = ["Menlo", "Monaco", "DejaVu Sans Mono", "Consolas"]
             .iter()
             .map(|f| f.to_string())
+            .chain(std::iter::once(DEFAULT_MONO_FAMILY.to_string()))
             .collect();
         let fallbacks = vec!["Nope Mono".to_owned(), "Monaco".to_owned()];
         let mut font = build_font(
