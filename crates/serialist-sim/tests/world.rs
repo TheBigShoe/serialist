@@ -10,7 +10,7 @@ use serialist_core::{
     TransportFactory, UsbInfo,
 };
 use serialist_sim::{
-    EchoDevice, LinkConfig, ManualClock, SimPortSource, SimTransportFactory, SimWorld,
+    EchoDevice, LinkConfig, ManualClock, MenuDevice, SimPortSource, SimTransportFactory, SimWorld,
     virtual_port, virtual_port_id,
 };
 
@@ -193,6 +193,20 @@ fn world_lists_and_opens_the_builtins() {
         let t = factory.open(&port.id, &SerialConfig::default());
         assert!(t.is_ok(), "{} failed to open", port.id);
     }
+}
+
+#[test]
+fn the_boot_menu_is_added_on_request_and_draws_on_connect() {
+    let world = SimWorld::new();
+    let id = virtual_port_id(SimWorld::MENU);
+    assert!(!world.source().contains(&id), "not a built-in");
+    assert_eq!(world.add_menu(), id);
+    assert!(world.source().contains(&id));
+    let mut t = world.factory().open(&id, &SerialConfig::default()).unwrap();
+    let first = MenuDevice::new().frame();
+    let expected = [&b"\x1b[?25l\x1b[2J"[..], &first].concat();
+    let got = read_exactly(&mut *t.reader, expected.len(), 4096, Duration::from_secs(5));
+    assert_eq!(got, expected);
 }
 
 #[test]
