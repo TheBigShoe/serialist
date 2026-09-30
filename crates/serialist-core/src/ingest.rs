@@ -757,6 +757,64 @@ mod tests {
         drop(handle);
     }
 
+    /// A panic on the ingest thread resolves the pending expectations instead of leaving
+    /// them waiting for a thread that is gone.
+    #[test]
+    fn a_panicking_thread_closes_the_matchers() {
+        use crate::matcher::ExpectResult;
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(
+            rx,
+            Store::default(),
+            vec![Box::new(Exploding)],
+            Box::new(|| {}),
+        );
+        let expectation = handle
+            .matchers()
+            .expect("^never", Duration::from_secs(60))
+            .unwrap();
+        tx.send(data(b"boom\n")).unwrap();
+        assert_eq!(
+            expectation.wait_timeout(Duration::from_secs(5)),
+            Some(ExpectResult::Closed)
+        );
+        assert!(handle.join().is_err());
+    }
+
+    /// Received lines reach the matchers; local lines do not, and move the start.
+    #[test]
+    fn received_lines_reach_the_matchers_and_local_lines_do_not() {
+        use crate::matcher::ExpectResult;
+        let (tx, rx) = unbounded();
+        let handle = Ingest::spawn(rx, Store::default(), Vec::new(), Box::new(|| {}));
+        let matchers = handle.matchers();
+        let wanted = matchers.expect("^hello", Duration::from_secs(60)).unwrap();
+        handle.append_local("hello (echo)", Direction::Tx).unwrap();
+        tx.send(connected("virtual:x")).unwrap();
+        wait_for_lines(&handle, 2);
+        assert_eq!(
+            wanted.try_wait(),
+            None,
+            "an echo and a notice are not replies"
+        );
+        tx.send(data(b"hello\n")).unwrap();
+        match wanted.wait_timeout(Duration::from_secs(5)) {
+            Some(ExpectResult::Matched { line, text, .. }) => {
+                assert_eq!((line, text.as_str()), (LineId(2), "hello"));
+            }
+            other => panic!("expected a match, got {other:?}"),
+        }
+        // The session's Disconnected closes the registry.
+        let late = matchers.expect("x", Duration::from_secs(60)).unwrap();
+        tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+        assert_eq!(
+            late.wait_timeout(Duration::from_secs(5)),
+            Some(ExpectResult::Closed)
+        );
+        drop(tx);
+        handle.join().expect("the ingest thread ran cleanly");
+    }
+
     /// Logs the link events a sink hears, in order.
     struct LinkLog(Arc<Mutex<Vec<String>>>);
 
