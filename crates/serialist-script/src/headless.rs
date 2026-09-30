@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::thread;
 
 use parking_lot::Mutex;
+use serialist_core::LinkState;
 use serialist_core::{
     ControlLine, Ingest, IngestHandle, PortId, PortSource, SerialConfig, Session, SessionClosed,
     SessionConfig, Store, StoreReader, TransportError, TransportFactory,
@@ -53,6 +54,15 @@ impl HeadlessSession {
             vec![Box::new(bell.sink())],
             Box::new(|| {}),
         );
+        // The script may ask for the description at once; give the ingest thread a
+        // moment to record the Connected event (a slow CI runner has taken longer than
+        // the script's first call).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matches!(ingest.connection().state, LinkState::Connecting)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         Ok(Self {
             port,
             reader: ingest.reader(),
