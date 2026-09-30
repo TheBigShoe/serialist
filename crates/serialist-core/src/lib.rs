@@ -4,6 +4,7 @@
 //! and every abstraction here has an in-process implementation in `serialist-sim`
 //! so the whole engine can be exercised without hardware.
 
+pub mod ansi;
 pub mod composite;
 pub mod config;
 pub mod discovery;
