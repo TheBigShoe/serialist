@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Serialist icon candidate 3: Terminal window. Original artwork, MIT OR Apache-2.0.
+
+  A small dark terminal card, tipped a few degrees as if it had just been set
+  down on a bright mint-to-cyan tile. Title bar with three dots (one warm) and a
+  small square wave where the title would be, then a mint prompt and a block
+  cursor. It is the only light tile of the set, so it
+  stands apart in a dark Dock, and the dark card gives it a strong shape on a
+  light one. The shadow is the card repeated, grown and pushed down in faint
+  steps, so no SVG filters are needed.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Serialist: Terminal window</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5df0c6"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+    <linearGradient id="dusk" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0.3" stop-color="#0a0f19" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0a0f19" stop-opacity="0.28"/>
+    </linearGradient>
+    <radialGradient id="sheen" gradientUnits="userSpaceOnUse" cx="360" cy="-80" r="820">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <rect id="card" x="172" y="262" width="680" height="520" rx="64"/>
+    <linearGradient id="body" gradientUnits="userSpaceOnUse" x1="0" y1="262" x2="0" y2="782">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="1" stop-color="#0a0f19"/>
+    </linearGradient>
+    <linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="0" y1="262" x2="0" y2="782">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.45"/>
+      <stop offset="0.3" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.02"/>
+    </linearGradient>
+    <path id="chev" d="M372 472L476 574L372 676"/>
+    <rect id="cur" x="560" y="486" width="112" height="176" rx="14"/>
+    <linearGradient id="cursor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#eafcff"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#dusk)"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#sheen)"/>
+
+  <!-- Shadow, cast straight down while the card is tipped: a tight contact shadow
+       and a broad ambient one, each step the card grown and pushed down. -->
+  <g stroke-linejoin="round">
+    <use xlink:href="#card" transform="translate(0 70) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.02" stroke="#08202e" stroke-opacity="0.02" stroke-width="160"/>
+    <use xlink:href="#card" transform="translate(0 60) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.025" stroke="#08202e" stroke-opacity="0.025" stroke-width="132"/>
+    <use xlink:href="#card" transform="translate(0 50) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.03" stroke="#08202e" stroke-opacity="0.03" stroke-width="106"/>
+    <use xlink:href="#card" transform="translate(0 40) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.036" stroke="#08202e" stroke-opacity="0.036" stroke-width="82"/>
+    <use xlink:href="#card" transform="translate(0 31) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.042" stroke="#08202e" stroke-opacity="0.042" stroke-width="60"/>
+    <use xlink:href="#card" transform="translate(0 22) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.05" stroke="#08202e" stroke-opacity="0.05" stroke-width="40"/>
+    <use xlink:href="#card" transform="translate(0 14) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.07" stroke="#08202e" stroke-opacity="0.07" stroke-width="22"/>
+    <use xlink:href="#card" transform="translate(0 8) rotate(-6 512 522)" fill="#08202e" fill-opacity="0.1" stroke="#08202e" stroke-opacity="0.1" stroke-width="8"/>
+  </g>
+
+  <g transform="rotate(-6 512 522)">
+    <use xlink:href="#card" fill="url(#body)"/>
+    <!-- Title bar. -->
+    <path d="M236 262H788A64 64 0 0 1 852 326V368H172V326A64 64 0 0 1 236 262Z" fill="#ffffff" fill-opacity="0.07"/>
+    <path d="M172 368H852" stroke="#000000" stroke-opacity="0.35" stroke-width="4"/>
+    <circle cx="236" cy="316" r="20" fill="#ffb454"/>
+    <circle cx="296" cy="316" r="20" fill="#ffffff" fill-opacity="0.22"/>
+    <circle cx="356" cy="316" r="20" fill="#ffffff" fill-opacity="0.22"/>
+    <!-- A line-activity glyph where a title would be: this window talks to a wire. -->
+    <path d="M672 330H700V300H732V330H764V300H790" fill="none" stroke="#5df0c6" stroke-opacity="0.75" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    <use xlink:href="#card" fill="none" stroke="url(#rim)" stroke-width="6"/>
+
+    <!-- Prompt and block cursor, with a faint phosphor halo. -->
+    <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.025" stroke-width="176"/>
+      <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.04" stroke-width="144"/>
+      <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.07" stroke-width="116"/>
+      <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.12" stroke-width="92"/>
+      <use xlink:href="#chev" stroke="#5df0c6" stroke-width="72"/>
+    </g>
+    <use xlink:href="#cur" fill="none" stroke="#4cc9f0" stroke-opacity="0.025" stroke-width="104" stroke-linejoin="round"/>
+    <use xlink:href="#cur" fill="none" stroke="#4cc9f0" stroke-opacity="0.04" stroke-width="72" stroke-linejoin="round"/>
+    <use xlink:href="#cur" fill="none" stroke="#4cc9f0" stroke-opacity="0.07" stroke-width="44" stroke-linejoin="round"/>
+    <use xlink:href="#cur" fill="none" stroke="#4cc9f0" stroke-opacity="0.12" stroke-width="20" stroke-linejoin="round"/>
+    <use xlink:href="#cur" fill="url(#cursor)"/>
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="6"/>
+</svg>
