@@ -7,6 +7,12 @@
 //! `Release` store after writing them. Readers only form references to slots below a
 //! length they loaded with `Acquire`, so they never see a slot being written and every
 //! slot they see is initialised. Written slots are never touched again.
+//!
+//! The buffer is also invariant in `T`, so no one can re-type a writer or a buffer to a
+//! shorter lifetime than its readers assume (see [`AppendWriter`]).
+//!
+//! Not part of the crate's API: the module is public only so doctests can check that
+//! variance, and every method is crate-private.
 
 use std::alloc::{self, Layout};
 use std::fmt;
@@ -15,11 +21,25 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) struct AppendBuf<T: Copy> {
+/// A fixed-capacity buffer one [`AppendWriter`] fills while readers read its prefix.
+///
+/// Invariant in `T`, like [`AppendWriter`]; shortening its lifetime does not compile:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use serialist_core::store::buf::AppendBuf;
+///
+/// fn shorten<'a>(b: Arc<AppendBuf<&'static u64>>) -> Arc<AppendBuf<&'a u64>> {
+///     b
+/// }
+/// ```
+pub struct AppendBuf<T: Copy> {
     ptr: NonNull<T>,
     cap: usize,
     len: AtomicUsize,
-    _owns: PhantomData<T>,
+    /// `fn(T) -> T` makes the buffer invariant in `T` (see [`AppendWriter`]). `T: Copy`
+    /// has no drop glue, so nothing is lost for drop checking by not owning a `T` here.
+    _invariant: PhantomData<fn(T) -> T>,
 }
 
 // SAFETY: the buffer owns plain `Copy` data; shared access is read-only below the
@@ -30,7 +50,7 @@ unsafe impl<T: Copy + Send + Sync> Sync for AppendBuf<T> {}
 
 impl<T: Copy> AppendBuf<T> {
     /// An empty buffer of `cap` slots and the one writer allowed to fill it.
-    pub fn new(cap: usize) -> (Arc<Self>, AppendWriter<T>) {
+    pub(crate) fn new(cap: usize) -> (Arc<Self>, AppendWriter<T>) {
         let ptr = if cap == 0 || size_of::<T>() == 0 {
             NonNull::dangling()
         } else {
@@ -43,7 +63,7 @@ impl<T: Copy> AppendBuf<T> {
             ptr,
             cap,
             len: AtomicUsize::new(0),
-            _owns: PhantomData,
+            _invariant: PhantomData,
         });
         let writer = AppendWriter {
             buf: Arc::clone(&buf),
@@ -53,19 +73,19 @@ impl<T: Copy> AppendBuf<T> {
     }
 
     /// A full buffer holding exactly `items`.
-    pub fn frozen(items: &[T]) -> Arc<Self> {
+    pub(crate) fn frozen(items: &[T]) -> Arc<Self> {
         let (buf, mut writer) = Self::new(items.len());
         writer.extend(items);
         buf
     }
 
     /// Slots written and published so far.
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
     }
 
     /// Everything published so far.
-    pub fn as_slice(&self) -> &[T] {
+    pub(crate) fn as_slice(&self) -> &[T] {
         let len = self.len();
         // SAFETY: slots below a length loaded with Acquire are initialised and are
         // never written again (module docs).
@@ -73,7 +93,7 @@ impl<T: Copy> AppendBuf<T> {
     }
 
     /// Bytes this buffer allocated.
-    pub fn heap_bytes(&self) -> usize {
+    pub(crate) fn heap_bytes(&self) -> usize {
         self.cap * size_of::<T>()
     }
 }
@@ -98,27 +118,51 @@ impl<T: Copy> fmt::Debug for AppendBuf<T> {
 }
 
 /// The unique right to append to one [`AppendBuf`].
-pub(crate) struct AppendWriter<T: Copy> {
+///
+/// Invariant in `T`. Were it covariant, a writer of `&'static u64` could be re-typed as
+/// a writer of `&'a u64` and push a reference that dies with `'a`, while a reader still
+/// holding the buffer as `&'static u64` reads it after it dangles. So this must not
+/// compile:
+///
+/// ```compile_fail
+/// use serialist_core::store::buf::AppendWriter;
+///
+/// fn shorten<'a>(w: AppendWriter<&'static u64>) -> AppendWriter<&'a u64> {
+///     w
+/// }
+/// ```
+///
+/// while the same function without the lifetime change does, so the failure above is
+/// the variance and not a typo:
+///
+/// ```
+/// use serialist_core::store::buf::AppendWriter;
+///
+/// fn keep<'a>(w: AppendWriter<&'a u64>) -> AppendWriter<&'a u64> {
+///     w
+/// }
+/// ```
+pub struct AppendWriter<T: Copy> {
     buf: Arc<AppendBuf<T>>,
     /// The writer's own copy of the published length.
     len: usize,
 }
 
 impl<T: Copy> AppendWriter<T> {
-    pub fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.buf.cap - self.len
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 
-    pub fn is_full(&self) -> bool {
+    pub(crate) fn is_full(&self) -> bool {
         self.len == self.buf.cap
     }
 
     /// Append as many of `items` as fit and publish them. Returns how many were written.
-    pub fn extend(&mut self, items: &[T]) -> usize {
+    pub(crate) fn extend(&mut self, items: &[T]) -> usize {
         let n = items.len().min(self.remaining());
         if n > 0 {
             // SAFETY: slots `len..len + n` are in bounds, unpublished (so no reader
@@ -137,12 +181,12 @@ impl<T: Copy> AppendWriter<T> {
     }
 
     /// Append one item. Returns `false` when the buffer is full.
-    pub fn push(&mut self, item: T) -> bool {
+    pub(crate) fn push(&mut self, item: T) -> bool {
         self.extend(std::slice::from_ref(&item)) == 1
     }
 
     /// Everything written so far.
-    pub fn written(&self) -> &[T] {
+    pub(crate) fn written(&self) -> &[T] {
         &self.buf.as_slice()[..self.len]
     }
 }
