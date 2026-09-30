@@ -13,7 +13,9 @@
 //! - [`SimWorld`]: a source and a factory wired together, with the built-in devices plugged in.
 //! - Built-in devices: [`EchoDevice`], [`AtDevice`], [`FirehoseDevice`] (configurable rate
 //!   and content, verified end to end by [`FirehoseVerifier`]), [`RaceDevice`] (Airoha RACE
-//!   binary frames mixed with text, for the codec plugins).
+//!   binary frames mixed with text, for the codec plugins), [`MenuDevice`] (a U-Boot style
+//!   boot menu redrawn in place with cursor addressing, for the VT screen; added to a
+//!   world with [`SimWorld::add_menu`]).
 //! - [`Clock`]: where a link gets its time. [`SystemClock`] is real time; a
 //!   [`ManualClock`] moves only when a test moves it, so timing assertions are exact.
 //!   [`VirtualLink::connect_with_clock`] and [`SimWorld::with_clock`] take one.
@@ -28,6 +30,7 @@ mod devices;
 mod factory;
 mod firehose;
 mod link;
+mod menu;
 mod race;
 mod source;
 mod world;
@@ -41,6 +44,7 @@ pub use firehose::{
     FirehoseVerifier, MIN_TICK, SeqGap,
 };
 pub use link::{HOST_BACKLOG_LIMIT, LinkHandle, PACED_LOOKAHEAD, PACKET_INTERVAL, VirtualLink};
+pub use menu::MenuDevice;
 pub use race::{
     RACE_COMMAND, RACE_INDICATION, RACE_LOG, RACE_MAX_LEN, RACE_RESPONSE, RACE_SYNC, RaceDevice,
     race_frame,
