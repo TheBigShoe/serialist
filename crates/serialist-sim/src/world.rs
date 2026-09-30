@@ -11,7 +11,7 @@ use serialist_core::{PortId, PortInfo, PortSource, TransportFactory};
 use crate::source::virtual_port;
 use crate::{
     AtDevice, Clock, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig,
-    LinkHandle, SimDevice, SimPortSource, SimTransportFactory,
+    LinkHandle, RaceDevice, SimDevice, SimPortSource, SimTransportFactory,
 };
 
 /// A simulated set of devices for tests and the app's developer mode. Cheap to clone;
@@ -26,6 +26,7 @@ use crate::{
 /// | `virtual:at`             | [`AtDevice::new`]                             |
 /// | `virtual:firehose`       | [`FirehoseDevice`], text, as fast as the baud |
 /// | `virtual:firehose-ansi`  | [`FirehoseDevice`], ANSI, as fast as the baud |
+/// | `virtual:race`           | [`RaceDevice::new`]                           |
 ///
 /// Links run in real time. A test that wants exact timing builds the world with
 /// [`SimWorld::with_clock`] (or [`SimWorld::empty_with_clock`]) and a
@@ -44,6 +45,7 @@ impl SimWorld {
     pub const AT: &'static str = "at";
     pub const FIREHOSE: &'static str = "firehose";
     pub const FIREHOSE_ANSI: &'static str = "firehose-ansi";
+    pub const RACE: &'static str = "race";
 
     /// A world with the built-in devices plugged in.
     pub fn new() -> Self {
@@ -93,11 +95,19 @@ impl SimWorld {
                 FirehoseContent::Text,
             )))
         });
-        world.add_virtual(Self::FIREHOSE_ANSI, "ANSI firehose (virtual)", link, || {
-            Box::new(
-                FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Ansi))
-                    .with_name(Self::FIREHOSE_ANSI),
-            )
+        world.add_virtual(
+            Self::FIREHOSE_ANSI,
+            "ANSI firehose (virtual)",
+            link.clone(),
+            || {
+                Box::new(
+                    FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Ansi))
+                        .with_name(Self::FIREHOSE_ANSI),
+                )
+            },
+        );
+        world.add_virtual(Self::RACE, "Airoha RACE (virtual)", link, || {
+            Box::new(RaceDevice::new())
         });
         world
     }

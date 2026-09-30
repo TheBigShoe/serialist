@@ -183,7 +183,8 @@ fn world_lists_and_opens_the_builtins() {
             "virtual:echo-lines",
             "virtual:at",
             "virtual:firehose",
-            "virtual:firehose-ansi"
+            "virtual:firehose-ansi",
+            "virtual:race"
         ]
     );
     assert!(ports.iter().all(|p| p.kind == PortKind::Virtual));
