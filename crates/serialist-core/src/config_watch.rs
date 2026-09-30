@@ -6,39 +6,42 @@
 //! many files change in one window, each [`ConfigEvent`] is sent once per batch.
 //!
 //! Files produce events; directories mostly do not. A directory event, including the
-//! creation of the config, `themes/`, `commands/` or `scripts/` directory that
-//! [`ConfigWatcher::spawn`] performs itself, is dropped: some backends (FSEvents on
+//! creation of the config, `themes/`, `commands/`, `scripts/` or `plugins/` directory
+//! that [`ConfigWatcher::spawn`] performs itself, is dropped: some backends (FSEvents on
 //! macOS) deliver directory events late and folded into later batches, and a reload
-//! for one would be spurious. The two exceptions, folders inside `scripts/` and the
-//! watched folders themselves coming and going, are below. A batch may still be split
+//! for one would be spurious. The two exceptions, folders inside `scripts/` and
+//! `plugins/` and the watched folders themselves coming and going, are below. A batch
+//! may still be split
 //! across debounce windows, so one save can produce more than one event of a kind;
 //! treat an event as "reload this", never as "exactly one change happened".
 //!
 //! The event says what to reload, not what changed; the receiver re-reads the file with
 //! [`load_settings`](crate::load_settings), [`load_keymap`](crate::load_keymap),
 //! [`ThemeRegistry::load`](crate::ThemeRegistry::load) or
-//! [`CommandStore::load`](crate::CommandStore::load), or lists the scripts folder again.
+//! [`CommandStore::load`](crate::CommandStore::load), or lists the scripts or plugins
+//! folder again.
 //!
 //! # Folders, and why Linux needs more
 //!
-//! `themes/` and `scripts/` are watched recursively and `commands/` flat, each with a
-//! watch of its own, and `spawn` creates all three first so they can be. The backends
-//! differ in two ways that matter:
+//! `themes/`, `scripts/` and `plugins/` are watched recursively and `commands/` flat,
+//! each with a watch of its own, and `spawn` creates all four first so they can be. The
+//! backends differ in two ways that matter:
 //!
 //! - **New subfolders.** Linux's inotify watches one directory at a time; notify
 //!   emulates a recursive watch by adding a watch for each subfolder when it sees the
 //!   subfolder appear. A file written into a new subfolder before that watch is in place
 //!   is never reported, so `mkdir -p scripts/lib && cp util.lua scripts/lib/` loses the
 //!   file's event. Under `scripts/` a folder appearing, disappearing or being renamed
-//!   therefore counts as [`ConfigEvent::Scripts`] by itself, and the receiver's relist
+//!   therefore counts as [`ConfigEvent::Scripts`] by itself (under `plugins/`, as
+//!   [`ConfigEvent::Plugins`]), and the receiver's relist
 //!   finds whatever the folder holds by then (the debounce gives it 100 ms). FSEvents
 //!   (macOS) and ReadDirectoryChangesW (Windows) watch whole trees and report the file
 //!   too; for them the folder event is one more harmless relist.
 //! - **Folders that go and come back.** On Linux (and with kqueue) and Windows a watch
-//!   belongs to the directory, not the path: when `themes/`, `commands/` or `scripts/`
-//!   is deleted or renamed away its watch dies with it (or, on Windows, follows the
-//!   renamed folder), and the config directory's flat watch only sees a new folder of
-//!   that name appear. So when a batch touches one of the three, the forwarding thread
+//!   belongs to the directory, not the path: when `themes/`, `commands/`, `scripts/` or
+//!   `plugins/` is deleted or renamed away its watch dies with it (or, on Windows,
+//!   follows the renamed folder), and the config directory's flat watch only sees a new
+//!   folder of that name appear. So when a batch touches one of the four, the forwarding thread
 //!   looks at the disk: a folder that is gone loses its watch, and one that is there but
 //!   unwatched, or was removed or renamed in the batch, gets its old watch dropped and a
 //!   new one added, so a path is never watched twice. Either way the folder's event is
@@ -93,6 +96,11 @@ pub enum ConfigEvent {
     /// A `*.lua` file under the `scripts/` folder, at any depth, or a folder inside it
     /// appearing, disappearing or being renamed (see the module docs).
     Scripts,
+    /// A plugin file (`*.lua`, `*.wasm`, or a plugin's `*.json` manifest) under the
+    /// `plugins/` folder, at any depth, or a folder inside it appearing, disappearing or
+    /// being renamed: the same rules as [`Scripts`](Self::Scripts), since a plugin is a
+    /// folder that may be copied in whole.
+    Plugins,
 }
 
 /// The files the watcher cares about, in the form the OS reports them.
@@ -104,7 +112,15 @@ struct Targets {
     commands: PathBuf,
     project_commands: Option<PathBuf>,
     scripts: PathBuf,
+    plugins: PathBuf,
 }
+
+/// Extensions of the files a change to which reloads the scripts.
+const SCRIPT_EXTENSIONS: &[&str] = &["lua"];
+
+/// Extensions of the files a change to which reloads the plugins: Lua and WebAssembly
+/// entry files, and the JSON manifest a WebAssembly plugin carries.
+const PLUGIN_EXTENSIONS: &[&str] = &["lua", "wasm", "json"];
 
 impl Targets {
     fn new(paths: &ConfigPaths) -> Self {
@@ -117,6 +133,7 @@ impl Targets {
             commands: canonical(&paths.commands_dir()),
             project_commands: paths.project_commands.as_deref().map(canonical),
             scripts: canonical(&paths.scripts_dir()),
+            plugins: canonical(&paths.plugins_dir()),
         }
     }
 
@@ -155,21 +172,13 @@ impl Targets {
     /// Anything removed or renamed in there counts, since what is gone cannot be told
     /// apart from a folder; a spurious relist is cheap.
     fn changes_scripts(&self, kind: &EventKind, path: &Path) -> bool {
-        if path == self.scripts || !path.starts_with(&self.scripts) {
-            return false;
-        }
-        let is_lua = path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"));
-        match kind {
-            EventKind::Access(_) => false,
-            EventKind::Create(CreateKind::Folder)
-            | EventKind::Remove(_)
-            | EventKind::Modify(ModifyKind::Name(_)) => true,
-            // Windows reports `Create(Any)` for folders.
-            EventKind::Create(_) => path.is_dir() || is_lua,
-            _ => is_lua && !path.is_dir(),
-        }
+        changes_tree(&self.scripts, SCRIPT_EXTENSIONS, kind, path)
+    }
+
+    /// The same as [`changes_scripts`](Self::changes_scripts) for the `plugins/` folder
+    /// and its plugin files.
+    fn changes_plugins(&self, kind: &EventKind, path: &Path) -> bool {
+        changes_tree(&self.plugins, PLUGIN_EXTENSIONS, kind, path)
     }
 
     /// The distinct events for a batch, in a fixed order.
@@ -186,6 +195,8 @@ impl Targets {
             for path in &event.paths {
                 let kind = if self.changes_scripts(&event.kind, path) {
                     Some(ConfigEvent::Scripts)
+                } else if self.changes_plugins(&event.kind, path) {
+                    Some(ConfigEvent::Plugins)
                 } else if folder_event {
                     None
                 } else {
@@ -200,6 +211,32 @@ impl Targets {
         }
         found.sort_unstable();
         found
+    }
+}
+
+/// Whether an event of `kind` on `path` changes the tree under `root` (`scripts/` or
+/// `plugins/`): a file with one of `extensions` at any depth, or a folder inside it that
+/// appears, disappears or is renamed, which on Linux may hold files whose own events
+/// were never delivered (see the module docs). Anything removed or renamed in there
+/// counts, since what is gone cannot be told apart from a folder; a spurious reload is
+/// cheap.
+fn changes_tree(root: &Path, extensions: &[&str], kind: &EventKind, path: &Path) -> bool {
+    if path == root || !path.starts_with(root) {
+        return false;
+    }
+    let wanted = path.extension().is_some_and(|ext| {
+        extensions
+            .iter()
+            .any(|wanted| ext.eq_ignore_ascii_case(wanted))
+    });
+    match kind {
+        EventKind::Access(_) => false,
+        EventKind::Create(CreateKind::Folder)
+        | EventKind::Remove(_)
+        | EventKind::Modify(ModifyKind::Name(_)) => true,
+        // Windows reports `Create(Any)` for folders.
+        EventKind::Create(_) => path.is_dir() || wanted,
+        _ => wanted && !path.is_dir(),
     }
 }
 
@@ -380,8 +417,8 @@ pub struct ConfigWatcher {
 impl ConfigWatcher {
     /// Starts watching and sends a [`ConfigEvent`] on `tx` for each change.
     ///
-    /// Watches the config directory non-recursively, `themes/` and `scripts/`
-    /// recursively and `commands/` non-recursively, creating each if it is missing so
+    /// Watches the config directory non-recursively, `themes/`, `scripts/` and
+    /// `plugins/` recursively and `commands/` non-recursively, creating each if it is missing so
     /// files added later are noticed, plus the directories of the project settings and commands files when
     /// `paths` has them. Creating those directories
     /// produces no event. If the OS watcher cannot be started the problem is logged and
@@ -489,7 +526,14 @@ fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, 
     // The directories have to exist to be watched.
     let commands_path = paths.commands_dir();
     let scripts_path = paths.scripts_dir();
-    for dir in [&paths.dir, &paths.themes, &commands_path, &scripts_path] {
+    let plugins_path = paths.plugins_dir();
+    for dir in [
+        &paths.dir,
+        &paths.themes,
+        &commands_path,
+        &scripts_path,
+        &plugins_path,
+    ] {
         if let Err(err) = std::fs::create_dir_all(dir) {
             tracing::warn!(%err, dir = %dir.display(), "cannot create the config directory");
         }
@@ -523,6 +567,11 @@ fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, 
             &scripts_path,
             RecursiveMode::Recursive,
             ConfigEvent::Scripts,
+        ),
+        (
+            &plugins_path,
+            RecursiveMode::Recursive,
+            ConfigEvent::Plugins,
         ),
     ] {
         let path = canonical(path);

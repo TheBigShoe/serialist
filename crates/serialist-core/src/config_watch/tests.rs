@@ -33,7 +33,7 @@ const GRACE: Duration = Duration::from_millis(500);
 /// Time for the OS watcher to be ready before a test touches a file.
 const SETTLE: Duration = Duration::from_millis(200);
 
-use ConfigEvent::{Commands, Keymap, Scripts, Settings, Themes};
+use ConfigEvent::{Commands, Keymap, Plugins, Scripts, Settings, Themes};
 
 struct Fixture {
     _root: TempDir,
@@ -190,6 +190,24 @@ fn a_script_file_is_noticed_at_any_depth() {
     std::thread::sleep(SETTLE);
     fs::write(lib.join("util.lua"), "return {}").unwrap();
     assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+}
+
+#[test]
+fn a_plugin_file_is_noticed_and_a_plugin_folder_copied_in_whole_too() {
+    let f = watched();
+    // The plugins folder was made by the watcher and is already watched, recursively.
+    assert!(f.paths.plugins_dir().is_dir());
+    let race = f.paths.plugins_dir().join("race");
+    fs::create_dir(&race).unwrap();
+    std::thread::sleep(SETTLE);
+    drain(&f.rx);
+    fs::write(race.join("plugin.lua"), "return {}").unwrap();
+    assert_eq!(expect(&f.rx, &[Plugins]), set(&[Plugins]));
+    // A folder made and filled at once, as copying a plugin in does.
+    let other = f.paths.plugins_dir().join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("plugin.lua"), "return {}").unwrap();
+    assert_eq!(expect(&f.rx, &[Plugins]), set(&[Plugins]));
 }
 
 /// Whether the backend's watches belong to directories, so a folder that comes back is
@@ -578,6 +596,7 @@ fn targets() -> Targets {
         commands: PathBuf::from("/cfg/commands"),
         project_commands: Some(PathBuf::from("/proj/.serialist/commands.json")),
         scripts: PathBuf::from("/cfg/scripts"),
+        plugins: PathBuf::from("/cfg/plugins"),
     }
 }
 
@@ -679,6 +698,44 @@ fn script_files_count_at_any_depth() {
             "{path}"
         );
     }
+}
+
+#[test]
+fn plugin_files_and_folders_count_as_plugins() {
+    let targets = targets();
+    let one = |kind: EventKind, path: &str| targets.events(&[event(kind, &[path])]);
+    let modify = EventKind::Modify(ModifyKind::Any);
+    for path in [
+        "/cfg/plugins/race/plugin.lua",
+        "/cfg/plugins/race/lib/frames.LUA",
+        "/cfg/plugins/proto/plugin.wasm",
+        "/cfg/plugins/proto/manifest.json",
+    ] {
+        assert_eq!(one(modify, path), vec![Plugins], "{path}");
+    }
+    for path in [
+        "/cfg/plugins",
+        "/cfg/plugins/race/README.md",
+        "/cfg/plugins.lua",
+    ] {
+        assert!(one(modify, path).is_empty(), "{path}");
+    }
+    for kind in [
+        EventKind::Create(CreateKind::Folder),
+        EventKind::Remove(RemoveKind::Folder),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+    ] {
+        assert_eq!(one(kind, "/cfg/plugins/race"), vec![Plugins], "{kind:?}");
+    }
+    assert!(one(EventKind::Create(CreateKind::Folder), "/cfg/plugins").is_empty());
+    // A Lua file under scripts/ is a script, not a plugin, and the other way round.
+    assert_eq!(one(modify, "/cfg/scripts/plugin.lua"), vec![Scripts]);
+    let batch = [
+        event(modify, &["/cfg/plugins/race/plugin.lua"]),
+        event(modify, &["/cfg/scripts/probe.lua"]),
+        event(modify, &["/cfg/settings.json"]),
+    ];
+    assert_eq!(targets.events(&batch), vec![Settings, Scripts, Plugins]);
 }
 
 #[test]
