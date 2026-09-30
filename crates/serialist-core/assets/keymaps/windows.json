@@ -4,7 +4,11 @@
 //
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
 // (ctrl-s is XOFF), so most bindings here use shifted chords. Pause is the exception at
-// plain ctrl-p.
+// plain ctrl-p, which inline mode sends to the device; there it is ctrl-shift-p.
+//
+// In inline mode (TerminalInline) the terminal sends every key it can encode to the
+// port, plain ctrl chords included; the bindings in that section are the exceptions,
+// which run as actions instead of being sent.
 [
   {
     "bindings": {
@@ -18,7 +22,8 @@
       "ctrl-shift-w": "serial::Disconnect",
       "ctrl-p": "terminal::Pause",
       "ctrl-shift-s": "terminal::Export",
-      "ctrl-shift-r": "terminal::ToggleRecord"
+      "ctrl-shift-r": "terminal::ToggleRecord",
+      "ctrl-i": "terminal::ToggleInline"
     }
   },
   {
@@ -27,6 +32,21 @@
       "down": "devices::SelectNext",
       "up": "devices::SelectPrevious",
       "enter": "serial::Connect"
+    }
+  },
+  {
+    "context": "CommandsPanel",
+    "bindings": {
+      "down": "commands::SelectNext",
+      "up": "commands::SelectPrevious",
+      "enter": "commands::SendSelected"
+    }
+  },
+  {
+    "context": "CommandsPanel > Input",
+    "bindings": {
+      "up": "commands::SelectPrevious",
+      "down": "commands::SelectNext"
     }
   },
   {
@@ -39,7 +59,8 @@
   {
     "context": "ComposeBar",
     "bindings": {
-      "ctrl-shift-e": "compose::CycleLineEnding"
+      "ctrl-shift-e": "compose::CycleLineEnding",
+      "ctrl-alt-s": "compose::SaveAsCommand"
     }
   },
   {
@@ -58,6 +79,24 @@
       "end": "terminal::JumpToBottom",
       "ctrl-home": "terminal::ScrollToTop",
       "ctrl-end": "terminal::JumpToBottom"
+    }
+  },
+  {
+    "context": "TerminalInline",
+    "bindings": {
+      "ctrl-i": "terminal::ToggleInline",
+      "ctrl-shift-v": "terminal::Paste",
+      "ctrl-shift-c": "terminal::Copy",
+      "ctrl-shift-a": "terminal::SelectAll",
+      "ctrl-shift-f": "terminal::Search",
+      "ctrl-alt-i": "terminal::ToggleFrameStats",
+      "shift-pageup": "terminal::PageUp",
+      "shift-pagedown": "terminal::PageDown",
+      "ctrl-shift-k": "terminal::Clear",
+      "ctrl-shift-w": "serial::Disconnect",
+      "ctrl-shift-p": "terminal::Pause",
+      "ctrl-shift-s": "terminal::Export",
+      "ctrl-shift-r": "terminal::ToggleRecord"
     }
   },
   {

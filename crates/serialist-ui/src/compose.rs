@@ -1,9 +1,13 @@
 //! The compose bar: a single-line input that sends a line plus a line ending, with
-//! shell-style history on Up and Down.
+//! shell-style history on Up and Down, and "save as command" for the text in it.
+//!
+//! The history a compose bar walks is seeded from the workspace's
+//! [`PersistentHistory`](crate::history::PersistentHistory) when its session opens, so it
+//! carries over from earlier runs.
 
 use std::collections::VecDeque;
 
-use crate::actions::{CycleLineEnding, HistoryNext, HistoryPrevious, context};
+use crate::actions::{CycleLineEnding, HistoryNext, HistoryPrevious, SaveAsCommand, context};
 use crate::config::Config;
 use crate::prelude::*;
 
@@ -73,6 +77,21 @@ impl History {
         self.entries.iter().map(String::as_str)
     }
 
+    /// The newest entry.
+    pub fn newest(&self) -> Option<&str> {
+        self.entries.back().map(String::as_str)
+    }
+
+    /// Replace the entries with `entries`, oldest first, keeping the newest that fit.
+    pub fn replace(&mut self, entries: impl IntoIterator<Item = String>) {
+        self.entries.clear();
+        self.cursor = None;
+        self.draft.clear();
+        for entry in entries {
+            self.push(&entry);
+        }
+    }
+
     /// Record a sent line and reset the cursor. Blank lines and an immediate repeat of
     /// the newest entry are not recorded, as in most shells.
     pub fn push(&mut self, line: &str) {
@@ -120,6 +139,9 @@ impl History {
 pub enum ComposeEvent {
     /// The user pressed Enter. `bytes` is the text framed with the line ending.
     Submit { text: String, bytes: Vec<u8> },
+    /// Save `text` as a saved command: the input's text, or the newest history entry
+    /// when the input is empty.
+    SaveAsCommand { text: String },
 }
 
 pub struct ComposeBar {
@@ -176,6 +198,27 @@ impl ComposeBar {
         &self.history
     }
 
+    /// Start from `entries`, oldest first, as history (the persisted history of earlier
+    /// sessions).
+    pub fn set_history_entries(&mut self, entries: Vec<String>, cx: &mut Context<Self>) {
+        self.history.replace(entries);
+        cx.notify();
+    }
+
+    /// Ask for the text in the input (or the newest history entry) to become a saved
+    /// command. Nothing happens when both are empty.
+    pub fn save_as_command(&mut self, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let text = if text.trim().is_empty() {
+            self.history.newest().unwrap_or_default().to_owned()
+        } else {
+            text
+        };
+        if !text.trim().is_empty() {
+            cx.emit(ComposeEvent::SaveAsCommand { text });
+        }
+    }
+
     pub fn input(&self) -> &Entity<InputState> {
         &self.input
     }
@@ -201,6 +244,15 @@ impl ComposeBar {
 
     fn cycle_line_ending(&mut self, _: &CycleLineEnding, _: &mut Window, cx: &mut Context<Self>) {
         self.set_line_ending(self.line_ending.next(), cx);
+    }
+
+    fn save_as_command_action(
+        &mut self,
+        _: &SaveAsCommand,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_as_command(cx);
     }
 
     fn history_previous(
@@ -236,6 +288,7 @@ impl Render for ComposeBar {
         h_flex()
             .key_context(context::COMPOSE_BAR)
             .on_action(cx.listener(Self::cycle_line_ending))
+            .on_action(cx.listener(Self::save_as_command_action))
             .on_action(cx.listener(Self::history_previous))
             .on_action(cx.listener(Self::history_next))
             .w_full()
@@ -270,6 +323,14 @@ impl Render for ComposeBar {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_line_ending(this.line_ending.next(), cx);
                     })),
+            )
+            .child(
+                Button::new("save-as-command")
+                    .label("Save…")
+                    .tooltip("Save this line (or the last one sent) as a command")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.save_as_command(cx))),
             )
             .child(
                 Button::new("send")
@@ -359,6 +420,16 @@ mod tests {
         assert_eq!(history.older("b"), Some("a"));
         history.push("c");
         assert_eq!(history.older(""), Some("c"));
+    }
+
+    #[test]
+    fn history_can_be_seeded_from_disk() {
+        let mut history = History::new(3);
+        history.push("typed");
+        history.replace(["a", "b", "b", "c", "d"].map(str::to_owned));
+        assert_eq!(history.entries().collect::<Vec<_>>(), ["b", "c", "d"]);
+        assert_eq!(history.newest(), Some("d"));
+        assert_eq!(history.older(""), Some("d"));
     }
 
     #[test]

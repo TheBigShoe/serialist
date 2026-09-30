@@ -12,7 +12,12 @@
 //! view its display defaults, the Devices panel its profiles, the workspace the notice.
 //!
 //! A [`ConfigWatcher`] reports saves; a foreground task drains its channel, reloads the
-//! piece that changed (settings, keymap or themes) and installs the result.
+//! piece that changed (settings, keymap, themes or saved commands) and installs the
+//! result.
+//!
+//! Saved commands ([`CommandStore`]) live here too, because their keybindings are part
+//! of the key bindings: every install that changes the keymap or the commands rebinds,
+//! with the commands' bindings layered after the keymap's (see [`keymap::apply`]).
 //!
 //! # Failures
 //!
@@ -31,14 +36,16 @@ use crossbeam_channel::RecvTimeoutError;
 use serialist_core::config_watch::{ConfigEvent, ConfigWatcher};
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    Appearance, FontSpec, Keymap, PortInfo, Rgba as CoreRgba, SerialConfig, Settings,
-    SettingsError, Theme as ZedTheme, ThemeRegistry, load_keymap, load_settings,
+    Appearance, CommandCollection, CommandStore, FontSpec, Keymap, PortInfo, Rgba as CoreRgba,
+    SerialConfig, Settings, SettingsError, Theme as ZedTheme, ThemeRegistry, load_keymap,
+    load_settings,
 };
 
 use crate::fonts::{
     FontParts, FontRole, TerminalFont, UiFont, build_font, clamp_font_size, clamp_line_height,
     installed_families, substitute_missing_family,
 };
+use crate::inline::InlineSettings;
 use crate::keymap;
 use crate::prelude::*;
 use crate::status::Notice;
@@ -134,6 +141,12 @@ pub struct Config {
     settings: Arc<Settings>,
     /// The bundled default bindings followed by the user's.
     keymap: Arc<Keymap>,
+    /// The saved commands: the user's and the project's collections and the bundled
+    /// examples.
+    commands: Arc<CommandStore>,
+    /// Read from `paths` (not just the bundled defaults), so files there may be written:
+    /// the compose history, a saved command.
+    loaded: bool,
     themes: Arc<ThemeRegistry>,
     theme: Arc<ZedTheme>,
     /// The window appearance `"mode": "system"` follows.
@@ -141,6 +154,8 @@ pub struct Config {
     terminal_font: TerminalFont,
     ui_font: UiFont,
     palette: TerminalPalette,
+    /// The `inline.*` settings, which the UI reads from the settings files itself.
+    inline: InlineSettings,
     problems: Vec<ConfigProblem>,
     /// Bumped by every install, so a view can tell a reload from a repeat.
     generation: u64,
@@ -168,11 +183,14 @@ impl Config {
             theme: Arc::new(themes.default_for(Appearance::Dark).clone()),
             settings,
             keymap: Arc::new(Keymap::bundled_default()),
+            commands: Arc::new(bundled_commands()),
+            loaded: false,
             themes,
             system_dark: true,
             terminal_font: TerminalFont::default(),
             ui_font: UiFont::default(),
             palette: TerminalPalette::default(),
+            inline: InlineSettings::default(),
             problems: Vec::new(),
             generation: 0,
         };
@@ -184,11 +202,13 @@ impl Config {
     pub fn load(paths: ConfigPaths, system_dark: bool) -> Self {
         let mut config = Self::bundled(paths);
         config.system_dark = system_dark;
+        config.loaded = true;
         // Themes first, so the settings resolve their theme against the user's files
         // rather than warning that it is missing from the bundled ones.
         config.reload_themes();
         config.reload_keymap();
         config.reload_settings();
+        config.reload_commands();
         config
     }
 
@@ -202,6 +222,17 @@ impl Config {
 
     pub fn keymap(&self) -> &Arc<Keymap> {
         &self.keymap
+    }
+
+    /// The saved commands.
+    pub fn commands(&self) -> &Arc<CommandStore> {
+        &self.commands
+    }
+
+    /// Whether this configuration was read from its directory, rather than being the
+    /// bundled defaults alone. Only then does the app write files there.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     /// The resolved Zed theme for the current appearance.
@@ -223,6 +254,11 @@ impl Config {
 
     pub fn palette(&self) -> &TerminalPalette {
         &self.palette
+    }
+
+    /// The `inline.*` settings: Backspace, the escape chord and paste pacing.
+    pub fn inline(&self) -> &InlineSettings {
+        &self.inline
     }
 
     /// `display.timestamp_format`: the `strftime` string of absolute gutter stamps. The
@@ -309,15 +345,26 @@ impl Config {
         );
         let problems = match loaded {
             Ok(settings) => {
-                let warnings = settings
+                // `inline.*` is read here rather than by the core loader, which reports
+                // the keys as unknown.
+                let mut warnings: Vec<ConfigProblem> = settings
                     .warnings
                     .iter()
+                    .filter(|warning| !is_inline_key(&warning.key))
                     .map(|warning| ConfigProblem {
                         piece: ConfigPiece::Settings,
                         is_error: false,
                         message: warning.to_string(),
                     })
                     .collect();
+                let (inline, inline_problems) =
+                    InlineSettings::from_value(inline_value(&self.paths).as_ref());
+                self.inline = inline;
+                warnings.extend(inline_problems.into_iter().map(|message| ConfigProblem {
+                    piece: ConfigPiece::Settings,
+                    is_error: false,
+                    message: format!("{}: {message}", self.paths.settings.display()),
+                }));
                 self.settings = Arc::new(settings);
                 warnings
             }
@@ -342,6 +389,27 @@ impl Config {
             }],
         };
         self.set_problems(ConfigPiece::Keymap, problems);
+    }
+
+    /// Read the saved-command collections again. Loading never fails; a file that
+    /// cannot be used is left out and reported.
+    pub fn reload_commands(&mut self) {
+        let store = if self.loaded {
+            CommandStore::load(&self.paths)
+        } else {
+            bundled_commands()
+        };
+        let problems = store
+            .warnings()
+            .iter()
+            .map(|warning| ConfigProblem {
+                piece: ConfigPiece::Commands,
+                is_error: false,
+                message: warning.to_string(),
+            })
+            .collect();
+        self.commands = Arc::new(store);
+        self.set_problems(ConfigPiece::Commands, problems);
     }
 
     /// Read the themes folder again.
@@ -441,6 +509,48 @@ impl Config {
     }
 }
 
+/// The bundled example collection alone, for a configuration read from nowhere.
+fn bundled_commands() -> CommandStore {
+    let mut store = CommandStore::empty();
+    store.set_collection(CommandCollection::bundled_examples());
+    store
+}
+
+fn is_inline_key(key: &str) -> bool {
+    key == "inline" || key.starts_with("inline.")
+}
+
+/// The `inline` object of the user's and the project's settings files, merged key by
+/// key with the project's winning, as the core loader merges every other key. The files
+/// already parsed (the core loader read them first), so a file that no longer does is
+/// skipped.
+fn inline_value(paths: &ConfigPaths) -> Option<serde_json::Value> {
+    let mut merged: Option<serde_json::Value> = None;
+    let files = std::iter::once(&paths.settings).chain(paths.project_settings.as_ref());
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let parsed = jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+            &text,
+            &jsonc_parser::ParseOptions::default(),
+        );
+        let Some(inline) = parsed
+            .ok()
+            .and_then(|mut value| value.get_mut("inline").map(std::mem::take))
+        else {
+            continue;
+        };
+        match (&mut merged, inline) {
+            (Some(serde_json::Value::Object(base)), serde_json::Value::Object(overlay)) => {
+                base.extend(overlay);
+            }
+            (slot, inline) => *slot = Some(inline),
+        }
+    }
+    merged
+}
+
 fn settings_error(error: &SettingsError) -> ConfigProblem {
     ConfigProblem {
         piece: ConfigPiece::Settings,
@@ -500,15 +610,19 @@ pub fn open_path(path: &Path, cx: &mut App) {
 }
 
 /// Install `config`: gpui-kit's theme and fonts, the key bindings (only when the
-/// keymap changed), then the global, which notifies every observer.
+/// keymap or the saved commands changed), then the global, which notifies every
+/// observer.
 pub fn install(mut config: Config, cx: &mut App) {
     let previous = cx.try_global::<Config>();
     config.generation = previous.map_or(1, |previous| previous.generation + 1);
-    let rebind = previous.is_none_or(|previous| !Arc::ptr_eq(&previous.keymap, &config.keymap));
+    let rebind = previous.is_none_or(|previous| {
+        !Arc::ptr_eq(&previous.keymap, &config.keymap)
+            || !Arc::ptr_eq(&previous.commands, &config.commands)
+    });
     config.check_fonts(cx);
     theme_bridge::apply_kit_theme(config.kit_theme(), cx);
     if rebind {
-        let problems = keymap::apply(&config.keymap, cx)
+        let problems = keymap::apply(&config.keymap, &config.commands, cx)
             .into_iter()
             .map(|message| ConfigProblem {
                 piece: ConfigPiece::Bindings,
@@ -538,8 +652,7 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
         ConfigPiece::Settings | ConfigPiece::Fonts => config.reload_settings(),
         ConfigPiece::Keymap | ConfigPiece::Bindings => config.reload_keymap(),
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
-        // The commands store reload is wired by the milestone 3 UI work.
-        ConfigPiece::Commands => {}
+        ConfigPiece::Commands => config.reload_commands(),
     });
 }
 
@@ -549,6 +662,7 @@ pub fn reload_all(cx: &mut App) {
         config.reload_themes();
         config.reload_keymap();
         config.reload_settings();
+        config.reload_commands();
     });
 }
 

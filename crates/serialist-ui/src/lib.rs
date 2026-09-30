@@ -1,19 +1,23 @@
 //! GPUI views. All GPUI and gpui-kit imports go through [`prelude`] so a snapshot bump
 //! or a move to the official crate touches one file.
 //!
-//! A workspace with a Devices panel on the left, a session view in the center (the
-//! terminal element over the session's page store, and a compose bar) and a status
-//! line. Settings, themes, fonts and key bindings come from Zed-format files through
+//! A workspace with the Devices and Commands panels on the left, a session view in the
+//! center (the terminal element over the session's page store, and a compose bar, or
+//! the terminal alone in inline mode) and a status line. Settings, themes, fonts and key bindings come from Zed-format files through
 //! [`config`], and apply to the running app as the files change.
 
 pub mod actions;
 pub mod capture;
+pub mod commands_panel;
 pub mod compose;
 pub mod config;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
+pub mod history;
+pub mod inline;
 pub mod keymap;
+pub mod param_prompt;
 pub mod scrollback;
 pub mod session_handle;
 pub mod session_options;
@@ -24,15 +28,20 @@ pub mod theme_bridge;
 pub mod workspace;
 
 #[cfg(test)]
+mod commands_tests;
+#[cfg(test)]
 mod config_tests;
 #[cfg(test)]
 mod gate;
+#[cfg(test)]
+mod inline_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
 mod test_support;
 
 pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
+pub use commands_panel::{CommandEditor, CommandsPanel, CommandsPanelEvent, EditorSeed};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding, LineEndingExt};
 pub use config::{Config, ConfigPiece, ConfigProblem, Opener};
 pub use devices_panel::{
@@ -40,10 +49,13 @@ pub use devices_panel::{
 };
 pub use export::{ExportFormat, ExportJob};
 pub use fonts::{TerminalFont, UiFont};
+pub use history::PersistentHistory;
+pub use inline::{InlineSettings, KeyEncoder, Mode, encode_key};
+pub use param_prompt::{ParamPrompt, ParamPromptEvent};
 pub use scrollback::{Floored, Floors, Scrollback};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 pub use session_options::{DisplayDefaults, SessionOptions};
-pub use session_view::SessionView;
+pub use session_view::{SessionView, SessionViewEvent};
 pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
@@ -75,6 +87,11 @@ pub mod prelude {
     pub use gpui_kit::test as gpui_test;
 
     pub use gpui_kit::component::button::{Button, ButtonVariants};
+    pub use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+    pub use gpui_kit::component::tooltip::Tooltip;
+    pub use gpui_kit::component::{WindowExt, v_resizable};
+    // For `#[derive(JsonSchema)]` on actions with fields; GPUI's derive names the trait
+    // through its private re-export, and `#[schemars(crate = …)]` points the derive here.
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
@@ -82,4 +99,5 @@ pub mod prelude {
         ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeConfig, ThemeConfigColors,
         ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,
     };
+    pub use gpui_kit::private::schemars::{self, JsonSchema};
 }

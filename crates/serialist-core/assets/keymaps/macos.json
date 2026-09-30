@@ -1,6 +1,10 @@
 // Serialist default key bindings for macOS, in Zed's keymap format: a list of sections,
 // each with an optional key context and a map of keystrokes to actions. Your keymap.json
 // is applied after this one, so its bindings win. Bind a key to null to unbind it.
+//
+// In inline mode (TerminalInline) the terminal sends every key it can encode to the
+// port, plain ctrl chords included; the bindings in that section are the exceptions,
+// which run as actions instead of being sent.
 [
   {
     "bindings": {
@@ -14,7 +18,8 @@
       "cmd-w": "serial::Disconnect",
       "cmd-p": "terminal::Pause",
       "cmd-s": "terminal::Export",
-      "cmd-shift-r": "terminal::ToggleRecord"
+      "cmd-shift-r": "terminal::ToggleRecord",
+      "cmd-i": "terminal::ToggleInline"
     }
   },
   {
@@ -23,6 +28,21 @@
       "down": "devices::SelectNext",
       "up": "devices::SelectPrevious",
       "enter": "serial::Connect"
+    }
+  },
+  {
+    "context": "CommandsPanel",
+    "bindings": {
+      "down": "commands::SelectNext",
+      "up": "commands::SelectPrevious",
+      "enter": "commands::SendSelected"
+    }
+  },
+  {
+    "context": "CommandsPanel > Input",
+    "bindings": {
+      "up": "commands::SelectPrevious",
+      "down": "commands::SelectNext"
     }
   },
   {
@@ -35,7 +55,8 @@
   {
     "context": "ComposeBar",
     "bindings": {
-      "cmd-e": "compose::CycleLineEnding"
+      "cmd-e": "compose::CycleLineEnding",
+      "cmd-alt-s": "compose::SaveAsCommand"
     }
   },
   {
@@ -52,6 +73,20 @@
       "pagedown": "terminal::PageDown",
       "home": "terminal::ScrollToTop",
       "end": "terminal::JumpToBottom",
+      "cmd-up": "terminal::ScrollToTop",
+      "cmd-down": "terminal::JumpToBottom"
+    }
+  },
+  {
+    "context": "TerminalInline",
+    "bindings": {
+      "cmd-v": "terminal::Paste",
+      "cmd-c": "terminal::Copy",
+      "cmd-a": "terminal::SelectAll",
+      "cmd-f": "terminal::Search",
+      "cmd-alt-i": "terminal::ToggleFrameStats",
+      "shift-pageup": "terminal::PageUp",
+      "shift-pagedown": "terminal::PageDown",
       "cmd-up": "terminal::ScrollToTop",
       "cmd-down": "terminal::JumpToBottom"
     }

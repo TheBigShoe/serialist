@@ -442,6 +442,7 @@ fn every_platform_default_loads_and_names_only_real_actions() {
 fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str, &'static str)> {
     let workspace = Some("Workspace");
     let terminal = Some("Terminal");
+    let inline = Some("TerminalInline");
     let keys: Vec<(Option<&str>, &str, &str)> = if mac {
         vec![
             (None, "cmd-q", "serialist::Quit"),
@@ -460,6 +461,19 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
             (Some("DevicesPanel"), "down", "devices::SelectNext"),
             (Some("DevicesPanel"), "up", "devices::SelectPrevious"),
             (Some("DevicesPanel"), "enter", "serial::Connect"),
+            (Some("CommandsPanel"), "down", "commands::SelectNext"),
+            (Some("CommandsPanel"), "up", "commands::SelectPrevious"),
+            (Some("CommandsPanel"), "enter", "commands::SendSelected"),
+            (
+                Some("CommandsPanel > Input"),
+                "up",
+                "commands::SelectPrevious",
+            ),
+            (
+                Some("CommandsPanel > Input"),
+                "down",
+                "commands::SelectNext",
+            ),
             (Some("ComposeBar > Input"), "up", "compose::HistoryPrevious"),
             (Some("ComposeBar > Input"), "down", "compose::HistoryNext"),
             (terminal, "alt-z", "terminal::ToggleWrap"),
@@ -470,6 +484,17 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
             (terminal, "home", "terminal::ScrollToTop"),
             (terminal, "end", "terminal::JumpToBottom"),
             (Some("TerminalSearch"), "escape", "terminal::DismissSearch"),
+            (workspace, "cmd-i", "terminal::ToggleInline"),
+            (Some("ComposeBar"), "cmd-alt-s", "compose::SaveAsCommand"),
+            (inline, "cmd-v", "terminal::Paste"),
+            (inline, "cmd-c", "terminal::Copy"),
+            (inline, "cmd-a", "terminal::SelectAll"),
+            (inline, "cmd-f", "terminal::Search"),
+            (inline, "cmd-alt-i", "terminal::ToggleFrameStats"),
+            (inline, "shift-pageup", "terminal::PageUp"),
+            (inline, "shift-pagedown", "terminal::PageDown"),
+            (inline, "cmd-up", "terminal::ScrollToTop"),
+            (inline, "cmd-down", "terminal::JumpToBottom"),
         ]
     } else {
         vec![
@@ -493,6 +518,19 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
             (Some("DevicesPanel"), "down", "devices::SelectNext"),
             (Some("DevicesPanel"), "up", "devices::SelectPrevious"),
             (Some("DevicesPanel"), "enter", "serial::Connect"),
+            (Some("CommandsPanel"), "down", "commands::SelectNext"),
+            (Some("CommandsPanel"), "up", "commands::SelectPrevious"),
+            (Some("CommandsPanel"), "enter", "commands::SendSelected"),
+            (
+                Some("CommandsPanel > Input"),
+                "up",
+                "commands::SelectPrevious",
+            ),
+            (
+                Some("CommandsPanel > Input"),
+                "down",
+                "commands::SelectNext",
+            ),
             (Some("ComposeBar > Input"), "up", "compose::HistoryPrevious"),
             (Some("ComposeBar > Input"), "down", "compose::HistoryNext"),
             (terminal, "alt-z", "terminal::ToggleWrap"),
@@ -503,6 +541,21 @@ fn expected_bindings(mac: bool) -> BTreeSet<(Option<&'static str>, &'static str,
             (terminal, "home", "terminal::ScrollToTop"),
             (terminal, "end", "terminal::JumpToBottom"),
             (Some("TerminalSearch"), "escape", "terminal::DismissSearch"),
+            (workspace, "ctrl-i", "terminal::ToggleInline"),
+            (Some("ComposeBar"), "ctrl-alt-s", "compose::SaveAsCommand"),
+            (inline, "ctrl-i", "terminal::ToggleInline"),
+            (inline, "ctrl-shift-v", "terminal::Paste"),
+            (inline, "ctrl-shift-c", "terminal::Copy"),
+            (inline, "ctrl-shift-a", "terminal::SelectAll"),
+            (inline, "ctrl-shift-f", "terminal::Search"),
+            (inline, "ctrl-alt-i", "terminal::ToggleFrameStats"),
+            (inline, "shift-pageup", "terminal::PageUp"),
+            (inline, "shift-pagedown", "terminal::PageDown"),
+            (inline, "ctrl-shift-k", "terminal::Clear"),
+            (inline, "ctrl-shift-w", "serial::Disconnect"),
+            (inline, "ctrl-shift-p", "terminal::Pause"),
+            (inline, "ctrl-shift-s", "terminal::Export"),
+            (inline, "ctrl-shift-r", "terminal::ToggleRecord"),
         ]
     };
     keys.into_iter().collect()
