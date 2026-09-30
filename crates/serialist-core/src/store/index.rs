@@ -238,45 +238,52 @@ impl BlockWriter {
     }
 }
 
-// Decoded text records.
+// Decoded text records, laid out so a text page is also a search haystack:
 //
-// record := varint(text_len) text varint(run_count) run*
+// page   := '\n' record*
+// record := text '\n' varint(run_count) run* '\n'
 // run    := varint(len) color(fg) color(bg) flags:u8
 // color  := 0 | 1 n | 2 n | 3 r g b          (Default | Ansi | Indexed | Rgb)
 //
+// A `DecRef` points at the text. Line text never contains '\n', so every text in a page
+// is preceded and followed by '\n' and a multi-line regex sees its ends as line ends.
 // A run count of zero with non-empty text means one default-style run over the text.
 
+/// Written at the start of every text page.
+pub(crate) const TEXT_PAGE_HEADER: &[u8] = b"\n";
+
 pub(crate) fn encode_record(out: &mut Vec<u8>, text: &str, runs: &[StyleRun]) {
+    debug_assert!(!text.contains('\n'));
     out.clear();
-    put_varint(out, text.len() as u64);
     out.extend_from_slice(text.as_bytes());
+    out.push(b'\n');
     let single_default = runs.len() == 1 && runs[0].style == Style::default();
     if runs.is_empty() || single_default {
         put_varint(out, 0);
-        return;
+    } else {
+        put_varint(out, runs.len() as u64);
+        for run in runs {
+            put_varint(out, run.len as u64);
+            put_color(out, run.style.fg);
+            put_color(out, run.style.bg);
+            out.push(run.style.flags.0);
+        }
     }
-    put_varint(out, runs.len() as u64);
-    for run in runs {
-        put_varint(out, run.len as u64);
-        put_color(out, run.style.fg);
-        put_color(out, run.style.bg);
-        out.push(run.style.flags.0);
-    }
+    out.push(b'\n');
 }
 
 /// The text of the record at the start of `bytes`.
 pub(crate) fn record_text(bytes: &[u8]) -> &[u8] {
-    let mut pos = 0;
-    let len = get_varint(bytes, &mut pos) as usize;
-    &bytes[pos..pos + len]
+    let end = memchr::memchr(b'\n', bytes).unwrap_or(bytes.len());
+    &bytes[..end]
 }
 
 /// Decode the record at the start of `bytes` into `text` and `runs`.
 pub(crate) fn decode_record(bytes: &[u8], text: &mut String, runs: &mut Vec<StyleRun>) {
-    let mut pos = 0;
-    let len = get_varint(bytes, &mut pos) as usize;
-    text.push_str(&String::from_utf8_lossy(&bytes[pos..pos + len]));
-    pos += len;
+    let raw_text = record_text(bytes);
+    let len = raw_text.len();
+    text.push_str(&String::from_utf8_lossy(raw_text));
+    let mut pos = len + 1;
     let count = get_varint(bytes, &mut pos) as usize;
     if count == 0 {
         if len > 0 {
