@@ -1,20 +1,19 @@
 //! GPUI views. All GPUI and gpui-kit imports go through [`prelude`] so a snapshot bump
 //! or a move to the official crate touches one file.
 //!
-//! Milestone 0 shell: a workspace with a Devices panel on the left, a session view in
-//! the center (a plain line list until the terminal element lands in milestone 1), a
-//! compose bar and a status line.
+//! A workspace with a Devices panel on the left, a session view in the center (the
+//! terminal element over the session's page store, and a compose bar) and a status
+//! line.
 
 pub mod actions;
 pub mod capture;
 pub mod compose;
 pub mod devices_panel;
-mod drain;
 pub mod export;
-pub mod line_buffer;
+pub mod scrollback;
 pub mod session_handle;
-pub mod session_model;
 pub mod session_view;
+pub mod status;
 pub mod terminal;
 pub mod workspace;
 
@@ -25,18 +24,16 @@ mod stream_tests;
 #[cfg(test)]
 mod test_support;
 
-pub use capture::{RawRing, Recorder, RecorderStats, RecordingSlot};
+pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
 pub use export::{ExportFormat, ExportJob};
-pub use line_buffer::{Line, LineBuffer, LineKind, LineSplitter, RxText};
+pub use scrollback::{Floored, Floors, Scrollback};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-pub use session_model::{
-    ConnectionState, Notice, RecordingStatus, SessionModel, SessionUpdate, StatusLine,
-};
 pub use session_view::SessionView;
+pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {

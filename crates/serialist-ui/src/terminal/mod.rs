@@ -2,8 +2,9 @@
 //! owns its state (scroll, selection, search, wrap, timestamps, hex view, pause).
 //!
 //! Everything here reads lines through the `LineSource` and `Searcher` traits from
-//! `serialist-core`, so the page store drops in for the in-memory doubles in
-//! [`double`] without changes here.
+//! `serialist-core`. In the app the session view hands the terminal each new store
+//! snapshot (see [`scrollback`](crate::scrollback)); the in-memory doubles in
+//! [`double`] stand in for the store in tests and in `--terminal-demo`.
 //!
 //! [`LineSource`]: serialist_core::LineSource
 

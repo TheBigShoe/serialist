@@ -12,7 +12,7 @@ use anyhow::bail;
 use serialist_core::composite::scheme_of;
 use serialist_core::{
     MergedPortSource, PortId, PortSource, RealPortSource, RoutingTransportFactory, SerialConfig,
-    SerialportFactory, TransportFactory, VIRTUAL_SCHEME,
+    SerialportFactory, StoreConfig, TransportFactory, VIRTUAL_SCHEME,
 };
 use serialist_sim::{SimWorld, virtual_port_id};
 use serialist_ui::AppOptions;
@@ -85,6 +85,7 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
         serial,
         connect_on_start: port.is_some(),
         select_port: port.or(first_virtual),
+        store: StoreConfig::default(),
     })
 }
 
