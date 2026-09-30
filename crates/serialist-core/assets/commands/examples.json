@@ -1,0 +1,59 @@
+// Serialist's example commands, shown read-only until you write collections of your own.
+// A collection is a file like this in ~/.config/serialist/commands/ (one file per
+// collection) or a project's .serialist/commands.json. Comments and trailing commas are
+// fine when you edit by hand, but the app rewrites a file as plain JSON when you save
+// changes to it from the Commands panel.
+//
+// Text payloads take the escapes \r \n \t \0 \\ \xNN and {{param}} placeholders. Without
+// an "eol" key a text command ends with the session's line ending; hex commands send
+// exactly the bytes written.
+{
+  "name": "AT basics",
+  "groups": [
+    {
+      "name": "Basics",
+      "commands": [
+        {
+          "name": "AT",
+          "description": "Are you there? A modem answers OK.",
+          "payload": { "text": "AT" },
+          "expect": { "pattern": "^OK|^ERROR", "timeout_ms": 1000 },
+        },
+        {
+          "name": "ATI",
+          "description": "Ask for the device's identity, then OK.",
+          "payload": { "text": "ATI" },
+          "expect": { "pattern": "^OK|^ERROR", "timeout_ms": 1000 },
+        },
+        {
+          "name": "AT+VER?",
+          "description": "Ask for the firmware version.",
+          "payload": { "text": "AT+VER?" },
+          "expect": { "pattern": "^\\+VER: (.+)", "timeout_ms": 1000 },
+        },
+      ],
+    },
+    {
+      "name": "With parameters",
+      "commands": [
+        {
+          "name": "Echo",
+          "description": "ATE0 turns command echo off, ATE1 turns it on.",
+          "payload": { "text": "ATE{{on}}" },
+          "expect": { "pattern": "^OK|^ERROR", "timeout_ms": 1000 },
+          "params": [
+            { "name": "on", "label": "Echo (0 or 1)", "default": "0", "kind": "int" },
+          ],
+        },
+        {
+          "name": "RACE query (hex)",
+          "description": "A hex payload: sync 0x05, type 0x5A, length, then the command id little-endian.",
+          "payload": { "hex": "05 5A 02 00 {{id}}" },
+          "params": [
+            { "name": "id", "label": "Command id", "default": "0x0F15", "kind": "hex16" },
+          ],
+        },
+      ],
+    },
+  ],
+}
