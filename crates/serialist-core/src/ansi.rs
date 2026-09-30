@@ -17,6 +17,18 @@
 //!   U+FFFD, because a monitor must not silently hide bytes it received. DEL and the C0
 //!   controls not listed above are dropped.
 //! - Each character takes one column; wide and combining characters are not measured.
+//! - Forward cursor motion (TAB, CUF, CHA) stops at column [`MOTION_WIDTH`] or the end
+//!   of the text, whichever is further, like a terminal that wide. A width probe such as
+//!   `ESC[999C` therefore pads at most 512 columns. Printing never wraps and is never
+//!   dropped: a line holds at most `max_line_bytes + MOTION_WIDTH` columns, because every
+//!   printed character consumes at least one raw byte of the line.
+//! - A line keeps at most [`MAX_RUNS`] style runs; past that, new text takes the style
+//!   of the last run. The text itself is never affected.
+//!
+//! Appending at the end of the line (almost all traffic) edits the text and runs
+//! directly. The first edit that is not an append (an overwrite after CR or BS, an
+//! erase) switches the line to one cell per column, so every later edit is O(1) and the
+//! text is rebuilt once per chunk instead of shifted once per character.
 //!
 //! The parser is stateful across calls: an escape sequence or UTF-8 character split
 //! between two [`AnsiParser::feed`] calls parses exactly as if it arrived in one. Two
@@ -30,7 +42,6 @@
 //!   lost, which bounds both line length and the escape parser's buffers.
 
 use std::fmt;
-use std::ops::Range;
 
 use vte::{Params, ParamsIter, Perform};
 
@@ -44,6 +55,20 @@ pub const DEFAULT_MAX_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_LINE_BYTES_LIMIT: usize = 1 << 20;
 /// The smallest `max_line_bytes` a parser accepts.
 pub const MIN_LINE_BYTES: usize = 16;
+/// Forward cursor motion stops at this column or the end of the text, whichever is
+/// further.
+pub const MOTION_WIDTH: usize = 512;
+/// Style runs kept per line; past this, new text takes the style of the last run.
+pub const MAX_RUNS: usize = 2048;
+/// Distinct styles a line in cell mode can hold (11 bits of a packed cell); past this,
+/// new styles reuse the last one.
+const MAX_PALETTE: usize = 1 << 11;
+/// Buffer capacities kept between lines; anything larger is released when a line ends.
+const KEEP_TEXT: usize = 16 * 1024;
+const KEEP_RUNS: usize = 256;
+const KEEP_CELLS: usize = 4 * 1024;
+const KEEP_PALETTE: usize = 64;
+const KEEP_JOINED: usize = 64 * 1024;
 
 /// A line as the parser produced it. Borrowed from the parser; copy what you keep.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,7 +148,7 @@ impl AnsiParser {
         let max_line_bytes = max_line_bytes.clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT);
         Self {
             vte: vte::Parser::new(),
-            line: LineState::new(max_line_bytes),
+            line: LineState::new(),
             max_line_bytes,
             held: [0; 4],
             held_len: 0,
@@ -167,8 +192,12 @@ impl AnsiParser {
             let keep = incomplete_utf8_suffix(&joined);
             self.feed_whole(&joined[..joined.len() - keep], &mut on_line);
             self.hold(&joined[joined.len() - keep..], &mut on_line);
-            self.joined = joined;
+            if joined.capacity() <= KEEP_JOINED {
+                self.joined = joined;
+            }
         }
+        // `current()` borrows the line; bring its text up to date with its cells.
+        self.line.sync();
     }
 
     /// Hold back `tail`, unless that would reach the line limit: then the limit breaks
@@ -203,6 +232,7 @@ impl AnsiParser {
                         self.vte = vte::Parser::new();
                     }
                     self.line.raw_len += i + 1;
+                    self.line.sync();
                     on_line(self.line.view(true));
                     self.line.reset();
                     rest = &rest[i + 1..];
@@ -212,6 +242,7 @@ impl AnsiParser {
                     self.line.raw_len += window.len();
                     if self.line.raw_len >= self.max_line_bytes {
                         self.vte = vte::Parser::new();
+                        self.line.sync();
                         on_line(self.line.view(false));
                         self.line.reset();
                     }
@@ -233,6 +264,7 @@ impl AnsiParser {
     pub fn break_line(&mut self, on_line: impl FnOnce(ParsedLine<'_>)) {
         self.held_len = 0;
         if self.line.raw_len > 0 {
+            self.line.sync();
             on_line(self.line.view(false));
             self.line.reset();
         }
@@ -240,10 +272,24 @@ impl AnsiParser {
 
     /// Bytes of heap this parser holds, for memory accounting.
     pub fn heap_bytes(&self) -> usize {
+        let line = &self.line;
         self.joined.capacity()
-            + self.line.text.capacity()
-            + (self.line.runs.capacity() + self.line.scratch.capacity())
-                * std::mem::size_of::<StyleRun>()
+            + line.text.capacity()
+            + line.runs.capacity() * size_of::<StyleRun>()
+            + line.cells.capacity() * size_of::<u32>()
+            + line.palette.capacity() * size_of::<Style>()
+    }
+
+    /// The most heap a parser with this `max_line_bytes` holds after a `feed`, whatever
+    /// the input: text, runs and cells for the widest possible line, all at twice their
+    /// length for vector growth. The store's minimum budget is built on it.
+    pub fn worst_case_heap(max_line_bytes: usize) -> usize {
+        let cols = max_line_bytes.clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT) + MOTION_WIDTH;
+        2 * (4 * cols
+            + MAX_RUNS * size_of::<StyleRun>()
+            + cols * size_of::<u32>()
+            + MAX_PALETTE * size_of::<Style>())
+            + KEEP_JOINED
     }
 
     /// Parse a whole buffer and return every line, the one in progress last. Convenient
@@ -260,41 +306,74 @@ impl AnsiParser {
 }
 
 /// The line being built plus the cursor and pen: the `vte::Perform` side of the parser.
+///
+/// In append mode `text` and `runs` are the line. In cell mode (entered by the first
+/// edit that is not an append) `cells` are, one per column, and `sync` rebuilds `text`
+/// and `runs` from them.
 struct LineState {
     text: String,
     runs: Vec<StyleRun>,
-    /// Reused by run splicing so an overwrite does not allocate.
-    scratch: Vec<StyleRun>,
-    /// Characters in `text`, which is also its width in columns.
+    /// Cell mode: a character (low 21 bits) and a `palette` index (high 11) per column.
+    cells: Vec<u32>,
+    palette: Vec<Style>,
+    /// The pen's `palette` index, found on first use after the pen or palette changes.
+    pen_index: Option<u32>,
+    cell_mode: bool,
+    /// `text` and `runs` lag behind `cells`.
+    stale: bool,
+    /// Width of the line in columns: characters in `text`, or cells.
     cols: usize,
-    /// `text` is all ASCII, so a column is a byte offset.
-    ascii: bool,
     cursor: usize,
     pen: Style,
     simple: bool,
     raw_len: usize,
     lf_executed: bool,
-    max_cols: usize,
+}
+
+fn pack(c: char, index: u32) -> u32 {
+    c as u32 | (index << 21)
+}
+
+fn unpack(cell: u32) -> (char, usize) {
+    let c = char::from_u32(cell & 0x1F_FFFF).unwrap_or(char::REPLACEMENT_CHARACTER);
+    (c, (cell >> 21) as usize)
+}
+
+/// A blank cell: a space in the default style (palette index 0).
+const BLANK: u32 = b' ' as u32;
+
+/// `style`'s index in `palette`, added if new; a full palette reuses its last entry.
+fn palette_index(palette: &mut Vec<Style>, style: Style) -> u32 {
+    if let Some(i) = palette.iter().position(|s| *s == style) {
+        return i as u32;
+    }
+    if palette.len() < MAX_PALETTE {
+        palette.push(style);
+    }
+    (palette.len() - 1) as u32
 }
 
 impl LineState {
-    fn new(max_cols: usize) -> Self {
+    fn new() -> Self {
         Self {
             text: String::new(),
             runs: Vec::new(),
-            scratch: Vec::new(),
+            cells: Vec::new(),
+            palette: Vec::new(),
+            pen_index: None,
+            cell_mode: false,
+            stale: false,
             cols: 0,
-            ascii: true,
             cursor: 0,
             pen: Style::default(),
             simple: true,
             raw_len: 0,
             lf_executed: false,
-            max_cols,
         }
     }
 
     fn view(&self, complete: bool) -> ParsedLine<'_> {
+        debug_assert!(!self.stale, "view of an unsynced line");
         ParsedLine {
             text: &self.text,
             runs: &self.runs,
@@ -304,155 +383,155 @@ impl LineState {
         }
     }
 
-    /// Start a new line. The pen carries over; everything else starts fresh.
+    /// Start a new line. The pen carries over; everything else starts fresh, and buffers
+    /// a long line grew are released so one pathological line cannot pin memory.
     fn reset(&mut self) {
         self.text.clear();
         self.runs.clear();
+        self.cells.clear();
+        self.palette.clear();
+        self.pen_index = None;
+        self.cell_mode = false;
+        self.stale = false;
         self.cols = 0;
-        self.ascii = true;
         self.cursor = 0;
         self.simple = true;
         self.raw_len = 0;
-        if self.text.capacity() > 4 * DEFAULT_MAX_LINE_BYTES {
-            self.text.shrink_to(DEFAULT_MAX_LINE_BYTES);
+        if self.text.capacity() > KEEP_TEXT {
+            self.text.shrink_to(KEEP_TEXT);
+        }
+        if self.runs.capacity() > KEEP_RUNS {
+            self.runs.shrink_to(KEEP_RUNS);
+        }
+        if self.cells.capacity() > KEEP_CELLS {
+            self.cells.shrink_to(KEEP_CELLS);
+        }
+        if self.palette.capacity() > KEEP_PALETTE {
+            self.palette.shrink_to(KEEP_PALETTE);
         }
     }
 
+    /// Erase the whole line; the cursor stays where it is.
     fn clear_text(&mut self) {
         self.text.clear();
         self.runs.clear();
+        self.cells.clear();
         self.cols = 0;
-        self.ascii = true;
+        self.stale = false;
     }
 
-    fn byte_of_col(&self, col: usize) -> usize {
-        if col >= self.cols {
-            self.text.len()
-        } else if self.ascii {
-            col
-        } else {
-            self.text
-                .char_indices()
-                .nth(col)
-                .map_or(self.text.len(), |(i, _)| i)
+    /// Switch to one cell per column, built from the current text and runs.
+    fn enter_cells(&mut self) {
+        if self.cell_mode {
+            return;
         }
-    }
-
-    fn style_at(&self, byte: usize) -> Style {
-        let mut pos = 0;
-        for run in &self.runs {
-            pos += run.len;
-            if byte < pos {
-                return run.style;
+        let Self {
+            text,
+            runs,
+            cells,
+            palette,
+            ..
+        } = self;
+        cells.clear();
+        palette.clear();
+        palette.push(Style::default());
+        let mut chars = text.chars();
+        for run in runs.iter() {
+            let index = palette_index(palette, run.style);
+            let mut used = 0;
+            while used < run.len {
+                let Some(c) = chars.next() else {
+                    break;
+                };
+                cells.push(pack(c, index));
+                used += c.len_utf8();
             }
         }
-        Style::default()
+        self.pen_index = None;
+        self.cell_mode = true;
+        self.stale = false;
+    }
+
+    /// Rebuild `text` and `runs` from the cells, if they changed.
+    fn sync(&mut self) {
+        if !self.stale {
+            return;
+        }
+        let Self {
+            text,
+            runs,
+            cells,
+            palette,
+            ..
+        } = self;
+        text.clear();
+        runs.clear();
+        for &cell in cells.iter() {
+            let (c, index) = unpack(cell);
+            text.push(c);
+            push_run(runs, c.len_utf8(), palette[index]);
+        }
+        self.stale = false;
     }
 
     fn append(&mut self, c: char, style: Style) {
         self.text.push(c);
-        if !c.is_ascii() {
-            self.ascii = false;
-        }
         push_run(&mut self.runs, c.len_utf8(), style);
         self.cols += 1;
     }
 
     /// Draw `c` at the cursor and advance it.
-    fn put(&mut self, c: char) {
-        if self.cursor >= self.max_cols {
-            return;
+    fn draw(&mut self, c: char) {
+        // Forward motion stops at MOTION_WIDTH or the text's end, and every column past
+        // MOTION_WIDTH was drawn by a character that consumed a raw byte of this line
+        // (an erase keeps the cursor where such characters left it). So the cursor stays
+        // within max_line_bytes + MOTION_WIDTH columns and nothing is ever dropped.
+        if !self.cell_mode && self.cursor < self.cols {
+            self.enter_cells();
         }
-        let style = self.pen;
-        if self.cursor >= self.cols {
+        if self.cell_mode {
+            let index = match self.pen_index {
+                Some(index) => index,
+                None => {
+                    let index = palette_index(&mut self.palette, self.pen);
+                    self.pen_index = Some(index);
+                    index
+                }
+            };
+            if self.cursor < self.cells.len() {
+                self.cells[self.cursor] = pack(c, index);
+            } else {
+                self.cells.resize(self.cursor, BLANK);
+                self.cells.push(pack(c, index));
+            }
+            self.cols = self.cells.len();
+            self.stale = true;
+        } else {
             for _ in self.cols..self.cursor {
                 self.append(' ', Style::default());
             }
-            self.append(c, style);
-        } else {
-            let start = self.byte_of_col(self.cursor);
-            let old_len = self.text[start..].chars().next().map_or(0, char::len_utf8);
-            let mut buf = [0u8; 4];
-            let new = c.encode_utf8(&mut buf);
-            let same_style = self.style_at(start) == style;
-            self.text.replace_range(start..start + old_len, new);
-            if !(same_style && old_len == new.len()) {
-                self.splice(start..start + old_len, new.len(), style);
-            }
-            if !c.is_ascii() {
-                self.ascii = false;
-            }
+            self.append(c, self.pen);
         }
         self.cursor += 1;
     }
 
-    /// Replace the runs over `range` (old byte offsets) with one run of `new_len` bytes.
-    fn splice(&mut self, range: Range<usize>, new_len: usize, style: Style) {
-        let mut out = std::mem::take(&mut self.scratch);
-        out.clear();
-        let mut pos = 0;
-        for run in &self.runs {
-            let (start, end) = (pos, pos + run.len);
-            pos = end;
-            let before_end = end.min(range.start);
-            if start < before_end {
-                push_run(&mut out, before_end - start, run.style);
-            }
-        }
-        if new_len > 0 {
-            push_run(&mut out, new_len, style);
-        }
-        pos = 0;
-        for run in &self.runs {
-            let (start, end) = (pos, pos + run.len);
-            pos = end;
-            let after_start = start.max(range.end);
-            if after_start < end {
-                push_run(&mut out, end - after_start, run.style);
-            }
-        }
-        self.scratch = std::mem::replace(&mut self.runs, out);
-    }
-
-    fn truncate_at_col(&mut self, col: usize) {
-        if col >= self.cols {
-            return;
-        }
-        if col == 0 {
-            self.clear_text();
-            return;
-        }
-        let byte = self.byte_of_col(col);
-        self.text.truncate(byte);
-        let mut pos = 0;
-        let mut keep = 0;
-        for run in &mut self.runs {
-            if pos + run.len >= byte {
-                run.len = byte - pos;
-                keep += 1;
-                break;
-            }
-            pos += run.len;
-            keep += 1;
-        }
-        self.runs.truncate(keep);
-        if self.runs.last().is_some_and(|r| r.len == 0) {
-            self.runs.pop();
-        }
-        self.cols = col;
-    }
-
     fn erase_in_line(&mut self, mode: u16) {
         match mode {
-            0 => self.truncate_at_col(self.cursor),
+            0 if self.cursor == 0 => self.clear_text(),
+            0 if self.cursor < self.cols => {
+                self.enter_cells();
+                self.cells.truncate(self.cursor);
+                self.cols = self.cursor;
+                self.stale = true;
+            }
             1 => {
                 let n = (self.cursor + 1).min(self.cols);
                 if n >= self.cols {
                     self.clear_text();
                 } else if n > 0 {
-                    let end = self.byte_of_col(n);
-                    self.text.replace_range(..end, &" ".repeat(n));
-                    self.splice(0..end, n, Style::default());
+                    self.enter_cells();
+                    self.cells[..n].fill(BLANK);
+                    self.stale = true;
                 }
             }
             2 => self.clear_text(),
@@ -460,11 +539,19 @@ impl LineState {
         }
     }
 
+    /// Move the cursor to `col`. Backward motion is free; forward motion stops at
+    /// [`MOTION_WIDTH`] or the end of the text, whichever is further, and never moves
+    /// the cursor back.
     fn move_to(&mut self, col: usize) {
-        self.cursor = col.min(self.max_cols);
+        self.cursor = if col <= self.cursor {
+            col
+        } else {
+            col.min(self.cols.max(MOTION_WIDTH)).max(self.cursor)
+        };
     }
 
     fn sgr(&mut self, params: &Params) {
+        self.pen_index = None;
         let mut it = params.iter();
         while let Some(param) = it.next() {
             let pen = &mut self.pen;
@@ -571,13 +658,15 @@ fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
     0
 }
 
-/// Append a run, merging it into the last one when the style matches.
-pub(crate) fn push_run(runs: &mut Vec<StyleRun>, len: usize, style: Style) {
+/// Append a run, merging it into the last one when the style matches or the line
+/// already has [`MAX_RUNS`] runs.
+fn push_run(runs: &mut Vec<StyleRun>, len: usize, style: Style) {
     if len == 0 {
         return;
     }
+    let full = runs.len() >= MAX_RUNS;
     match runs.last_mut() {
-        Some(last) if last.style == style => last.len += len,
+        Some(last) if full || last.style == style => last.len += len,
         _ => runs.push(StyleRun { len, style }),
     }
 }
@@ -598,7 +687,7 @@ impl Perform for LineState {
         {
             self.simple = false;
         }
-        self.put(c);
+        self.draw(c);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -615,7 +704,7 @@ impl Perform for LineState {
             }
             0x80..=0x9F => {
                 self.simple = false;
-                self.put(char::REPLACEMENT_CHARACTER);
+                self.draw(char::REPLACEMENT_CHARACTER);
             }
             _ => self.simple = false,
         }
@@ -1133,5 +1222,277 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn motion_stops_at_the_motion_width() {
+        // A width probe with nothing answering it: the prompt lands at column 512.
+        let probe = AnsiParser::parse_all(b"\x1b[999Cuart:~$ \n");
+        assert_eq!(probe[0].text.len(), MOTION_WIDTH + 8);
+        assert!(probe[0].text.ends_with("uart:~$ "));
+        let cha = AnsiParser::parse_all(b"\x1b[65535Gx\n");
+        assert_eq!(cha[0].text, format!("{}x", " ".repeat(MOTION_WIDTH)));
+        // Past the motion width, printed text keeps going and motion stops at its end.
+        let long = format!("{}\t\x1b[9CY\n", "x".repeat(600));
+        let lines = AnsiParser::parse_all(long.as_bytes());
+        assert_eq!(lines[0].text, format!("{}Y", "x".repeat(600)));
+        // Motion back into the text is unaffected.
+        let back = AnsiParser::parse_all(b"abcdef\x1b[2GZ\x1b[999CQ\n");
+        assert_eq!(
+            back[0].text,
+            format!("aZcdef{}Q", " ".repeat(MOTION_WIDTH - 6))
+        );
+    }
+
+    #[test]
+    fn motion_cannot_amplify_input() {
+        // 10 KiB of absolute moves to column 65535, each followed by a character.
+        let input: Vec<u8> = b"\x1b[65535Gx\n"
+            .iter()
+            .copied()
+            .cycle()
+            .take(10 * 1024)
+            .collect();
+        let lines = AnsiParser::parse_all(&input);
+        let text: usize = lines.iter().map(|l| l.text.len()).sum();
+        assert_eq!(lines.len(), 1024);
+        assert!(
+            text <= lines.len() * (MOTION_WIDTH + 1),
+            "{text} text bytes"
+        );
+    }
+
+    #[test]
+    fn nothing_is_dropped_at_the_line_limit() {
+        let mut parser = AnsiParser::with_max_line_bytes(16);
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        parser.feed(b"abcdefghijklm\tZ\n", |l| lines.push(l.into()));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "abcdefghijklm   Z");
+        // A tab or move far past the raw limit still keeps every character.
+        let mut parser = AnsiParser::with_max_line_bytes(16);
+        let mut lines: Vec<OwnedLine> = Vec::new();
+        parser.feed(b"\t\t\t\t\t\t\t\t\t\tabcdef", |l| lines.push(l.into()));
+        parser.feed(b"\x1b[999Cgh", |l| lines.push(l.into()));
+        if let Some(l) = parser.current() {
+            lines.push(l.into());
+        }
+        let all: String = lines.iter().map(|l| l.text.trim()).collect();
+        assert_eq!(all, "abcdefgh");
+    }
+
+    #[test]
+    fn runs_are_capped_per_line() {
+        let mut input = Vec::new();
+        for i in 0..(MAX_RUNS + 500) {
+            input.extend_from_slice(format!("\x1b[3{}mx", 1 + i % 2).as_bytes());
+        }
+        input.push(b'\n');
+        let lines = AnsiParser::parse_all(&input);
+        let line = &lines[0];
+        assert_eq!(line.text.len(), MAX_RUNS + 500, "text is never capped");
+        assert_eq!(line.runs.len(), MAX_RUNS);
+        assert_eq!(
+            line.runs.iter().map(|r| r.len).sum::<usize>(),
+            line.text.len()
+        );
+        // The same holds once the line is in cell mode.
+        let mut input = input[..input.len() - 1].to_vec();
+        input.extend_from_slice(b"\rX\n");
+        let lines = AnsiParser::parse_all(&input);
+        let line = &lines[0];
+        assert!(line.runs.len() <= MAX_RUNS);
+        assert_eq!(
+            line.runs.iter().map(|r| r.len).sum::<usize>(),
+            line.text.len()
+        );
+        assert!(line.text.starts_with('X'));
+    }
+
+    #[test]
+    fn buffers_shrink_after_a_long_line() {
+        let mut parser = AnsiParser::with_max_line_bytes(MAX_LINE_BYTES_LIMIT);
+        let small = parser.heap_bytes();
+        let mut input = Vec::new();
+        for i in 0..100_000 {
+            input.extend_from_slice(format!("\x1b[3{}mé", 1 + i % 7).as_bytes());
+        }
+        input.extend_from_slice(b"\r\x1b[0mX\n");
+        parser.feed(&input, |_| {});
+        assert!(parser.heap_bytes() <= AnsiParser::worst_case_heap(MAX_LINE_BYTES_LIMIT));
+        parser.feed(b"short\n", |_| {});
+        let after = parser.heap_bytes();
+        assert!(
+            after <= small + KEEP_TEXT + KEEP_RUNS * 24 + KEEP_CELLS * 4 + KEEP_PALETTE * 9,
+            "{after} bytes held after the long line"
+        );
+    }
+
+    /// Overwriting a long line of multi-byte characters is linear, not quadratic.
+    #[test]
+    fn long_overwrites_are_linear() {
+        let n = 15 * 1024;
+        let cases = [("é", "è"), ("a", "é"), ("é", "a")];
+        for (under, over) in cases {
+            let mut input = under.repeat(n).into_bytes();
+            input.push(b'\r');
+            input.extend_from_slice(over.repeat(n).as_bytes());
+            input.push(b'\n');
+            let start = std::time::Instant::now();
+            let lines = AnsiParser::parse_all(&input);
+            let elapsed = start.elapsed();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].text, over.repeat(n));
+            // Quadratic editing took over 400 ms in release; linear takes a few ms.
+            let limit = if cfg!(debug_assertions) { 500 } else { 100 };
+            assert!(
+                elapsed.as_millis() < limit,
+                "{under:?} overwritten by {over:?}: {elapsed:?}"
+            );
+        }
+    }
+
+    /// A naive one-cell-per-column model of the documented line semantics.
+    #[derive(Default)]
+    struct Model {
+        cells: Vec<(char, Style)>,
+        cursor: usize,
+        pen: Style,
+    }
+
+    impl Model {
+        fn move_to(&mut self, col: usize) {
+            self.cursor = if col <= self.cursor {
+                col
+            } else {
+                col.min(self.cells.len().max(MOTION_WIDTH)).max(self.cursor)
+            };
+        }
+
+        fn apply(&mut self, op: &Op) {
+            match *op {
+                Op::Char(c) => {
+                    if self.cursor < self.cells.len() {
+                        self.cells[self.cursor] = (c, self.pen);
+                    } else {
+                        self.cells.resize(self.cursor, (' ', D));
+                        self.cells.push((c, self.pen));
+                    }
+                    self.cursor += 1;
+                }
+                Op::Cr => self.cursor = 0,
+                Op::Bs => self.cursor = self.cursor.saturating_sub(1),
+                Op::Tab => self.move_to((self.cursor / TAB_WIDTH + 1) * TAB_WIDTH),
+                Op::Cuf(n) => self.move_to(self.cursor + n.max(1) as usize),
+                Op::Cub(n) => self.cursor = self.cursor.saturating_sub(n.max(1) as usize),
+                Op::Cha(n) => self.move_to(n.max(1) as usize - 1),
+                Op::El(0) => {
+                    if self.cursor < self.cells.len() {
+                        self.cells.truncate(self.cursor);
+                    }
+                }
+                Op::El(1) => {
+                    let n = (self.cursor + 1).min(self.cells.len());
+                    if n >= self.cells.len() {
+                        self.cells.clear();
+                    } else {
+                        self.cells[..n].fill((' ', D));
+                    }
+                }
+                Op::El(_) => self.cells.clear(),
+                Op::Fg(0) => self.pen = D,
+                Op::Fg(k) => self.pen = fg(Color::Ansi(k)),
+            }
+        }
+
+        fn line(&self) -> (String, Vec<StyleRun>) {
+            let mut text = String::new();
+            let mut runs = Vec::new();
+            for &(c, style) in &self.cells {
+                text.push(c);
+                push_run(&mut runs, c.len_utf8(), style);
+            }
+            (text, runs)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Char(char),
+        Cr,
+        Bs,
+        Tab,
+        Cuf(u16),
+        Cub(u16),
+        Cha(u16),
+        El(u8),
+        Fg(u8),
+    }
+
+    impl Op {
+        fn encode(&self, out: &mut Vec<u8>) {
+            match *self {
+                Op::Char(c) => out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes()),
+                Op::Cr => out.push(b'\r'),
+                Op::Bs => out.push(0x08),
+                Op::Tab => out.push(b'\t'),
+                Op::Cuf(n) => out.extend_from_slice(format!("\x1b[{n}C").as_bytes()),
+                Op::Cub(n) => out.extend_from_slice(format!("\x1b[{n}D").as_bytes()),
+                Op::Cha(n) => out.extend_from_slice(format!("\x1b[{n}G").as_bytes()),
+                Op::El(k) => out.extend_from_slice(format!("\x1b[{k}K").as_bytes()),
+                Op::Fg(0) => out.extend_from_slice(b"\x1b[0m"),
+                Op::Fg(k) => out.extend_from_slice(format!("\x1b[3{k}m").as_bytes()),
+            }
+        }
+    }
+
+    fn op() -> impl proptest::strategy::Strategy<Value = Op> {
+        use proptest::prelude::*;
+        prop_oneof![
+            8 => prop::sample::select(vec!['a', 'b', 'Z', ' ', 'é', '€', '😀', 'ñ'])
+                .prop_map(Op::Char),
+            2 => Just(Op::Cr),
+            1 => Just(Op::Bs),
+            1 => Just(Op::Tab),
+            1 => (0u16..700).prop_map(Op::Cuf),
+            1 => (0u16..30).prop_map(Op::Cub),
+            1 => (0u16..700).prop_map(Op::Cha),
+            1 => (0u8..3).prop_map(Op::El),
+            1 => (0u8..4).prop_map(Op::Fg),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Append mode, cell mode and the switch between them all match the model, and
+        /// splitting the bytes anywhere changes nothing.
+        #[test]
+        fn line_edits_match_the_model(
+            ops in proptest::collection::vec(op(), 0..120),
+            cut in 0usize..2000,
+        ) {
+            let mut model = Model::default();
+            let mut bytes = Vec::new();
+            for op in &ops {
+                model.apply(op);
+                op.encode(&mut bytes);
+            }
+            bytes.push(b'\n');
+            let (text, runs) = model.line();
+            let cut = cut.min(bytes.len());
+            let mut parser = AnsiParser::new();
+            let mut lines: Vec<OwnedLine> = Vec::new();
+            parser.feed(&bytes[..cut], |l| lines.push(l.into()));
+            if let Some(l) = parser.current() {
+                // The line in progress is readable mid-way, and well formed.
+                let total: usize = l.runs.iter().map(|r| r.len).sum();
+                proptest::prop_assert_eq!(total, l.text.len());
+            }
+            parser.feed(&bytes[cut..], |l| lines.push(l.into()));
+            proptest::prop_assert_eq!(lines.len(), 1);
+            proptest::prop_assert_eq!(&lines[0].text, &text);
+            proptest::prop_assert_eq!(&lines[0].runs, &runs);
+        }
     }
 }
