@@ -1,39 +1,5 @@
-//! Where a virtual link gets its time.
-//!
-//! Every time the link keeps (its release schedule, look-ahead window, latency, jitter,
-//! read timeouts, device tick deadlines and unplug timing) comes from a [`Clock`], and
-//! every blocking wait in the link goes through [`Clock::wait`]. [`SystemClock`] is real
-//! time. [`ManualClock`] only moves when a test moves it, which makes timing assertions
-//! exact and independent of how busy the machine is.
-//!
-//! # The wait protocol
-//!
-//! A thread that has to wait for "some condition, or until a deadline" does this:
-//!
-//! 1. Under the lock that guards the condition, check it, then read
-//!    [`Wakeup::epoch`] from the [`Wakeup`] that is notified when it changes.
-//! 2. Release the lock and call [`Clock::wait`] with that epoch and the deadline.
-//! 3. Retake the lock and check again. Waits can end early, so this is always a loop.
-//!
-//! Whoever changes the condition does so under the same lock and calls
-//! [`Wakeup::notify`] afterwards, which moves the epoch on. A wait that starts after the
-//! change sees a newer epoch and returns at once, so no wake-up is ever lost.
-//!
-//! # Driving a manual clock from a test
-//!
-//! Time on a [`ManualClock`] stands still until the test calls [`ManualClock::advance`]
-//! or [`ManualClock::set`], which wake every thread waiting on the clock; each re-checks
-//! its own deadline against the new time and either proceeds or goes back to sleep.
-//! Those threads then run in real time, so before asserting anything the test calls
-//! [`ManualClock::settle`] with the number of threads it expects to be waiting (for a
-//! link: its device thread, plus any thread blocked in the host's `read`). When `settle`
-//! returns, every one of them has seen the new time and has nothing left to do until the
-//! clock moves again or something notifies it.
-//!
-//! A read on a manual clock blocks until the clock passes its timeout, so the thread
-//! that moves the clock must not be the one blocked in `read`. Either read with a zero
-//! timeout (a non-blocking probe), or read on a helper thread and advance the clock from
-//! the test thread.
+//! Where a virtual link gets its time: the [`Clock`] trait, real time
+//! ([`SystemClock`]) and a clock a test moves by hand ([`ManualClock`]).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -48,12 +14,31 @@ use crate::link::later;
 const SETTLE_LIMIT: Duration = Duration::from_secs(10);
 
 /// A source of time, and of timed waits against that time.
+///
+/// Every time a virtual link keeps (its release schedule, look-ahead window, latency,
+/// jitter, read timeouts, device tick deadlines and unplug timing) comes from its clock,
+/// and every blocking wait in the link goes through [`Clock::wait`]. [`SystemClock`] is
+/// real time. [`ManualClock`] only moves when a test moves it, which makes timing
+/// assertions exact and independent of how busy the machine is.
+///
+/// # The wait protocol
+///
+/// A thread that has to wait for "some condition, or until a deadline" does this:
+///
+/// 1. Under the lock that guards the condition, check it, then read
+///    [`Wakeup::epoch`] from the [`Wakeup`] that is notified when it changes.
+/// 2. Release the lock and call [`Clock::wait`] with that epoch and the deadline.
+/// 3. Retake the lock and check again. Waits can end early, so this is always a loop.
+///
+/// Whoever changes the condition does so under the same lock and calls
+/// [`Wakeup::notify`] afterwards, which moves the epoch on. A wait that starts after the
+/// change sees a newer epoch and returns at once, so no wake-up is ever lost.
 pub trait Clock: Send + Sync {
     /// The current time on this clock.
     fn now(&self) -> Instant;
 
     /// Block until `wakeup` is notified after `seen` was read from it, or until this
-    /// clock reaches `deadline` (`None`: no deadline). See the module docs for the
+    /// clock reaches `deadline` (`None`: no deadline). See the trait docs for the
     /// protocol. May return early, so callers re-check their condition and
     /// [`Clock::now`] in a loop.
     fn wait(&self, wakeup: &Arc<Wakeup>, seen: u64, deadline: Option<Instant>);
@@ -74,7 +59,7 @@ impl Clock for SystemClock {
 }
 
 /// What a waiting thread is woken through: an epoch counter plus a condition variable.
-/// See the module docs for how it is used with [`Clock::wait`].
+/// The [`Clock`] docs describe how it is used with [`Clock::wait`].
 #[derive(Debug, Default)]
 pub struct Wakeup {
     epoch: Mutex<u64>,
@@ -121,11 +106,32 @@ impl Wakeup {
 /// A clock that only moves when told to. Compiled into the crate (not just its tests)
 /// so integration tests and other crates' tests can drive links with it.
 ///
-/// Waits on it never time out by themselves: [`ManualClock::advance`] and
-/// [`ManualClock::set`] wake every waiting thread, and each one re-checks its deadline
-/// against the new time. Share it as `Arc<ManualClock>`, which coerces to the
-/// `Arc<dyn Clock>` that [`VirtualLink::connect_with_clock`](crate::VirtualLink::connect_with_clock)
-/// and [`SimWorld::with_clock`](crate::SimWorld::with_clock) take.
+/// Share it as `Arc<ManualClock>`, which coerces to the `Arc<dyn Clock>` that
+/// [`VirtualLink::connect_with_clock`](crate::VirtualLink::connect_with_clock),
+/// [`SimTransportFactory::with_clock`](crate::SimTransportFactory::with_clock) and
+/// [`SimWorld::with_clock`](crate::SimWorld::with_clock) take.
+///
+/// # Driving it from a test
+///
+/// Time stands still until the test calls [`ManualClock::advance`] or
+/// [`ManualClock::set`], which wake every thread waiting on the clock; each re-checks
+/// its own deadline against the new time and either proceeds or goes back to sleep.
+/// Waits never time out by themselves. The woken threads then run in real time, so
+/// before asserting anything the test calls [`ManualClock::settle`] with the number of
+/// threads it expects to be waiting (for a link: its device thread, plus whichever
+/// thread is blocked in the host's `read`, such as a session's reader thread). When
+/// `settle` returns, every one of them has seen the new time and has nothing left to do
+/// until the clock moves again or something notifies it.
+///
+/// A read on a manual clock blocks until the clock passes its timeout, so the thread
+/// that moves the clock must not be the one blocked in `read`. Either read with a zero
+/// timeout (a non-blocking probe), or read on a helper thread and move the clock from
+/// the test thread.
+///
+/// A paced link's device thread refills the wire when it wakes, and keeps it busy as
+/// long as it wakes within 24 ms of its deadline (the look-ahead's refill margin). So a
+/// test that wants the wire never to run dry moves the clock in steps of at most that,
+/// settling after each, as a device thread that wakes on time would see it.
 pub struct ManualClock {
     state: Mutex<ManualState>,
     /// Notified whenever a thread starts or stops waiting, for `settle`.
