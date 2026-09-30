@@ -9,8 +9,11 @@ authors.workspace = true
 
 [dependencies]
 crossbeam-channel.workspace = true
+futures-core = "0.3"
+nusb.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+serialport.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
