@@ -101,6 +101,15 @@ fn reads(c: &mut Criterion) {
                 .expect("pattern")
         });
     });
+    // The same backward search as above, from a Clear floor 10 000 lines below the end:
+    // the hidden 990 000 lines are not scanned.
+    let floor = LineId(LINES - 10_000)..LineId(LINES);
+    group.bench_function("backward_above_floor", |b| {
+        b.iter(|| {
+            snap.search_in("^00000000 ", floor.clone(), LineId(LINES), true, 1, &cancel)
+                .expect("pattern")
+        });
+    });
     group.bench_function("regex_full_scan", |b| {
         b.iter(|| {
             snap.search(r"temp=9\d needle", LineId(0), false, 1, &cancel)
