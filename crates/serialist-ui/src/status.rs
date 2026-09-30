@@ -6,9 +6,10 @@
 //! [`StatusInputs`] from the session's counters and the newest store snapshot, and
 //! [`StatusLine::new`] turns it into text.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serialist_core::{SessionStats, StoreStats};
 
@@ -152,6 +153,72 @@ impl PauseMark {
     }
 }
 
+/// How long the byte rates look back.
+pub const RATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Byte rates over the last [`RATE_WINDOW`], from counter samples taken on a timer.
+#[derive(Clone, Debug, Default)]
+pub struct RateMeter {
+    samples: VecDeque<(Instant, u64, u64)>,
+}
+
+/// Received and sent bytes per second.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rates {
+    pub rx: f64,
+    pub tx: f64,
+}
+
+impl RateMeter {
+    /// Take a sample of the counters at `now`, and forget the ones the window no longer
+    /// needs (it keeps the newest sample older than the window, to measure from).
+    pub fn record(&mut self, now: Instant, rx: u64, tx: u64) {
+        if let Some((last, ..)) = self.samples.back()
+            && *last > now
+        {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, rx, tx));
+        while self.samples.len() > 2
+            && self
+                .samples
+                .get(1)
+                .is_some_and(|(at, ..)| now.duration_since(*at) >= RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The rates across the samples kept: zero until two samples a tenth of a second
+    /// apart, and zero again once the counters have not moved for a whole window.
+    pub fn rates(&self) -> Rates {
+        let (Some((first, rx0, tx0)), Some((last, rx1, tx1))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return Rates::default();
+        };
+        let span = last.duration_since(*first).as_secs_f64();
+        if span < 0.1 {
+            return Rates::default();
+        }
+        Rates {
+            rx: rx1.saturating_sub(*rx0) as f64 / span,
+            tx: tx1.saturating_sub(*tx0) as f64 / span,
+        }
+    }
+
+    /// Start over, as a reconnect does.
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+}
+
+/// `1.2 KiB/s`; `None` for no traffic.
+pub fn format_rate(bytes_per_second: f64) -> Option<String> {
+    let rounded = bytes_per_second.round();
+    (rounded >= 1.0).then(|| format!("{}/s", format_bytes(rounded as u64)))
+}
+
 /// Everything the status line is made from.
 #[derive(Clone, Debug)]
 pub struct StatusInputs<'a> {
@@ -173,6 +240,8 @@ pub struct StatusInputs<'a> {
     pub script: Option<&'a ScriptStatus>,
     /// The codec decoding the session, if any.
     pub codec: Option<&'a str>,
+    /// Bytes per second each way, lately.
+    pub rates: Rates,
 }
 
 /// The text of the status line for one session, kept apart from rendering so tests can
@@ -186,8 +255,12 @@ pub struct StatusLine {
     pub settings: Option<String>,
     /// `RX 1.2 MiB`: bytes the session read from the port.
     pub rx: String,
+    /// `↓ 1.2 KiB/s`: the receive rate, while bytes arrive.
+    pub rx_rate: Option<String>,
     /// `TX 4 B`: bytes the session wrote.
     pub tx: String,
+    /// `↑ 12 B/s`: the send rate, while bytes go out.
+    pub tx_rate: Option<String>,
     /// `10000 lines, 1.2 MiB kept`: what the scrollback retains now.
     pub retained: String,
     /// `evicted 3000 lines, 512.0 KiB` once the store's budget has dropped anything.
@@ -222,7 +295,9 @@ impl StatusLine {
             settings: (!inputs.title.contains(&inputs.settings)).then_some(inputs.settings),
             title: inputs.title,
             rx: format!("RX {}", format_bytes(inputs.session.rx_bytes)),
+            rx_rate: format_rate(inputs.rates.rx).map(|rate| format!("\u{2193} {rate}")),
             tx: format!("TX {}", format_bytes(inputs.session.tx_bytes)),
+            tx_rate: format_rate(inputs.rates.tx).map(|rate| format!("\u{2191} {rate}")),
             retained: format!(
                 "{} lines, {} kept",
                 store.lines(),
@@ -298,6 +373,7 @@ mod tests {
             paste: None,
             script: None,
             codec: None,
+            rates: Rates::default(),
         }
     }
 
@@ -414,6 +490,35 @@ mod tests {
             StatusLine::new(inputs(&state, store(0, 3, 0, 20))).script,
             None
         );
+    }
+
+    #[test]
+    fn rates_follow_the_counters_and_settle_to_nothing() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut meter = RateMeter::default();
+        meter.record(at(0), 0, 0);
+        assert_eq!(meter.rates(), Rates::default(), "one sample is no rate");
+        meter.record(at(250), 512, 0);
+        meter.record(at(500), 1024, 10);
+        let rates = meter.rates();
+        assert_eq!(rates.rx, 2048.0);
+        assert_eq!(rates.tx, 20.0);
+        let state = ConnectionState::Connected;
+        let mut status = inputs(&state, store(0, 3, 0, 20));
+        status.rates = rates;
+        let line = StatusLine::new(status);
+        assert_eq!(line.rx_rate.as_deref(), Some("\u{2193} 2.0 KiB/s"));
+        assert_eq!(line.tx_rate.as_deref(), Some("\u{2191} 20 B/s"));
+
+        // Quiet for a whole window: nothing moves, and the rate says so.
+        for ms in (750..=3000).step_by(250) {
+            meter.record(at(ms), 1024, 10);
+        }
+        assert_eq!(meter.rates(), Rates::default());
+        assert_eq!(format_rate(0.4), None);
+        let line = StatusLine::new(inputs(&state, store(0, 3, 0, 20)));
+        assert_eq!(line.rx_rate, None);
     }
 
     #[test]

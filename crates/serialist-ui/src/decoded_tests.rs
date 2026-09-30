@@ -140,6 +140,9 @@ fn race_frames_fill_the_panel_and_a_frame_reply_resolves_the_send(cx: &mut TestA
         view,
         _world,
     } = open(cx, &dir, false);
+    // Marks go on lines the terminal shows: show the lines of binary frames, which are
+    // hidden by default while a codec decodes.
+    view.update(cx, |v, cx| v.set_hide_framed_bytes(false, cx));
     assert_eq!(
         view.read_with(cx, |v, _| v.codec_name().map(str::to_owned)),
         Some("airoha-race".into())
@@ -406,6 +409,12 @@ fn summaries_go_into_the_scrollback_and_framed_lines_can_be_hidden(cx: &mut Test
         view.read_with(cx, |v, _| v.decoded_inline()),
         "on by default"
     );
+    // Framed bytes are hidden by default while a codec decodes; show them to start.
+    assert!(
+        view.read_with(cx, |v, _| v.hides_framed_bytes()),
+        "hidden by default: the Decoded panel shows those frames"
+    );
+    view.update(cx, |v, cx| v.set_hide_framed_bytes(false, cx));
 
     // Summaries of the logs, as notice lines; none for the text frames.
     run_until(cx, "two log summaries", |cx| {
@@ -499,6 +508,9 @@ fn selecting_a_decoded_row_marks_its_bytes_in_the_terminal(cx: &mut TestAppConte
         view,
         _world,
     } = open(cx, &dir, false);
+    // Marks go on lines the terminal shows: show the lines of binary frames, which are
+    // hidden by default while a codec decodes.
+    view.update(cx, |v, cx| v.set_hide_framed_bytes(false, cx));
     wait_frames(cx, &workspace, "three logs", |frames| {
         frames.iter().filter(|f| is_log(f)).count() >= 3
     });

@@ -393,15 +393,18 @@ fn the_escape_chord_leaves_and_a_double_press_sends_it(cx: &mut TestAppContext) 
 fn the_toolbar_toggles_the_mode_and_the_compose_bar(cx: &mut TestAppContext) {
     let (window, view, _feed) = open_view(cx, false);
     assert!(compose_rendered(cx, window));
-    cx.update_window(window, |_, window, cx| window.click("inline-mode", cx))
+    cx.update_window(window, |_, window, cx| window.click("mode-inline", cx))
         .unwrap();
     assert_eq!(mode(cx, &view), Mode::Inline);
     assert!(!compose_rendered(cx, window), "hidden in inline mode");
     assert!(terminal_focused(cx, window, &view));
     assert_eq!(view.read_with(cx, |v, _| v.status_line().mode), "INLINE");
 
-    cx.update_window(window, |_, window, cx| window.click("inline-mode", cx))
-        .unwrap();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("mode-command", cx)
+    })
+    .unwrap();
     assert_eq!(mode(cx, &view), Mode::Command);
     assert!(compose_rendered(cx, window));
     assert!(

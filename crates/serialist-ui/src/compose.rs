@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 
 use crate::actions::{CycleLineEnding, HistoryNext, HistoryPrevious, SaveAsCommand, context};
+use crate::chrome;
 use crate::config::Config;
 use crate::prelude::*;
 
@@ -157,9 +158,7 @@ impl EventEmitter<ComposeEvent> for ComposeBar {}
 
 impl ComposeBar {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Type a line and press Enter to send")
-        });
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Send a line\u{2026}"));
         let subscription = cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if let InputEvent::PressEnter { .. } = event {
                 this.submit(window, cx);
@@ -284,59 +283,103 @@ impl ComposeBar {
 impl Render for ComposeBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let toolbar = Config::toolbar_background(cx);
+        let compose = cx.entity().downgrade();
         let theme = cx.theme();
+        let (border, muted, mono) = (
+            theme.border,
+            theme.muted_foreground,
+            theme.mono_font_family.clone(),
+        );
+        let echo = self.local_echo;
+        let context = Some(context::COMPOSE_BAR);
+        // Inside the field, on its right: what goes out with each line, and the rest.
+        let controls = h_flex()
+            .gap_0p5()
+            .items_center()
+            .child(
+                Button::new("line-ending")
+                    .label(self.line_ending.label())
+                    .xsmall()
+                    .ghost()
+                    .font_family(mono.clone())
+                    .text_color(muted)
+                    .tooltip_with_action(
+                        "Line ending sent after each line (click for the next)",
+                        &CycleLineEnding,
+                        context,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_line_ending(this.line_ending.next(), cx);
+                    })),
+            )
+            .child(
+                chrome::toggle_button(
+                    "local-echo",
+                    if echo {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    },
+                    echo,
+                    cx,
+                )
+                .xsmall()
+                .tooltip(if echo {
+                    "Local echo on: sent lines show in the scrollback"
+                } else {
+                    "Local echo off: only the device's own echo shows"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.set_local_echo(!this.local_echo, cx);
+                })),
+            )
+            .child(
+                chrome::icon_button("compose-more", IconName::ChevronDown, cx)
+                    .xsmall()
+                    .tooltip("More")
+                    .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+                        let compose = compose.clone();
+                        menu.min_w(px(200.)).item(
+                            PopupMenuItem::new("Save as command\u{2026}")
+                                .icon(IconName::ListPlus)
+                                .action(Box::new(SaveAsCommand))
+                                .on_click(move |_, _, cx| {
+                                    compose
+                                        .update(cx, |compose, cx| compose.save_as_command(cx))
+                                        .ok();
+                                }),
+                        )
+                    }),
+            );
         h_flex()
             .key_context(context::COMPOSE_BAR)
             .on_action(cx.listener(Self::cycle_line_ending))
             .on_action(cx.listener(Self::save_as_command_action))
             .on_action(cx.listener(Self::history_previous))
             .on_action(cx.listener(Self::history_next))
+            .flex_none()
             .w_full()
-            .gap_2()
+            .gap_1()
             .px_2()
-            .py_1p5()
+            .py_1()
+            .items_center()
             .border_t_1()
-            .border_color(theme.border)
+            .border_color(border)
             .when_some(toolbar, |bar, background| bar.bg(background))
             .child(
-                div()
-                    .flex_1()
-                    .font_family(theme.mono_font_family.clone())
-                    .child(Input::new(&self.input).id("compose-input").small()),
-            )
-            .child(
-                Button::new("local-echo")
-                    .label(if self.local_echo { "Echo" } else { "No echo" })
-                    .tooltip("Show sent lines in the scrollback; click to toggle")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_local_echo(!this.local_echo, cx);
-                    })),
-            )
-            .child(
-                Button::new("line-ending")
-                    .label(self.line_ending.label())
-                    .tooltip("Line ending sent after each line; click to cycle")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.set_line_ending(this.line_ending.next(), cx);
-                    })),
-            )
-            .child(
-                Button::new("save-as-command")
-                    .label("Save…")
-                    .tooltip("Save this line (or the last one sent) as a command")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.save_as_command(cx))),
+                div().flex_1().min_w_0().font_family(mono).child(
+                    Input::new(&self.input)
+                        .id("compose-input")
+                        .small()
+                        .suffix(controls),
+                ),
             )
             .child(
                 Button::new("send")
-                    .label("Send")
+                    .icon(IconName::SendHorizontal)
                     .small()
                     .primary()
+                    .tooltip("Send the line (Enter)")
                     .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
             )
     }
