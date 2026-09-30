@@ -1,5 +1,6 @@
-//! Codec plugins for Serialist: built-in Rust codecs, the Lua adapter (tier 1), and the
-//! Airoha RACE reference plugin in both.
+//! Codec plugins for Serialist: built-in Rust codecs, the Lua adapter (tier 1), the
+//! WebAssembly adapter (tier 2, the `wasm` feature), and the Airoha RACE reference plugin
+//! in all three.
 //!
 //! Every codec implements [`serialist_core::Codec`]; the app keeps their factories in a
 //! [`CodecRegistry`] and runs the active one on the ingest thread through a
@@ -15,13 +16,15 @@
 //! | [`builtin_registry`], [`register_builtins`] | The Rust codecs: [`TextLines`] (`text-lines`) and [`AirohaRace`] (`airoha-race`) |
 //! | [`LuaCodec`], [`LuaCodecFactory`], [`LuaLimits`] | A codec written in Lua; the contract is in [`lua`] |
 //! | [`AIROHA_RACE_LUA`], [`bundled_race_lua`] | The reference RACE plugin in Lua, bundled |
-//! | [`find_plugins`], [`load_plugins`] | Plugin folders on disk, and the WebAssembly seam ([`dir`]) |
+//! | `WasmCodec`, `WasmCodecFactory`, `WasmLimits` | A codec compiled to a WebAssembly component (`wasm` feature); the contract is in `wasm` and `wit/v1/serialist-codec.wit` |
+//! | [`find_plugins`], [`load_plugins`] | Plugin folders on disk, Lua and WebAssembly ([`dir`]) |
 //! | [`encode_payload`], [`PayloadEncoder`] | A saved command's `{ "codec": …, "fields": … }` payload to bytes |
 //! | [`corpus`] | Deterministic RACE captures for conformance tests and benchmarks |
 //!
-//! The Rust and Lua RACE codecs must agree byte for byte: the same description, the same
-//! frames for every way a capture is cut into chunks, and the same bytes (or the same
-//! error) for every encode request. `tests/conformance.rs` checks all three.
+//! The Rust, Lua and WebAssembly RACE codecs must agree byte for byte: the same
+//! description, the same frames for every way a capture is cut into chunks, and the same
+//! bytes (or the same error) for every encode request. `tests/conformance.rs` checks all
+//! three (the WebAssembly one with the `wasm` feature).
 //!
 //! ```
 //! use std::time::Instant;
@@ -44,6 +47,8 @@ pub mod lua;
 mod payload;
 pub mod race;
 pub mod text_lines;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use serialist_core::codec::{CodecFactory, CodecRegistry};
 
@@ -52,6 +57,8 @@ pub use lua::{LuaCodec, LuaCodecFactory, LuaLimits, PLUGIN_ERROR_KIND};
 pub use payload::{PayloadEncoder, PayloadError, encode_payload};
 pub use race::AirohaRace;
 pub use text_lines::TextLines;
+#[cfg(feature = "wasm")]
+pub use wasm::{WasmCodec, WasmCodecFactory, WasmEngine, WasmLimits};
 
 /// The reference RACE plugin's source, `assets/plugins/airoha-race/plugin.lua`.
 pub const AIROHA_RACE_LUA: &str = include_str!("../assets/plugins/airoha-race/plugin.lua");

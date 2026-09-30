@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Serialist app icon. Original artwork, licensed like the rest of the project
+  (MIT OR Apache-2.0).
+
+  A terminal prompt chevron followed by a digital signal trace on a dark rounded
+  square. The square fills the whole 1024 canvas; render.sh insets it for each
+  platform (macOS wants roughly 10% transparent margin, Windows and Linux less).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Serialist</title>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="1" stop-color="#0a0f19"/>
+    </linearGradient>
+    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5df0c6"/>
+      <stop offset="1" stop-color="#22c39c"/>
+    </linearGradient>
+    <linearGradient id="signal" gradientUnits="userSpaceOnUse" x1="452" y1="0" x2="822" y2="0">
+      <stop offset="0" stop-color="#e6edf9"/>
+      <stop offset="1" stop-color="#e6edf9" stop-opacity="0.45"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" ry="230" fill="url(#body)"/>
+  <rect x="3" y="3" width="1018" height="1018" rx="227" ry="227" fill="none"
+        stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+
+  <g transform="translate(512 512) scale(1.12) translate(-524 -512)">
+  <!-- The prompt. -->
+  <path d="M 226 376 L 376 512 L 226 648" fill="none" stroke="url(#prompt)"
+        stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- The line: a signal that idles low, pulses, and keeps going. -->
+  <path d="M 452 628 H 500 V 396 H 604 V 628 H 708 V 396 H 822" fill="none"
+        stroke="url(#signal)" stroke-width="52" stroke-linecap="round"
+        stroke-linejoin="round"/>
+  </g>
+</svg>

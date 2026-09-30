@@ -1,6 +1,8 @@
 //! The Rust and Lua RACE codecs agree byte for byte: the same description, the same
 //! frames for every way a capture is cut into chunks, and the same bytes (or the same
-//! error) for every encode request.
+//! error) for every encode request. With the `wasm` feature, the WebAssembly RACE plugin
+//! (`examples/plugins/airoha-race-wasm`, its committed build in `tests/fixtures`) is
+//! held to the same checks in [`wasm`].
 
 mod common;
 
@@ -139,16 +141,21 @@ proptest! {
 /// Same bytes, or errors of the same kind about the same field. (An error's `reason` is
 /// prose and may be worded differently.)
 fn assert_same_encoding(request: &EncodeRequest) {
+    assert_encodes_like_rust(&mut lua_race(), "Lua", request);
+}
+
+/// `codec` (called `name`) encodes `request` as the Rust codec does.
+fn assert_encodes_like_rust(codec: &mut dyn Codec, name: &str, request: &EncodeRequest) {
     let rust = AirohaRace::new().encode(request);
-    let lua = lua_race().encode(request);
-    match (&rust, &lua) {
+    let other = codec.encode(request);
+    match (&rust, &other) {
         (Ok(a), Ok(b)) => assert_eq!(a, b, "{request:?}"),
         (
             Err(CodecError::BadField { field: a, .. }),
             Err(CodecError::BadField { field: b, .. }),
-        ) => assert_eq!(a, b, "{request:?}: {rust:?} vs {lua:?}"),
+        ) => assert_eq!(a, b, "{request:?}: {rust:?} vs {other:?}"),
         (Err(a), Err(b)) => assert_eq!(a, b, "{request:?}"),
-        _ => panic!("{request:?}: Rust gave {rust:?}, Lua gave {lua:?}"),
+        _ => panic!("{request:?}: Rust gave {rust:?}, {name} gave {other:?}"),
     }
 }
 
@@ -164,9 +171,22 @@ fn request(command: &str, fields: JsonValue) -> EncodeRequest {
 
 #[test]
 fn both_encode_the_documented_forms_alike() {
+    let cases = documented_requests();
+    for case in &cases {
+        assert_same_encoding(case);
+    }
+    // And the forms really do what they say.
+    assert_eq!(
+        lua_race().encode(&cases[4]),
+        Ok(vec![0x05, 0x5C, 0x05, 0x00, 0x15, 0x0F, 1, 2, 255])
+    );
+}
+
+/// Every documented form of a request, and the errors in a fixed order.
+fn documented_requests() -> Vec<EncodeRequest> {
     let long = "AB".repeat(4094);
     let too_long = "AB".repeat(4095);
-    let cases = [
+    vec![
         request("race_version", json!({})),
         request("race", json!({ "cmd_id": "0x0F15" })),
         request("race", json!({ "cmd_id": 3861, "type": "command" })),
@@ -216,15 +236,7 @@ fn both_encode_the_documented_forms_alike() {
             "race",
             json!({ "type": "x", "cmd_id": "y", "payload": "z" }),
         ),
-    ];
-    for case in &cases {
-        assert_same_encoding(case);
-    }
-    // And the forms really do what they say.
-    assert_eq!(
-        lua_race().encode(&cases[4]),
-        Ok(vec![0x05, 0x5C, 0x05, 0x00, 0x15, 0x0F, 1, 2, 255])
-    );
+    ]
 }
 
 fn field_value(field: &'static str) -> impl Strategy<Value = JsonValue> {
@@ -331,5 +343,94 @@ proptest! {
     #[test]
     fn rust_and_lua_encode_any_request_alike(request in encode_request()) {
         assert_same_encoding(&request);
+    }
+}
+
+/// The WebAssembly RACE plugin against the Rust codec: the same checks as the Lua one.
+#[cfg(feature = "wasm")]
+mod wasm {
+    use super::*;
+    use common::wasm_race;
+
+    #[test]
+    fn it_describes_the_same_codec() {
+        assert_eq!(wasm_race().describe(), race_info());
+    }
+
+    #[test]
+    fn the_corpus_decodes_identically_at_every_chunk_size() {
+        let t0 = Instant::now();
+        for seed in 0..6u64 {
+            let bytes = corpus::generate(seed, 90);
+            let mut whole_codec = AirohaRace::new();
+            let whole = decode_chunks(&mut whole_codec, &[&bytes], t0);
+            for max in [1, 2, 3, 7, 64, 700, 5000] {
+                let sizes = corpus::chunk_sizes(seed * 31 + max as u64, bytes.len(), max);
+                let chunks = corpus::split(&bytes, &sizes);
+                let rust = decode_chunks(&mut AirohaRace::new(), &chunks, t0);
+                let mut wasm_codec = wasm_race();
+                let wasm = decode_chunks(&mut wasm_codec, &chunks, t0);
+                let context = format!("seed {seed}, chunks up to {max}");
+                assert_same_frames(&rust, &wasm, &context);
+                assert_eq!(wasm_codec.held_back(), whole_codec.pending(), "{context}");
+                assert_eq!(timeless(&rust, t0), timeless(&whole, t0), "{context}");
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        #[test]
+        fn rust_and_wasm_agree_on_any_capture_however_it_is_cut(
+            seed in any::<u64>(),
+            segments in 1usize..40,
+            sizes in prop::collection::vec(1usize..400, 1..16),
+        ) {
+            let t0 = Instant::now();
+            let bytes = corpus::generate(seed, segments);
+            let chunks = corpus::split(&bytes, &sizes);
+            let mut rust_codec = AirohaRace::new();
+            let rust = decode_chunks(&mut rust_codec, &chunks, t0);
+            let mut wasm_codec = wasm_race();
+            let wasm = decode_chunks(&mut wasm_codec, &chunks, t0);
+            prop_assert_eq!(&rust, &wasm);
+            prop_assert_eq!(wasm_codec.held_back(), rust_codec.pending());
+            assert_tiled(&wasm, (bytes.len() - wasm_codec.held_back()) as u64);
+        }
+
+        #[test]
+        fn rust_and_wasm_agree_on_arbitrary_bytes(
+            bytes in byte_soup(),
+            sizes in prop::collection::vec(1usize..64, 1..8),
+        ) {
+            let t0 = Instant::now();
+            let chunks = corpus::split(&bytes, &sizes);
+            let rust = decode_chunks(&mut AirohaRace::new(), &chunks, t0);
+            let wasm = decode_chunks(&mut wasm_race(), &chunks, t0);
+            prop_assert_eq!(&rust, &wasm);
+        }
+    }
+
+    #[test]
+    fn it_encodes_the_documented_forms_alike() {
+        let mut codec = wasm_race();
+        let cases = documented_requests();
+        for case in &cases {
+            assert_encodes_like_rust(&mut codec, "WebAssembly", case);
+        }
+        assert_eq!(
+            codec.encode(&cases[4]),
+            Ok(vec![0x05, 0x5C, 0x05, 0x00, 0x15, 0x0F, 1, 2, 255])
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        #[test]
+        fn rust_and_wasm_encode_any_request_alike(request in encode_request()) {
+            assert_encodes_like_rust(&mut wasm_race(), "WebAssembly", &request);
+        }
     }
 }

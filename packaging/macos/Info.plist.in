@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for Serialist.app/Contents/Info.plist. bundle.sh replaces @VERSION@ with the
+  workspace version (pre-release suffix dropped: Apple wants plain dotted numbers).
+  CFBundleIdentifier is what macOS uses to decide the process runs from a bundle, which
+  is what turns system notifications on.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>serialist</string>
+    <key>CFBundleIconFile</key>
+    <string>serialist</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.serialist.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Serialist</string>
+    <key>CFBundleDisplayName</key>
+    <string>Serialist</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <!-- The release binary is built with a macOS 11.0 deployment target (rustc's default
+         for Apple Silicon). Keep this in step with `otool -l` on the binary. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 John Gunn. Licensed under MIT OR Apache-2.0.</string>
+</dict>
+</plist>

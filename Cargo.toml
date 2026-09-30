@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# WebAssembly plugins (the example and the adapter's test plugin) are members so they
+# share the lock file, are linted and unit-tested natively with everything else, and
+# build reproducibly (a path member's metadata hash does not depend on where the
+# checkout lives).
+members = ["crates/*", "examples/plugins/*", "crates/serialist-plugins/tests/plugins/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +19,7 @@ serialist-sim = { path = "crates/serialist-sim" }
 serialist-script = { path = "crates/serialist-script" }
 serialist-plugins = { path = "crates/serialist-plugins" }
 serialist-ui = { path = "crates/serialist-ui" }
+serialist-plugin-sdk = { path = "crates/serialist-plugin-sdk" }
 
 # GPUI: the community snapshot pinned by gpui-kit. Import it only through serialist_ui::prelude.
 gpui = { package = "gpui-pre", version = "=0.3.7" }
@@ -50,9 +55,40 @@ insta = "1"
 mlua = { version = "0.12", features = ["lua54", "vendored", "async"] }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync"] }
 
+# WebAssembly plugins (tier 2): the host runtime behind serialist-plugins' `wasm` feature,
+# off by default because wasmtime and Cranelift dominate a clean build. Only what a
+# component-model host needs: no WASI, no async, no wat, no GC, no pooling allocator.
+wasmtime = { version = "49", default-features = false, features = [
+    "std",
+    "runtime",
+    "cranelift",
+    "component-model",
+] }
+# Tests only: hand-written components in the text format (the version wasmtime's own
+# wasm-encoder matches).
+wat = "1.258"
+# plugin.toml, the manifest next to a plugin.wasm.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
+# The guest side: serialist-plugin-sdk generates its bindings from the same WIT, and a
+# no_std guest gets its allocator from dlmalloc (the one std uses on wasm32).
+wit-bindgen = { version = "0.62", default-features = false, features = ["macros", "realloc"] }
+dlmalloc = { version = "0.2", features = ["global"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# WebAssembly plugin components (examples/plugins): small, no unwinding, no symbols, so
+# the build is reproducible and the committed test fixture can be checked against it.
+# `cargo build -p <plugin> --target wasm32-wasip2 --profile wasm-plugin`.
+[profile.wasm-plugin]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
 
 # Keep debug builds usable for stress testing without a full release build.
 [profile.dev.package."*"]
