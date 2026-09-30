@@ -14,7 +14,8 @@ use crate::prelude::*;
 pub struct TerminalPalette {
     pub foreground: Hsla,
     pub background: Hsla,
-    /// Faint text (SGR 2) with the default color, and the timestamp gutter.
+    /// Faint text (SGR 2) with the default color, the placeholder glyphs for control
+    /// characters, and the timestamp gutter.
     pub dim_foreground: Hsla,
     /// Bold text with the default color, when `bold_is_bright` is on.
     pub bright_foreground: Hsla,
@@ -238,6 +239,11 @@ impl TerminalPalette {
                 foreground.opacity(0.7)
             };
         }
+        if flags.contains(StyleFlags::CONTROL) {
+            // A placeholder for a control byte is always the dim color, whatever the pen
+            // was when the byte arrived: it is not the device's text.
+            foreground = self.dim_foreground;
+        }
         let behind = background.unwrap_or(self.background);
         foreground = if flags.contains(StyleFlags::HIDDEN) {
             behind
@@ -341,6 +347,42 @@ mod tests {
         let c = color.to_rgb();
         let byte = |v: f32| (v * 255.0).round() as u8;
         (byte(c.r), byte(c.g), byte(c.b))
+    }
+
+    #[test]
+    fn control_glyphs_are_the_dim_color_whatever_the_pen_was() {
+        let palette = TerminalPalette::default();
+        let control = StyleFlags(StyleFlags::DIM.0 | StyleFlags::CONTROL.0);
+        let style = |fg, flags| Style {
+            fg,
+            bg: Color::Default,
+            flags,
+        };
+        for direction in [Direction::Rx, Direction::Tx, Direction::Notice] {
+            let glyph = palette.resolve(&style(Color::Default, control), direction);
+            assert_eq!(glyph.foreground, palette.dim_foreground, "{direction:?}");
+            assert_eq!(glyph.background, None);
+            assert!(!glyph.bold && !glyph.italic && !glyph.underline);
+        }
+        // A colored pen, or bold, does not tint or brighten a placeholder.
+        let red = style(Color::Ansi(1), StyleFlags(control.0 | StyleFlags::BOLD.0));
+        assert_eq!(
+            palette.resolve(&red, Direction::Rx).foreground,
+            palette.dim_foreground
+        );
+        // Ordinary text next to it is still the foreground, and plain dim text is the
+        // same color, so glyphs read as the faint text they are.
+        let text = palette.resolve(&Style::default(), Direction::Rx);
+        assert_eq!(text.foreground, palette.foreground);
+        let faint = palette.resolve(&style(Color::Default, StyleFlags::DIM), Direction::Rx);
+        assert_eq!(faint.foreground, palette.dim_foreground);
+        // A theme's dim color is the glyphs' color.
+        let themed = TerminalPalette {
+            dim_foreground: Hsla::from(rgb(0x808040)),
+            ..palette
+        };
+        let glyph = themed.resolve(&style(Color::Default, control), Direction::Rx);
+        assert_eq!(glyph.foreground, themed.dim_foreground);
     }
 
     #[test]

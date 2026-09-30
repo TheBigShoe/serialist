@@ -422,6 +422,31 @@ fn normalized_runs(line: &StyledLine) -> Vec<(Range<usize>, Style)> {
     out
 }
 
+/// A line's runs as byte ranges with the colors and decorations they are drawn in. The
+/// glyphs of a `CONTROL` run (the store's placeholders for control bytes, when
+/// `display.show_control_chars` is on) come out in the palette's dim color.
+fn resolved_runs(
+    line: &StyledLine,
+    palette: &TerminalPalette,
+) -> Vec<(Range<usize>, ResolvedStyle)> {
+    let mut resolved: Vec<(Style, ResolvedStyle)> = Vec::new();
+    normalized_runs(line)
+        .into_iter()
+        .map(|(range, run_style)| {
+            let found = resolved
+                .iter()
+                .find(|(s, _)| *s == run_style)
+                .map(|(_, r)| *r);
+            let resolved_style = found.unwrap_or_else(|| {
+                let r = palette.resolve(&run_style, line.direction);
+                resolved.push((run_style, r));
+                r
+            });
+            (range, resolved_style)
+        })
+        .collect()
+}
+
 struct ShapeStyle<'a> {
     font: &'a Font,
     font_size: Pixels,
@@ -468,22 +493,7 @@ fn shape_entry(
     starts.push(text.len());
     let column_of = |byte: usize| starts.partition_point(|&start| start < byte);
 
-    let mut resolved: Vec<(Style, ResolvedStyle)> = Vec::new();
-    let runs: Vec<(Range<usize>, ResolvedStyle)> = normalized_runs(line)
-        .into_iter()
-        .map(|(range, run_style)| {
-            let found = resolved
-                .iter()
-                .find(|(s, _)| *s == run_style)
-                .map(|(_, r)| *r);
-            let resolved_style = found.unwrap_or_else(|| {
-                let r = style.palette.resolve(&run_style, line.direction);
-                resolved.push((run_style, r));
-                r
-            });
-            (range, resolved_style)
-        })
-        .collect();
+    let runs = resolved_runs(line, style.palette);
 
     let per_row = if key.columns == 0 {
         chars.max(1)
@@ -1073,6 +1083,72 @@ mod tests {
         let mut d = a.clone();
         d.received_at += std::time::Duration::from_secs(1);
         assert_eq!(EntryKey::of(&a, 0), EntryKey::of(&d, 0));
+    }
+
+    /// `text` with `glyphs` glyph bytes at the end, in the runs the store produces.
+    fn with_glyph_run(text: &str, glyphs: &str) -> StyledLine {
+        let runs = vec![
+            StyleRun {
+                len: text.len(),
+                style: Style::default(),
+            },
+            StyleRun {
+                len: glyphs.len(),
+                style: serialist_core::ansi::CONTROL_STYLE,
+            },
+        ];
+        line(&format!("{text}{glyphs}"), runs)
+    }
+
+    #[test]
+    fn a_control_glyph_run_is_painted_in_the_dim_color() {
+        let palette = TerminalPalette::default();
+        let styled = with_glyph_run("abc", "\u{240d}\u{240a}");
+        let runs = resolved_runs(&styled, &palette);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].0, 0..3);
+        assert_eq!(runs[0].1.foreground, palette.foreground);
+        assert_eq!(runs[1].0, 3..9, "both glyphs are one run");
+        assert_eq!(runs[1].1.foreground, palette.dim_foreground);
+        assert_ne!(runs[0].1.foreground, runs[1].1.foreground);
+
+        // What the shaper hands the text system for that run: its length and its color.
+        let font = Font::default();
+        let run = text_run(&font, 6, &runs[1].1);
+        assert_eq!((run.len, run.color), (6, palette.dim_foreground));
+        assert!(run.underline.is_none() && run.strikethrough.is_none());
+        assert_eq!(run.font.weight, FontWeight::NORMAL, "not bold");
+
+        // It is the palette's dim color, so a theme decides it.
+        let themed = TerminalPalette {
+            dim_foreground: Hsla::from(rgb(0x808040)),
+            ..palette
+        };
+        let runs = resolved_runs(&styled, &themed);
+        assert_eq!(runs[1].1.foreground, themed.dim_foreground);
+    }
+
+    #[test]
+    fn glyph_runs_do_not_disturb_the_lines_own_styles() {
+        let palette = TerminalPalette::default();
+        let red = StyleRun {
+            len: 3,
+            style: Style {
+                fg: Color::Ansi(1),
+                ..Style::default()
+            },
+        };
+        let glyph = StyleRun {
+            len: 3,
+            style: serialist_core::ansi::CONTROL_STYLE,
+        };
+        let styled = line("red\u{241b}", vec![red, glyph]);
+        let runs = resolved_runs(&styled, &palette);
+        assert_eq!(runs[0].1.foreground, palette.indexed(1));
+        assert_eq!(runs[1].1.foreground, palette.dim_foreground);
+        // A changed run (a different key) reshapes the line: the flag is part of it.
+        let plain = line("red\u{241b}", vec![red, StyleRun { len: 3, ..red }]);
+        assert_ne!(EntryKey::of(&styled, 0), EntryKey::of(&plain, 0));
     }
 
     #[test]

@@ -2,6 +2,10 @@
 //! matches its port: the store's size, the line ending, local echo and the display
 //! defaults (`display.*`). The status line and key bindings change them per session
 //! afterwards.
+//!
+//! `display.show_control_chars` is not a view setting but a parser one: it goes to the
+//! session's store, which parses received bytes once, when they arrive. A change to the
+//! setting therefore applies to sessions opened after it, not to ones already open.
 
 use serialist_core::{DisplayView, LineEnding, PortInfo, Settings, StoreConfig, TimestampMode};
 
@@ -64,11 +68,15 @@ impl Default for SessionOptions {
 impl SessionOptions {
     /// The options for `port` under `settings`: the scrollback budget, `display.*`,
     /// `local_echo`, and the line ending of the first matching device profile, else
-    /// `line_ending`.
+    /// `line_ending`. `display.show_control_chars` is the store's, so it is read here,
+    /// when the session opens.
     pub fn from_settings(settings: &Settings, port: &PortInfo) -> Self {
         let display = &settings.display;
         Self {
-            store: StoreConfig::with_budget(settings.scrollback_budget()),
+            store: StoreConfig {
+                show_control_chars: display.show_control_chars,
+                ..StoreConfig::with_budget(settings.scrollback_budget())
+            },
             line_ending: settings.line_ending_for(port),
             local_echo: settings.local_echo,
             display: DisplayDefaults {
@@ -134,6 +142,28 @@ mod tests {
         );
         let other = SessionOptions::from_settings(&settings, &usb("Something else"));
         assert_eq!(other.line_ending, LineEnding::Lf);
+    }
+
+    #[test]
+    fn control_characters_are_the_stores_to_parse() {
+        let shown = |json: &str| {
+            let settings = Settings::from_jsonc(json).unwrap();
+            SessionOptions::from_settings(&settings, &usb("x"))
+                .store
+                .show_control_chars
+        };
+        assert!(!shown("{}"), "off unless asked for");
+        assert!(shown(r#"{ "display": { "show_control_chars": true } }"#));
+        assert!(!shown(r#"{ "display": { "show_control_chars": false } }"#));
+        // The rest of the store's configuration is as it was.
+        let settings =
+            Settings::from_jsonc(r#"{ "display": { "show_control_chars": true } }"#).unwrap();
+        let options = SessionOptions::from_settings(&settings, &usb("x"));
+        assert_eq!(options.store.budget, settings.scrollback_budget());
+        assert_eq!(
+            options.store.max_line_bytes,
+            StoreConfig::default().max_line_bytes
+        );
     }
 
     #[test]
