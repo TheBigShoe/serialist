@@ -83,8 +83,8 @@ fn open(
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         baud: None,
-        select_port: Some(PortId::new(port)),
-        connect_on_start: true,
+        select_port: None,
+        open_ports: vec![PortId::new(port)],
         store: None,
     };
     let paths = ConfigPaths::new(dir.path());
@@ -644,7 +644,14 @@ fn disconnecting_mid_script_stops_it_and_says_so(cx: &mut TestAppContext) {
     assert!(run_path(cx, window, &workspace, "wait.lua"));
     wait_line(cx, &workspace, "waiting");
 
+    // A script is running, so disconnecting asks first.
     press(cx, window, keys::DISCONNECT);
+    assert!(view.read_with(cx, |v, _| v.pending_disconnect()));
+    assert!(view.read_with(cx, |v, _| !v.state().is_disconnected()));
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |v, cx| v.confirm_disconnect(window, cx));
+    })
+    .unwrap();
     wait_line(cx, &workspace, "\u{25a0} wait.lua stopped after ");
     let texts = texts(cx, &workspace);
     assert!(

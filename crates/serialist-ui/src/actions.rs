@@ -115,6 +115,36 @@ pub mod commands {
     }
 }
 
+/// The session tabs' actions: a tab per open port (see [`workspace`](crate::workspace)).
+pub mod tabs {
+    use crate::prelude::*;
+
+    actions!(
+        tabs,
+        [
+            /// Open a blank tab (or go to the one open) and focus the Devices panel to
+            /// pick its port.
+            NewTab,
+            /// Close the active tab: disconnect its port and stop its script and its
+            /// recording, asking first while either runs.
+            CloseTab,
+            /// Go to the tab on the right, or the first after the last.
+            NextTab,
+            /// Go to the tab on the left, or the last before the first.
+            PreviousTab,
+            ActivateTab1,
+            ActivateTab2,
+            ActivateTab3,
+            ActivateTab4,
+            ActivateTab5,
+            ActivateTab6,
+            ActivateTab7,
+            ActivateTab8,
+            ActivateTab9,
+        ]
+    );
+}
+
 /// The Script console's actions and [`scripts::Run`](Run).
 pub mod scripts {
     use crate::prelude::*;
@@ -179,7 +209,13 @@ pub mod context {
 pub(crate) mod keys {
     pub const QUIT: &str = "cmd-q";
     pub const CLEAR: &str = "cmd-k";
-    pub const DISCONNECT: &str = "cmd-w";
+    pub const DISCONNECT: &str = "cmd-shift-w";
+    pub const NEW_TAB: &str = "cmd-t";
+    pub const CLOSE_TAB: &str = "cmd-w";
+    pub const NEXT_TAB: &str = "cmd-shift-]";
+    pub const PREVIOUS_TAB: &str = "cmd-shift-[";
+    pub const TAB_1: &str = "cmd-1";
+    pub const TAB_2: &str = "cmd-2";
     pub const CYCLE_LINE_ENDING: &str = "cmd-e";
     pub const PAUSE: &str = "cmd-p";
     pub const EXPORT: &str = "cmd-s";
@@ -202,7 +238,13 @@ pub(crate) mod keys {
 pub(crate) mod keys {
     pub const QUIT: &str = "ctrl-q";
     pub const CLEAR: &str = "ctrl-shift-k";
-    pub const DISCONNECT: &str = "ctrl-shift-w";
+    pub const DISCONNECT: &str = "ctrl-alt-w";
+    pub const NEW_TAB: &str = "ctrl-shift-t";
+    pub const CLOSE_TAB: &str = "ctrl-shift-w";
+    pub const NEXT_TAB: &str = "ctrl-shift-]";
+    pub const PREVIOUS_TAB: &str = "ctrl-shift-[";
+    pub const TAB_1: &str = "ctrl-1";
+    pub const TAB_2: &str = "ctrl-2";
     pub const CYCLE_LINE_ENDING: &str = "ctrl-shift-e";
     pub const PAUSE: &str = "ctrl-p";
     pub const EXPORT: &str = "ctrl-shift-s";
@@ -354,6 +396,12 @@ mod tests {
         assert_eq!(bound(None, keys::QUIT), "serialist::Quit");
         assert_eq!(bound(workspace, keys::CLEAR), "terminal::Clear");
         assert_eq!(bound(workspace, keys::DISCONNECT), "serial::Disconnect");
+        assert_eq!(bound(workspace, keys::NEW_TAB), "tabs::NewTab");
+        assert_eq!(bound(workspace, keys::CLOSE_TAB), "tabs::CloseTab");
+        assert_eq!(bound(workspace, keys::NEXT_TAB), "tabs::NextTab");
+        assert_eq!(bound(workspace, keys::PREVIOUS_TAB), "tabs::PreviousTab");
+        assert_eq!(bound(workspace, keys::TAB_1), "tabs::ActivateTab1");
+        assert_eq!(bound(workspace, keys::TAB_2), "tabs::ActivateTab2");
         assert_eq!(bound(workspace, keys::PAUSE), "terminal::Pause");
         assert_eq!(bound(workspace, keys::EXPORT), "terminal::Export");
         assert_eq!(

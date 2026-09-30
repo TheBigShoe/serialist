@@ -451,6 +451,13 @@ impl CodecSlotSink {
             offset: 0,
         }
     }
+
+    /// The same, for a stream whose first `offset` bytes came before (a session opened
+    /// again on a store that already holds them), so frames name the store's offsets.
+    pub fn starting_at(mut self, offset: u64) -> Self {
+        self.offset = offset;
+        self
+    }
 }
 
 impl ChunkSink for CodecSlotSink {

@@ -157,6 +157,7 @@ fn bundled_defaults_are_complete_and_as_documented() {
     assert_eq!(settings.default_baud, 115_200);
     assert_eq!(settings.line_ending, LineEnding::Crlf);
     assert!(!settings.local_echo);
+    assert!(settings.restore_session);
     assert!(settings.devices.is_empty());
     assert!(settings.warnings.is_empty());
     assert_eq!(settings, load_settings(None, None).unwrap());

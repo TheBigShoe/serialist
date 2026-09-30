@@ -91,6 +91,11 @@
   // Show what you type in the scrollback. In inline mode the text appears as you type
   // it, as a Tx line of its own (Backspace takes the last character back until Enter).
   "local_echo": false,
+  // Reopen the tabs that were open when Serialist last quit: their ports, line
+  // settings, codec and input mode, kept in state.json next to this file. A simulated
+  // port, or a real one that is plugged in, connects again; any other waits in its tab
+  // for Connect. Ports named on the command line (--port, --virtual NAME) open instead.
+  "restore_session": true,
 
   // ---- Inline interactive mode ----
   // Inline mode sends every keystroke to the port as it is typed, like picocom.

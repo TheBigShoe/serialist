@@ -42,8 +42,10 @@ pub fn run(
     world: SimWorld,
     ui: Arc<dyn ScriptUi>,
 ) -> anyhow::Result<ScriptOutcome> {
-    let Some(port) = args.port.as_deref() else {
-        bail!("--script needs --port <PATH> (virtual:<NAME> for a simulated device)");
+    let port = match args.ports.as_slice() {
+        [port] => port.as_str(),
+        [] => bail!("--script needs --port <PATH> (virtual:<NAME> for a simulated device)"),
+        _ => bail!("--script runs against one --port, not {}", args.ports.len()),
     };
     let source = ScriptSource::from_file(script)
         .with_context(|| format!("could not read the script {}", script.display()))?;

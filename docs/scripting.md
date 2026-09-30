@@ -52,6 +52,14 @@ callback (`serialist --virtual firehose` gives it something to count).
   there too.
 - Every run starts a fresh Lua VM. A session runs one script at a time; one started while
   another runs waits for it.
+- With several ports open, each tab's session has its own script thread. A script runs on
+  the session of the tab that was in front when it started (the console's Run buttons and
+  REPL, a key binding, a saved command) or of the port that connected (`on_connect`), and
+  stays there: `serial.current()` is that session, `commands.send` sends on it, and a
+  saved command's `expect` is watched on the session it was sent on, whichever tab is in
+  front meanwhile. A script in a background tab keeps running; its output goes to that
+  tab's Script console output, which the console shows when the tab is in front again.
+  Closing a tab, or disconnecting its port, stops its script.
 
 ## Triggers
 

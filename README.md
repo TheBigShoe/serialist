@@ -17,9 +17,9 @@ Milestones 0 to 5 of `docs/plan.md` have landed: the session engine and GPUI she
 terminal element over a page-store scrollback, Zed-format settings, themes and keymaps that
 apply live, inline interactive and saved-command modes, Lua scripting with a headless
 `--script` mode, and protocol plugins in Rust, Lua and WebAssembly. Milestone 6 has
-started: CI on macOS, Linux and Windows and release packaging are in; tabs for several
-sessions and full terminal emulation are pending (the terminal is monitor mode, an ANSI
-parser over the received text). The plan's "Status as built" section lists where the build
+started: CI on macOS, Linux and Windows, release packaging, and tabs for several sessions
+(with a port settings popover and session restore) are in; full terminal emulation is
+pending (the terminal is monitor mode, an ANSI parser over the received text). The plan's "Status as built" section lists where the build
 differs from the plan, and `CHANGELOG.md` says what each milestone shipped.
 
 ## Quick start
@@ -40,15 +40,35 @@ with `--port <PATH> --baud <N>`.
 
 | Flag | What it does |
 |---|---|
-| `--port <PATH>` | Open this port at startup (`virtual:<NAME>` for a simulated one) |
+| `--port <PATH>` | Open this port at startup in a tab of its own (`virtual:<NAME>` for a simulated one). Repeatable |
 | `--baud <N>` | Baud rate for `--port` and the Connect field, any positive integer (default 115200) |
-| `--virtual [NAME]` | List the simulated devices next to the real ports; with a NAME, also open `virtual:<NAME>` at startup (repeatable; the first is opened unless `--port` is given) |
+| `--virtual [NAME]` | List the simulated devices next to the real ports; with a NAME, also open `virtual:<NAME>` at startup in a tab of its own. Repeatable |
 | `--config-dir <DIR>` | Read and keep the configuration in DIR instead of the user config directory (also `SERIALIST_CONFIG_DIR`) |
 | `--script <PATH>` | Run this Lua script against `--port` with no window, then exit: 0 if it ends well, 1 on an error, 2 if it is stopped |
 | `--terminal-demo` | Open only the milestone 1 terminal element, fed by an in-memory stream |
 | `-h`, `--help`, `-V`, `--version` | Print the help or the version |
 
 Logging follows `RUST_LOG`, for example `RUST_LOG=serialist=debug`.
+
+### Tabs
+
+Every open port has a tab: `serialist --virtual at --virtual race` opens two, the first in
+front. Connect in the Devices panel opens a new tab (or goes to the port's tab if it has
+one), `cmd-t` opens an empty tab to pick a port for, `cmd-w` closes a tab (asking first while
+it records or runs a script), `cmd-1` to `cmd-9` and `cmd-shift-]`/`[` switch, and tabs
+reorder by dragging. The tab bar shows once two tabs are open. The status line, the window
+title, the Decoded panel and the Script console follow the tab in front; the others keep
+receiving, recording and running their scripts without drawing, and their label counts the
+bytes that arrived meanwhile. When the window closes the tabs are written to `state.json`
+and reopen at the next start (the `restore_session` setting; ports named on the command line
+open instead).
+
+The button at the left of a session's toolbar (`115200 8N1`) opens its port settings: baud
+(any integer, or one from the list), data bits, parity, stop bits, flow control, line ending,
+local echo, live DTR and RTS switches and Send break, applied to the open port at once. The
+gear on a Devices row sets the same things for the next connect to that port. Disconnect in
+the toolbar closes the port and keeps the scrollback; Connect in its place opens it again,
+with the same settings, into the same scrollback.
 
 ### The config directory
 
@@ -66,6 +86,7 @@ The app watches it and applies changes as you save; there is no restart.
 | `scripts/` | Lua scripts, `*.lua` at any depth. The Scripts menu's Open Scripts Folder creates it with two example scripts if it holds none. |
 | `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. See [`docs/plugins.md`](docs/plugins.md). |
 | `history.jsonl` | The compose bar's history, one JSON string per line. |
+| `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode), reopened at the next start. Written by the app. |
 
 A project can also check in `.serialist/settings.json` and `.serialist/commands.json`; the
 nearest one found searching up from the working directory is used. Defaults for every
@@ -83,7 +104,12 @@ that section has no entry for the action. Linux and Windows use the same binding
 |---|---|---|---|---|
 | Anywhere | `serialist::Quit` | Quit | `cmd-q` | `ctrl-q` |
 | Workspace | `terminal::Clear` | Clear the terminal | `cmd-k` | `ctrl-shift-k` |
-| Workspace | `serial::Disconnect` | Disconnect the port | `cmd-w` | `ctrl-shift-w` |
+| Workspace | `serial::Disconnect` | Disconnect the port (asking first while it records or runs a script) | `cmd-shift-w` | `ctrl-alt-w` |
+| Workspace | `tabs::NewTab` | Open an empty tab and focus the Devices panel | `cmd-t` | `ctrl-shift-t` |
+| Workspace | `tabs::CloseTab` | Close the tab: disconnect, stop its script and recording (asking first while either runs) | `cmd-w` | `ctrl-shift-w` |
+| Workspace | `tabs::NextTab` | Go to the next tab | `cmd-shift-]` | `ctrl-shift-]`, `ctrl-pagedown` |
+| Workspace | `tabs::PreviousTab` | Go to the previous tab | `cmd-shift-[` | `ctrl-shift-[`, `ctrl-pageup` |
+| Workspace | `tabs::ActivateTab1` to `9` | Go to tab 1 to 9 | `cmd-1` to `cmd-9` | `ctrl-1` to `ctrl-9` |
 | Workspace | `terminal::Pause` | Pause or resume the view (capture continues) | `cmd-p` | `ctrl-p` |
 | Workspace | `terminal::Export` | Export the scrollback, the paused view or the selection | `cmd-s` | `ctrl-shift-s` |
 | Workspace | `terminal::ToggleRecord` | Start or stop raw recording to a file | `cmd-shift-r` | `ctrl-shift-r` |
@@ -122,7 +148,11 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Terminal, inline mode | `terminal::JumpToBottom` | Jump to the live tail | `cmd-down` | — |
 | Terminal, inline mode | `terminal::ToggleInline` | Switch between inline mode and command mode | — | `ctrl-i` |
 | Terminal, inline mode | `terminal::Clear` | Clear the terminal | — | `ctrl-shift-k` |
-| Terminal, inline mode | `serial::Disconnect` | Disconnect the port | — | `ctrl-shift-w` |
+| Terminal, inline mode | `serial::Disconnect` | Disconnect the port | — | `ctrl-alt-w` |
+| Terminal, inline mode | `tabs::NewTab` | Open an empty tab | — | `ctrl-shift-t` |
+| Terminal, inline mode | `tabs::CloseTab` | Close the tab | — | `ctrl-shift-w` |
+| Terminal, inline mode | `tabs::NextTab` | Go to the next tab | — | `ctrl-shift-]` |
+| Terminal, inline mode | `tabs::PreviousTab` | Go to the previous tab | — | `ctrl-shift-[` |
 | Terminal, inline mode | `terminal::Pause` | Pause or resume the view (capture continues) | — | `ctrl-shift-p` |
 | Terminal, inline mode | `terminal::Export` | Export the scrollback, the paused view or the selection | — | `ctrl-shift-s` |
 | Terminal, inline mode | `terminal::ToggleRecord` | Start or stop raw recording to a file | — | `ctrl-shift-r` |
@@ -133,6 +163,9 @@ included; the entries in the "Terminal, inline mode" section are the exceptions,
 as actions instead of being sent. Plain ctrl chords belong to the device there (ctrl-s is
 XOFF), which is why Linux and Windows mostly use shifted chords. Pause is the exception at
 plain `ctrl-p`, which inline mode sends to the device; in inline mode it is `ctrl-shift-p`.
+So are the tab numbers `ctrl-1` to `ctrl-9` and `ctrl-pageup`/`ctrl-pagedown`: in inline
+mode, `ctrl-shift-[` and `ctrl-shift-]` switch tabs. On macOS no `cmd` chord is sent to the
+device, so every Workspace binding works in inline mode too.
 The chord that leaves inline mode is a setting, `inline.escape_chord` (default `ctrl-]`),
 not a keymap entry.
 
