@@ -16,6 +16,7 @@ use crate::actions::{
     self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
     SearchNext, SearchPrevious, SelectAll, ToggleFrameStats, ToggleHexView, ToggleWrap, context,
 };
+use crate::fonts::TerminalFont;
 use crate::prelude::*;
 use crate::terminal::element::{
     CellMetrics, Highlights, Hit, ShapeCache, TerminalElement, TerminalInputs,
@@ -86,6 +87,7 @@ pub struct TerminalView {
     wrap: bool,
     timestamps: TimestampMode,
     palette: Rc<TerminalPalette>,
+    font: TerminalFont,
     /// Bumped whenever what the element draws from changes wholesale, dropping its
     /// caches.
     generation: u64,
@@ -131,6 +133,7 @@ impl TerminalView {
             wrap: false,
             timestamps: TimestampMode::Off,
             palette: Rc::new(TerminalPalette::default()),
+            font: TerminalFont::default(),
             generation: 1,
             clock,
             cache: Rc::default(),
@@ -278,9 +281,27 @@ impl TerminalView {
     }
 
     pub fn set_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
+        if *self.palette == palette {
+            return;
+        }
         self.palette = Rc::new(palette);
         self.generation += 1;
         cx.notify();
+    }
+
+    /// The font the terminal draws with.
+    pub fn font(&self) -> &TerminalFont {
+        &self.font
+    }
+
+    /// Draw with `font` from the next frame on. The element measures the new grid and
+    /// drops every shaped line when the font, size or line height differ from the last
+    /// frame's.
+    pub fn set_font(&mut self, font: TerminalFont, cx: &mut Context<Self>) {
+        if self.font != font {
+            self.font = font;
+            cx.notify();
+        }
     }
 
     pub fn wrap(&self) -> bool {
@@ -930,9 +951,6 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let font = font(theme.mono_font_family.clone());
-        let font_size = theme.mono_font_size;
         let search_open = self.search.open;
         let highlights = if search_open {
             Highlights {
@@ -951,8 +969,9 @@ impl Render for TerminalView {
             stats: self.stats.clone(),
             palette: self.palette.clone(),
             generation: self.generation,
-            font,
-            font_size,
+            font: self.font.font.clone(),
+            font_size: self.font.size,
+            line_height: self.font.line_height,
             wrap: self.wrap,
             timestamps: self.timestamps,
             clock: self.clock,

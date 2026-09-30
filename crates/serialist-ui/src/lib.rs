@@ -10,11 +10,13 @@ pub mod capture;
 pub mod compose;
 pub mod devices_panel;
 pub mod export;
+pub mod fonts;
 pub mod scrollback;
 pub mod session_handle;
 pub mod session_view;
 pub mod status;
 pub mod terminal;
+pub mod theme_bridge;
 pub mod workspace;
 
 #[cfg(test)]
@@ -64,10 +66,11 @@ pub mod prelude {
     pub use gpui_kit::test as gpui_test;
 
     pub use gpui_kit::component::button::{Button, ButtonVariants};
+    pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
     pub use gpui_kit::component::{
-        ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeMode, h_flex, h_resizable,
-        resizable_panel, v_flex,
+        ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeConfig, ThemeConfigColors,
+        ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,
     };
 }
