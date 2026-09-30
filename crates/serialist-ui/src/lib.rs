@@ -6,26 +6,36 @@
 //! compose bar and a status line.
 
 pub mod actions;
+pub mod capture;
 pub mod compose;
 pub mod devices_panel;
 mod drain;
+pub mod export;
 pub mod line_buffer;
 pub mod session_handle;
+pub mod session_model;
 pub mod session_view;
 pub mod workspace;
 
 #[cfg(test)]
 mod gate;
 #[cfg(test)]
+mod stream_tests;
+#[cfg(test)]
 mod test_support;
 
+pub use capture::{RawRing, Recorder, RecorderStats, RecordingSlot};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
+pub use export::{ExportFormat, ExportJob};
 pub use line_buffer::{Line, LineBuffer, LineKind, LineSplitter, RxText};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-pub use session_view::{ConnectionState, SessionModel, SessionUpdate, SessionView, StatusLine};
+pub use session_model::{
+    ConnectionState, Notice, RecordingStatus, SessionModel, SessionUpdate, StatusLine,
+};
+pub use session_view::SessionView;
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {
