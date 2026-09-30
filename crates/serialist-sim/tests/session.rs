@@ -162,6 +162,7 @@ fn at_conversation() {
 
 #[test]
 fn firehose_at_3_mbaud_is_complete_and_on_rate() {
+    skip_unless_wall_clock_timing!();
     let _heavy = heavy();
     let world = SimWorld::empty();
     let id = world.add_virtual("hose", "Firehose", LinkConfig::default(), || {
@@ -324,6 +325,7 @@ fn unplug_at_9600_baud_disconnects_within_100ms() {
 
 #[test]
 fn idle_session_reader_does_not_spin() {
+    skip_unless_wall_clock_timing!();
     let world = SimWorld::new();
     let id = virtual_port_id(SimWorld::ECHO);
     let mut cfg = SessionConfig::new(id.clone(), serial(115_200));
@@ -358,6 +360,7 @@ fn idle_session_reader_does_not_spin() {
 
 #[test]
 fn reconfigure_through_the_session_changes_the_link_rate() {
+    skip_unless_wall_clock_timing!();
     let _heavy = heavy();
     let world = SimWorld::new();
     let id = virtual_port_id(SimWorld::FIREHOSE);
