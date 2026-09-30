@@ -19,6 +19,11 @@
 //! of the key bindings: every install that changes the keymap or the commands rebinds,
 //! with the commands' bindings layered after the keymap's (see [`keymap::apply`]).
 //!
+//! So do the codecs ([`CodecSet`]): the built-ins and the plugin folders under
+//! `plugins/`, reloaded on [`ConfigEvent::Plugins`]. A session view that observes the
+//! global notices when the factory of the codec it runs changed (see
+//! [`codecs`](crate::codecs)) and switches to the new one at the next chunk.
+//!
 //! # Failures
 //!
 //! Nothing here is fatal. A settings file that does not parse keeps the last good
@@ -41,6 +46,7 @@ use serialist_core::{
     load_settings,
 };
 
+use crate::codecs::CodecSet;
 use crate::fonts::{
     FontParts, FontRole, TerminalFont, UiFont, build_font, clamp_font_size, clamp_line_height,
     installed_families, substitute_missing_family,
@@ -112,6 +118,8 @@ pub enum ConfigPiece {
     Commands,
     /// The Lua scripts in `scripts/`.
     Scripts,
+    /// The codec plugins in `plugins/`.
+    Plugins,
 }
 
 impl fmt::Display for ConfigPiece {
@@ -125,6 +133,7 @@ impl fmt::Display for ConfigPiece {
             ConfigPiece::Fonts => "fonts",
             ConfigPiece::Commands => "commands",
             ConfigPiece::Scripts => "scripts",
+            ConfigPiece::Plugins => "plugins",
         })
     }
 }
@@ -151,6 +160,9 @@ pub struct Config {
     /// The `*.lua` files in the scripts folder, for the Script console and the menu.
     /// Empty for the bundled defaults, which read nothing from disk.
     scripts: Arc<Vec<ScriptEntry>>,
+    /// The codecs: the built-ins, and the plugins in `plugins/` for a configuration read
+    /// from its directory.
+    codecs: CodecSet,
     /// Read from `paths` (not just the bundled defaults), so files there may be written:
     /// the compose history, a saved command.
     loaded: bool,
@@ -192,6 +204,7 @@ impl Config {
             keymap: Arc::new(Keymap::bundled_default()),
             commands: Arc::new(bundled_commands()),
             scripts: Arc::new(Vec::new()),
+            codecs: CodecSet::builtin(),
             loaded: false,
             themes,
             system_dark: true,
@@ -218,6 +231,7 @@ impl Config {
         config.reload_settings();
         config.reload_commands();
         config.reload_scripts();
+        config.reload_plugins();
         config
     }
 
@@ -241,6 +255,16 @@ impl Config {
     /// The scripts in the scripts folder, sorted by their path under it.
     pub fn scripts(&self) -> &Arc<Vec<ScriptEntry>> {
         &self.scripts
+    }
+
+    /// The codecs: the built-ins and the plugins.
+    pub fn codecs(&self) -> &CodecSet {
+        &self.codecs
+    }
+
+    /// Every codec by name, for sessions and saved commands.
+    pub fn codec_registry(&self) -> &Arc<serialist_core::CodecRegistry> {
+        self.codecs.registry()
     }
 
     /// Whether this configuration was read from its directory, rather than being the
@@ -421,6 +445,29 @@ impl Config {
         if self.loaded {
             self.scripts = Arc::new(list_scripts(&self.paths.scripts_dir()));
         }
+    }
+
+    /// Load the plugin folders again. A plugin that does not load is a problem, and its
+    /// last good version (if any) stays in use; see [`CodecSet::reload_plugins`]. Only a
+    /// configuration read from its directory looks there.
+    pub fn reload_plugins(&mut self) {
+        if !self.loaded {
+            return;
+        }
+        let problems = self
+            .codecs
+            .reload_plugins(
+                &self.paths.plugins_dir(),
+                serialist_plugins::LuaLimits::default(),
+            )
+            .into_iter()
+            .map(|problem| ConfigProblem {
+                piece: ConfigPiece::Plugins,
+                is_error: true,
+                message: problem.to_string(),
+            })
+            .collect();
+        self.set_problems(ConfigPiece::Plugins, problems);
     }
 
     /// Read the themes folder again.
@@ -636,6 +683,7 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
         ConfigPiece::Commands => config.reload_commands(),
         ConfigPiece::Scripts => config.reload_scripts(),
+        ConfigPiece::Plugins => config.reload_plugins(),
     });
 }
 
@@ -647,6 +695,7 @@ pub fn reload_all(cx: &mut App) {
         config.reload_settings();
         config.reload_commands();
         config.reload_scripts();
+        config.reload_plugins();
     });
 }
 
@@ -695,6 +744,7 @@ fn piece_of(event: ConfigEvent) -> ConfigPiece {
         ConfigEvent::Themes => ConfigPiece::Themes,
         ConfigEvent::Commands => ConfigPiece::Commands,
         ConfigEvent::Scripts => ConfigPiece::Scripts,
+        ConfigEvent::Plugins => ConfigPiece::Plugins,
     }
 }
 

@@ -596,7 +596,11 @@ fn an_expect_can_be_a_frame_predicate() {
     let frame = version.frame.as_ref().unwrap();
     assert_eq!(frame["kind"], json!("response"));
     assert_eq!(frame["cmd_id"], json!("0x0F15"));
-    assert!(commands[0].problems().is_empty(), "{:?}", commands[0].problems());
+    assert!(
+        commands[0].problems().is_empty(),
+        "{:?}",
+        commands[0].problems()
+    );
     let both = commands[1].expect.as_ref().unwrap();
     assert_eq!(both.pattern, "^OK");
     assert!(both.frame.is_some());
@@ -623,10 +627,7 @@ fn an_expect_can_be_a_frame_predicate() {
     assert_eq!(&read, version);
     let mut predicate = Map::new();
     predicate.insert("kind".into(), json!("response"));
-    assert_eq!(
-        Expect::frame(predicate.clone(), 500).frame,
-        Some(predicate)
-    );
+    assert_eq!(Expect::frame(predicate.clone(), 500).frame, Some(predicate));
 }
 
 #[test]
@@ -890,7 +891,12 @@ fn the_bundled_examples_load_clean_and_encode() {
             command.name
         );
         let frame = command.expect.as_ref().and_then(|e| e.frame.as_ref());
-        assert_eq!(frame.unwrap()["kind"], json!("response"), "{}", command.name);
+        assert_eq!(
+            frame.unwrap()["kind"],
+            json!("response"),
+            "{}",
+            command.name
+        );
         assert!(command.problems().is_empty(), "{:?}", command.problems());
     }
     let (_, version) = examples.find("RACE version").unwrap();
