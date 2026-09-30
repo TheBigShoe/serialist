@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use serialist_core::{PortId, SerialConfig, Transport, TransportError, TransportFactory};
 
 use crate::source::virtual_port_id;
-use crate::{LinkConfig, LinkHandle, SimDevice, VirtualLink};
+use crate::{Clock, LinkConfig, LinkHandle, SimDevice, SystemClock, VirtualLink};
 
 /// Builds a fresh device for each open, so every connection starts from power-on state.
 pub type DeviceConstructor = Arc<dyn Fn() -> Box<dyn SimDevice> + Send + Sync>;
@@ -29,18 +29,41 @@ impl Entry {
     }
 }
 
-/// Opens `virtual:<name>` ports. Cheap to clone; clones share one registry.
+/// Opens `virtual:<name>` ports. Cheap to clone; clones share one registry and clock.
 ///
 /// `open` uses the registered [`LinkConfig`] with its `serial` replaced by the config the
-/// host asked for, so a session opened at 3 Mbaud is paced at 3 Mbaud.
-#[derive(Clone, Default)]
+/// host asked for, so a session opened at 3 Mbaud is paced at 3 Mbaud. Every link it
+/// opens runs on the factory's [`Clock`]: real time unless it was built with
+/// [`SimTransportFactory::with_clock`].
+#[derive(Clone)]
 pub struct SimTransportFactory {
     inner: Arc<Mutex<BTreeMap<PortId, Entry>>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for SimTransportFactory {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemClock))
+    }
 }
 
 impl SimTransportFactory {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty factory whose links all run on `clock`, such as a
+    /// [`ManualClock`](crate::ManualClock) shared with the test driving it.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            inner: Arc::default(),
+            clock,
+        }
+    }
+
+    /// The clock every link this factory opens runs on.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
     }
 
     /// Register a device under `virtual:<name>`, present and ready to open.
@@ -147,7 +170,8 @@ impl TransportFactory for SimTransportFactory {
         link_cfg.serial = config.clone();
         // Device code runs outside the registry lock.
         let device = constructor();
-        let (mut transport, handle) = VirtualLink::connect(device, link_cfg);
+        let (mut transport, handle) =
+            VirtualLink::connect_with_clock(device, link_cfg, Arc::clone(&self.clock));
         transport.description = format!("{port} @ {}", config.summary());
 
         let mut entries = self.inner.lock();
