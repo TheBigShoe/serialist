@@ -1,0 +1,163 @@
+// Serialist codec plugins, API version 1.
+//
+// A plugin is a component that exports this world. A plugin folder holds the compiled
+// component as `plugin.wasm` next to a `plugin.toml` manifest whose `api = "1"` pins
+// this file. A later, incompatible API gets its own directory (`wit/v2/`) and package
+// version, and the host keeps loading v1 plugins.
+//
+// The host gives a plugin no WASI: no files, no network, no clocks, no environment.
+// The one import is `log`. Every call runs under a time and a memory budget, and a call
+// that traps or runs out of either turns the bytes it was given into one `plugin_error`
+// frame; the host then starts the plugin over from a fresh instance.
+package serialist:codec@1.0.0;
+
+world plugin {
+  // Description ---------------------------------------------------------------------
+
+  /// The type of a field's value.
+  enum field-type { %bool, int, uint, float, str, bytes, %list }
+
+  /// A named, typed field of a frame kind or of a command.
+  record field-info {
+    name: string,
+    ty: field-type,
+    description: string,
+    /// A frame may leave it out; a command may be sent without it.
+    optional: bool,
+  }
+
+  /// A kind of frame `decode` produces, with its fields in display order.
+  record frame-kind-info {
+    kind: string,
+    description: string,
+    fields: list<field-info>,
+  }
+
+  /// A command `encode` accepts and its fields.
+  record command-info {
+    name: string,
+    description: string,
+    fields: list<field-info>,
+  }
+
+  record codec-info {
+    /// The name saved commands and settings use, such as `airoha-race`. Must match the
+    /// manifest's `name`.
+    name: string,
+    /// Must match the manifest's `version`.
+    version: string,
+    description: string,
+    kinds: list<frame-kind-info>,
+    /// The first is the default for a saved command that does not name one.
+    commands: list<command-info>,
+  }
+
+  // Decoding ------------------------------------------------------------------------
+
+  enum severity { info, warning, error }
+
+  /// `first .. first + len` of an arena list: a frame's `items` for a `value`, a
+  /// request's `nodes` for a `json`.
+  record span { first: u32, len: u32 }
+
+  /// A field value. WIT has no recursive types, so the items of a list live in the
+  /// frame's `items`; each item belongs to at most one list.
+  variant value {
+    %bool(bool),
+    int(s64),
+    uint(u64),
+    float(f64),
+    str(string),
+    bytes(list<u8>),
+    %list(span),
+  }
+
+  record frame {
+    /// One of the kinds `describe` lists.
+    kind: string,
+    /// The frame's bytes: `offset .. offset + len` of the chunk given to `decode`.
+    offset: u32,
+    len: u32,
+    severity: severity,
+    /// A one-line description for a list or the terminal.
+    summary: string,
+    /// Named values, in the order the kind declares them.
+    fields: list<tuple<string, value>>,
+    /// The items of every `list` value in `fields`, nested lists included.
+    items: list<value>,
+  }
+
+  record decode-result {
+    /// The frames completed, in stream order.
+    frames: list<frame>,
+    /// How many trailing bytes of the chunk are not decided yet. The host presents them
+    /// again, followed by the next bytes received, at the start of the next `decode`.
+    held: u32,
+  }
+
+  // Encoding ------------------------------------------------------------------------
+
+  /// A JSON value of a request. The items of an array and the members of an object live
+  /// in the request's `nodes`: a member's name is its key there, an item's key is empty.
+  variant json {
+    null,
+    %bool(bool),
+    /// A number that is an integer and fits an s64.
+    int(s64),
+    /// A number that is an integer larger than any s64.
+    uint(u64),
+    /// Any other number.
+    float(f64),
+    str(string),
+    array(span),
+    object(span),
+  }
+
+  /// A command and its JSON fields, as a saved command's
+  /// `{ "codec": ..., "fields": { ... } }` payload gives them.
+  record encode-request {
+    command: string,
+    fields: list<tuple<string, json>>,
+    nodes: list<tuple<string, json>>,
+  }
+
+  record bad-field {
+    field: string,
+    reason: string,
+  }
+
+  variant codec-error {
+    /// The codec has no command by this name.
+    unknown-command(string),
+    /// A required field is absent.
+    missing-field(string),
+    /// A field is present but unusable.
+    bad-field(bad-field),
+    /// Anything else.
+    internal(string),
+  }
+
+  // Imports -------------------------------------------------------------------------
+
+  enum log-level { debug, info, warn, error }
+
+  /// A line for the app's log. The host keeps the last `error` line of a call and shows
+  /// it if the call then traps, so a panic handler can say what went wrong.
+  import log: func(level: log-level, message: string);
+
+  // Exports -------------------------------------------------------------------------
+
+  /// What the codec is and speaks. Called once when the plugin loads.
+  export describe: func() -> codec-info;
+
+  /// Decode the next bytes of the stream: whatever the last call held back, followed by
+  /// the bytes received since. The plugin may keep its own state between calls, or none
+  /// and hold bytes back instead.
+  export decode: func(chunk: list<u8>) -> decode-result;
+
+  /// The bytes for one command.
+  export encode: func(request: encode-request) -> result<list<u8>, codec-error>;
+
+  /// The stream starts over (a disconnect or a reconnect): forget all decode state.
+  export reset: func();
+}
