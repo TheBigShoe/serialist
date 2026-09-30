@@ -298,6 +298,15 @@ impl Keymap {
         }
     }
 
+    /// The bundled defaults' source text for `platform`, comments included.
+    pub fn bundled_source(platform: Platform) -> &'static str {
+        match platform {
+            Platform::MacOs => MACOS_DEFAULTS,
+            Platform::Linux => LINUX_DEFAULTS,
+            Platform::Windows => WINDOWS_DEFAULTS,
+        }
+    }
+
     /// The bundled defaults for the platform this binary runs on.
     pub fn bundled_default() -> Keymap {
         Keymap::bundled(Platform::current())

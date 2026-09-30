@@ -33,7 +33,7 @@ const GRACE: Duration = Duration::from_millis(500);
 /// Time for the OS watcher to be ready before a test touches a file.
 const SETTLE: Duration = Duration::from_millis(200);
 
-use ConfigEvent::{Keymap, Settings, Themes};
+use ConfigEvent::{Commands, Keymap, Settings, Themes};
 
 struct Fixture {
     _root: TempDir,
@@ -110,6 +110,7 @@ fn creating_the_watcher_makes_no_event() {
     // The watcher created both directories itself.
     assert!(paths.dir.is_dir());
     assert!(paths.themes.is_dir());
+    assert!(paths.commands_dir().is_dir());
     // Long enough for FSEvents to have reported them, folded into a later batch.
     std::thread::sleep(Duration::from_millis(800));
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
@@ -169,6 +170,47 @@ fn a_theme_file_is_noticed() {
 }
 
 #[test]
+fn a_commands_file_is_noticed() {
+    let f = watched();
+    // The commands folder was made by the watcher and is already watched.
+    assert!(f.paths.commands_dir().is_dir());
+    fs::write(f.paths.commands_dir().join("mine.json"), "{}").unwrap();
+    assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
+}
+
+#[test]
+fn a_collection_saved_by_the_store_is_noticed_once_it_is_whole() {
+    let f = watched();
+    let mut store = crate::CommandStore::load(&f.paths);
+    store.create_collection("Mine").unwrap();
+    store
+        .add_command("Mine", "G", crate::Command::text("c", "AT"))
+        .unwrap();
+    // Written through a temp file and a rename: only the finished file is an event.
+    store.save_collection("Mine").unwrap();
+    assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
+}
+
+#[test]
+fn the_project_commands_file_is_watched_too() {
+    let root = TempDir::new("watch-project-commands");
+    let project_file = root.write("repo/.serialist/commands.json", "{}");
+    let paths =
+        ConfigPaths::new(root.path().join("config")).with_project_from(&root.path().join("repo"));
+    assert_eq!(
+        paths.project_commands.as_deref(),
+        Some(project_file.as_path())
+    );
+    let (tx, rx) = unbounded();
+    let _watcher = ConfigWatcher::spawn(&paths, tx);
+    std::thread::sleep(SETTLE);
+    drain(&rx);
+
+    fs::write(&project_file, "{ \"name\": \"Mine\" }").unwrap();
+    assert_eq!(expect(&rx, &[Commands]), set(&[Commands]));
+}
+
+#[test]
 fn a_theme_file_in_a_subfolder_is_noticed() {
     let f = watched();
     let pack = f.paths.themes.join("pack");
@@ -185,6 +227,11 @@ fn files_that_are_not_config_and_directories_are_ignored() {
     let themes = &f.paths.themes;
     let dir = &f.paths.dir;
     // None of these may produce an event.
+    let commands = f.paths.commands_dir();
+    fs::write(commands.join("notes.txt"), "hi").unwrap();
+    fs::create_dir(commands.join("sub")).unwrap();
+    fs::create_dir(commands.join("looks-like-a-collection.json")).unwrap();
+    fs::write(commands.join(".mine.json.1-0.tmp"), "x").unwrap();
     fs::write(themes.join("notes.txt"), "hi").unwrap();
     fs::write(themes.join("readme.md"), "hi").unwrap();
     fs::create_dir(themes.join("pack")).unwrap();
@@ -214,11 +261,16 @@ fn changes_to_several_files_are_all_reported() {
             format!("{{ \"round\": {round} }}"),
         )
         .unwrap();
+        fs::write(
+            f.paths.commands_dir().join("c.json"),
+            format!("{{ \"name\": \"round {round}\" }}"),
+        )
+        .unwrap();
     }
     // How many of each is up to the OS, so this checks the set.
     assert_eq!(
-        expect(&f.rx, &[Settings, Keymap, Themes]),
-        set(&[Settings, Keymap, Themes])
+        expect(&f.rx, &[Settings, Keymap, Themes, Commands]),
+        set(&[Settings, Keymap, Themes, Commands])
     );
 }
 
@@ -401,6 +453,8 @@ fn targets() -> Targets {
         ],
         keymap: PathBuf::from("/cfg/keymap.json"),
         themes: PathBuf::from("/cfg/themes"),
+        commands: PathBuf::from("/cfg/commands"),
+        project_commands: Some(PathBuf::from("/proj/.serialist/commands.json")),
     }
 }
 
@@ -441,6 +495,43 @@ fn theme_files_count_at_any_depth() {
     ] {
         assert_eq!(targets().events(&[event(modify, &[path])]), vec![Themes]);
     }
+}
+
+#[test]
+fn command_files_count_directly_in_the_commands_folder() {
+    let modify = EventKind::Modify(ModifyKind::Any);
+    for path in [
+        "/cfg/commands/a.json",
+        "/cfg/commands/B.JSON",
+        "/proj/.serialist/commands.json",
+    ] {
+        assert_eq!(targets().events(&[event(modify, &[path])]), vec![Commands]);
+    }
+    for path in [
+        "/cfg/commands",
+        "/cfg/commands/sub/a.json",
+        "/cfg/commands/a.txt",
+        // The temp file `CommandStore::save` writes before it renames.
+        "/cfg/commands/.a.json.123-0.tmp",
+        "/cfg/commands.json",
+        "/proj/commands.json",
+        "/proj/.serialist/other.json",
+    ] {
+        assert!(
+            targets().events(&[event(modify, &[path])]).is_empty(),
+            "{path}"
+        );
+    }
+    let batch = [
+        event(modify, &["/cfg/commands/a.json"]),
+        event(modify, &["/cfg/themes/a.json"]),
+        event(modify, &["/cfg/keymap.json"]),
+        event(modify, &["/cfg/settings.json"]),
+    ];
+    assert_eq!(
+        targets().events(&batch),
+        vec![Settings, Keymap, Themes, Commands]
+    );
 }
 
 #[test]
