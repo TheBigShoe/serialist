@@ -21,6 +21,7 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::crc::crc32;
+use crate::link::later;
 use crate::{DeviceOutput, SimDevice};
 
 /// What the firehose sends.
@@ -52,7 +53,8 @@ pub struct FirehoseConfig {
     pub seed: u64,
     /// Largest single send, in bytes.
     pub max_batch: usize,
-    /// How often a rate-limited firehose wakes up.
+    /// How often a rate-limited firehose wakes up. Values under [`MIN_TICK`] are raised
+    /// to it, so a zero tick cannot spin the device thread.
     pub tick: Duration,
     /// Unplug the link once `total_bytes` have been sent.
     pub disconnect_when_done: bool,
@@ -95,6 +97,9 @@ impl FirehoseConfig {
         self
     }
 }
+
+/// The shortest `tick` a rate-limited firehose uses.
+pub const MIN_TICK: Duration = Duration::from_millis(1);
 
 /// SplitMix64: tiny, fast and plenty for content that only has to be deterministic.
 #[derive(Clone, Debug)]
@@ -420,7 +425,7 @@ impl SimDevice for FirehoseDevice {
         if self.cfg.bytes_per_second.is_none() || behind {
             Some(now)
         } else {
-            Some(now + self.cfg.tick)
+            Some(later(now, self.cfg.tick.max(MIN_TICK)))
         }
     }
 }
@@ -779,6 +784,23 @@ mod tests {
         assert_eq!(out.sent.len(), 25_000);
         assert!(out.disconnected);
         assert_eq!(out.sent, stream(FirehoseContent::Text, 0, 25_000));
+    }
+
+    #[test]
+    fn tick_is_clamped_and_saturates() {
+        let t0 = Instant::now();
+        let mut zero = FirehoseDevice::new(FirehoseConfig {
+            tick: Duration::ZERO,
+            ..FirehoseConfig::new(FirehoseContent::Text).with_rate(1_000)
+        });
+        let mut out = CaptureOutput::new();
+        assert_eq!(zero.on_tick(t0, &mut out), Some(t0 + MIN_TICK));
+
+        let mut huge = FirehoseDevice::new(FirehoseConfig {
+            tick: Duration::MAX,
+            ..FirehoseConfig::new(FirehoseContent::Text).with_rate(1_000)
+        });
+        assert!(huge.on_tick(t0, &mut out).is_some_and(|t| t > t0));
     }
 
     #[test]
