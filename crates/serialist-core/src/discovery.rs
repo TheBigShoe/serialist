@@ -200,15 +200,26 @@ struct Shared {
     /// Diffing and broadcasting happen under this one lock, and `subscribe` snapshots
     /// under it too, so a subscriber sees `Snapshot` and then exactly the later changes.
     state: Mutex<State>,
+    /// Held for the whole of a refresh, enumeration included, so two refreshes can never
+    /// overlap and a slow older result can never be applied over a newer one. It is a
+    /// separate lock from `state` on purpose: `subscribe` and `snapshot` only take
+    /// `state`, so they never wait behind a slow enumeration.
+    refresh_lock: Mutex<()>,
     enumerate: Enumerator,
     /// Log the first failure of a run at `warn`, the repeats at `debug`.
     enumerate_failing: AtomicBool,
 }
 
 impl Shared {
-    /// Enumerates, applies the diff to `state` and notifies subscribers. Returns the
-    /// fresh list, or `None` when enumeration failed (the old list is kept).
-    fn refresh(&self) -> Option<Vec<PortInfo>> {
+    /// Enumerates, applies the diff to `state` and notifies subscribers. When
+    /// enumeration fails the old list is kept, so an error never reads as "every port
+    /// was unplugged".
+    ///
+    /// Refreshes are serialised: each one enumerates only after the previous one has
+    /// been applied, so results are applied in the order they were taken.
+    fn refresh(&self) {
+        let _one_at_a_time = self.refresh_lock.lock();
+
         let fresh = match (self.enumerate)() {
             Ok(list) => {
                 self.enumerate_failing.store(false, AtomicOrdering::Relaxed);
@@ -220,13 +231,13 @@ impl Shared {
                 } else {
                     tracing::warn!(error = %err, "port enumeration failed; keeping the previous list");
                 }
-                return None;
+                return;
             }
         };
 
         let mut state = self.state.lock();
         let events = diff_ports(&state.current, &fresh);
-        state.current = fresh.clone();
+        state.current = fresh;
         if !events.is_empty() {
             tracing::debug!(events = events.len(), "port list changed");
             // A send only fails when the receiver is gone, which is how dead
@@ -235,7 +246,6 @@ impl Shared {
                 .subscribers
                 .retain(|tx| events.iter().all(|e| tx.send(e.clone()).is_ok()));
         }
-        Some(fresh)
     }
 }
 
@@ -272,7 +282,11 @@ impl Default for RealPortSource {
 }
 
 impl RealPortSource {
-    /// Enumerates once, then starts the monitor thread.
+    /// Enumerates once on the calling thread, then starts the monitor thread. The first
+    /// enumeration is what lets `snapshot` and `subscribe` be correct from the start;
+    /// it costs a few milliseconds on macOS and Linux and can take a few hundred on
+    /// Windows, so construct the source off the UI thread if that matters. Every later
+    /// enumeration happens on the monitor thread.
     pub fn new() -> Self {
         Self::with_parts(Box::new(list_ports), MonitorOptions::default())
     }
@@ -283,6 +297,7 @@ impl RealPortSource {
                 current: Vec::new(),
                 subscribers: Vec::new(),
             }),
+            refresh_lock: Mutex::new(()),
             enumerate,
             enumerate_failing: AtomicBool::new(false),
         });
@@ -329,11 +344,16 @@ impl RealPortSource {
 }
 
 impl PortSource for RealPortSource {
+    /// The cached list, which the monitor thread keeps current: within about 150 ms of
+    /// a USB hotplug event and within 3 s otherwise. This never enumerates on the
+    /// caller's thread, since enumeration can take hundreds of milliseconds on Windows
+    /// and the caller may be the UI thread. It also nudges the monitor to refresh (a
+    /// channel send, coalesced with any pending request), so the next call is fresher
+    /// and subscribers hear about any difference as events.
     fn snapshot(&self) -> Vec<PortInfo> {
-        // Going through `refresh` keeps subscribers in step with what this call saw.
-        self.shared
-            .refresh()
-            .unwrap_or_else(|| self.shared.state.lock().current.clone())
+        let cached = self.shared.state.lock().current.clone();
+        self.request_refresh();
+        cached
     }
 
     fn subscribe(&self) -> Receiver<PortEvent> {
@@ -860,6 +880,8 @@ mod tests {
         ports: Arc<Mutex<Vec<PortInfo>>>,
         calls: Arc<AtomicUsize>,
         failing: Arc<AtomicBool>,
+        /// How long each enumeration takes, like a slow SetupAPI scan.
+        delay: Arc<Mutex<Duration>>,
         /// Dropped with the source's last reference to the enumerator.
         probe: Arc<()>,
     }
@@ -870,6 +892,7 @@ mod tests {
                 ports: Arc::new(Mutex::new(initial.iter().map(|n| info(n)).collect())),
                 calls: Arc::new(AtomicUsize::new(0)),
                 failing: Arc::new(AtomicBool::new(false)),
+                delay: Arc::new(Mutex::new(Duration::ZERO)),
                 probe: Arc::new(()),
             }
         }
@@ -899,6 +922,10 @@ mod tests {
                 // Borrow the whole bus so the closure owns the probe clone too.
                 let bus = &bus;
                 bus.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                let delay = *bus.delay.lock();
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 if bus.failing.load(AtomicOrdering::SeqCst) {
                     return Err(serialport::Error::new(
                         serialport::ErrorKind::Unknown,
@@ -952,25 +979,102 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reflects_the_current_list() {
+    fn snapshot_returns_the_cache_without_enumerating_on_the_callers_thread() {
+        let bus = FakeBus::new(&["A"]);
+        let source = bus.source(Duration::from_millis(200), LONG);
+        assert_eq!(ids(&source.snapshot()), ["A"]);
+        bus.wait_for_monitor_startup();
+
+        // A device appears, and every enumeration now takes 400 ms.
+        bus.set(&["A", "B"]);
+        *bus.delay.lock() = Duration::from_millis(400);
+        let before = bus.calls();
+        let started = Instant::now();
+        let listed = source.snapshot();
+        let took = started.elapsed();
+
+        assert_eq!(ids(&listed), ["A"], "the cache, not a fresh scan");
+        assert!(
+            took < Duration::from_millis(150),
+            "snapshot blocked for {took:?}"
+        );
+        assert_eq!(
+            bus.calls(),
+            before,
+            "snapshot enumerated on the caller's thread"
+        );
+    }
+
+    #[test]
+    fn snapshot_requests_a_refresh_that_reaches_subscribers_and_later_snapshots() {
         let bus = FakeBus::new(&["A"]);
         let source = bus.source(Duration::from_millis(20), LONG);
-        assert_eq!(ids(&source.snapshot()), ["A"]);
+        let rx = source.subscribe();
+        expect_snapshot(&rx);
+        bus.wait_for_monitor_startup();
+
         bus.set(&["A", "B"]);
+        assert_eq!(ids(&source.snapshot()), ["A"], "stale for now");
+        assert_eq!(
+            rx.recv_timeout(PATIENCE).unwrap(),
+            PortEvent::Added(info("B")),
+            "the nudge made the monitor refresh"
+        );
         assert_eq!(ids(&source.snapshot()), ["A", "B"]);
     }
 
     #[test]
-    fn snapshot_call_keeps_subscribers_in_step() {
-        let bus = FakeBus::new(&["A"]);
-        let source = bus.source(Duration::from_secs(30), LONG);
-        let rx = source.subscribe();
-        expect_snapshot(&rx);
-        bus.set(&["A", "B"]);
-        let _ = source.snapshot();
+    fn overlapping_refreshes_never_apply_a_stale_result() {
+        // Enumeration #0 is slow and reports the old list (its picture was taken before
+        // B appeared). Enumeration #1 is fast and reports the new one. Started from two
+        // threads, an unserialised refresh applies #1 first and then #0 over it, which
+        // shows up as a spurious `Removed(B)` and a stale cache until the next poll.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let enumerate: Enumerator = {
+            let calls = Arc::clone(&calls);
+            Box::new(move || match calls.fetch_add(1, AtomicOrdering::SeqCst) {
+                0 => {
+                    let old = vec![info("A")];
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(old)
+                }
+                _ => Ok(vec![info("A"), info("B")]),
+            })
+        };
+        let (tx, rx) = unbounded();
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                current: vec![info("A")],
+                subscribers: vec![tx],
+            }),
+            refresh_lock: Mutex::new(()),
+            enumerate,
+            enumerate_failing: AtomicBool::new(false),
+        });
+
+        let slow = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || shared.refresh()
+        });
+        while calls.load(AtomicOrdering::SeqCst) < 1 {
+            std::thread::sleep(Duration::from_millis(1)); // the slow scan is under way
+        }
+        let fast = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            move || shared.refresh()
+        });
+        slow.join().unwrap();
+        fast.join().unwrap();
+
         assert_eq!(
-            rx.recv_timeout(PATIENCE).unwrap(),
-            PortEvent::Added(info("B"))
+            ids(&shared.state.lock().current),
+            ["A", "B"],
+            "cache went stale"
+        );
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![PortEvent::Added(info("B"))],
+            "subscribers must see B arrive and never leave"
         );
     }
 
