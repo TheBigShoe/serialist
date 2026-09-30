@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use serialist_core::store::DEFAULT_TIMESTAMP_FORMAT;
 use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
 
 use crate::actions::{
@@ -90,6 +91,8 @@ pub struct TerminalView {
     selecting: bool,
     wrap: bool,
     timestamps: TimestampMode,
+    /// `display.timestamp_format` as last seen, to notice a change to it alone.
+    timestamp_format: String,
     palette: Rc<TerminalPalette>,
     font: TerminalFont,
     /// Bumped whenever what the element draws from changes wholesale, dropping its
@@ -135,13 +138,26 @@ impl TerminalView {
             Some(config) => (config.terminal_font().clone(), config.palette().clone()),
             None => (TerminalFont::default(), TerminalPalette::default()),
         };
+        // With no configuration the gutter uses the default format.
+        let timestamp_format = cx.try_global::<Config>().map_or_else(
+            || DEFAULT_TIMESTAMP_FORMAT.to_owned(),
+            |config| config.timestamp_format().to_owned(),
+        );
         let config_changes = cx.observe_global::<Config>(|this, cx| {
             let config = cx.global::<Config>();
             let (font, palette) = (config.terminal_font().clone(), config.palette().clone());
+            let format = config.timestamp_format().to_owned();
             this.set_font(font, cx);
             // A reload about something else keeps the shaped lines.
             if *this.palette != palette {
                 this.set_palette(palette, cx);
+            }
+            // The gutter reads the format every frame, but only a repaint shows a new
+            // one: a reload that changes nothing else would otherwise wait for the next
+            // line to arrive.
+            if this.timestamp_format != format {
+                this.timestamp_format = format;
+                cx.notify();
             }
         });
         Self {
@@ -156,6 +172,7 @@ impl TerminalView {
             selecting: false,
             wrap: false,
             timestamps: TimestampMode::Off,
+            timestamp_format,
             palette: Rc::new(palette),
             font,
             generation: 1,
