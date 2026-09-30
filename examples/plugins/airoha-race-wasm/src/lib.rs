@@ -19,14 +19,12 @@
 //! ```text
 //! rustup target add wasm32-wasip2
 //! cargo build -p airoha-race-wasm --target wasm32-wasip2 --profile wasm-plugin
-//! mkdir -p ~/.config/serialist/plugins/airoha-race-wasm
-//! cp target/wasm32-wasip2/wasm-plugin/airoha_race_wasm.wasm \
-//!    ~/.config/serialist/plugins/airoha-race-wasm/plugin.wasm
-//! cp examples/plugins/airoha-race-wasm/plugin.toml ~/.config/serialist/plugins/airoha-race-wasm/
 //! ```
 //!
-//! `just wasm-fixture` rebuilds the copy the host's tests load
-//! (`serialist-plugins/tests/fixtures/plugins/airoha-race-wasm/`).
+//! The component is `target/wasm32-wasip2/wasm-plugin/airoha_race_wasm.wasm`. A plugin
+//! folder, as `serialist_plugins::load_plugins` reads it, holds it as `plugin.wasm` next
+//! to this crate's `plugin.toml`. `just wasm-fixtures` rebuilds the copy the host's tests
+//! load (`serialist-plugins/tests/fixtures/plugins/airoha-race-wasm/`).
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
 
