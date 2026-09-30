@@ -130,7 +130,10 @@ impl TerminalView {
             let config = cx.global::<Config>();
             let (font, palette) = (config.terminal_font().clone(), config.palette().clone());
             this.set_font(font, cx);
-            this.set_palette(palette, cx);
+            // A reload about something else keeps the shaped lines.
+            if *this.palette != palette {
+                this.set_palette(palette, cx);
+            }
         });
         Self {
             text_source: source,
@@ -299,10 +302,9 @@ impl TerminalView {
         &self.palette
     }
 
+    /// Draw with `palette`, dropping every shaped line (their runs carry colors), even
+    /// when it equals the current one.
     pub fn set_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
-        if *self.palette == palette {
-            return;
-        }
         self.palette = Rc::new(palette);
         self.generation += 1;
         cx.notify();
