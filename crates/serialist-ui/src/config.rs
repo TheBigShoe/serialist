@@ -37,6 +37,7 @@ use serialist_core::{
 
 use crate::fonts::{
     FontParts, FontRole, TerminalFont, UiFont, build_font, clamp_font_size, clamp_line_height,
+    installed_families, substitute_missing_family,
 };
 use crate::keymap;
 use crate::prelude::*;
@@ -97,6 +98,8 @@ pub enum ConfigPiece {
     Theme,
     /// Keymap entries GPUI could not bind: an unknown action, a bad keystroke.
     Bindings,
+    /// A font family the settings name that is not installed.
+    Fonts,
 }
 
 impl fmt::Display for ConfigPiece {
@@ -107,6 +110,7 @@ impl fmt::Display for ConfigPiece {
             ConfigPiece::Themes => "themes",
             ConfigPiece::Theme => "theme",
             ConfigPiece::Bindings => "bindings",
+            ConfigPiece::Fonts => "fonts",
         })
     }
 }
@@ -374,6 +378,35 @@ impl Config {
         self.ui_font = ui_font(&self.settings.resolved_ui_font());
     }
 
+    /// Swap a font family the settings name but the machine lacks for an installed one
+    /// (see [`substitute_missing_family`]), and say so. Fonts are only listed when a
+    /// family is named, so the defaults cost nothing at startup.
+    fn check_fonts(&mut self, cx: &App) {
+        let named = self.settings.resolved_terminal_font().family.is_some()
+            || self.settings.resolved_ui_font().family.is_some();
+        let mut problems = Vec::new();
+        if named {
+            let installed = installed_families(cx);
+            let fonts = [
+                (&mut self.terminal_font.font, FontRole::Mono, "the terminal"),
+                (&mut self.ui_font.font, FontRole::Ui, "the UI"),
+            ];
+            for (font, role, user) in fonts {
+                if let Some(missing) = substitute_missing_family(font, role, installed) {
+                    problems.push(ConfigProblem {
+                        piece: ConfigPiece::Fonts,
+                        is_error: false,
+                        message: format!(
+                            "Font {missing:?} is not installed; {user} uses {:?}",
+                            font.family
+                        ),
+                    });
+                }
+            }
+        }
+        self.set_problems(ConfigPiece::Fonts, problems);
+    }
+
     /// gpui-kit's theme for this configuration.
     pub fn kit_theme(&self) -> ThemeConfig {
         let theme = self.theme.clone();
@@ -454,6 +487,7 @@ pub fn install(mut config: Config, cx: &mut App) {
     let previous = cx.try_global::<Config>();
     config.generation = previous.map_or(1, |previous| previous.generation + 1);
     let rebind = previous.is_none_or(|previous| !Arc::ptr_eq(&previous.keymap, &config.keymap));
+    config.check_fonts(cx);
     theme_bridge::apply_kit_theme(config.kit_theme(), cx);
     if rebind {
         let problems = keymap::apply(&config.keymap, cx)
@@ -483,7 +517,7 @@ pub fn update(cx: &mut App, edit: impl FnOnce(&mut Config)) {
 pub fn reload(piece: ConfigPiece, cx: &mut App) {
     tracing::info!(%piece, "reloading configuration");
     update(cx, |config| match piece {
-        ConfigPiece::Settings => config.reload_settings(),
+        ConfigPiece::Settings | ConfigPiece::Fonts => config.reload_settings(),
         ConfigPiece::Keymap | ConfigPiece::Bindings => config.reload_keymap(),
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
     });
