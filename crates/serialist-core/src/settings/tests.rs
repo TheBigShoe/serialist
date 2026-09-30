@@ -1051,3 +1051,31 @@ fn ensure_keymap_file_writes_a_commented_template_once() {
     // And the settings file is separate.
     assert!(paths.ensure_settings_file().unwrap());
 }
+
+#[test]
+fn emulation_comes_from_the_terminal_setting_then_the_profile() {
+    let defaults = Settings::default();
+    assert_eq!(defaults.terminal.emulation, Emulation::Monitor);
+    assert!(!defaults.terminal.cursor_blink, "a steady cursor by default");
+    assert_eq!(defaults.emulation_for(&airoha_port()), Emulation::Monitor);
+
+    let settings = user_settings(
+        r#"{
+            "terminal": { "emulation": "vt", "cursor_blink": true },
+            "devices": [ { "match": { "product": "Airoha" }, "emulation": "monitor" } ]
+        }"#,
+    );
+    assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+    assert!(settings.terminal.cursor_blink);
+    assert_eq!(
+        settings.emulation_for(&airoha_port()),
+        Emulation::Monitor,
+        "the profile wins"
+    );
+    let other = usb_port("/dev/cu.usbserial-1", 0x0403, 0x6001, None, None, None);
+    assert_eq!(settings.emulation_for(&other), Emulation::Vt);
+
+    error_of(r#"{ "terminal": { "emulation": "vt100" } }"#);
+    assert_eq!(Emulation::Monitor.toggled(), Emulation::Vt);
+    assert_eq!(Emulation::Vt.toggled().label(), "Monitor");
+}

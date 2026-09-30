@@ -40,7 +40,7 @@ pub use paths::{
 };
 pub use profile::{DeviceMatch, DeviceProfile, UsbId};
 pub use types::{
-    DisplaySettings, DisplayView, LineEnding, Settings, TerminalSettings, ThemeMode,
+    DisplaySettings, DisplayView, Emulation, LineEnding, Settings, TerminalSettings, ThemeMode,
     ThemeSelection, TimestampMode,
 };
 

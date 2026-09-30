@@ -57,7 +57,7 @@ pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use settings::{
     BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView,
-    FontFeatures, FontSpec, InlineSettings, LineEnding, LineHeight, Platform, Settings,
+    Emulation, FontFeatures, FontSpec, InlineSettings, LineEnding, LineHeight, Platform, Settings,
     SettingsError, SettingsWarning, TerminalSettings, ThemeMode, ThemeSelection, TimestampMode,
     UsbId, load_settings,
 };
