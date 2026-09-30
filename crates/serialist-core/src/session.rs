@@ -95,6 +95,7 @@ enum Command {
     Write(Vec<u8>),
     Control(ControlLine, bool),
     Reconfigure(SerialConfig),
+    Break(Duration),
     /// Queued by `close`: everything before it goes out, then the writer exits.
     Close,
 }
@@ -261,6 +262,13 @@ impl Session {
     /// reflects them once the transport has accepted them.
     pub fn reconfigure(&self, serial: SerialConfig) -> Result<(), SessionClosed> {
         self.send(Command::Reconfigure(serial))
+    }
+
+    /// Hold the line in the break condition for `duration`, after the writes queued
+    /// before it have gone out. A transport that cannot send a break reports
+    /// `WriteFailed(Unsupported)` on the event channel, as a failed reconfigure does.
+    pub fn send_break(&self, duration: Duration) -> Result<(), SessionClosed> {
+        self.send(Command::Break(duration))
     }
 
     pub fn stats(&self) -> SessionStats {
@@ -453,6 +461,7 @@ fn writer_loop(
             Command::Reconfigure(serial) => writer
                 .reconfigure(&serial)
                 .map(|()| *shared.serial.lock() = serial),
+            Command::Break(duration) => writer.send_break(duration),
         };
         if let Err(err) = result {
             tracing::warn!(%err, "write failed");
@@ -478,6 +487,7 @@ mod tests {
         Write(Vec<u8>),
         Control(ControlLine, bool),
         Reconfigure(u32),
+        Break(Duration),
     }
 
     /// Makes the mock writer panic.
@@ -569,6 +579,10 @@ mod tests {
 
         fn reconfigure(&mut self, config: &SerialConfig) -> Result<(), TransportError> {
             self.record(Op::Reconfigure(config.baud))
+        }
+
+        fn send_break(&mut self, duration: Duration) -> Result<(), TransportError> {
+            self.record(Op::Break(duration))
         }
     }
 
@@ -696,14 +710,16 @@ mod tests {
         session.write(b"a".to_vec()).unwrap();
         session.set_control(ControlLine::Dtr, false).unwrap();
         session.reconfigure(slow.clone()).unwrap();
+        session.send_break(Duration::from_millis(5)).unwrap();
         session.write(b"bc".to_vec()).unwrap();
-        wait_for(|| probe.ops.lock().len() == 4);
+        wait_for(|| probe.ops.lock().len() == 5);
         assert_eq!(
             *probe.ops.lock(),
             [
                 Op::Write(b"a".to_vec()),
                 Op::Control(ControlLine::Dtr, false),
                 Op::Reconfigure(9600),
+                Op::Break(Duration::from_millis(5)),
                 Op::Write(b"bc".to_vec()),
             ]
         );
