@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
-use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Event, EventKind};
 
 use crate::settings::ConfigPaths;
@@ -190,6 +190,87 @@ fn a_script_file_is_noticed_at_any_depth() {
     std::thread::sleep(SETTLE);
     fs::write(lib.join("util.lua"), "return {}").unwrap();
     assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+}
+
+/// Whether the backend's watches belong to directories, so a folder that comes back is
+/// re-watched and reported for sure (see the module docs). FSEvents may fold a quick
+/// delete and re-create of one path into nothing, and needs no re-watch.
+fn rewatches() -> bool {
+    watches_follow_directories()
+}
+
+/// Let the events of what a test just did arrive, then forget them.
+fn settle_and_drain(rx: &Receiver<ConfigEvent>) {
+    std::thread::sleep(GRACE);
+    drain(rx);
+}
+
+#[test]
+fn a_script_subfolder_made_and_filled_at_once_is_noticed() {
+    let f = watched();
+    // No pause between the folder and the file: on Linux the file can land before the
+    // new folder has a watch, and only the folder's own event says anything happened.
+    let lib = f.paths.scripts_dir().join("lib");
+    fs::create_dir(&lib).unwrap();
+    fs::write(lib.join("util.lua"), "return {}").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+}
+
+#[test]
+fn a_scripts_folder_made_after_the_old_one_went_is_watched_again() {
+    let f = watched();
+    let scripts = f.paths.scripts_dir();
+    // Move the watched folder away: on Linux and Windows its watch goes with it.
+    let old = f.paths.dir.join("scripts-old");
+    fs::rename(&scripts, &old).unwrap();
+    if rewatches() {
+        assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+    } else {
+        settle_and_drain(&f.rx);
+    }
+
+    // A new folder, filled at once, as "Open scripts folder" does: reported even though
+    // the file may land before the new watch.
+    fs::create_dir(&scripts).unwrap();
+    fs::write(scripts.join("probe.lua"), "print(1)").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+
+    // The new folder is watched: a later file in it is noticed by its own event.
+    fs::write(scripts.join("second.lua"), "print(2)").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+    // And in a subfolder of it, which only a recursive watch sees.
+    let lib = scripts.join("lib");
+    fs::create_dir(&lib).unwrap();
+    std::thread::sleep(SETTLE);
+    drain(&f.rx);
+    fs::write(lib.join("util.lua"), "return {}").unwrap();
+    assert_eq!(expect(&f.rx, &[Scripts]), set(&[Scripts]));
+}
+
+/// Deleting a watched folder is not portable to test: Windows keeps a directory with an
+/// open handle (the watch's) in a pending-delete state, so the name cannot be reused
+/// until the watch lets go. The rename test above covers Windows.
+#[cfg(not(windows))]
+#[test]
+fn a_commands_folder_deleted_and_made_again_is_watched_again() {
+    let f = watched();
+    let commands = f.paths.commands_dir();
+    fs::remove_dir(&commands).unwrap();
+    if rewatches() {
+        assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
+    } else {
+        settle_and_drain(&f.rx);
+    }
+    fs::create_dir(&commands).unwrap();
+    if rewatches() {
+        // Reported once the new watch is in place.
+        assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
+    } else {
+        settle_and_drain(&f.rx);
+    }
+    // The folder there now is watched.
+    fs::write(commands.join("mine.json"), "{}").unwrap();
+    assert_eq!(expect(&f.rx, &[Commands]), set(&[Commands]));
 }
 
 #[test]
@@ -394,7 +475,16 @@ fn the_forwarder_sends_each_kind_once_per_batch_and_stops_when_asked() {
     let alive = Arc::new(AtomicBool::new(true));
     let forwarder = {
         let alive = Arc::clone(&alive);
-        std::thread::spawn(move || forward(&targets(), &batch_rx, &stop_rx, &tx, &alive))
+        std::thread::spawn(move || {
+            forward(
+                &targets(),
+                &mut OwnFolders::default(),
+                &batch_rx,
+                &stop_rx,
+                &tx,
+                &alive,
+            )
+        })
     };
 
     let modify = EventKind::Modify(ModifyKind::Any);
@@ -422,7 +512,16 @@ fn the_forwarder_sends_nothing_once_the_watcher_is_not_alive() {
     let alive = Arc::new(AtomicBool::new(false));
     let forwarder = {
         let alive = Arc::clone(&alive);
-        std::thread::spawn(move || forward(&targets(), &batch_rx, &stop_rx, &tx, &alive))
+        std::thread::spawn(move || {
+            forward(
+                &targets(),
+                &mut OwnFolders::default(),
+                &batch_rx,
+                &stop_rx,
+                &tx,
+                &alive,
+            )
+        })
     };
     batch_tx
         .send(vec![event(
@@ -445,7 +544,16 @@ fn the_forwarder_ends_when_the_receiver_is_gone() {
     drop(rx);
     let forwarder = {
         let alive = Arc::clone(&alive);
-        std::thread::spawn(move || forward(&targets(), &batch_rx, &stop_rx, &tx, &alive))
+        std::thread::spawn(move || {
+            forward(
+                &targets(),
+                &mut OwnFolders::default(),
+                &batch_rx,
+                &stop_rx,
+                &tx,
+                &alive,
+            )
+        })
     };
     batch_tx
         .send(vec![event(
@@ -571,6 +679,83 @@ fn script_files_count_at_any_depth() {
             "{path}"
         );
     }
+}
+
+#[test]
+fn folders_inside_the_scripts_folder_count_as_scripts() {
+    let targets = targets();
+    let one = |kind: EventKind, path: &str| targets.events(&[event(kind, &[path])]);
+    for kind in [
+        EventKind::Create(CreateKind::Folder),
+        EventKind::Remove(RemoveKind::Folder),
+        EventKind::Remove(RemoveKind::Any),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+    ] {
+        assert_eq!(one(kind, "/cfg/scripts/lib"), vec![Scripts], "{kind:?}");
+    }
+    // The folder itself is the watcher's business (see `folder_changes`), and folders
+    // elsewhere stay quiet.
+    assert!(one(EventKind::Create(CreateKind::Folder), "/cfg/scripts").is_empty());
+    assert!(one(EventKind::Create(CreateKind::Folder), "/cfg/scripts-old").is_empty());
+    assert!(one(EventKind::Create(CreateKind::Folder), "/cfg/themes/pack").is_empty());
+    assert!(one(EventKind::Access(AccessKind::Any), "/cfg/scripts/lib").is_empty());
+    assert!(one(EventKind::Modify(ModifyKind::Any), "/cfg/scripts/lib").is_empty());
+}
+
+#[test]
+fn own_folders_are_rewatched_when_they_come_back() {
+    let folders = [
+        PathBuf::from("/cfg/themes"),
+        PathBuf::from("/cfg/commands"),
+        PathBuf::from("/cfg/scripts"),
+    ];
+    let changes = |batch: &[DebouncedEvent]| folder_changes(&folders, batch);
+    let create = EventKind::Create(CreateKind::Folder);
+    let remove = EventKind::Remove(RemoveKind::Folder);
+    // Deleted and made again in one batch: removed at some point.
+    assert_eq!(
+        changes(&[
+            event(remove, &["/cfg/scripts"]),
+            event(create, &["/cfg/scripts"])
+        ]),
+        [(2, true)]
+    );
+    assert_eq!(changes(&[event(create, &["/cfg/themes"])]), [(0, false)]);
+    // Renamed away, then another renamed into place.
+    let both = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+    assert_eq!(
+        changes(&[event(both, &["/cfg/commands", "/cfg/commands-old"])]),
+        [(1, true)]
+    );
+    assert_eq!(
+        changes(&[event(both, &["/cfg/new", "/cfg/commands"])]),
+        [(1, false)]
+    );
+    // Events inside a folder, and access, are not about the folder.
+    assert!(
+        changes(&[
+            event(create, &["/cfg/scripts/lib"]),
+            event(EventKind::Access(AccessKind::Any), &["/cfg/themes"]),
+        ])
+        .is_empty()
+    );
+    // Any other event on its path is: FSEvents may report a folder deleted soon after
+    // it was made as only a metadata change, and the disk decides.
+    let metadata = EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended));
+    assert_eq!(changes(&[event(metadata, &["/cfg/scripts"])]), [(2, false)]);
+
+    // Re-watch a folder that is there and was removed or is not watched; drop the
+    // watch of one that is gone; leave a watched folder that never went (a late
+    // FSEvents create for a folder `spawn` made).
+    assert_eq!(folder_action(true, true, true), FolderAction::Rewatch);
+    assert_eq!(folder_action(true, false, false), FolderAction::Rewatch);
+    assert_eq!(folder_action(true, true, false), FolderAction::Rewatch);
+    assert_eq!(folder_action(false, true, true), FolderAction::Unwatch);
+    assert_eq!(folder_action(false, false, true), FolderAction::Unwatch);
+    assert_eq!(folder_action(true, false, true), FolderAction::Keep);
+    assert_eq!(folder_action(false, true, false), FolderAction::Keep);
 }
 
 #[test]
