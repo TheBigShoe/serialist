@@ -64,8 +64,8 @@
 //! [`WasmCodecFactory`] compiles and links the component once and keeps the result in
 //! memory; each codec it creates is a new instance of that, which costs microseconds.
 //! Compiled code is not cached on disk: wasmtime's precompiled artifacts are loaded with
-//! an `unsafe` call that trusts the file, and the reference plugin compiles in
-//! milliseconds, so a cache would buy little for the risk.
+//! an `unsafe` call that trusts the file, and the reference plugin compiles, links and
+//! describes itself in about 60 ms (release), so a cache would buy little for the risk.
 //!
 //! # Threads
 //!

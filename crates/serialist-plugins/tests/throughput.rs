@@ -53,3 +53,25 @@ fn race_decode_throughput_on_32_mib() {
         assert!(frames > 100_000);
     }
 }
+
+/// What loading a WebAssembly plugin costs: compiling, linking and describing it once
+/// per factory, then an instance per codec.
+#[cfg(feature = "wasm")]
+#[test]
+#[ignore = "a timing run: use --release --ignored --nocapture"]
+fn wasm_plugin_load_and_instantiate_times() {
+    use serialist_plugins::{WasmCodecFactory, WasmEngine, WasmLimits};
+
+    let engine = WasmEngine::new().unwrap();
+    let dir = common::fixtures().join("plugins/airoha-race-wasm");
+    let started = Instant::now();
+    let factory = WasmCodecFactory::load_dir_with(&dir, &engine, WasmLimits::default()).unwrap();
+    let load = started.elapsed();
+    let n = 1000u32;
+    let started = Instant::now();
+    for _ in 0..n {
+        factory.create_wasm().unwrap();
+    }
+    let each = started.elapsed() / n;
+    eprintln!("wasm: load (compile, link, describe) {load:?}, then {each:?} per codec");
+}
