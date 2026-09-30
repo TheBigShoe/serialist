@@ -15,11 +15,15 @@ bench = false
 [dependencies]
 crossbeam-channel.workspace = true
 futures-core = "0.3"
+jsonc-parser.workspace = true
 memchr.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
 nusb.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serialport.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
