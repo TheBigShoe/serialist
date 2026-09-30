@@ -1,0 +1,21 @@
+[package]
+name = "serialist-plugin-sdk"
+description = "Write Serialist codec plugins as WebAssembly components: the v1 WIT bindings, a plugin trait, frame and request helpers, and hex."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# For `#![no_std]` guests on wasm32: a panic handler that logs the panic and traps, and a
+# global allocator. A guest built this way imports nothing but `log`, which is all the
+# host provides. Does nothing on other targets.
+rt = ["dep:dlmalloc"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dlmalloc = { workspace = true, optional = true }
