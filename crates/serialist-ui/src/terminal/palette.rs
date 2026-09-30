@@ -29,6 +29,8 @@ pub struct TerminalPalette {
     pub tx: Hsla,
     /// Default-colored text of app notices (connected, timeouts).
     pub notice: Hsla,
+    /// The plugin color: default-colored text of decoded frames' summary lines.
+    pub decoded: Hsla,
     /// Draw bold text in ANSI colors 0..=7 with their bright variants, as xterm does.
     pub bold_is_bright: bool,
     /// Minimum WCAG contrast ratio between a glyph and what is behind it; 1.0 turns the
@@ -69,6 +71,7 @@ impl Default for TerminalPalette {
             active_match: Hsla::from(rgba(0xe8a33dcc)),
             tx: hex(0x74ade8),
             notice: hex(0xa9afbc),
+            decoded: hex(0xc162de),
             bold_is_bright: true,
             minimum_contrast: 3.0,
         }
@@ -113,6 +116,7 @@ impl TerminalPalette {
     /// | active match | `search.active_match_background`, then the search match |
     /// | sent lines | `info`, `text.accent` |
     /// | notices | `text.muted`, `hint` |
+    /// | decoded frame summaries | `syntax.keyword`, `terminal.ansi.magenta` |
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<Hsla>) -> Self {
         let defaults = Self::default();
         let first = |keys: &[&str]| keys.iter().find_map(|key| lookup(key));
@@ -152,6 +156,8 @@ impl TerminalPalette {
             ),
             tx: first(&["info", "text.accent"]).unwrap_or(defaults.tx),
             notice: first(&["text.muted", "hint"]).unwrap_or(defaults.notice),
+            decoded: first(&["syntax.keyword", "terminal.ansi.magenta"])
+                .unwrap_or(defaults.decoded),
             ..defaults
         }
     }
@@ -222,10 +228,28 @@ impl TerminalPalette {
     /// Resolve a run's style: colors, then inverse, dim, hidden, then the contrast guard
     /// against whatever the glyph will actually sit on.
     pub fn resolve(&self, style: &Style, direction: Direction) -> ResolvedStyle {
+        self.resolve_with(style, direction, None)
+    }
+
+    /// [`Self::resolve`] for a run of a decoded frame's summary line (a notice), whose
+    /// default color is the plugin color, [`Self::decoded`].
+    pub fn resolve_decoded(&self, style: &Style) -> ResolvedStyle {
+        self.resolve_with(style, Direction::Notice, Some(self.decoded))
+    }
+
+    fn resolve_with(
+        &self,
+        style: &Style,
+        direction: Direction,
+        default_foreground: Option<Hsla>,
+    ) -> ResolvedStyle {
         let flags = style.flags;
         let bold = flags.contains(StyleFlags::BOLD);
         let inverse = flags.contains(StyleFlags::INVERSE);
-        let mut foreground = self.foreground_of(style.fg, bold, direction);
+        let mut foreground = match (style.fg, default_foreground) {
+            (Color::Default, Some(color)) => color,
+            _ => self.foreground_of(style.fg, bold, direction),
+        };
         let mut background = self.background_of(style.bg);
         if inverse {
             let behind = background.unwrap_or(self.background);
@@ -427,6 +451,22 @@ mod tests {
         assert_eq!(palette.dim_foreground, keys["text.muted"]);
         assert_eq!(palette.notice, keys["text.muted"]);
         assert_eq!(palette.tx, keys["info"]);
+        assert_eq!(palette.decoded, defaults.decoded);
+        let keyword =
+            TerminalPalette::from_lookup(|key| (key == "syntax.keyword").then(|| hex(0xc678dd)));
+        assert_eq!(keyword.decoded, hex(0xc678dd), "the plugin color");
+    }
+
+    #[test]
+    fn decoded_summaries_take_the_plugin_color_unless_colored() {
+        let palette = TerminalPalette::default();
+        let plain = palette.resolve_decoded(&Style::default());
+        assert_eq!(plain.foreground, palette.decoded);
+        let red = palette.resolve_decoded(&Style {
+            fg: Color::Ansi(1),
+            ..Style::default()
+        });
+        assert_eq!(red.foreground, palette.ansi[1]);
     }
 
     #[test]

@@ -171,6 +171,8 @@ pub struct StatusInputs<'a> {
     pub paste: Option<PasteProgress>,
     /// The script running on the session.
     pub script: Option<&'a ScriptStatus>,
+    /// The codec decoding the session, if any.
+    pub codec: Option<&'a str>,
 }
 
 /// The text of the status line for one session, kept apart from rendering so tests can
@@ -201,6 +203,8 @@ pub struct StatusLine {
     pub paste: Option<String>,
     /// `Script: version_probe.lua running 3.2 s` while a script runs.
     pub script: Option<String>,
+    /// `Codec: airoha-race` while a codec decodes the session.
+    pub codec: Option<String>,
 }
 
 impl StatusLine {
@@ -234,6 +238,7 @@ impl StatusLine {
             mode: inputs.mode.label(),
             paste: inputs.paste.and_then(|paste| paste.label()),
             script: inputs.script.map(ScriptStatus::label),
+            codec: inputs.codec.map(|codec| format!("Codec: {codec}")),
         }
     }
 }
@@ -292,7 +297,20 @@ mod tests {
             mode: Mode::Command,
             paste: None,
             script: None,
+            codec: None,
         }
+    }
+
+    #[test]
+    fn the_active_codec_is_named() {
+        let state = ConnectionState::Connected;
+        let mut status = inputs(&state, store(0, 3, 0, 20));
+        assert_eq!(StatusLine::new(status.clone()).codec, None);
+        status.codec = Some("airoha-race");
+        assert_eq!(
+            StatusLine::new(status).codec.as_deref(),
+            Some("Codec: airoha-race")
+        );
     }
 
     #[test]
