@@ -11,7 +11,7 @@ use serialist_core::{PortId, PortInfo, PortSource, TransportFactory};
 use crate::source::virtual_port;
 use crate::{
     AtDevice, Clock, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig,
-    LinkHandle, RaceDevice, SimDevice, SimPortSource, SimTransportFactory,
+    LinkHandle, MenuDevice, RaceDevice, SimDevice, SimPortSource, SimTransportFactory,
 };
 
 /// A simulated set of devices for tests and the app's developer mode. Cheap to clone;
@@ -27,6 +27,10 @@ use crate::{
 /// | `virtual:firehose`       | [`FirehoseDevice`], text, as fast as the baud |
 /// | `virtual:firehose-ansi`  | [`FirehoseDevice`], ANSI, as fast as the baud |
 /// | `virtual:race`           | [`RaceDevice::new`]                           |
+///
+/// [`SimWorld::add_menu`] adds `virtual:menu`, a [`MenuDevice`] (a U-Boot style boot menu
+/// for the VT screen). It is not a built-in yet: the app lists the built-ins in developer
+/// mode, and a full-screen menu only makes sense there once the UI has a VT mode.
 ///
 /// Links run in real time. A test that wants exact timing builds the world with
 /// [`SimWorld::with_clock`] (or [`SimWorld::empty_with_clock`]) and a
@@ -46,6 +50,8 @@ impl SimWorld {
     pub const FIREHOSE: &'static str = "firehose";
     pub const FIREHOSE_ANSI: &'static str = "firehose-ansi";
     pub const RACE: &'static str = "race";
+    /// The name [`SimWorld::add_menu`] registers.
+    pub const MENU: &'static str = "menu";
 
     /// A world with the built-in devices plugged in.
     pub fn new() -> Self {
@@ -110,6 +116,17 @@ impl SimWorld {
             Box::new(RaceDevice::new())
         });
         world
+    }
+
+    /// Register `virtual:menu`, a [`MenuDevice`] with its default redraw interval, on a
+    /// default (paced) link, and plug it in.
+    pub fn add_menu(&self) -> PortId {
+        self.add_virtual(
+            Self::MENU,
+            "Boot menu (virtual)",
+            LinkConfig::default(),
+            || Box::new(MenuDevice::new()),
+        )
     }
 
     /// Register a device under `virtual:<name>` and plug it in.

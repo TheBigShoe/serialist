@@ -1,0 +1,19 @@
+[package]
+name = "serialist-vt"
+description = "Full VT terminal emulation for Serialist: alacritty_terminal fed without a PTY, read as a LineSource. No GPUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+parking_lot.workspace = true
+serialist-core.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+crossbeam-channel.workspace = true
+proptest.workspace = true
+serialist-sim.workspace = true
