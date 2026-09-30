@@ -5,9 +5,10 @@
 //! [`DevicesPanelEvent::Connect`] for the workspace, which owns sessions.
 //!
 //! Device profiles from the settings show here: a port a profile matches is listed
-//! under the profile's `name` with a "profile" badge, and selecting it fills the baud
-//! field with the profile's rate. Connecting uses the profile's framing and flow
-//! control with the rate in the field.
+//! under the profile's `name` with a "profile" badge (and a badge naming its `plugin`,
+//! the codec the session decodes with), and selecting it fills the baud field with the
+//! profile's rate. Connecting uses the profile's framing and flow control with the rate
+//! in the field.
 
 use std::fmt;
 use std::sync::Arc;
@@ -358,6 +359,16 @@ impl DevicesPanel {
         settings_of(cx).is_some_and(|settings| settings.profile_for(info).is_some())
     }
 
+    /// The codec the device profile matching `info` decodes with (its `plugin`), shown as
+    /// a badge on the row.
+    pub fn plugin_for(&self, info: &PortInfo, cx: &App) -> Option<String> {
+        settings_of(cx)?
+            .profile_for(info)?
+            .plugin
+            .clone()
+            .filter(|plugin| !plugin.trim().is_empty())
+    }
+
     /// The line settings to open `info` with, other than the rate: its device profile's
     /// framing and flow control over 8N1.
     fn serial_for(&self, info: &PortInfo, cx: &App) -> SerialConfig {
@@ -497,6 +508,7 @@ impl DevicesPanel {
         }
         let name = SharedString::from(self.display_name(&entry.info, cx));
         let profiled = self.has_profile(&entry.info, cx);
+        let plugin = self.plugin_for(&entry.info, cx);
 
         v_flex()
             .id(("device-row", ix))
@@ -536,6 +548,21 @@ impl DevicesPanel {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child("profile"),
+                        )
+                    })
+                    .when_some(plugin, |this, plugin| {
+                        this.child(
+                            div()
+                                .id(("device-plugin", ix))
+                                .test_support()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(theme.info)
+                                .text_xs()
+                                .text_color(theme.info)
+                                .child(SharedString::from(plugin)),
                         )
                     })
                     .when(connected, |this| {

@@ -3,9 +3,10 @@
 //!
 //! A workspace with the Devices and Commands panels on the left, a session view in the
 //! center (the terminal element over the session's page store, and a compose bar, or
-//! the terminal alone in inline mode), the Script console on the right, and a status
-//! line. Settings, themes, fonts and key bindings come from Zed-format files through
-//! [`config`], and apply to the running app as the files change.
+//! the terminal alone in inline mode), the Decoded panel and the Script console on the
+//! right, and a status line. Settings, themes, fonts, key bindings and codec plugins come
+//! from Zed-format files and plugin folders through [`config`], and apply to the running
+//! app as the files change.
 
 pub mod actions;
 pub mod capture;
@@ -13,6 +14,7 @@ pub mod codecs;
 pub mod commands_panel;
 pub mod compose;
 pub mod config;
+pub mod decoded_panel;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
@@ -38,6 +40,8 @@ mod commands_tests;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
+mod decoded_tests;
+#[cfg(test)]
 mod gate;
 #[cfg(test)]
 mod inline_tests;
@@ -53,6 +57,7 @@ pub use codecs::{CodecSelection, CodecSet, CodecSlotSink, PluginCodec, PluginPro
 pub use commands_panel::{CommandEditor, CommandsPanel, CommandsPanelEvent, EditorSeed};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding, LineEndingExt};
 pub use config::{Config, ConfigPiece, ConfigProblem, Opener};
+pub use decoded_panel::{DecodedPanel, FrameTable};
 pub use devices_panel::{
     BaudError, DeviceEntry, DeviceList, DevicesPanel, DevicesPanelEvent, parse_baud,
 };
