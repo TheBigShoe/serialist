@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serialist_core::LineId;
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
     CollectionSource, CommandCollection, CommandRef, CommandStore, Direction, PortId,
@@ -394,7 +395,17 @@ fn the_highlight_is_the_range_the_matcher_found(cx: &mut TestAppContext) {
     });
     let first = marks(cx);
     assert_eq!(first.len(), 1);
-    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    // The mark lands when the expectation resolves; the view's snapshot follows on the
+    // next wake, so wait for the marked line to be shown before reading it.
+    let source_with = |cx: &mut TestAppContext, line: LineId| {
+        run_until(cx, "the marked line to be shown", |cx| {
+            view.read_with(cx, |v, cx| {
+                v.terminal().read(cx).source().line(line).is_some()
+            })
+        });
+        view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone())
+    };
+    let source = source_with(cx, first[0].line);
     let marked = source.line(first[0].line).expect("the marked line");
     assert_eq!(marked.text, "+VER: 1.0.0");
     assert_eq!(first[0].range, 6..9, "the first match, 1.0");
@@ -409,7 +420,7 @@ fn the_highlight_is_the_range_the_matcher_found(cx: &mut TestAppContext) {
     );
     run_until(cx, "the second match", |cx| marks(cx).len() == 2);
     let second = marks(cx);
-    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    let source = source_with(cx, second[1].line);
     let marked = source.line(second[1].line).expect("the marked line");
     assert!(!marked.text.is_empty(), "a line with a word boundary");
     assert_eq!(second[1].range, 0..marked.text.len());
