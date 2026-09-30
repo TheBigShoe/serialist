@@ -101,6 +101,8 @@ pub enum ConfigPiece {
     Bindings,
     /// A font family the settings name that is not installed.
     Fonts,
+    /// Saved-command collections in `commands/` and the project commands file.
+    Commands,
 }
 
 impl fmt::Display for ConfigPiece {
@@ -112,6 +114,7 @@ impl fmt::Display for ConfigPiece {
             ConfigPiece::Theme => "theme",
             ConfigPiece::Bindings => "bindings",
             ConfigPiece::Fonts => "fonts",
+            ConfigPiece::Commands => "commands",
         })
     }
 }
@@ -577,6 +580,8 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
         ConfigPiece::Settings | ConfigPiece::Fonts => config.reload_settings(),
         ConfigPiece::Keymap | ConfigPiece::Bindings => config.reload_keymap(),
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
+        // The commands store reload is wired by the milestone 3 UI work.
+        ConfigPiece::Commands => {}
     });
 }
 
@@ -632,6 +637,7 @@ fn piece_of(event: ConfigEvent) -> ConfigPiece {
         ConfigEvent::Settings => ConfigPiece::Settings,
         ConfigEvent::Keymap => ConfigPiece::Keymap,
         ConfigEvent::Themes => ConfigPiece::Themes,
+        ConfigEvent::Commands => ConfigPiece::Commands,
     }
 }
 
