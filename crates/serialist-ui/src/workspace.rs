@@ -9,7 +9,7 @@ use crate::actions::{self, Clear, Disconnect, Quit, context};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::prelude::*;
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
-use crate::session_view::{ConnectionState, SessionView, format_bytes};
+use crate::session_view::{ConnectionState, SessionView, StatusLine};
 
 const STATUS_LINE_HEIGHT: Pixels = px(26.);
 
@@ -277,31 +277,29 @@ impl Workspace {
             ConnectionState::Disconnected { error: None } => theme.muted_foreground,
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
         };
-        let title = model.title();
-        let summary = model.serial.summary();
-        // Serial transports already put the line settings in their description.
-        let summary = (!title.contains(&summary)).then_some(summary);
+        let status = model.status_line();
         line.child(
             h_flex()
                 .gap_1p5()
                 .child(dot(state_color))
-                .child(model.state.label()),
+                .child(status.state),
         )
         .child(
             div()
                 .font_family(theme.mono_font_family.clone())
                 .truncate()
-                .child(SharedString::from(title)),
+                .child(SharedString::from(status.title)),
         )
-        .children(summary.map(SharedString::from))
-        .child(SharedString::from(format!(
-            "RX {}",
-            format_bytes(model.stats.rx_bytes)
-        )))
-        .child(SharedString::from(format!(
-            "TX {}",
-            format_bytes(model.stats.tx_bytes)
-        )))
+        .children(status.settings.map(SharedString::from))
+        .child(SharedString::from(status.rx))
+        .child(SharedString::from(status.tx))
+    }
+
+    /// The status line's text for the current session, as rendered.
+    pub fn status_line(&self, cx: &App) -> Option<StatusLine> {
+        self.session
+            .as_ref()
+            .map(|session| session.read(cx).model().status_line())
     }
 }
 
