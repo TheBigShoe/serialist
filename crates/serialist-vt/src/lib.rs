@@ -1,6 +1,6 @@
 //! Full terminal emulation for Serialist's VT mode: a screen that U-Boot menus, Linux
 //! consoles and router CLIs can draw on with cursor addressing, shown through the same
-//! [`LineSource`] contract as the scrollback store, so the existing terminal element
+//! [`LineSource`](serialist_core::LineSource) contract as the scrollback store, so the existing terminal element
 //! renders it.
 //!
 //! The emulator is [`alacritty_terminal`] 0.26 with no PTY: received bytes go through its
@@ -10,7 +10,7 @@
 //!   [`resize`](VtScreen::resize), [`reset`](VtScreen::reset),
 //!   [`snapshot`](VtScreen::snapshot), [`take_events`](VtScreen::take_events).
 //! - [`VtSnapshot`] is an immutable view of the screen plus its scrollback. It
-//!   implements [`LineSource`] (one [`StyledLine`] per grid row) and adds the
+//!   implements [`LineSource`](serialist_core::LineSource) (one [`StyledLine`](serialist_core::StyledLine) per grid row) and adds the
 //!   cursor, the modes, the title and damage ([`VtSnapshot::changed_since`],
 //!   [`VtSnapshot::generation`]).
 //! - [`VtSink`] is the [`ChunkSink`](serialist_core::ChunkSink) that feeds a screen
@@ -20,13 +20,13 @@
 //!
 //! # Line ids
 //!
-//! Every row a snapshot shows has a [`LineId`], so scrolling, search results and the
+//! Every row a snapshot shows has a [`LineId`](serialist_core::LineId), so scrolling, search results and the
 //! shaped-line cache work as they do on the store. The policy:
 //!
 //! - **Scrollback rows** get ids in the order they scroll off the top of the primary
 //!   screen: the first row ever to scroll off is 0, the next 1, and so on. An id never
 //!   changes and is never reused. The newest `scrollback_lines` rows are kept; older ones
-//!   are evicted and [`LineSource::first_line`] moves past them, as on the store.
+//!   are evicted and [`LineSource::first_line`](serialist_core::LineSource::first_line) moves past them, as on the store.
 //! - **Screen rows follow**: row `r` of the screen is [`VtSnapshot::first_visible`] + `r`,
 //!   where `first_visible` counts the rows scrolled off so far. When the screen scrolls,
 //!   a row moves up one position and `first_visible` goes up one, so a row keeps its id
@@ -98,7 +98,3 @@ pub use screen::{
 };
 pub use sink::{VtHandle, VtSink};
 pub use snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};
-
-// For the docs above.
-#[allow(unused_imports)]
-use serialist_core::{LineId, LineSource, StyledLine};
