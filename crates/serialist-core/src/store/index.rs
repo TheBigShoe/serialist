@@ -166,6 +166,11 @@ impl Block {
 /// The block struct, its `Arc` and the five `Arc`s it holds, roughly.
 pub(crate) const BLOCK_OVERHEAD: usize = 64 + 5 * 32;
 
+/// Heap of an open block: its four arrays at full capacity, plus overhead.
+pub(crate) const OPEN_BLOCK_BYTES: usize = BLOCK_LINES
+    * (size_of::<u32>() + size_of::<u8>() + size_of::<Mark>() + size_of::<DecRef>())
+    + BLOCK_OVERHEAD;
+
 /// Appends lines to the open block.
 #[derive(Debug)]
 pub(crate) struct BlockWriter {
