@@ -17,7 +17,7 @@ use crate::terminal::{
     DisplayMode, FrameSample, Selection, SelectionPoint, TerminalView, TimestampMode,
     TimestampModeExt,
 };
-use crate::test_support::open_test_window;
+use crate::test_support::{TestDir, open_test_window};
 
 /// gpui-kit's `Input` binds select-all to the platform primary modifier.
 const INPUT_SELECT_ALL: &str = if cfg!(target_os = "macos") {
@@ -424,6 +424,46 @@ fn the_timestamp_gutter_shifts_the_text(cx: &mut TestAppContext) {
         press(cx, window, "alt-t");
         assert_eq!(view.read_with(cx, |view, _| view.timestamps()), mode);
     }
+}
+
+#[gpui_test]
+fn the_gutter_is_as_wide_as_the_configured_timestamp_format(cx: &mut TestAppContext) {
+    // Twenty-three characters with the date: a gutter twice the default's width.
+    const FORMAT_WIDTH: usize = 23;
+    let dir = TestDir::new("gutter-format");
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{ "display": { "timestamp_format": "%Y-%m-%d %H:%M:%S%.3f" } }"#,
+    )
+    .unwrap();
+    // The window comes first: it sets up the theme the configuration installs over.
+    let (window, view) = open(cx, lines(["abcdef".into()]));
+    let paths = serialist_core::settings::ConfigPaths::new(dir.path());
+    cx.update(|cx| crate::config::install(crate::config::Config::load(paths, false), cx));
+    assert_eq!(
+        cx.update(|cx| cx
+            .global::<crate::config::Config>()
+            .timestamp_format()
+            .to_owned()),
+        "%Y-%m-%d %H:%M:%S%.3f"
+    );
+    focus(cx, window, &view);
+    press(cx, window, "alt-t");
+    assert_eq!(
+        view.read_with(cx, |view, _| view.timestamps()),
+        TimestampMode::Absolute
+    );
+    let geometry = Geometry::of(cx, &view);
+    // Drag from the line's start to two cells past a gutter as wide as the format and
+    // its gap: two characters. A gutter as wide as the default format's is too narrow
+    // for that, so the same drag would end in the ninth cell and take all six.
+    let gutter = geometry.metrics.cell_width * (FORMAT_WIDTH + 1) as f32;
+    let end = point(geometry.caret(2, 0).x + gutter, geometry.caret(2, 0).y);
+    drag(cx, window, geometry.caret(0, 0), end);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.selection_text()),
+        Some("ab".into())
+    );
 }
 
 /// Delegates to a real searcher and counts calls, recording whether each saw its
