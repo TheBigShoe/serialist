@@ -9,6 +9,7 @@
 
 pub mod actions;
 pub mod capture;
+pub mod codecs;
 pub mod commands_panel;
 pub mod compose;
 pub mod config;
@@ -47,6 +48,7 @@ mod stream_tests;
 mod test_support;
 
 pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
+pub use codecs::{CodecSelection, CodecSet, CodecSlotSink, PluginCodec, PluginProblem};
 pub use commands_panel::{CommandEditor, CommandsPanel, CommandsPanelEvent, EditorSeed};
 pub use compose::{ComposeBar, ComposeEvent, History, LineEnding, LineEndingExt};
 pub use config::{Config, ConfigPiece, ConfigProblem, Opener};

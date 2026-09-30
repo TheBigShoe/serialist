@@ -939,6 +939,9 @@ pub struct CommandEditor {
     params: Vec<serialist_core::Param>,
     /// A codec or script payload the form cannot edit, kept as it is.
     codec: Option<Payload>,
+    /// A frame predicate the command waits for, which the form cannot edit, kept as it
+    /// is (with the form's timeout).
+    expect_frame: Option<serde_json::Map<String, serde_json::Value>>,
     name: Entity<InputState>,
     collection: Entity<InputState>,
     group: Entity<InputState>,
@@ -984,6 +987,7 @@ impl CommandEditor {
             target: seed.target,
             params: command.params.clone(),
             codec,
+            expect_frame: command.expect.as_ref().and_then(|e| e.frame.clone()),
             collection: field(&seed.collection, "Collection", window, cx),
             group: field(&seed.group, "Group", window, cx),
             description: field(
@@ -1099,7 +1103,7 @@ impl CommandEditor {
             (None, PayloadKind::Hex) => Payload::Hex(text(Field::Payload)),
         };
         let pattern = self.field(Field::ExpectPattern, cx);
-        let expect = if pattern.trim().is_empty() {
+        let expect = if pattern.trim().is_empty() && self.expect_frame.is_none() {
             None
         } else {
             let timeout = text(Field::ExpectTimeout);
@@ -1114,7 +1118,15 @@ impl CommandEditor {
                         format!("The timeout {timeout:?} is not a number of milliseconds")
                     })?
             };
-            Some(Expect::new(pattern, timeout_ms))
+            let pattern = if pattern.trim().is_empty() {
+                String::new()
+            } else {
+                pattern
+            };
+            Some(Expect {
+                frame: self.expect_frame.clone(),
+                ..Expect::new(pattern, timeout_ms)
+            })
         };
         let keybinding = match text(Field::Keybinding) {
             keys if keys.is_empty() => None,

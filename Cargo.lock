@@ -6681,6 +6681,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialist-core",
+ "serialist-plugins",
  "serialist-script",
  "serialist-sim",
  "tracing",
