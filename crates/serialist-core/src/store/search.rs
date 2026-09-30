@@ -9,6 +9,15 @@
 //! lines (spanning two raw pages, the line in progress) get. Backward search scans
 //! windows of lines forward, newest window first, and reports each window in reverse.
 //!
+//! Every search runs inside a line range. [`Snapshot::search_in`] takes it from the
+//! caller (a view whose Clear hid the older lines searches only what it shows) and
+//! [`Searcher::search`] passes every retained line. Nothing outside the range is scanned,
+//! not merely dropped from the results: segments and backward windows are cut at the
+//! range's ends, so a backward search from a floor costs the lines above it and no more.
+//! One driver, [`drive`], owns the direction, the clamping and the windows for every
+//! source that searches its lines this way; a source only says how to scan a stretch of
+//! lines forward.
+//!
 //! This is exact. The bulk regex is the same pattern in multi-line CRLF mode, so `^`,
 //! `$`, `\b` and `.` see a line ending exactly where the line's own text would end, and
 //! any match inside one line's text is also a match at the same offset in the bulk
@@ -17,6 +26,7 @@
 //! that anchor to the whole haystack (`\A`, `\z`) or turn off multi-line or CRLF mode
 //! inline skip the bulk pass.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::bytes::{Regex, RegexBuilder};
@@ -153,6 +163,82 @@ impl Segment {
 /// Lines per window when searching backward: each window is scanned forward and its
 /// matches reported in reverse.
 const BACKWARD_WINDOW: u64 = 4096;
+
+// Lines visited by searches on this thread, for tests that check a bound is respected.
+#[cfg(test)]
+thread_local! {
+    static SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `lines` as visited by a search (test builds only).
+#[cfg(test)]
+pub(super) fn note_scanned(lines: u64) {
+    SCANNED.with(|scanned| scanned.set(scanned.get() + lines));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(super) fn note_scanned(_lines: u64) {}
+
+/// Lines visited by searches on this thread since [`reset_scanned`].
+#[cfg(test)]
+pub(super) fn scanned() -> u64 {
+    SCANNED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn reset_scanned() {
+    SCANNED.with(|scanned| scanned.set(0));
+}
+
+/// Search the lines `bounds` of a source in either direction and return the matches in
+/// the order the search goes. `scan(lines, limit, out)` pushes the matches in the lines
+/// `lines` (always inside `bounds`), in forward order, until `out` holds `limit`.
+///
+/// Forward from `from` (raised to the start of `bounds`) to the end of `bounds`.
+/// Backward from `from` (lowered to the last line of `bounds`) down to the start; a
+/// `from` below `bounds` finds nothing. Backward scans `window` lines at a time, forward
+/// within a window, newest window first, and stops once `limit` matches are in hand or
+/// `cancel` is set. A window is never wider than `bounds` allows.
+pub(super) fn drive(
+    bounds: Range<u64>,
+    from: u64,
+    backward: bool,
+    limit: usize,
+    window: u64,
+    cancel: &AtomicBool,
+    mut scan: impl FnMut(Range<u64>, usize, &mut Vec<SearchMatch>),
+) -> Vec<SearchMatch> {
+    let mut out = Vec::new();
+    if limit == 0 || bounds.start >= bounds.end {
+        return out;
+    }
+    if !backward {
+        let start = from.max(bounds.start);
+        if start < bounds.end {
+            scan(start..bounds.end, limit, &mut out);
+        }
+        return out;
+    }
+    if from < bounds.start {
+        return out;
+    }
+    let mut found = Vec::new();
+    let mut until = from.min(bounds.end - 1) + 1;
+    while until > bounds.start && out.len() < limit && !cancel.load(Ordering::Relaxed) {
+        let start = until.saturating_sub(window).max(bounds.start);
+        found.clear();
+        scan(start..until, usize::MAX, &mut found);
+        // Newest line first, and within a line the last match first.
+        while out.len() < limit
+            && let Some(m) = found.pop()
+        {
+            out.push(m);
+        }
+        until = start;
+    }
+    out
+}
 
 impl Snapshot {
     /// The longest raw segment starting at committed line `id` and ending before
@@ -305,9 +391,11 @@ impl Snapshot {
                 && (self.raw_segment(id, until, &mut seg) || self.text_segment(id, until, &mut seg))
             {
                 self.scan_segment(q, bulk, &seg, limit, out);
+                note_scanned(seg.lines.len() as u64);
                 id = seg.end_id();
                 continue;
             }
+            note_scanned(1);
             if let Some(text) = self.line_text(id, &mut scratch) {
                 q.match_line(text, id, limit, out);
             }
@@ -315,33 +403,36 @@ impl Snapshot {
         }
     }
 
-    fn search_backward(
+    /// [`Searcher::search`] restricted to the lines `range` (clipped to what is
+    /// retained). The same smart-case regex search with the same direction and `from`
+    /// rules, except that it never returns a match outside `range` and never scans a
+    /// line outside it: a forward search starts no earlier than `range.start` and ends at
+    /// `range.end`, and a backward search from `from` stops at `range.start`. A backward
+    /// search from a "clear floor" therefore costs only the lines above the floor, not
+    /// the hidden ones below it. A `from` below `range` finds nothing backward. An
+    /// invalid pattern is an `Err` whatever the range.
+    pub fn search_in(
         &self,
-        q: &Query,
-        from: u64,
+        pattern: &str,
+        range: Range<LineId>,
+        from: LineId,
+        backward: bool,
         limit: usize,
         cancel: &AtomicBool,
-    ) -> Vec<SearchMatch> {
-        let p = &*self.p;
-        let mut out = Vec::new();
-        if p.end_line == p.first_line || from < p.first_line {
-            return out;
-        }
-        let mut window = Vec::new();
-        let mut until = from.min(p.end_line - 1) + 1;
-        while until > p.first_line && out.len() < limit && !cancel.load(Ordering::Relaxed) {
-            let start = until.saturating_sub(BACKWARD_WINDOW).max(p.first_line);
-            window.clear();
-            self.search_range(q, start, until, usize::MAX, cancel, &mut window);
-            // Newest line first, and within a line the last match first.
-            while out.len() < limit
-                && let Some(m) = window.pop()
-            {
-                out.push(m);
-            }
-            until = start;
-        }
-        out
+    ) -> Result<Vec<SearchMatch>, String> {
+        let query = Query::new(pattern)?;
+        let bounds = range.start.0.max(self.p.first_line)..range.end.0.min(self.p.end_line);
+        Ok(drive(
+            bounds,
+            from.0,
+            backward,
+            limit,
+            BACKWARD_WINDOW,
+            cancel,
+            |lines, limit, out| {
+                self.search_range(&query, lines.start, lines.end, limit, cancel, out);
+            },
+        ))
     }
 }
 
@@ -350,7 +441,8 @@ impl Searcher for Snapshot {
     /// [`smart_case_insensitive`]). Forward searches lines `from..end` in order, backward
     /// searches `first_line..=from` newest first; both include `from`, clamped to the
     /// retained lines. Within a line, matches come in the search direction. Stops after
-    /// `limit` matches or when `cancel` is set, returning what it found so far.
+    /// `limit` matches or when `cancel` is set, returning what it found so far. This is
+    /// [`Snapshot::search_in`] over every retained line.
     fn search(
         &self,
         pattern: &str,
@@ -359,17 +451,14 @@ impl Searcher for Snapshot {
         limit: usize,
         cancel: &AtomicBool,
     ) -> Result<Vec<SearchMatch>, String> {
-        let query = Query::new(pattern)?;
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        if backward {
-            return Ok(self.search_backward(&query, from.0, limit, cancel));
-        }
-        let mut out = Vec::new();
-        let start = from.0.max(self.p.first_line);
-        self.search_range(&query, start, self.p.end_line, limit, cancel, &mut out);
-        Ok(out)
+        self.search_in(
+            pattern,
+            LineId(self.p.first_line)..LineId(self.p.end_line),
+            from,
+            backward,
+            limit,
+            cancel,
+        )
     }
 }
 

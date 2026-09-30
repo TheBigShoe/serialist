@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -104,6 +105,50 @@ fn check(
     );
 }
 
+/// What a search inside `range` from `from` should return: the same matches, with
+/// everything outside the range gone.
+fn expected_in(
+    all: &[SearchMatch],
+    range: &Range<u64>,
+    from: u64,
+    backward: bool,
+    limit: usize,
+) -> Vec<SearchMatch> {
+    let inside: Vec<_> = all
+        .iter()
+        .filter(|m| range.contains(&m.line.0))
+        .cloned()
+        .collect();
+    expected(&inside, from, backward, limit)
+}
+
+/// `search_in` over `range` must equal the unbounded reference cut to the range.
+fn check_in(
+    snap: &Snapshot,
+    all: &[SearchMatch],
+    pattern: &str,
+    range: Range<u64>,
+    from: u64,
+    backward: bool,
+    limit: usize,
+) {
+    let got = snap
+        .search_in(
+            pattern,
+            LineId(range.start)..LineId(range.end),
+            LineId(from),
+            backward,
+            limit,
+            &AtomicBool::new(false),
+        )
+        .expect("valid pattern");
+    assert_eq!(
+        got,
+        expected_in(all, &range, from, backward, limit),
+        "pattern {pattern:?} in {range:?} from {from} backward {backward} limit {limit}"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
@@ -116,6 +161,8 @@ proptest! {
         from_frac in 0.0f64..1.2,
         backward in any::<bool>(),
         limit in prop_oneof![Just(1usize), Just(3), Just(usize::MAX)],
+        lo_frac in 0.0f64..1.1,
+        hi_frac in 0.0f64..1.2,
     ) {
         let mut store = Store::new(StoreConfig {
             max_line_bytes: max_line,
@@ -137,6 +184,10 @@ proptest! {
         let from = (snap.end().0 as f64 * from_frac) as u64;
         let all = reference_all(&snap, pattern);
         check(&snap, &all, pattern, from, backward, limit);
+        // The same search inside a random range, which may be empty or inverted.
+        let end = snap.end().0 as f64;
+        let range = (end * lo_frac) as u64..(end * hi_frac) as u64;
+        check_in(&snap, &all, pattern, range, from, backward, limit);
     }
 }
 
@@ -197,5 +248,17 @@ fn large_stream(content: FirehoseContent, seed: u64, chunks: usize, budget: usiz
         }
         check(&snap, &all, pattern, first, false, usize::MAX);
         check(&snap, &all, pattern, end, true, usize::MAX);
+        // Bounded to a middle third, and to the newest tenth (a clear floor).
+        let third = first + (end - first) / 3..first + 2 * (end - first) / 3;
+        let floor = end - (end - first) / 10..end;
+        for range in [third, floor] {
+            for from in [range.start, (range.start + range.end) / 2, end] {
+                for backward in [false, true] {
+                    for limit in [1, 50, usize::MAX] {
+                        check_in(&snap, &all, pattern, range.clone(), from, backward, limit);
+                    }
+                }
+            }
+        }
     }
 }
