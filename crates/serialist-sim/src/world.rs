@@ -10,8 +10,8 @@ use serialist_core::{PortId, PortInfo, PortSource, TransportFactory};
 
 use crate::source::virtual_port;
 use crate::{
-    AtDevice, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig, LinkHandle,
-    SimDevice, SimPortSource, SimTransportFactory,
+    AtDevice, Clock, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig,
+    LinkHandle, SimDevice, SimPortSource, SimTransportFactory,
 };
 
 /// A simulated set of devices for tests and the app's developer mode. Cheap to clone;
@@ -26,6 +26,10 @@ use crate::{
 /// | `virtual:at`             | [`AtDevice::new`]                             |
 /// | `virtual:firehose`       | [`FirehoseDevice`], text, as fast as the baud |
 /// | `virtual:firehose-ansi`  | [`FirehoseDevice`], ANSI, as fast as the baud |
+///
+/// Links run in real time. A test that wants exact timing builds the world with
+/// [`SimWorld::with_clock`] (or [`SimWorld::empty_with_clock`]) and a
+/// [`ManualClock`](crate::ManualClock).
 #[derive(Clone, Default)]
 pub struct SimWorld {
     source: SimPortSource,
@@ -43,7 +47,34 @@ impl SimWorld {
 
     /// A world with the built-in devices plugged in.
     pub fn new() -> Self {
-        let world = Self::empty();
+        Self::empty().with_builtins()
+    }
+
+    /// [`SimWorld::new`] with every link on `clock`.
+    pub fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self::empty_with_clock(clock).with_builtins()
+    }
+
+    /// A world with no devices. `SimWorld::default()` is the same; only `new` adds the built-ins.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// [`SimWorld::empty`] with every link on `clock`.
+    pub fn empty_with_clock(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            factory: SimTransportFactory::with_clock(clock),
+            ..Self::default()
+        }
+    }
+
+    /// The clock every link in this world runs on.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        self.factory.clock()
+    }
+
+    fn with_builtins(self) -> Self {
+        let world = self;
         let link = LinkConfig::default();
         world.add_virtual(Self::ECHO, "Echo (virtual)", link.clone(), || {
             Box::new(EchoDevice::new())
@@ -69,11 +100,6 @@ impl SimWorld {
             )
         });
         world
-    }
-
-    /// A world with no devices. `SimWorld::default()` is the same; only `new` adds the built-ins.
-    pub fn empty() -> Self {
-        Self::default()
     }
 
     /// Register a device under `virtual:<name>` and plug it in.
