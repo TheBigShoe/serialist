@@ -22,7 +22,7 @@ pub struct FuzzyMatch {
 const CHAR: i32 = 10;
 const AT_START: i32 = 30;
 const AT_WORD: i32 = 20;
-const ADJACENT: i32 = 15;
+const ADJACENT: i32 = 25;
 const GAP: i32 = 3;
 const MAX_GAP: usize = 5;
 const PREFIX: i32 = 25;
