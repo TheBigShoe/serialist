@@ -122,8 +122,9 @@ pub enum PayloadError {
     /// Something in a hex payload that is not bytes.
     #[error("bad hex `{token}`: {reason}")]
     BadHex { token: String, reason: String },
-    /// A codec payload; plugins arrive with milestone 5.
-    #[error("codec payloads need a plugin, which is not available yet")]
+    /// A codec payload: the app encodes it with the codec it names (see
+    /// `serialist_plugins::encode_payload`), so this crate has no bytes for it.
+    #[error("codec payloads are encoded by the codec they name, which is not available here")]
     CodecUnavailable,
     /// A `{ "script": … }` payload: sending the command runs the script, so it has no
     /// bytes. Holds the script's path as written.
@@ -238,7 +239,19 @@ impl Command {
             Err(err) => found.push(err.to_string()),
         }
         if let Some(expect) = &self.expect {
-            if let Err(err) = crate::matcher::compile_pattern(&expect.pattern) {
+            match &expect.frame {
+                Some(frame) if frame.is_empty() => {
+                    found.push("expect frame names nothing to match".to_owned());
+                }
+                Some(_) => {}
+                None if expect.pattern.is_empty() => {
+                    found.push("expect needs a pattern or a frame".to_owned());
+                }
+                None => {}
+            }
+            if !expect.pattern.is_empty()
+                && let Err(err) = crate::matcher::compile_pattern(&expect.pattern)
+            {
                 found.push(format!("expect pattern: {err}"));
             }
             if expect.timeout_ms == 0 {

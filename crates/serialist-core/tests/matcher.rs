@@ -320,7 +320,9 @@ fn the_bundled_commands_work_against_the_simulated_modem() {
     let examples = CommandCollection::bundled_examples();
     let mut sent = 0;
     for (group, command) in examples.commands() {
-        let Some(expect) = &command.expect else {
+        // The RACE group waits for decoded frames, which need a codec (the UI tests
+        // run those against the simulated RACE device).
+        let Some(expect) = command.expect.as_ref().filter(|e| e.frame.is_none()) else {
             continue;
         };
         let bytes = command
