@@ -3,7 +3,8 @@
 //!
 //! A workspace with the Devices and Commands panels on the left, a session view in the
 //! center (the terminal element over the session's page store, and a compose bar, or
-//! the terminal alone in inline mode) and a status line. Settings, themes, fonts and key bindings come from Zed-format files through
+//! the terminal alone in inline mode), the Script console on the right, and a status
+//! line. Settings, themes, fonts and key bindings come from Zed-format files through
 //! [`config`], and apply to the running app as the files change.
 
 pub mod actions;
@@ -18,6 +19,8 @@ pub mod history;
 pub mod inline;
 pub mod keymap;
 pub mod param_prompt;
+pub mod script_bridge;
+pub mod script_console;
 pub mod script_files;
 pub mod scrollback;
 pub mod session_handle;
@@ -37,6 +40,8 @@ mod gate;
 #[cfg(test)]
 mod inline_tests;
 #[cfg(test)]
+mod script_tests;
+#[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
 mod test_support;
@@ -53,11 +58,16 @@ pub use fonts::{TerminalFont, UiFont};
 pub use history::PersistentHistory;
 pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
+pub use script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, SessionScripts};
+pub use script_console::{ScriptConsole, ScriptConsoleEvent, ScriptPrompt};
+pub use script_files::{ScriptEntry, list_scripts, resolve_script};
 pub use scrollback::{Floored, Floors, Scrollback};
-pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
+pub use session_handle::{
+    CoreSessionOpener, SessionControl, SessionHandle, SessionOpener, SharedSession,
+};
 pub use session_options::{DisplayDefaults, SessionOptions};
 pub use session_view::{SessionView, SessionViewEvent};
-pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, StatusLine};
+pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusLine};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {

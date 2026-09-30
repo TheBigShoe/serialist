@@ -7,7 +7,16 @@
 //! keybinding call [`Workspace::send_command`], which asks for the command's parameters
 //! in a dialog when it has any, then hands it to the session view. The workspace also
 //! owns the persisted compose history, which every session's compose bar shares.
+//!
+//! Scripts start here too, whatever starts them: the Script console's Run buttons and
+//! REPL, a [`scripts::Run`](crate::actions::scripts::Run) key binding or menu entry, a
+//! saved command whose payload is `{ "script": … }`, and the `on_connect` script of the
+//! device profile that matches a port, run once the session is open (and the opener
+//! has set DTR and RTS). Each reads its file from the scripts folder and queues it on
+//! the session view, which owns the session's script thread; the console shows what
+//! the runs report.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
@@ -15,7 +24,9 @@ use serialist_core::{
     CommandRef, ParamValues, PortId, PortInfo, PortKind, PortSource, SerialConfig, StoreConfig,
     TransportError, TransportFactory,
 };
+use serialist_script::ScriptSource;
 
+use crate::actions::scripts::{ClearConsole, Run as RunScript, RunInline, Stop as StopScript};
 use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
 use crate::config::{self, Config};
@@ -24,6 +35,9 @@ use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
 use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
 use crate::prelude::*;
+use crate::script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, inline_source};
+use crate::script_console::{ScriptConsole, ScriptConsoleEvent};
+use crate::script_files::{display_name, resolve_script};
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 use crate::session_options::SessionOptions;
 use crate::session_view::{SessionView, SessionViewEvent};
@@ -86,6 +100,10 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
 pub struct Workspace {
     devices: Entity<DevicesPanel>,
     commands: Entity<CommandsPanel>,
+    /// The Script console in the right dock.
+    console: Entity<ScriptConsole>,
+    /// The saved commands scripts send by name, kept current on every reload.
+    script_commands: CommandsSnapshot,
     /// The compose history every session shares, kept in `history.jsonl`.
     history: Entity<PersistentHistory>,
     /// The parameter dialog, while it is open.
@@ -149,6 +167,20 @@ impl Workspace {
                     this.connect(port.clone(), serial.clone(), window, cx);
                 }
             });
+        let console = cx.new(|cx| ScriptConsole::new(window, cx));
+        let console_events =
+            cx.subscribe_in(&console, window, |this, _, event, window, cx| match event {
+                ScriptConsoleEvent::Run(path) => {
+                    this.run_script_path(Path::new(path), "console", window, cx);
+                }
+                ScriptConsoleEvent::RunInline(code) => this.run_inline(code, window, cx),
+                ScriptConsoleEvent::Stop => this.stop_script(cx),
+            });
+        let script_commands = CommandsSnapshot::new(
+            cx.try_global::<Config>()
+                .map(|config| config.commands().clone())
+                .unwrap_or_default(),
+        );
         let commands = cx.new(|cx| CommandsPanel::new(window, cx));
         let commands_events =
             cx.subscribe_in(
@@ -186,6 +218,8 @@ impl Workspace {
         Self {
             devices,
             commands,
+            console,
+            script_commands,
             history,
             param_prompt: None,
             session: None,
@@ -203,6 +237,7 @@ impl Workspace {
             _subscriptions: vec![
                 devices_events,
                 commands_events,
+                console_events,
                 flush_history,
                 config_changes,
                 appearance,
@@ -254,6 +289,9 @@ impl Workspace {
     /// The configuration changed: hand the session its new defaults and repaint the
     /// status line.
     fn config_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(config) = cx.try_global::<Config>() {
+            self.script_commands.set(config.commands().clone());
+        }
         if let (Some(session), Some(port)) = (&self.session, &self.session_port) {
             let options = self.session_options_for(port, cx);
             session.update(cx, |view, cx| view.apply_options(options, cx));
@@ -271,6 +309,10 @@ impl Workspace {
 
     pub fn commands(&self) -> &Entity<CommandsPanel> {
         &self.commands
+    }
+
+    pub fn console(&self) -> &Entity<ScriptConsole> {
+        &self.console
     }
 
     pub fn history(&self) -> &Entity<PersistentHistory> {
@@ -312,6 +354,13 @@ impl Workspace {
             });
             return;
         };
+        // A script payload has no bytes: sending it runs the script.
+        if let Some(script) = command.payload.script() {
+            let script = script.to_path_buf();
+            let origin = format!("command {}", command.name);
+            self.run_script_path(&script, &origin, window, cx);
+            return;
+        }
         if command.params.is_empty() {
             session.update(cx, |view, cx| {
                 view.send_command(&reference, &command, &ParamValues::new(), cx);
@@ -392,6 +441,113 @@ impl Workspace {
         self.connecting.as_ref()
     }
 
+    // --- Scripts ---------------------------------------------------------------------
+
+    /// What a new session's scripts get: the port list, the scripts folder for
+    /// `require`, and the saved commands.
+    fn script_env(&self, cx: &App) -> ScriptEnv {
+        ScriptEnv {
+            ports: Some(self.port_source.clone()),
+            scripts_dir: cx
+                .try_global::<Config>()
+                .map(|config| config.paths().scripts_dir()),
+            commands: self.script_commands.clone(),
+        }
+    }
+
+    /// Run the script at `path` (under the scripts folder, or absolute) on the session;
+    /// `origin` says what started it. Returns whether it was queued; a script that
+    /// cannot be read, or no session, is reported in the console.
+    pub fn run_script_path(
+        &mut self,
+        path: &Path,
+        origin: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let paths = cx
+            .try_global::<Config>()
+            .map(|config| config.paths().clone())
+            .unwrap_or_else(ConfigPaths::default_for_platform);
+        let file = resolve_script(&paths, path);
+        // Small, local and read once per run: read here, like the settings.
+        let code = match std::fs::read_to_string(&file) {
+            Ok(code) => code,
+            Err(error) => {
+                self.script_problem(
+                    format!("Could not read the script {}: {error}", file.display()),
+                    cx,
+                );
+                return false;
+            }
+        };
+        let source = ScriptSource {
+            name: display_name(&paths, &file),
+            code,
+            path: Some(file),
+        };
+        self.run_script(source, origin, window, cx)
+    }
+
+    /// Run a REPL line on the session.
+    pub fn run_inline(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_script(inline_source(code), "console", window, cx);
+    }
+
+    /// Queue `source` on the session's script thread.
+    pub fn run_script(
+        &mut self,
+        source: ScriptSource,
+        origin: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(session) = self.session.clone() else {
+            self.script_problem(
+                format!("Not connected; connect a port to run {}", source.name),
+                cx,
+            );
+            return false;
+        };
+        session.update(cx, |view, cx| view.run_script(source, origin, window, cx))
+    }
+
+    /// Stop the script running on the session.
+    pub fn stop_script(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.update(cx, |view, cx| view.stop_script(cx));
+        }
+    }
+
+    fn script_problem(&mut self, message: String, cx: &mut Context<Self>) {
+        tracing::warn!("{message}");
+        self.console.update(cx, |console, cx| {
+            console.push_lines([ConsoleLine::new(ConsoleKind::Error, message)], cx);
+        });
+    }
+
+    fn run_script_action(
+        &mut self,
+        action: &RunScript,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_script_path(Path::new(&action.path), "key binding", window, cx);
+    }
+
+    fn run_inline_action(&mut self, _: &RunInline, window: &mut Window, cx: &mut Context<Self>) {
+        self.console
+            .update(cx, |console, cx| console.submit_inline(window, cx));
+    }
+
+    fn stop_script_action(&mut self, _: &StopScript, _: &mut Window, cx: &mut Context<Self>) {
+        self.stop_script(cx);
+    }
+
+    fn clear_console_action(&mut self, _: &ClearConsole, _: &mut Window, cx: &mut Context<Self>) {
+        self.console.update(cx, |console, cx| console.clear(cx));
+    }
+
     /// Open `port` on the background executor, then swap in a new session view.
     pub fn connect(
         &mut self,
@@ -434,6 +590,9 @@ impl Workspace {
                 }
                 let info = self.port_info(&port, cx);
                 let options = self.session_options_for(&info, cx);
+                let on_connect = cx
+                    .try_global::<Config>()
+                    .and_then(|config| config.settings().on_connect_for(&info).cloned());
                 self.session_port = Some(info);
                 let view = cx
                     .new(|cx| SessionView::new(port.clone(), serial, session, options, window, cx));
@@ -453,16 +612,31 @@ impl Workspace {
                                 panel.save_text_as_command(text, window, cx);
                             });
                         }
+                        SessionViewEvent::Script(lines) => {
+                            this.console.update(cx, |console, cx| {
+                                console.push_lines(lines.iter().cloned(), cx);
+                            });
+                        }
                     },
                 ));
                 let history = self.history.clone();
+                let env = self.script_env(cx);
                 view.update(cx, |view, cx| {
                     view.set_history(history, cx);
+                    view.attach_scripts(env);
                     view.focus_compose(window, cx);
                 });
+                let weak = view.downgrade();
+                self.console
+                    .update(cx, |console, cx| console.set_session(Some(weak), cx));
                 self.devices
                     .update(cx, |devices, cx| devices.set_connected(Some(port), cx));
                 self.session = Some(view);
+                // The profile's script, now that the port is open and the opener has set
+                // DTR and RTS (queued ahead of anything the script writes).
+                if let Some(script) = on_connect {
+                    self.run_script_path(&script, "on_connect", window, cx);
+                }
             }
             Err(error) => {
                 tracing::warn!(%port, %error, "could not open port");
@@ -612,6 +786,13 @@ impl Workspace {
                 .text_color(theme.info)
                 .child(SharedString::from(paste))
         }))
+        .children(status.script.map(|script| {
+            div()
+                .id("status-script")
+                .flex_none()
+                .text_color(theme.info)
+                .child(SharedString::from(script))
+        }))
         .children(status.recording.map(|recording| {
             h_flex()
                 .gap_1p5()
@@ -691,6 +872,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_record))
             .on_action(cx.listener(Self::toggle_inline))
             .on_action(cx.listener(Self::send_command_action))
+            .on_action(cx.listener(Self::run_script_action))
+            .on_action(cx.listener(Self::run_inline_action))
+            .on_action(cx.listener(Self::stop_script_action))
+            .on_action(cx.listener(Self::clear_console_action))
             .size_full()
             .when_some(ui_font, |this, font| this.font(font))
             .bg(background)
@@ -713,7 +898,13 @@ impl Render for Workspace {
                                         .child(resizable_panel().child(self.commands.clone())),
                                 ),
                         )
-                        .child(resizable_panel().child(center)),
+                        .child(resizable_panel().child(center))
+                        .child(
+                            resizable_panel()
+                                .size(px(320.))
+                                .size_range(px(220.)..px(720.))
+                                .child(self.console.clone()),
+                        ),
                 ),
             )
             .child(status_line)
