@@ -17,6 +17,38 @@
 //! fills, without a lock or a copy. A snapshot holds `Arc`s to everything it can reach,
 //! so eviction never invalidates it.
 //!
+//! # How the UI reads it
+//!
+//! The UI never touches the [`Store`]. The ingest thread ([`crate::ingest`]) publishes
+//! after each append and, if the UI has not been woken since it last looked, calls its
+//! waker, which rings a doorbell of capacity one. Per ring the UI first calls
+//! [`IngestHandle::acknowledge`] and only then takes a [`Snapshot`], so whatever the
+//! snapshot lacks rings again and nothing published is ever missed. It hands the
+//! snapshot, and the hex view and searchers made from it, to the terminal, and repaints
+//! at most once per frame. A snapshot is a value: a paused view keeps its old one while
+//! newer ones arrive underneath, and Clear is a floor the view keeps, not something the
+//! store does.
+//!
+//! A snapshot offers, all on the snapshot's fixed contents and on any thread:
+//!
+//! - **Lines.** [`Snapshot`] is a [`LineSource`]: `line`, `lines`, `first_line`, `end`.
+//! - **Hex rows.** [`Snapshot::hex_view`] is a [`LineSource`] over the retained raw
+//!   bytes, `bytes_per_row` to a row. Row ids are stream offsets divided by the row
+//!   width, so they are stable as bytes arrive and are evicted.
+//! - **Search.** Both implement [`Searcher`]: a regex with smart case (see
+//!   [`smart_case_insensitive`]), forward or backward from a line, up to a limit, with
+//!   a cancel flag. A hex view searches the text of its rows (offset, hex and ASCII
+//!   columns) and reports byte ranges within the row text. [`Snapshot::search_in`] and
+//!   [`HexView::search_in`] take a line range as well and never return a match outside
+//!   it, and never scan a line outside it: a backward search from a Clear floor costs
+//!   only the lines above the floor. `Searcher::search` is the same search over every
+//!   retained line.
+//! - **Export.** [`write_lines`] writes any [`LineSource`], a hex view's rows included,
+//!   as text with the same timestamp options, and returns a [`TextExportReport`] of
+//!   lines and bytes written. [`Snapshot::write_text_counted`] is that for a snapshot,
+//!   [`Snapshot::write_text`] the same without the report, and [`Snapshot::text`] the
+//!   result as a `String`. [`Snapshot::raw`] streams the raw bytes.
+//!
 //! # Memory model
 //!
 //! Everything below counts against one byte budget (default 256 MiB,
@@ -60,7 +92,10 @@
 //! Snapshots are not counted: one held across evictions (a paused view) keeps the pages
 //! it references alive until it is dropped.
 //!
+//! [`LineSource`]: crate::text::LineSource
 //! [`LineSource::first_line`]: crate::text::LineSource::first_line
+//! [`Searcher`]: crate::text::Searcher
+//! [`IngestHandle::acknowledge`]: crate::ingest::IngestHandle::acknowledge
 
 #[doc(hidden)]
 pub mod buf;
@@ -86,7 +121,7 @@ use crate::text::{Direction, Epoch, LineId, Style, StyleRun};
 use buf::{AppendBuf, AppendWriter};
 use index::{BLOCK_LINES, Block, BlockWriter, LineFlags};
 
-pub use export::{TextOptions, Timestamps, format_utc};
+pub use export::{TextExportReport, TextOptions, Timestamps, format_utc, write_lines};
 pub use hex::{HexStyles, HexView};
 pub use search::smart_case_insensitive;
 pub use snapshot::{RawIter, Snapshot};
