@@ -15,7 +15,7 @@
 //! The event says what to reload, not what changed; the receiver re-reads the file with
 //! [`load_settings`](crate::load_settings), [`load_keymap`](crate::load_keymap),
 //! [`ThemeRegistry::load`](crate::ThemeRegistry::load) or
-//! [`CommandStore::load`](crate::CommandStore::load).
+//! [`CommandStore::load`](crate::CommandStore::load), or lists the scripts folder again.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -49,6 +49,8 @@ pub enum ConfigEvent {
     Themes,
     /// A `*.json` file directly in the `commands/` folder, or the project commands file.
     Commands,
+    /// A `*.lua` file under the `scripts/` folder, at any depth.
+    Scripts,
 }
 
 /// The files the watcher cares about, in the form the OS reports them.
@@ -59,6 +61,7 @@ struct Targets {
     themes: PathBuf,
     commands: PathBuf,
     project_commands: Option<PathBuf>,
+    scripts: PathBuf,
 }
 
 impl Targets {
@@ -71,6 +74,7 @@ impl Targets {
             themes: canonical(&paths.themes),
             commands: canonical(&paths.commands_dir()),
             project_commands: paths.project_commands.as_deref().map(canonical),
+            scripts: canonical(&paths.scripts_dir()),
         }
     }
 
@@ -95,6 +99,13 @@ impl Targets {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
         {
             ConfigEvent::Commands
+        } else if path != self.scripts
+            && path.starts_with(&self.scripts)
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+        {
+            ConfigEvent::Scripts
         } else {
             return None;
         };
@@ -156,9 +167,9 @@ pub struct ConfigWatcher {
 impl ConfigWatcher {
     /// Starts watching and sends a [`ConfigEvent`] on `tx` for each change.
     ///
-    /// Watches the config directory non-recursively, `themes/` recursively and
-    /// `commands/` non-recursively, creating each if it is missing so files added later
-    /// are noticed, plus the directories of the project settings and commands files when
+    /// Watches the config directory non-recursively, `themes/` and `scripts/`
+    /// recursively and `commands/` non-recursively, creating each if it is missing so
+    /// files added later are noticed, plus the directories of the project settings and commands files when
     /// `paths` has them. Creating those directories
     /// produces no event. If the OS watcher cannot be started the problem is logged and
     /// the returned watcher is inert ([`is_active`](Self::is_active) is false); the app
@@ -253,7 +264,8 @@ fn forward(
 fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, notify::Error> {
     // The directories have to exist to be watched.
     let commands_path = paths.commands_dir();
-    for dir in [&paths.dir, &paths.themes, &commands_path] {
+    let scripts_path = paths.scripts_dir();
+    for dir in [&paths.dir, &paths.themes, &commands_path, &scripts_path] {
         if let Err(err) = std::fs::create_dir_all(dir) {
             tracing::warn!(%err, dir = %dir.display(), "cannot create the config directory");
         }
@@ -287,8 +299,14 @@ fn start(paths: &ConfigPaths, tx: Sender<ConfigEvent>) -> Result<ConfigWatcher, 
     {
         tracing::warn!(%err, dir = %commands_dir.display(), "cannot watch the commands folder");
     }
+    let scripts_dir = canonical(&scripts_path);
+    if scripts_dir != config_dir
+        && let Err(err) = debouncer.watch(&scripts_dir, RecursiveMode::Recursive)
+    {
+        tracing::warn!(%err, dir = %scripts_dir.display(), "cannot watch the scripts folder");
+    }
     // Project files usually live outside the config directory, and both in one folder.
-    let mut watched = vec![config_dir.clone(), themes_dir, commands_dir];
+    let mut watched = vec![config_dir.clone(), themes_dir, commands_dir, scripts_dir];
     for project in [&paths.project_settings, &paths.project_commands]
         .into_iter()
         .flatten()

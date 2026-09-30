@@ -607,6 +607,42 @@ fn syntax_errors_carry_a_position() {
 }
 
 #[test]
+fn a_script_payload_runs_a_script_and_has_no_bytes() {
+    let loaded = parse(
+        r#"{ "name": "Scripts", "groups": [ { "name": "G", "commands": [
+            { "name": "Probe", "payload": { "script": "lib/probe.lua" }, "keybinding": "cmd-9" } ] } ] }"#,
+    );
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    let command = &loaded.collection.groups[0].commands[0];
+    assert_eq!(
+        command.payload,
+        Payload::Script {
+            path: PathBuf::from("lib/probe.lua")
+        }
+    );
+    assert_eq!(
+        command.payload.script(),
+        Some(std::path::Path::new("lib/probe.lua"))
+    );
+    assert_eq!(Payload::Text("AT".into()).script(), None);
+    // Nothing may send it as bytes, and that is not a problem with the command.
+    let error = command
+        .encode(&ParamValues::new(), LineEnding::Crlf)
+        .unwrap_err();
+    assert_eq!(error, PayloadError::ScriptPayload("lib/probe.lua".into()));
+    assert_eq!(
+        error.to_string(),
+        "this command runs the script lib/probe.lua; it has no bytes to send"
+    );
+    assert!(command.problems().is_empty(), "{:?}", command.problems());
+    assert!(command.placeholders().is_empty());
+    // It writes back in the same form.
+    let json = loaded.collection.to_json();
+    assert!(json.contains(r#""script": "lib/probe.lua""#), "{json}");
+    assert!(!json.contains("\"text\""), "{json}");
+}
+
+#[test]
 fn a_payload_needs_exactly_one_form() {
     let wrap = |payload: &str| {
         format!(
@@ -616,7 +652,10 @@ fn a_payload_needs_exactly_one_form() {
         )
     };
     for (payload, needle) in [
-        (r#"{}"#, "no text, hex or codec"),
+        (r#"{}"#, "no text, hex, codec or script"),
+        (r#"{ "script": "a.lua", "text": "a" }"#, "exactly one"),
+        (r#"{ "script": "a.lua", "fields": {} }"#, "exactly one"),
+        (r#"{ "script": "" }"#, "needs the script's path"),
         (r#"{ "text": "a", "hex": "00" }"#, "exactly one"),
         (r#"{ "text": "a", "codec": "x" }"#, "exactly one"),
         (r#"{ "text": "a", "fields": {} }"#, "exactly one"),

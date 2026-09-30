@@ -84,7 +84,7 @@ const COMMAND_KEYS: &[&str] = &[
     "keybinding",
     "params",
 ];
-const PAYLOAD_KEYS: &[&str] = &["text", "hex", "codec", "fields"];
+const PAYLOAD_KEYS: &[&str] = &["text", "hex", "codec", "fields", "script"];
 const EXPECT_KEYS: &[&str] = &["pattern", "timeout_ms"];
 const PARAM_KEYS: &[&str] = &["name", "label", "default", "kind"];
 

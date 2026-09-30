@@ -108,6 +108,55 @@ impl ConfigPaths {
         self.dir.join("history.jsonl")
     }
 
+    /// `scripts/` in `dir`: Lua scripts, `*.lua` at any depth. The Script console lists
+    /// them, `scripts::Run` paths and saved-command `script` payloads are relative to
+    /// it, and it is the only directory a script's `require` and `dofile` read from.
+    pub fn scripts_dir(&self) -> PathBuf {
+        self.dir.join("scripts")
+    }
+
+    /// The example scripts that ship with the app, as `(file name, source)`.
+    pub const EXAMPLE_SCRIPTS: &'static [(&'static str, &'static str)] = &[
+        (
+            "version_probe.lua",
+            include_str!("../../assets/scripts/version_probe.lua"),
+        ),
+        (
+            "firehose_stats.lua",
+            include_str!("../../assets/scripts/firehose_stats.lua"),
+        ),
+    ];
+
+    /// Creates `scripts/` and, if it holds no `*.lua` file directly inside it, writes
+    /// the [example scripts](Self::EXAMPLE_SCRIPTS) there. Returns the files it wrote.
+    ///
+    /// So a new config directory gets the examples the first time the scripts folder is
+    /// opened, and a folder with scripts of the user's own is never touched. A file
+    /// that already exists is never overwritten.
+    pub fn ensure_example_scripts(&self) -> io::Result<Vec<PathBuf>> {
+        let dir = self.scripts_dir();
+        std::fs::create_dir_all(&dir)?;
+        let has_scripts = std::fs::read_dir(&dir)?.any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+            })
+        });
+        if has_scripts {
+            return Ok(Vec::new());
+        }
+        let mut written = Vec::new();
+        for (name, source) in Self::EXAMPLE_SCRIPTS {
+            let path = dir.join(name);
+            if self.create_new(&path, source)? {
+                written.push(path);
+            }
+        }
+        Ok(written)
+    }
+
     /// Adds the project settings and commands files found by searching up from `cwd`.
     pub fn with_project_from(mut self, cwd: &Path) -> Self {
         self.project_settings = Self::project_settings_path(cwd);
@@ -219,4 +268,41 @@ pub fn settings_template() -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn scripts_live_in_the_config_directory() {
+        let paths = ConfigPaths::new("/cfg/serialist");
+        assert_eq!(paths.scripts_dir(), Path::new("/cfg/serialist/scripts"));
+    }
+
+    #[test]
+    fn the_examples_go_into_a_folder_without_scripts_only() {
+        let root = TempDir::new("example-scripts");
+        let paths = ConfigPaths::new(root.path().join("config"));
+        let written = paths.ensure_example_scripts().unwrap();
+        let names: Vec<_> = written
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["version_probe.lua", "firehose_stats.lua"]);
+        let probe = std::fs::read_to_string(paths.scripts_dir().join("version_probe.lua"));
+        assert!(probe.unwrap().contains(r"^\+VER: (\S+)"));
+
+        // Once there are scripts, nothing is written again, even a deleted example.
+        std::fs::remove_file(paths.scripts_dir().join("firehose_stats.lua")).unwrap();
+        assert!(paths.ensure_example_scripts().unwrap().is_empty());
+        assert!(!paths.scripts_dir().join("firehose_stats.lua").exists());
+
+        // A folder with only the user's own scripts is left alone too.
+        let other = ConfigPaths::new(root.path().join("other"));
+        root.write("other/scripts/mine.LUA", "print(1)");
+        assert!(other.ensure_example_scripts().unwrap().is_empty());
+        assert!(!other.scripts_dir().join("version_probe.lua").exists());
+    }
 }

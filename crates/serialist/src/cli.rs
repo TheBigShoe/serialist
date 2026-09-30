@@ -1,5 +1,5 @@
-//! Command-line flags. Hand-rolled: three flags do not justify an argument-parser
-//! dependency, and keeping `main` free of one keeps cold start small.
+//! Command-line flags. Hand-rolled: a handful of flags do not justify an
+//! argument-parser dependency, and keeping `main` free of one keeps cold start small.
 
 use std::path::PathBuf;
 
@@ -16,9 +16,12 @@ Options:
                       NAME, also open virtual:<NAME> at startup (repeatable; the
                       first is opened unless --port is given). Built-ins: echo,
                       echo-lines, at, firehose, firehose-ansi
-  --config-dir <DIR>  Read settings.json, keymap.json, themes/ and commands/, and
-                      keep history.jsonl, in DIR instead of the user config
-                      directory (also SERIALIST_CONFIG_DIR)
+  --config-dir <DIR>  Read settings.json, keymap.json, themes/, commands/ and
+                      scripts/, and keep history.jsonl, in DIR instead of the user
+                      config directory (also SERIALIST_CONFIG_DIR)
+  --script <PATH>     Run this Lua script against --port with no window, then
+                      exit: 0 if it ends well, 1 on an error, 2 if it is stopped.
+                      --baud and a matching device profile set the line
   --terminal-demo     Open only the milestone 1 terminal element, fed by an
                       in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help
@@ -36,9 +39,11 @@ pub struct Args {
     pub simulator: bool,
     /// `--terminal-demo`: the terminal element alone, over an in-memory stream.
     pub terminal_demo: bool,
-    /// `--config-dir`: where settings, keymap, themes, saved commands and the compose
-    /// history live, over the environment and the platform default.
+    /// `--config-dir`: where settings, keymap, themes, saved commands, scripts and the
+    /// compose history live, over the environment and the platform default.
     pub config_dir: Option<PathBuf>,
+    /// `--script`: run this script against `--port` headless, then exit.
+    pub script: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +84,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
             "--terminal-demo" if inline.is_none() => parsed.terminal_demo = true,
             "--port" => parsed.port = Some(value("--port")?),
             "--config-dir" => parsed.config_dir = Some(PathBuf::from(value("--config-dir")?)),
+            "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--baud" => {
                 let text = value("--baud")?;
                 let baud = serialist_ui::parse_baud(&text)
@@ -120,6 +126,7 @@ mod tests {
             simulator: true,
             terminal_demo: false,
             config_dir: Some(PathBuf::from("/tmp/serialist config")),
+            script: Some(PathBuf::from("probe.lua")),
         });
         let spaced = run(&[
             "--port",
@@ -132,6 +139,8 @@ mod tests {
             "at",
             "--config-dir",
             "/tmp/serialist config",
+            "--script",
+            "probe.lua",
         ]);
         let joined = run(&[
             "--port=/dev/cu.usbserial-1420",
@@ -139,6 +148,7 @@ mod tests {
             "--virtual=echo",
             "--virtual=at",
             "--config-dir=/tmp/serialist config",
+            "--script=probe.lua",
         ]);
         assert_eq!(spaced.unwrap(), expected);
         assert_eq!(joined.unwrap(), expected);
@@ -192,6 +202,7 @@ mod tests {
         let message = |args: &[&str]| format!("{:#}", run(args).unwrap_err());
         assert_eq!(message(&["--port"]), "--port needs a value");
         assert_eq!(message(&["--config-dir"]), "--config-dir needs a value");
+        assert_eq!(message(&["--script"]), "--script needs a value");
         assert_eq!(message(&["--baud="]), "--baud needs a value");
         assert!(message(&["--baud", "fast"]).starts_with("invalid --baud \"fast\""));
         assert!(message(&["--baud", "0"]).contains("above zero"));

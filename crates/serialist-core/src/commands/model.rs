@@ -159,9 +159,25 @@ pub enum Payload {
         codec: String,
         fields: Map<String, Value>,
     },
+    /// `{ "script": "probe.lua" }`: sending the command runs this Lua script on the
+    /// session instead of sending bytes. A relative path is relative to the scripts
+    /// folder. [`Command::encode`] fails with
+    /// [`PayloadError::ScriptPayload`](super::PayloadError::ScriptPayload), so nothing
+    /// sends it as bytes by mistake.
+    Script { path: PathBuf },
 }
 
-/// The file form of a [`Payload`]: exactly one of `text`, `hex` or `codec`.
+impl Payload {
+    /// The script a `{ "script": … }` payload runs.
+    pub fn script(&self) -> Option<&Path> {
+        match self {
+            Payload::Script { path } => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// The file form of a [`Payload`]: exactly one of `text`, `hex`, `codec` or `script`.
 #[derive(Serialize, Deserialize)]
 struct PayloadRepr {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,20 +188,34 @@ struct PayloadRepr {
     codec: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fields: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    script: Option<PathBuf>,
 }
 
 impl TryFrom<PayloadRepr> for Payload {
     type Error = String;
 
     fn try_from(repr: PayloadRepr) -> Result<Self, String> {
-        const HINT: &str =
-            "a payload is { \"text\": … }, { \"hex\": … } or { \"codec\": …, \"fields\": … }";
+        const HINT: &str = "a payload is { \"text\": … }, { \"hex\": … }, \
+             { \"codec\": …, \"fields\": … } or { \"script\": \"probe.lua\" }";
         let PayloadRepr {
             text,
             hex,
             codec,
             fields,
+            script,
         } = repr;
+        if let Some(path) = script {
+            return match (text, hex, codec, fields) {
+                (None, None, None, None) if path.as_os_str().is_empty() => {
+                    Err("a script payload needs the script's path".to_owned())
+                }
+                (None, None, None, None) => Ok(Payload::Script { path }),
+                _ => Err(format!(
+                    "a payload has exactly one of text, hex, codec and script: {HINT}"
+                )),
+            };
+        }
         match (text, hex, codec, fields) {
             (Some(text), None, None, None) => Ok(Payload::Text(text)),
             (None, Some(hex), None, None) => Ok(Payload::Hex(hex)),
@@ -193,14 +223,14 @@ impl TryFrom<PayloadRepr> for Payload {
                 codec,
                 fields: fields.unwrap_or_default(),
             }),
-            (None, None, None, None) => {
-                Err(format!("this payload has no text, hex or codec: {HINT}"))
-            }
+            (None, None, None, None) => Err(format!(
+                "this payload has no text, hex, codec or script: {HINT}"
+            )),
             (None, None, None, Some(_)) => {
                 Err(format!("`fields` belongs to a codec payload: {HINT}"))
             }
             _ => Err(format!(
-                "a payload has exactly one of text, hex and codec: {HINT}"
+                "a payload has exactly one of text, hex, codec and script: {HINT}"
             )),
         }
     }
@@ -213,6 +243,7 @@ impl From<Payload> for PayloadRepr {
             hex: None,
             codec: None,
             fields: None,
+            script: None,
         };
         match payload {
             Payload::Text(text) => PayloadRepr {
@@ -226,6 +257,10 @@ impl From<Payload> for PayloadRepr {
             Payload::Codec { codec, fields } => PayloadRepr {
                 codec: Some(codec),
                 fields: Some(fields),
+                ..empty
+            },
+            Payload::Script { path } => PayloadRepr {
+                script: Some(path),
                 ..empty
             },
         }

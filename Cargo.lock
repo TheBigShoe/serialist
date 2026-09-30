@@ -6561,6 +6561,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serialist-core",
+ "serialist-script",
  "serialist-sim",
  "serialist-ui",
  "tracing",
@@ -6641,6 +6642,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialist-core",
+ "serialist-script",
  "serialist-sim",
  "tracing",
 ]

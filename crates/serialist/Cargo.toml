@@ -16,6 +16,7 @@ path = "src/main.rs"
 # `serialist_ui::prelude`, so neither is listed here.
 [dependencies]
 serialist-core.workspace = true
+serialist-script.workspace = true
 serialist-sim.workspace = true
 serialist-ui.workspace = true
 anyhow.workspace = true
