@@ -123,9 +123,9 @@ impl Prng {
 }
 
 const WORDS: &[&str] = &[
-    "boot", "sensor", "temp", "ok", "link", "up", "down", "rx", "tx", "dma", "irq", "uart",
-    "gpio", "flash", "write", "read", "retry", "timeout", "ready", "idle", "wifi", "ble", "adc",
-    "sample", "value", "status", "event", "queue", "heap", "task", "watchdog", "clock",
+    "boot", "sensor", "temp", "ok", "link", "up", "down", "rx", "tx", "dma", "irq", "uart", "gpio",
+    "flash", "write", "read", "retry", "timeout", "ready", "idle", "wifi", "ble", "adc", "sample",
+    "value", "status", "event", "queue", "heap", "task", "watchdog", "clock",
 ];
 
 const LEVELS: &[&str] = &[
@@ -322,7 +322,8 @@ impl FirehoseGenerator {
     fn binary_record(&mut self) {
         let len = self.rng.range(1, 256) as usize;
         self.record.extend_from_slice(&SYNC);
-        self.record.extend_from_slice(&(self.seq as u32).to_le_bytes());
+        self.record
+            .extend_from_slice(&(self.seq as u32).to_le_bytes());
         self.record.extend_from_slice(&(len as u16).to_le_bytes());
         let end = self.record.len() + len;
         while self.record.len() < end {
@@ -405,7 +406,11 @@ impl SimDevice for FirehoseDevice {
             out.send(&self.batch);
             self.emitted += n;
         }
-        if self.cfg.total_bytes.is_some_and(|total| self.emitted >= total) {
+        if self
+            .cfg
+            .total_bytes
+            .is_some_and(|total| self.emitted >= total)
+        {
             self.done = true;
             if self.cfg.disconnect_when_done {
                 out.disconnect();
@@ -727,7 +732,11 @@ mod tests {
             dropped.drain(40_000..40_500);
             let mut v = FirehoseVerifier::new(content);
             v.feed(&dropped);
-            assert!(v.report().missing_records > 0, "{content:?}: {:?}", v.report());
+            assert!(
+                v.report().missing_records > 0,
+                "{content:?}: {:?}",
+                v.report()
+            );
             assert!(!v.report().gaps.is_empty());
 
             // One flipped byte.

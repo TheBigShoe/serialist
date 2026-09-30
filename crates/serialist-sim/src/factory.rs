@@ -57,10 +57,7 @@ impl SimTransportFactory {
     /// `/dev/cu.usbserial-1420`. Replaces an existing registration; its open links stay up.
     pub fn register_port(&self, id: PortId, link: LinkConfig, constructor: DeviceConstructor) {
         let mut entries = self.inner.lock();
-        let links = entries
-            .remove(&id)
-            .map(|e| e.links)
-            .unwrap_or_default();
+        let links = entries.remove(&id).map(|e| e.links).unwrap_or_default();
         entries.insert(
             id,
             Entry {

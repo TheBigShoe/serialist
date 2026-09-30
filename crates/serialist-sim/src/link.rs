@@ -411,7 +411,12 @@ impl LinkHandle {
         let deadline = Instant::now() + timeout.min(MAX_WAIT);
         let mut st = self.shared.state.lock();
         while st.device_running {
-            if self.shared.exit_cv.wait_until(&mut st, deadline).timed_out() {
+            if self
+                .shared
+                .exit_cv
+                .wait_until(&mut st, deadline)
+                .timed_out()
+            {
                 return !st.device_running;
             }
         }
@@ -702,7 +707,10 @@ mod tests {
             let expected = Duration::from_micros(1000 * (i as u64 + 1));
             let got = p.release_at - t0;
             let err = got.abs_diff(expected);
-            assert!(err < Duration::from_micros(1), "packet {i}: {got:?} vs {expected:?}");
+            assert!(
+                err < Duration::from_micros(1),
+                "packet {i}: {got:?} vs {expected:?}"
+            );
         }
         assert_eq!(wire.wire_free_at - t0, Duration::from_millis(100));
 

@@ -245,7 +245,10 @@ mod tests {
             feed(&mut dev, b"ATI\r\n"),
             b"\r\nSerialist Virtual Modem\r\n\r\nOK\r\n"
         );
-        assert_eq!(feed(&mut dev, b"AT+VER?\n"), b"\r\n+VER: 1.0.0\r\n\r\nOK\r\n");
+        assert_eq!(
+            feed(&mut dev, b"AT+VER?\n"),
+            b"\r\n+VER: 1.0.0\r\n\r\nOK\r\n"
+        );
         assert_eq!(feed(&mut dev, b"AT+FOO\r"), b"\r\nERROR\r\n");
         assert_eq!(feed(&mut dev, b"hello\r"), b"\r\nERROR\r\n");
     }
@@ -255,7 +258,10 @@ mod tests {
         let mut dev = AtDevice::new().with_version("9.9");
         // CRLF, LFCR, blank lines and split chunks all give one response per command.
         assert_eq!(feed(&mut dev, b"\r\n\r\nat\r\n"), b"\r\nOK\r\n");
-        assert_eq!(feed(&mut dev, b"  at+ver?  \n\r"), b"\r\n+VER: 9.9\r\n\r\nOK\r\n");
+        assert_eq!(
+            feed(&mut dev, b"  at+ver?  \n\r"),
+            b"\r\n+VER: 9.9\r\n\r\nOK\r\n"
+        );
         assert_eq!(feed(&mut dev, b"A"), b"");
         assert_eq!(feed(&mut dev, b"T"), b"");
         assert_eq!(feed(&mut dev, b"\r"), b"\r\nOK\r\n");

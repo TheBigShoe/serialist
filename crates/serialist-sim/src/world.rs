@@ -10,8 +10,8 @@ use serialist_core::{PortId, PortInfo, PortSource, TransportFactory};
 
 use crate::source::virtual_port;
 use crate::{
-    AtDevice, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig,
-    LinkHandle, SimDevice, SimPortSource, SimTransportFactory,
+    AtDevice, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig, LinkHandle,
+    SimDevice, SimPortSource, SimTransportFactory,
 };
 
 /// A simulated set of devices for tests and the app's developer mode. Cheap to clone;
@@ -62,17 +62,12 @@ impl SimWorld {
                 FirehoseContent::Text,
             )))
         });
-        world.add_virtual(
-            Self::FIREHOSE_ANSI,
-            "ANSI firehose (virtual)",
-            link,
-            || {
-                Box::new(
-                    FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Ansi))
-                        .with_name(Self::FIREHOSE_ANSI),
-                )
-            },
-        );
+        world.add_virtual(Self::FIREHOSE_ANSI, "ANSI firehose (virtual)", link, || {
+            Box::new(
+                FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Ansi))
+                    .with_name(Self::FIREHOSE_ANSI),
+            )
+        });
         world
     }
 
