@@ -29,7 +29,7 @@ pub use font::{FontFeatures, FontSpec, LineHeight};
 pub use load::{
     SettingsError, SettingsLayer, SettingsWarning, load_settings, load_settings_from_layers,
 };
-pub use paths::{CONFIG_DIR_ENV, ConfigPaths, Platform, settings_template};
+pub use paths::{CONFIG_DIR_ENV, ConfigPaths, Platform, keymap_template, settings_template};
 pub use profile::{DeviceMatch, DeviceProfile, UsbId};
 pub use types::{
     DisplaySettings, DisplayView, LineEnding, Settings, TerminalSettings, ThemeMode,
