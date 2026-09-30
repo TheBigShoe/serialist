@@ -805,7 +805,7 @@ fn open_settings_writes_the_template_and_opens_it(cx: &mut TestAppContext) {
 
     cx.dispatch_action(window, OpenSettings);
     let settings = dir.dir.join("settings.json");
-    assert_eq!(opened.lock().as_slice(), [settings.clone()]);
+    assert_eq!(opened.lock().as_slice(), std::slice::from_ref(&settings));
     let template = std::fs::read_to_string(&settings).unwrap();
     assert!(
         template.contains("// \"buffer_font_size\""),

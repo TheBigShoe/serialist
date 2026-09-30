@@ -5,7 +5,7 @@
 //! features and fallbacks. The size and line height travel next to it, since GPUI takes
 //! the size per text run and the terminal turns the line height into its row pitch.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::prelude::*;
 
@@ -135,6 +135,53 @@ impl Default for UiFont {
     }
 }
 
+/// The font families installed on this machine, listed once per process: listing
+/// costs around a hundred milliseconds on macOS, so it only happens when settings name
+/// a family (see [`substitute_missing_family`]).
+pub fn installed_families(cx: &App) -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| cx.text_system().all_font_names())
+}
+
+/// When `font` names a family `installed` does not list, switch to the first of its
+/// fallbacks that is installed, else the role's default, and return the family that
+/// was missing. GPUI would otherwise draw a missing family in its own fallback stack,
+/// which starts with a proportional face (Helvetica on macOS) and ruins a terminal.
+///
+/// Families GPUI provides itself (`.SystemUIFont`, `.ZedMono`) are never missing, and
+/// an empty `installed` (a text system that cannot list fonts) changes nothing.
+pub fn substitute_missing_family(
+    font: &mut Font,
+    role: FontRole,
+    installed: &[String],
+) -> Option<SharedString> {
+    let is_installed = |family: &str| {
+        family.starts_with('.')
+            || installed
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(family))
+    };
+    if installed.is_empty() || is_installed(&font.family) {
+        return None;
+    }
+    let fallbacks = font
+        .fallbacks
+        .as_ref()
+        .map(|f| f.fallback_list().to_vec())
+        .unwrap_or_default();
+    let substitute = fallbacks
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(role.default_family()))
+        .chain(role.default_fallbacks().iter().copied())
+        .find(|family| is_installed(family))
+        .unwrap_or(SYSTEM_UI_FAMILY);
+    Some(std::mem::replace(
+        &mut font.family,
+        SharedString::from(substitute.to_owned()),
+    ))
+}
+
 /// Sizes outside this range are clamped: a zero or negative size from a typo would
 /// make every row zero pixels tall.
 pub fn clamp_font_size(size: f32) -> Pixels {
@@ -207,6 +254,60 @@ mod tests {
             font.fallbacks.unwrap().fallback_list(),
             ["Menlo", "Symbols Nerd Font"]
         );
+    }
+
+    #[test]
+    fn a_missing_family_falls_to_an_installed_fallback_then_the_default() {
+        let installed: Vec<String> = ["Menlo", "Monaco", "DejaVu Sans Mono", "Consolas"]
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        let fallbacks = vec!["Nope Mono".to_owned(), "Monaco".to_owned()];
+        let mut font = build_font(
+            &FontParts {
+                family: Some("Berkeley Mono"),
+                fallbacks: &fallbacks,
+                ..FontParts::default()
+            },
+            FontRole::Mono,
+        );
+        let missing = substitute_missing_family(&mut font, FontRole::Mono, &installed);
+        assert_eq!(missing.as_deref(), Some("Berkeley Mono"));
+        assert_eq!(
+            font.family.as_ref(),
+            "Monaco",
+            "the first installed fallback"
+        );
+
+        let mut font = build_font(
+            &FontParts {
+                family: Some("Berkeley Mono"),
+                ..FontParts::default()
+            },
+            FontRole::Mono,
+        );
+        substitute_missing_family(&mut font, FontRole::Mono, &installed);
+        assert_eq!(font.family.as_ref(), DEFAULT_MONO_FAMILY);
+
+        // Installed (in any case), virtual, or nothing to compare with: unchanged.
+        for (family, list) in [
+            ("menlo", installed.clone()),
+            (".ZedMono", installed.clone()),
+            ("Berkeley Mono", Vec::new()),
+        ] {
+            let mut font = build_font(
+                &FontParts {
+                    family: Some(family),
+                    ..FontParts::default()
+                },
+                FontRole::Mono,
+            );
+            assert_eq!(
+                substitute_missing_family(&mut font, FontRole::Mono, &list),
+                None
+            );
+            assert_eq!(font.family.as_ref(), family);
+        }
     }
 
     #[test]
