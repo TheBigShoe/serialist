@@ -661,3 +661,191 @@ fn min_budget_scales_with_the_line_limit() {
         StoreConfig::default().min_budget()
     );
 }
+
+/// `count` lines `"{i:06} alpha"`, with `" needle"` added to every 1000th.
+fn numbered_store(count: u64) -> Store {
+    let mut store = Store::default();
+    let now = Instant::now();
+    let mut data = Vec::new();
+    for i in 0..count {
+        let mark = if i % 1000 == 0 { " needle" } else { "" };
+        data.extend_from_slice(format!("{i:06} alpha{mark}\r\n").as_bytes());
+        if data.len() >= 4096 {
+            store.append(&data, now);
+            data.clear();
+        }
+    }
+    store.append(&data, now);
+    store
+}
+
+fn search_in(
+    snap: &Snapshot,
+    pattern: &str,
+    range: Range<u64>,
+    from: u64,
+    backward: bool,
+    limit: usize,
+) -> Vec<SearchMatch> {
+    snap.search_in(
+        pattern,
+        LineId(range.start)..LineId(range.end),
+        LineId(from),
+        backward,
+        limit,
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+}
+
+fn hit_lines(hits: &[SearchMatch]) -> Vec<u64> {
+    hits.iter().map(|m| m.line.0).collect()
+}
+
+#[test]
+fn bounded_search_never_returns_a_match_outside_its_range() {
+    let store = numbered_store(20_000);
+    let snap = store.snapshot();
+    let needles: Vec<u64> = (6..=14).map(|k| k * 1000).collect();
+    let mut reversed = needles.clone();
+    reversed.reverse();
+    // Lines 5500..15000: needles at 6000 through 14000; 5000 and 15000 are outside.
+    let range = 5_500..15_000;
+    let go =
+        |from, backward, limit| search_in(&snap, "needle", range.clone(), from, backward, limit);
+    assert_eq!(hit_lines(&go(0, false, usize::MAX)), needles);
+    assert_eq!(hit_lines(&go(u64::MAX, true, usize::MAX)), reversed);
+    // `from` is inclusive and is clamped into the range.
+    assert_eq!(hit_lines(&go(10_000, true, usize::MAX)), reversed[4..]);
+    assert_eq!(hit_lines(&go(10_000, false, usize::MAX)), needles[4..]);
+    assert_eq!(hit_lines(&go(14_999, true, 2)), [14_000, 13_000]);
+    assert_eq!(hit_lines(&go(0, false, 2)), [6_000, 7_000]);
+    // Nothing when `from` lies on the wrong side of the range.
+    assert!(go(5_499, true, 10).is_empty());
+    assert!(go(15_000, false, 10).is_empty());
+    assert!(go(20_000, false, 10).is_empty());
+    assert!(go(0, false, 0).is_empty());
+    // A pattern that matches every line yields exactly the range's lines, both ways,
+    // so the bulk scan is cut at both ends.
+    let all = r"^\d{6} alpha";
+    let forward = search_in(&snap, all, range.clone(), 0, false, usize::MAX);
+    assert_eq!(hit_lines(&forward), (5_500..15_000).collect::<Vec<_>>());
+    let backward = search_in(&snap, all, range.clone(), u64::MAX, true, usize::MAX);
+    assert_eq!(
+        hit_lines(&backward),
+        (5_500..15_000).rev().collect::<Vec<_>>()
+    );
+    // Small, empty and inverted ranges, and ranges past what is retained.
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 6_000..6_001, 0, false, 9)),
+        [6_000]
+    );
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 6_000..6_001, 9_999, true, 9)),
+        [6_000]
+    );
+    assert!(search_in(&snap, "needle", 6_001..6_002, 0, false, 9).is_empty());
+    assert!(search_in(&snap, "needle", 9_000..9_000, 0, false, 9).is_empty());
+    let (later, earlier) = (9_000, 1_000);
+    assert!(search_in(&snap, "needle", later..earlier, 0, true, 9).is_empty());
+    assert_eq!(
+        hit_lines(&search_in(&snap, "needle", 19_000..u64::MAX, 0, false, 9)),
+        [19_000]
+    );
+    assert!(search_in(&snap, "needle", 30_000..40_000, 0, false, 9).is_empty());
+    // The full range is what `search` does.
+    let full = snap
+        .search(
+            "needle",
+            LineId(0),
+            false,
+            usize::MAX,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        full,
+        search_in(&snap, "needle", 0..u64::MAX, 0, false, usize::MAX)
+    );
+    // A bad pattern is an error whatever the range, and a set cancel flag stops the scan.
+    let cancelled = AtomicBool::new(true);
+    let bad = snap.search_in("(", LineId(9)..LineId(9), LineId(0), false, 1, &cancelled);
+    assert!(bad.is_err());
+    let none = snap.search_in(
+        "needle",
+        LineId(0)..LineId(20_000),
+        LineId(0),
+        false,
+        9,
+        &cancelled,
+    );
+    assert!(none.unwrap().is_empty());
+}
+
+/// The reason for `search_in`: a backward search from a clear floor must not scan the
+/// hidden lines below it. Counted in lines visited, not measured in time.
+#[test]
+fn a_bounded_search_scans_no_line_outside_its_range() {
+    use super::search::{reset_scanned, scanned};
+
+    let store = numbered_store(200_000);
+    let snap = store.snapshot();
+    let cancel = AtomicBool::new(false);
+    // "needle" occurs only at multiples of 1000, all below the floor.
+    let floor = 199_500;
+    reset_scanned();
+    let hits = search_in(&snap, "needle", floor..200_000, u64::MAX, true, usize::MAX);
+    assert!(hits.is_empty());
+    assert_eq!(scanned(), 200_000 - floor, "only the lines above the floor");
+    // Unbounded, the same search walks down past the floor to line 199_000.
+    reset_scanned();
+    let hits = snap
+        .search("needle", LineId(u64::MAX), true, 1, &cancel)
+        .unwrap();
+    assert_eq!(hit_lines(&hits), [199_000]);
+    assert!(scanned() >= 1_000, "{}", scanned());
+    // A forward search stops at the end of its range, and starts at its start.
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 100_000..100_500, 0, false, usize::MAX);
+    assert_eq!(hit_lines(&hits), [100_000]);
+    assert_eq!(scanned(), 500);
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 100_001..100_500, 0, false, usize::MAX);
+    assert!(hits.is_empty());
+    assert_eq!(scanned(), 499);
+    // A limit stops a backward search after the window that held the match, which is
+    // still inside the range.
+    reset_scanned();
+    let hits = search_in(&snap, "needle", 150_000..200_000, u64::MAX, true, 1);
+    assert_eq!(hit_lines(&hits), [199_000]);
+    assert!(scanned() < 50_000, "{}", scanned());
+}
+
+/// Eviction moves the store's first line up through the range: the retained part is what
+/// is searched.
+#[test]
+fn a_bounded_search_clips_to_the_retained_lines() {
+    let mut store = Store::new(StoreConfig {
+        budget: 0,
+        max_line_bytes: 4096,
+        ..StoreConfig::default()
+    });
+    let now = Instant::now();
+    let mut i = 0u64;
+    while store.stats().first_line.0 < 3_000 {
+        store.append(format!("{i:08} needle\r\n").as_bytes(), now);
+        i += 1;
+    }
+    let snap = store.snapshot();
+    let (first, end) = (snap.first_line().0, snap.end().0);
+    let hits = search_in(&snap, "needle", 0..end, 0, false, usize::MAX);
+    assert_eq!(hits.len() as u64, end - first);
+    assert_eq!(hits[0].line.0, first);
+    let hits = search_in(&snap, "needle", 0..first + 10, u64::MAX, true, usize::MAX);
+    assert_eq!(
+        hit_lines(&hits),
+        (first..first + 10).rev().collect::<Vec<_>>()
+    );
+    // From below the retained lines, backward finds nothing, as `search` does.
+    assert!(search_in(&snap, "needle", 0..end, first - 1, true, 5).is_empty());
+}
