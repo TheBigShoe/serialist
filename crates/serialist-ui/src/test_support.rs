@@ -340,7 +340,7 @@ pub(crate) fn open_workspace(
     world: &SimWorld,
     connect_to: Option<&str>,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
-    open_workspace_with(cx, world, connect_to, StoreConfig::default())
+    open_workspace_options(cx, world, connect_to, None)
 }
 
 /// [`open_workspace`] with sessions stored as `store` says.
@@ -350,11 +350,20 @@ pub(crate) fn open_workspace_with(
     connect_to: Option<&str>,
     store: StoreConfig,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_workspace_options(cx, world, connect_to, Some(store))
+}
+
+fn open_workspace_options(
+    cx: &mut TestAppContext,
+    world: &SimWorld,
+    connect_to: Option<&str>,
+    store: Option<StoreConfig>,
+) -> (AnyWindowHandle, Entity<Workspace>) {
     allow_engine_threads(cx);
     let options = AppOptions {
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
-        serial: SerialConfig::default(),
+        baud: None,
         select_port: connect_to.map(PortId::new),
         connect_on_start: connect_to.is_some(),
         store,
@@ -410,6 +419,13 @@ pub(crate) fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, t
             .iter()
             .any(|line| line.direction == Direction::Rx && line.text == text)
     })
+}
+
+/// Turn on local echo in the session's compose bar, as its Echo button does. The
+/// bundled settings leave it off.
+pub(crate) fn enable_local_echo(cx: &mut TestAppContext, view: &Entity<SessionView>) {
+    let compose = view.read_with(cx, |v, _| v.compose().clone());
+    compose.update(cx, |compose, cx| compose.set_local_echo(true, cx));
 }
 
 /// Type into whatever has focus and press Enter, as a user would.

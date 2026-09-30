@@ -16,6 +16,8 @@ use crate::actions::{
     self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
     SearchNext, SearchPrevious, SelectAll, ToggleFrameStats, ToggleHexView, ToggleWrap, context,
 };
+use crate::config::Config;
+use crate::fonts::TerminalFont;
 use crate::prelude::*;
 use crate::terminal::element::{
     CellMetrics, Highlights, Hit, ShapeCache, TerminalElement, TerminalInputs,
@@ -26,7 +28,7 @@ use crate::terminal::scroll::TerminalScrollHandle;
 use crate::terminal::search::{MAX_MATCHES, SearchResults};
 use crate::terminal::selection::{Selection, SelectionMode, SelectionPoint, word_at};
 use crate::terminal::stats::{FrameStats, FrameSummary};
-use crate::terminal::timestamps::{Clock, TimestampMode};
+use crate::terminal::timestamps::{Clock, TimestampMode, TimestampModeExt};
 
 /// Which source is on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,6 +88,7 @@ pub struct TerminalView {
     wrap: bool,
     timestamps: TimestampMode,
     palette: Rc<TerminalPalette>,
+    font: TerminalFont,
     /// Bumped whenever what the element draws from changes wholesale, dropping its
     /// caches.
     generation: u64,
@@ -118,6 +121,20 @@ impl TerminalView {
                 InputEvent::Focus | InputEvent::Blur => {}
             });
         let clock = Clock::local(source.epoch());
+        // The font and colors follow the configuration, when the app has one.
+        let (font, palette) = match cx.try_global::<Config>() {
+            Some(config) => (config.terminal_font().clone(), config.palette().clone()),
+            None => (TerminalFont::default(), TerminalPalette::default()),
+        };
+        let config_changes = cx.observe_global::<Config>(|this, cx| {
+            let config = cx.global::<Config>();
+            let (font, palette) = (config.terminal_font().clone(), config.palette().clone());
+            this.set_font(font, cx);
+            // A reload about something else keeps the shaped lines.
+            if *this.palette != palette {
+                this.set_palette(palette, cx);
+            }
+        });
         Self {
             text_source: source,
             text_searcher: None,
@@ -130,7 +147,8 @@ impl TerminalView {
             selecting: false,
             wrap: false,
             timestamps: TimestampMode::Off,
-            palette: Rc::new(TerminalPalette::default()),
+            palette: Rc::new(palette),
+            font,
             generation: 1,
             clock,
             cache: Rc::default(),
@@ -146,7 +164,7 @@ impl TerminalView {
                 stale: false,
             },
             focus_handle: cx.focus_handle(),
-            _subscriptions: vec![input_events],
+            _subscriptions: vec![input_events, config_changes],
         }
     }
 
@@ -227,6 +245,13 @@ impl TerminalView {
         self.display
     }
 
+    /// Show text or hex. Hex needs a hex source; without one this stays on text.
+    pub fn set_display_mode(&mut self, mode: DisplayMode, cx: &mut Context<Self>) {
+        if mode != self.display {
+            self.toggle_hex(cx);
+        }
+    }
+
     pub fn has_hex_source(&self) -> bool {
         self.hex_source.is_some()
     }
@@ -277,10 +302,27 @@ impl TerminalView {
         &self.palette
     }
 
+    /// Draw with `palette`, dropping every shaped line (their runs carry colors), even
+    /// when it equals the current one.
     pub fn set_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
         self.palette = Rc::new(palette);
         self.generation += 1;
         cx.notify();
+    }
+
+    /// The font the terminal draws with.
+    pub fn font(&self) -> &TerminalFont {
+        &self.font
+    }
+
+    /// Draw with `font` from the next frame on. The element measures the new grid and
+    /// drops every shaped line when the font, size or line height differ from the last
+    /// frame's.
+    pub fn set_font(&mut self, font: TerminalFont, cx: &mut Context<Self>) {
+        if self.font != font {
+            self.font = font;
+            cx.notify();
+        }
     }
 
     pub fn wrap(&self) -> bool {
@@ -848,6 +890,7 @@ impl TerminalView {
     // --- Rendering -------------------------------------------------------------------
 
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let toolbar = Config::toolbar_background(cx);
         let theme = cx.theme();
         let results = &self.search.results;
         let label = results.count_label();
@@ -866,6 +909,7 @@ impl TerminalView {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .when_some(toolbar, |bar, background| bar.bg(background))
             .child(
                 div().flex_1().child(
                     Input::new(&self.search.input)
@@ -930,9 +974,6 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let font = font(theme.mono_font_family.clone());
-        let font_size = theme.mono_font_size;
         let search_open = self.search.open;
         let highlights = if search_open {
             Highlights {
@@ -951,8 +992,9 @@ impl Render for TerminalView {
             stats: self.stats.clone(),
             palette: self.palette.clone(),
             generation: self.generation,
-            font,
-            font_size,
+            font: self.font.font.clone(),
+            font_size: self.font.size,
+            line_height: self.font.line_height,
             wrap: self.wrap,
             timestamps: self.timestamps,
             clock: self.clock,

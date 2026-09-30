@@ -4,52 +4,28 @@
 use std::collections::VecDeque;
 
 use crate::actions::{CycleLineEnding, HistoryNext, HistoryPrevious, context};
+use crate::config::Config;
 use crate::prelude::*;
 
-/// What Enter appends to the typed text.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum LineEnding {
-    None,
-    Cr,
-    Lf,
-    #[default]
-    CrLf,
+/// What Enter appends to the typed text: the settings type, so a `line_ending` setting
+/// or a device profile's `eol` is used as is.
+pub use serialist_core::LineEnding;
+
+/// What the compose bar does with a [`LineEnding`] beyond what settings need.
+pub trait LineEndingExt: Sized {
+    /// The next ending in the order the cycle button walks through.
+    fn next(self) -> Self;
+    /// The bytes a submitted line puts on the wire.
+    fn frame(self, text: &str) -> Vec<u8>;
 }
 
-impl LineEnding {
-    /// The order the cycle button walks through.
-    pub const ALL: [LineEnding; 4] = [
-        LineEnding::None,
-        LineEnding::Cr,
-        LineEnding::Lf,
-        LineEnding::CrLf,
-    ];
-
-    pub fn bytes(self) -> &'static [u8] {
-        match self {
-            LineEnding::None => b"",
-            LineEnding::Cr => b"\r",
-            LineEnding::Lf => b"\n",
-            LineEnding::CrLf => b"\r\n",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            LineEnding::None => "None",
-            LineEnding::Cr => "CR",
-            LineEnding::Lf => "LF",
-            LineEnding::CrLf => "CRLF",
-        }
-    }
-
-    pub fn next(self) -> Self {
+impl LineEndingExt for LineEnding {
+    fn next(self) -> Self {
         let ix = Self::ALL.iter().position(|e| *e == self).unwrap_or(0);
         Self::ALL[(ix + 1) % Self::ALL.len()]
     }
 
-    /// The bytes a submitted line puts on the wire.
-    pub fn frame(self, text: &str) -> Vec<u8> {
+    fn frame(self, text: &str) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(text.len() + 2);
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(self.bytes());
@@ -150,6 +126,8 @@ pub struct ComposeBar {
     input: Entity<InputState>,
     history: History,
     line_ending: LineEnding,
+    /// Echo each sent line into the scrollback, for devices that do not echo.
+    local_echo: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -169,12 +147,24 @@ impl ComposeBar {
             input,
             history: History::default(),
             line_ending: LineEnding::default(),
+            local_echo: true,
             _subscriptions: vec![subscription],
         }
     }
 
     pub fn line_ending(&self) -> LineEnding {
         self.line_ending
+    }
+
+    pub fn local_echo(&self) -> bool {
+        self.local_echo
+    }
+
+    pub fn set_local_echo(&mut self, echo: bool, cx: &mut Context<Self>) {
+        if self.local_echo != echo {
+            self.local_echo = echo;
+            cx.notify();
+        }
     }
 
     pub fn set_line_ending(&mut self, line_ending: LineEnding, cx: &mut Context<Self>) {
@@ -241,6 +231,7 @@ impl ComposeBar {
 
 impl Render for ComposeBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let toolbar = Config::toolbar_background(cx);
         let theme = cx.theme();
         h_flex()
             .key_context(context::COMPOSE_BAR)
@@ -253,11 +244,22 @@ impl Render for ComposeBar {
             .py_1p5()
             .border_t_1()
             .border_color(theme.border)
+            .when_some(toolbar, |bar, background| bar.bg(background))
             .child(
                 div()
                     .flex_1()
                     .font_family(theme.mono_font_family.clone())
                     .child(Input::new(&self.input).id("compose-input").small()),
+            )
+            .child(
+                Button::new("local-echo")
+                    .label(if self.local_echo { "Echo" } else { "No echo" })
+                    .tooltip("Show sent lines in the scrollback; click to toggle")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_local_echo(!this.local_echo, cx);
+                    })),
             )
             .child(
                 Button::new("line-ending")
@@ -285,8 +287,8 @@ mod tests {
 
     #[test]
     fn line_ending_cycles_through_all_four_and_defaults_to_crlf() {
-        assert_eq!(LineEnding::default(), LineEnding::CrLf);
-        let mut ending = LineEnding::CrLf;
+        assert_eq!(LineEnding::default(), LineEnding::Crlf);
+        let mut ending = LineEnding::Crlf;
         let mut seen = Vec::new();
         for _ in 0..4 {
             ending = ending.next();
@@ -298,7 +300,7 @@ mod tests {
                 LineEnding::None,
                 LineEnding::Cr,
                 LineEnding::Lf,
-                LineEnding::CrLf
+                LineEnding::Crlf
             ]
         );
     }
@@ -308,8 +310,8 @@ mod tests {
         assert_eq!(LineEnding::None.frame("AT"), b"AT");
         assert_eq!(LineEnding::Cr.frame("AT"), b"AT\r");
         assert_eq!(LineEnding::Lf.frame("AT"), b"AT\n");
-        assert_eq!(LineEnding::CrLf.frame("AT"), b"AT\r\n");
-        assert_eq!(LineEnding::CrLf.frame(""), b"\r\n");
+        assert_eq!(LineEnding::Crlf.frame("AT"), b"AT\r\n");
+        assert_eq!(LineEnding::Crlf.frame(""), b"\r\n");
     }
 
     #[test]

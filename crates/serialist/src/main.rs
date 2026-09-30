@@ -6,6 +6,7 @@
 mod cli;
 mod wiring;
 
+use serialist_ui::config;
 use serialist_ui::prelude::application;
 use tracing_subscriber::EnvFilter;
 
@@ -34,9 +35,13 @@ fn main() {
         )
         .init();
 
+    // --config-dir, else SERIALIST_CONFIG_DIR, else the platform's config directory.
+    let config_paths = config::paths_for(args.config_dir.clone());
+
     if args.terminal_demo {
-        application().run(|cx| {
+        application().run(move |cx| {
             serialist_ui::init(cx);
+            config::start(config_paths, cx);
             if let Err(error) = serialist_ui::terminal::open_terminal_demo(cx) {
                 tracing::error!("could not open the terminal demo: {error:#}");
                 cx.quit();
@@ -60,6 +65,9 @@ fn main() {
     };
     application().run(move |cx| {
         serialist_ui::init(cx);
+        // Settings, keymap and themes: loaded before the window opens so it starts in
+        // the user's theme and fonts, then watched for changes.
+        config::start(config_paths, cx);
         if let Err(error) = serialist_ui::open_main_window(options, cx) {
             tracing::error!("could not open the main window: {error:#}");
             cx.quit();

@@ -150,11 +150,12 @@ impl Searcher for Floored<HexView> {
     }
 }
 
-/// Where Clear put the floors: a text line id and a hex row id.
+/// Where Clear put the floors: a text line id, and the stream offset the hex rows are
+/// hidden below. The hex floor is kept in bytes so it survives a change of row width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Floors {
     pub text: LineId,
-    pub hex: LineId,
+    pub raw: u64,
 }
 
 impl Default for Floors {
@@ -162,21 +163,25 @@ impl Default for Floors {
     fn default() -> Self {
         Self {
             text: LineId::ZERO,
-            hex: LineId::ZERO,
+            raw: 0,
         }
     }
 }
 
 impl Floors {
-    /// Floors that hide everything `snapshot` holds: its lines, and every hex row that
-    /// starts before its last byte. A row the clear cut through stays, so no byte after
-    /// the clear is ever hidden.
+    /// Floors that hide everything `snapshot` holds: its lines and its bytes.
     pub fn above(snapshot: &Snapshot) -> Self {
-        let raw_end = snapshot.raw_range().end;
         Self {
             text: snapshot.end(),
-            hex: LineId(raw_end / HEX_BYTES_PER_ROW as u64),
+            raw: snapshot.raw_range().end,
         }
+    }
+
+    /// The first hex row shown at `bytes_per_row`: every row that starts before the
+    /// clear is hidden, except a row the clear cut through, so no byte after the clear
+    /// is ever hidden.
+    pub fn hex_row(&self, bytes_per_row: usize) -> LineId {
+        LineId(self.raw / bytes_per_row.max(1) as u64)
     }
 }
 
@@ -188,14 +193,23 @@ pub struct Scrollback {
 }
 
 impl Scrollback {
+    /// Hex rows of [`HEX_BYTES_PER_ROW`] bytes.
     pub fn new(snapshot: &Snapshot, floors: Floors) -> Self {
+        Self::with_hex_row(snapshot, floors, HEX_BYTES_PER_ROW)
+    }
+
+    /// Hex rows of `bytes_per_row` bytes (clamped to 1..=256 by the store).
+    pub fn with_hex_row(snapshot: &Snapshot, floors: Floors, bytes_per_row: usize) -> Self {
+        let hex = snapshot.hex_view(bytes_per_row);
+        let hex_floor = floors.hex_row(hex.bytes_per_row());
         Self {
             text: Arc::new(Floored::new(snapshot.clone(), floors.text)),
-            hex: Arc::new(Floored::new(
-                snapshot.hex_view(HEX_BYTES_PER_ROW),
-                floors.hex,
-            )),
+            hex: Arc::new(Floored::new(hex, hex_floor)),
         }
+    }
+
+    pub fn hex_bytes_per_row(&self) -> usize {
+        self.hex.inner.bytes_per_row()
     }
 
     pub fn snapshot(&self) -> &Snapshot {
@@ -304,10 +318,17 @@ mod tests {
 
         // A clear hides the rows before the last byte, but not a row it cut through.
         let floors = Floors::above(&store.snapshot());
-        assert_eq!(floors.hex, LineId(1));
+        assert_eq!(floors.hex_row(HEX_BYTES_PER_ROW), LineId(1));
         store.append(b"more", Instant::now());
         let cleared = Scrollback::new(&store.snapshot(), floors);
         assert_eq!(cleared.hex_source().first_line(), LineId(1));
         assert_eq!(search(cleared.hex_searcher().as_ref(), "41 54", false), []);
+
+        // The same clear at eight bytes a row: 28 bytes cleared, so rows 0 to 2 go and
+        // row 3, which the clear cut through, stays.
+        let narrow = Scrollback::with_hex_row(&store.snapshot(), floors, 8);
+        assert_eq!(narrow.hex_bytes_per_row(), 8);
+        assert_eq!(narrow.hex_source().first_line(), LineId(3));
+        assert_eq!(narrow.hex_source().line_count(), 1);
     }
 }

@@ -1,8 +1,9 @@
 //! Terminal colors: the palette the element draws with, and the mapping from the
 //! store's [`Color`] and [`Style`] to GPUI colors.
 //!
-//! Milestone 2 fills a [`TerminalPalette`] from a Zed theme's `terminal.*`, `players[0]`
-//! and `search.*` keys; until then [`TerminalPalette::default`] is a One Dark-like set.
+//! [`TerminalPalette::from_lookup`] fills a palette from a Zed theme's `terminal.*`,
+//! `players[0]` and `search.*` keys; [`TerminalPalette::default`] is a One Dark-like set
+//! and the fallback for every key a theme leaves out.
 
 use serialist_core::{Color, Direction, Style, StyleFlags};
 
@@ -69,6 +70,88 @@ impl Default for TerminalPalette {
             notice: hex(0xa9afbc),
             bold_is_bright: true,
             minimum_contrast: 3.0,
+        }
+    }
+}
+
+/// The Zed theme keys of the sixteen ANSI colors, in [`TerminalPalette::ansi`] order.
+pub const ANSI_KEYS: [&str; 16] = [
+    "terminal.ansi.black",
+    "terminal.ansi.red",
+    "terminal.ansi.green",
+    "terminal.ansi.yellow",
+    "terminal.ansi.blue",
+    "terminal.ansi.magenta",
+    "terminal.ansi.cyan",
+    "terminal.ansi.white",
+    "terminal.ansi.bright_black",
+    "terminal.ansi.bright_red",
+    "terminal.ansi.bright_green",
+    "terminal.ansi.bright_yellow",
+    "terminal.ansi.bright_blue",
+    "terminal.ansi.bright_magenta",
+    "terminal.ansi.bright_cyan",
+    "terminal.ansi.bright_white",
+];
+
+impl TerminalPalette {
+    /// A palette from a Zed theme's style keys, looked up by name (`terminal.foreground`,
+    /// `players[0].cursor`). Each color falls back through related keys, then to the
+    /// [`Default`] palette, so a theme that sets nothing terminal-specific still draws.
+    ///
+    /// | Palette | Keys, first set wins |
+    /// | --- | --- |
+    /// | background | `terminal.background`, `editor.background`, `background` |
+    /// | foreground | `terminal.foreground`, `editor.foreground`, `text` |
+    /// | bright foreground | `terminal.bright_foreground`, then the foreground |
+    /// | dim foreground | `terminal.dim_foreground`, `text.muted` |
+    /// | ANSI 0 to 15 | `terminal.ansi.black` … `terminal.ansi.bright_white` |
+    /// | cursor | `players[0].cursor`, `text.accent` |
+    /// | selection | `players[0].selection`, `element.selected` |
+    /// | search match | `search.match_background` |
+    /// | active match | `search.active_match_background`, then the search match |
+    /// | sent lines | `info`, `text.accent` |
+    /// | notices | `text.muted`, `hint` |
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<Hsla>) -> Self {
+        let defaults = Self::default();
+        let first = |keys: &[&str]| keys.iter().find_map(|key| lookup(key));
+        let foreground = first(&["terminal.foreground", "editor.foreground", "text"])
+            .unwrap_or(defaults.foreground);
+        let search_match = first(&["search.match_background"]).unwrap_or(defaults.search_match);
+        let mut ansi = defaults.ansi;
+        for (slot, key) in ansi.iter_mut().zip(ANSI_KEYS) {
+            if let Some(color) = lookup(key) {
+                *slot = color;
+            }
+        }
+        Self {
+            foreground,
+            background: first(&["terminal.background", "editor.background", "background"])
+                .unwrap_or(defaults.background),
+            dim_foreground: first(&["terminal.dim_foreground", "text.muted"])
+                .unwrap_or(defaults.dim_foreground),
+            bright_foreground: first(&["terminal.bright_foreground"]).unwrap_or(
+                if lookup("terminal.foreground").is_some() {
+                    foreground
+                } else {
+                    defaults.bright_foreground
+                },
+            ),
+            ansi,
+            selection: first(&["players[0].selection", "element.selected"])
+                .unwrap_or(defaults.selection),
+            cursor: first(&["players[0].cursor", "text.accent"]).unwrap_or(defaults.cursor),
+            search_match,
+            active_match: first(&["search.active_match_background"]).unwrap_or(
+                if lookup("search.match_background").is_some() {
+                    search_match.opacity(1.0)
+                } else {
+                    defaults.active_match
+                },
+            ),
+            tx: first(&["info", "text.accent"]).unwrap_or(defaults.tx),
+            notice: first(&["text.muted", "hint"]).unwrap_or(defaults.notice),
+            ..defaults
         }
     }
 }
@@ -258,6 +341,50 @@ mod tests {
         let c = color.to_rgb();
         let byte = |v: f32| (v * 255.0).round() as u8;
         (byte(c.r), byte(c.g), byte(c.b))
+    }
+
+    #[test]
+    fn theme_keys_fill_the_palette_and_the_rest_falls_back() {
+        assert_eq!(
+            TerminalPalette::from_lookup(|_| None),
+            TerminalPalette::default(),
+            "a theme with no keys draws with the defaults"
+        );
+
+        let hex = |value: u32| Hsla::from(rgb(value));
+        let keys = std::collections::HashMap::from([
+            ("terminal.background", hex(0x101010)),
+            ("terminal.foreground", hex(0xe0e0e0)),
+            ("terminal.ansi.red", hex(0xaa0000)),
+            ("terminal.ansi.bright_white", hex(0xfefefe)),
+            ("players[0].cursor", hex(0x00ff00)),
+            ("players[0].selection", Hsla::from(rgba(0x3355ff40))),
+            ("search.match_background", Hsla::from(rgba(0xffff0040))),
+            ("text.muted", hex(0x808080)),
+            ("info", hex(0x2080ff)),
+        ]);
+        let palette = TerminalPalette::from_lookup(|key| keys.get(key).copied());
+        let defaults = TerminalPalette::default();
+        assert_eq!(palette.background, keys["terminal.background"]);
+        assert_eq!(palette.foreground, keys["terminal.foreground"]);
+        assert_eq!(palette.ansi[1], keys["terminal.ansi.red"]);
+        assert_eq!(palette.ansi[15], keys["terminal.ansi.bright_white"]);
+        assert_eq!(
+            palette.ansi[2], defaults.ansi[2],
+            "unset ANSI colors keep theirs"
+        );
+        assert_eq!(palette.cursor, keys["players[0].cursor"]);
+        assert_eq!(palette.selection, keys["players[0].selection"]);
+        assert_eq!(palette.search_match, keys["search.match_background"]);
+        assert_eq!(
+            palette.active_match,
+            keys["search.match_background"].opacity(1.0)
+        );
+        // Related keys stand in for the missing terminal ones.
+        assert_eq!(palette.bright_foreground, palette.foreground);
+        assert_eq!(palette.dim_foreground, keys["text.muted"]);
+        assert_eq!(palette.notice, keys["text.muted"]);
+        assert_eq!(palette.tx, keys["info"]);
     }
 
     #[test]
