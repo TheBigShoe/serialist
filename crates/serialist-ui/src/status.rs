@@ -1,5 +1,6 @@
 //! What the status line says about a session, as plain data: connection state, byte
-//! counters, the scrollback's retention, pause, recording and the last notice.
+//! counters, the scrollback's retention, pause, recording, a running script and the
+//! last notice.
 //!
 //! No GPUI here, so the wording tests as plain Rust. The session view fills a
 //! [`StatusInputs`] from the session's counters and the newest store snapshot, and
@@ -7,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serialist_core::{SessionStats, StoreStats};
 
@@ -92,6 +94,38 @@ pub(crate) fn file_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// The script running on a session, or about to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptStatus {
+    /// Its path under the scripts folder, or `inline`.
+    pub name: String,
+    /// How long it has run; `None` until the script thread has started it.
+    pub running_for: Option<Duration>,
+    /// Runs queued behind it.
+    pub queued: usize,
+}
+
+impl ScriptStatus {
+    /// `Script: version_probe.lua running 3.2 s`, with `(+1 queued)` when others wait.
+    pub fn label(&self) -> String {
+        let state = match self.running_for {
+            Some(elapsed) => format!("running {}", format_seconds(elapsed)),
+            None => "starting".to_owned(),
+        };
+        let queued = if self.queued > 0 {
+            format!(" (+{} queued)", self.queued)
+        } else {
+            String::new()
+        };
+        format!("Script: {} {state}{queued}", self.name)
+    }
+}
+
+/// Seconds with one decimal: `3.2 s`.
+pub fn format_seconds(elapsed: Duration) -> String {
+    format!("{:.1} s", elapsed.as_secs_f64())
+}
+
 /// Where the stream stood when the view was paused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PauseMark {
@@ -135,6 +169,8 @@ pub struct StatusInputs<'a> {
     pub mode: Mode,
     /// A paste in progress in inline mode.
     pub paste: Option<PasteProgress>,
+    /// The script running on the session.
+    pub script: Option<&'a ScriptStatus>,
 }
 
 /// The text of the status line for one session, kept apart from rendering so tests can
@@ -163,6 +199,8 @@ pub struct StatusLine {
     pub mode: &'static str,
     /// `Pasting 128 B of 4.0 KiB` while a large paste is being sent.
     pub paste: Option<String>,
+    /// `Script: version_probe.lua running 3.2 s` while a script runs.
+    pub script: Option<String>,
 }
 
 impl StatusLine {
@@ -195,6 +233,7 @@ impl StatusLine {
             notice: inputs.notice.cloned(),
             mode: inputs.mode.label(),
             paste: inputs.paste.and_then(|paste| paste.label()),
+            script: inputs.script.map(ScriptStatus::label),
         }
     }
 }
@@ -252,6 +291,7 @@ mod tests {
             notice: None,
             mode: Mode::Command,
             paste: None,
+            script: None,
         }
     }
 
@@ -326,6 +366,36 @@ mod tests {
         let line = StatusLine::new(status);
         assert_eq!(line.mode, "INLINE");
         assert_eq!(line.paste.as_deref(), Some("Pasting 640 B of 4.0 KiB"));
+    }
+
+    #[test]
+    fn a_running_script_names_itself_and_its_time() {
+        let state = ConnectionState::Connected;
+        let running = ScriptStatus {
+            name: "version_probe.lua".into(),
+            running_for: Some(Duration::from_millis(3240)),
+            queued: 0,
+        };
+        let mut status = inputs(&state, store(0, 3, 0, 20));
+        status.script = Some(&running);
+        assert_eq!(
+            StatusLine::new(status.clone()).script.as_deref(),
+            Some("Script: version_probe.lua running 3.2 s")
+        );
+        let starting = ScriptStatus {
+            running_for: None,
+            queued: 2,
+            ..running.clone()
+        };
+        status.script = Some(&starting);
+        assert_eq!(
+            StatusLine::new(status).script.as_deref(),
+            Some("Script: version_probe.lua starting (+2 queued)")
+        );
+        assert_eq!(
+            StatusLine::new(inputs(&state, store(0, 3, 0, 20))).script,
+            None
+        );
     }
 
     #[test]

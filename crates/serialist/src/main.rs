@@ -2,15 +2,23 @@
 //!
 //! The binary parses flags, sets up logging, picks the port source and transport
 //! factory, and hands them to the UI. Everything visual lives in `serialist-ui`.
+//! `--script` runs a Lua script against `--port` with no window instead (see
+//! [`headless`]).
 
 mod cli;
+mod headless;
 mod wiring;
 
+use std::path::Path;
+use std::sync::Arc;
+
+use serialist_script::{ScriptOutcome, StdioUi};
+use serialist_sim::SimWorld;
 use serialist_ui::config;
 use serialist_ui::prelude::application;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::Command;
+use crate::cli::{Args, Command};
 
 fn main() {
     let args = match cli::parse(std::env::args().skip(1)) {
@@ -28,6 +36,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(script) = args.script.clone() {
+        std::process::exit(run_script(&args, &script));
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -73,4 +85,41 @@ fn main() {
             cx.quit();
         }
     });
+}
+
+/// `--script`: run the script headless and return the exit status. The script's output
+/// is stdout's alone: logs go to stderr, warnings and errors only unless `RUST_LOG`
+/// says otherwise.
+fn run_script(args: &Args, script: &Path) -> i32 {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .init();
+    let paths = config::paths_for(args.config_dir.clone());
+    let outcome = headless::run(
+        args,
+        script,
+        &paths,
+        wiring::Backend::real(),
+        SimWorld::new(),
+        Arc::new(StdioUi::new()),
+    );
+    match outcome {
+        Ok(outcome) => {
+            match &outcome {
+                ScriptOutcome::Ok => {}
+                ScriptOutcome::Error(message) => {
+                    eprintln!("serialist: the script failed: {message}")
+                }
+                ScriptOutcome::Stopped => eprintln!("serialist: the script was stopped"),
+            }
+            headless::exit_code(&outcome)
+        }
+        Err(error) => {
+            eprintln!("serialist: {error:#}");
+            2
+        }
+    }
 }

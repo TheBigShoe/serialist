@@ -16,7 +16,8 @@
 //!         {
 //!           "name": "Version",
 //!           "description": "Ask the device for its firmware version",
-//!           "payload": { "text": "AT+VER?" },       // or { "hex": "05 5A 02 00 15 0F" }
+//!           "payload": { "text": "AT+VER?" },       // or { "hex": "05 5A 02 00 15 0F" },
+//!                                                   // or { "script": "probe.lua" } to run it
 //!           "eol": "crlf",                          // none | cr | lf | crlf; else the session's
 //!           "expect": { "pattern": "^OK|^ERROR", "timeout_ms": 1000 },
 //!           "keybinding": "cmd-1"

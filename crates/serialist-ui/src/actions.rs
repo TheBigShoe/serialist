@@ -115,6 +115,38 @@ pub mod commands {
     }
 }
 
+/// The Script console's actions and [`scripts::Run`](Run).
+pub mod scripts {
+    use crate::prelude::*;
+
+    actions!(
+        scripts,
+        [
+            /// Run the Script console's input line as a script (`=expr` prints `expr`).
+            RunInline,
+            /// Stop the script running on the session; queued ones still run.
+            Stop,
+            /// Empty the Script console's output.
+            ClearConsole,
+            /// Open the scripts folder, first creating it with the example scripts if
+            /// it holds none.
+            OpenScriptsFolder,
+        ]
+    );
+
+    /// Run a script on the session, named by its path under the scripts folder (or an
+    /// absolute path). A keymap file binds one like this:
+    /// `["scripts::Run", { "path": "version_probe.lua" }]`. A script started while
+    /// another runs waits for it.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, JsonSchema, Action)]
+    #[action(namespace = scripts)]
+    #[serde(deny_unknown_fields)]
+    #[schemars(crate = "crate::prelude::schemars")]
+    pub struct Run {
+        pub path: String,
+    }
+}
+
 actions!(
     compose,
     [
@@ -138,6 +170,7 @@ pub mod context {
     /// the ones bound here.
     pub const TERMINAL_INLINE: &str = "TerminalInline";
     pub const TERMINAL_SEARCH: &str = "TerminalSearch";
+    pub const SCRIPT_CONSOLE: &str = "ScriptConsole";
 }
 
 /// The default chords tests press. The bundled keymap in `serialist-core` is where they
@@ -195,14 +228,52 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &OpenKeymap, cx| open_keymap(cx));
     cx.on_action(|_: &OpenThemesFolder, cx| open_themes_folder(cx));
     cx.on_action(|_: &ReloadConfig, cx| config::reload_all(cx));
-    cx.set_menus([Menu::new("Serialist").items([
-        MenuItem::action("Open Settings", OpenSettings),
-        MenuItem::action("Open Keymap", OpenKeymap),
-        MenuItem::action("Open Themes Folder", OpenThemesFolder),
-        MenuItem::action("Reload Configuration", ReloadConfig),
-        MenuItem::separator(),
-        MenuItem::action("Quit Serialist", Quit),
-    ])]);
+    cx.on_action(|_: &scripts::OpenScriptsFolder, cx| open_scripts_folder(cx));
+    set_menus(cx);
+}
+
+/// Most scripts the Scripts menu lists; the console lists them all.
+const MENU_SCRIPTS: usize = 40;
+
+/// The app menu, which is the palette: the Serialist menu, and a Scripts menu with a
+/// Run entry per script in the scripts folder. The configuration calls it again when
+/// the list of scripts changes.
+pub fn set_menus(cx: &mut App) {
+    let listed = cx
+        .try_global::<Config>()
+        .map(|config| config.scripts().clone())
+        .unwrap_or_default();
+    let mut script_items: Vec<MenuItem> = listed
+        .iter()
+        .take(MENU_SCRIPTS)
+        .map(|entry| {
+            MenuItem::action(
+                format!("Run {}", entry.relative),
+                scripts::Run {
+                    path: entry.relative.clone(),
+                },
+            )
+        })
+        .collect();
+    if !script_items.is_empty() {
+        script_items.push(MenuItem::separator());
+    }
+    script_items.extend([
+        MenuItem::action("Stop Script", scripts::Stop),
+        MenuItem::action("Clear Script Console", scripts::ClearConsole),
+        MenuItem::action("Open Scripts Folder", scripts::OpenScriptsFolder),
+    ]);
+    cx.set_menus([
+        Menu::new("Serialist").items([
+            MenuItem::action("Open Settings", OpenSettings),
+            MenuItem::action("Open Keymap", OpenKeymap),
+            MenuItem::action("Open Themes Folder", OpenThemesFolder),
+            MenuItem::action("Reload Configuration", ReloadConfig),
+            MenuItem::separator(),
+            MenuItem::action("Quit Serialist", Quit),
+        ]),
+        Menu::new("Scripts").items(script_items),
+    ]);
 }
 
 fn paths(cx: &App) -> Option<serialist_core::settings::ConfigPaths> {
@@ -230,6 +301,23 @@ pub fn open_keymap(cx: &mut App) {
     match paths.ensure_keymap_file() {
         Ok(_) => config::open_path(&paths.keymap, cx),
         Err(error) => report("keymap.json", error),
+    }
+}
+
+/// Create the scripts folder if needed, with the example scripts if it holds no script
+/// yet, then open it.
+pub fn open_scripts_folder(cx: &mut App) {
+    let Some(paths) = paths(cx) else { return };
+    match paths.ensure_example_scripts() {
+        Ok(written) => {
+            if !written.is_empty() {
+                tracing::info!(count = written.len(), "wrote the example scripts");
+                // The watcher would notice too; this makes the console show them now.
+                config::reload(config::ConfigPiece::Scripts, cx);
+            }
+            config::open_path(&paths.scripts_dir(), cx);
+        }
+        Err(error) => report("the scripts folder", error),
     }
 }
 
