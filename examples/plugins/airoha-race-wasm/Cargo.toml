@@ -1,0 +1,24 @@
+[package]
+name = "airoha-race-wasm"
+description = "The Airoha RACE codec as a Serialist WebAssembly plugin: the tier 2 reference, checked byte for byte against the Rust and Lua codecs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+# Build the component (the crate docs in src/lib.rs say more):
+#   cargo build -p airoha-race-wasm --target wasm32-wasip2 --profile wasm-plugin
+# The output is target/wasm32-wasip2/wasm-plugin/airoha_race_wasm.wasm, a component that
+# imports nothing but the world's `log`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serialist-plugin-sdk.workspace = true
+
+# On wasm32 the plugin is #![no_std]; the SDK's `rt` brings the allocator and the panic
+# handler. Natively it is an ordinary std crate, so its unit tests run with the rest.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serialist-plugin-sdk = { workspace = true, features = ["rt"] }
