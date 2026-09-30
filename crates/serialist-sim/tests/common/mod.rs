@@ -152,3 +152,24 @@ pub fn collect_until(
     }
     received
 }
+
+/// Wall-clock timing assertions are reliable on a developer machine but not on shared CI
+/// runners (a macOS runner has returned a 10 ms timeout after 63 ms). Until the link runs
+/// on a virtual clock, tests that assert real-time behaviour skip themselves under `CI`
+/// unless `SERIALIST_TIMING_TESTS` is set.
+pub fn wall_clock_timing_enabled() -> bool {
+    std::env::var_os("CI").is_none() || std::env::var_os("SERIALIST_TIMING_TESTS").is_some()
+}
+
+/// Return early from a wall-clock timing test on CI. See [`wall_clock_timing_enabled`].
+#[macro_export]
+macro_rules! skip_unless_wall_clock_timing {
+    () => {
+        if !$crate::common::wall_clock_timing_enabled() {
+            eprintln!(
+                "skipped: wall-clock timing test under CI (set SERIALIST_TIMING_TESTS=1 to run)"
+            );
+            return;
+        }
+    };
+}

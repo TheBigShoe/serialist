@@ -101,6 +101,7 @@ fn echo_round_trip() {
 
 #[test]
 fn idle_read_times_out_after_about_the_timeout() {
+    skip_unless_wall_clock_timing!();
     let (mut t, link) = VirtualLink::connect(Box::new(EchoDevice::new()), paced(115_200));
     let mut buf = [0u8; 64];
     for timeout_ms in [10u64, 50] {
@@ -119,6 +120,7 @@ fn idle_read_times_out_after_about_the_timeout() {
 
 #[test]
 fn idle_reader_loop_does_not_spin() {
+    skip_unless_wall_clock_timing!();
     let (mut t, link) = VirtualLink::connect(Box::new(EchoDevice::new()), paced(115_200));
     let mut buf = [0u8; 64];
     let started = Instant::now();
@@ -173,6 +175,7 @@ fn reads_never_exceed_max_chunk() {
 
 #[test]
 fn paced_rate_is_accurate_over_500ms_windows() {
+    skip_unless_wall_clock_timing!();
     // 1 Mbaud 8N1 = 100_000 bytes/s = 50_000 bytes per 500 ms window.
     let (mut t, _link) = VirtualLink::connect(firehose(16 * 1024), paced(1_000_000));
     let got = arrivals(&mut *t.reader, Duration::from_millis(1_650));
@@ -198,6 +201,7 @@ fn paced_rate_is_accurate_over_500ms_windows() {
 
 #[test]
 fn reconfigure_changes_the_rate_live() {
+    skip_unless_wall_clock_timing!();
     let (mut t, _link) = VirtualLink::connect(firehose(16 * 1024), paced(1_000_000));
     let fast = rate(&arrivals(&mut *t.reader, Duration::from_millis(500)));
     t.writer.reconfigure(&serial(500_000)).unwrap();
@@ -214,6 +218,7 @@ fn reconfigure_changes_the_rate_live() {
 
 #[test]
 fn one_callback_commits_at_most_one_lookahead_to_the_wire() {
+    skip_unless_wall_clock_timing!();
     // 9600 baud 8N1 = 960 bytes/s. The firehose hands the link 16 KiB (17 s of data)
     // per tick; only about PACED_LOOKAHEAD of it may be on the wire at a time.
     let (_t, link) = VirtualLink::connect(firehose(16 * 1024), paced(9_600));
