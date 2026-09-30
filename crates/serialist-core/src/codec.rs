@@ -46,7 +46,11 @@ use crate::text::Direction;
 ///
 /// Implementations must never panic on any input and must keep bounded memory whatever
 /// arrives (a codec that holds back partial frames caps how much it holds).
-pub trait Codec: Send {
+///
+/// Not `Send`: a codec may hold state bound to one thread (a Lua VM). It is made on the
+/// thread that uses it, by a [`CodecFactory`], which is `Send + Sync` and is what
+/// crosses threads (see [`CodecSink::from_factory`](crate::frames::CodecSink::from_factory)).
+pub trait Codec {
     /// Name, version, the frame kinds it produces and the commands it encodes.
     fn describe(&self) -> CodecInfo;
 
@@ -72,7 +76,8 @@ pub trait Codec: Send {
     fn reset(&mut self);
 }
 
-/// Makes codec instances. What the [`CodecRegistry`] holds.
+/// Makes codec instances. What the [`CodecRegistry`] holds. Call
+/// [`create`](Self::create) on the thread that will use the codec.
 pub trait CodecFactory: Send + Sync {
     /// The same description the codecs it makes return from [`Codec::describe`].
     fn info(&self) -> CodecInfo;

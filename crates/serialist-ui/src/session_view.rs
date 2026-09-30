@@ -326,7 +326,7 @@ impl SessionView {
         serial: SerialConfig,
         session: Box<dyn SessionHandle>,
         options: SessionOptions,
-        extra_sinks: Vec<Box<dyn ChunkSink>>,
+        extra_sinks: Vec<Box<dyn ChunkSink + Send>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -379,7 +379,7 @@ impl SessionView {
         let recording = RecordingSlot::default();
         let script_link = ScriptLinkParts::default();
         let (doorbell, rings) = async_channel::bounded::<()>(1);
-        let mut sinks: Vec<Box<dyn ChunkSink>> = vec![
+        let mut sinks: Vec<Box<dyn ChunkSink + Send>> = vec![
             Box::new(RecordingSink::new(recording.clone())),
             Box::new(script_link.sink()),
         ];

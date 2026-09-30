@@ -1,6 +1,32 @@
 //! Decoded frames: a bounded store the ingest thread fills and any thread reads, and the
 //! [`ChunkSink`] that runs a [`Codec`] on the ingest thread.
 //!
+//! A codec is not `Send` (a Lua codec holds a VM that must stay on one thread), so it is
+//! made on the thread that runs it: build the [`CodecSink`] inside
+//! [`Ingest::spawn_with`](crate::Ingest::spawn_with)'s closure, from a
+//! [`CodecFactory`] (which is `Send + Sync` and crosses threads freely).
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use serialist_core::{
+//!     ChunkSink, CodecFactory, CodecSink, FrameStore, Ingest, Session, Store,
+//! };
+//!
+//! fn start(session: &Session, factory: Arc<dyn CodecFactory>) {
+//!     let frames = FrameStore::default();
+//!     let decoded = frames.reader(); // for the Decoded panel
+//!     let ingest = Ingest::spawn_with(
+//!         session.events(),
+//!         Store::default(),
+//!         Box::new(move || -> Vec<Box<dyn ChunkSink>> {
+//!             vec![Box::new(CodecSink::from_factory(factory, frames, None))]
+//!         }),
+//!         Box::new(|| {}),
+//!     );
+//! #   let _ = (decoded, ingest);
+//! }
+//! ```
+//!
 //! # Threads
 //!
 //! [`FrameStore`] is the writer, owned by one thread (inside a [`CodecSink`], the ingest
@@ -45,7 +71,7 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 
-use crate::codec::{Codec, Frame, Severity};
+use crate::codec::{Codec, CodecFactory, Frame, Severity};
 use crate::ingest::ChunkSink;
 
 /// Frames a store keeps by default.
@@ -379,34 +405,49 @@ impl FrameSnapshot {
     }
 }
 
-/// Kind of the frame a [`CodecSink`] records when its codec panics.
-pub const CODEC_PANIC_KIND: &str = "codec_error";
+/// Kind of the frame a [`CodecSink`] records when its codec cannot be made or panics.
+pub const CODEC_ERROR_KIND: &str = "codec_error";
+
+/// The sink's codec, made on first use when it comes from a factory.
+enum Slot {
+    Pending(Arc<dyn CodecFactory>),
+    Ready(Box<dyn Codec>),
+    /// The codec could not be made, or panicked again while resetting: decoding stopped.
+    Broken,
+}
 
 /// Runs a codec over every received chunk on the ingest thread and records the frames.
 ///
-/// Give it to [`Ingest::spawn`](crate::Ingest::spawn) with the other sinks; the ingest
-/// thread is unchanged. Each chunk costs one `decode` call and, if frames came out, one
-/// publication and at most one wake. The codec is reset when the session disconnects,
-/// so a partial frame never joins bytes from a later connection.
+/// Build it where it runs, inside [`Ingest::spawn_with`](crate::Ingest::spawn_with)'s
+/// closure (see the module docs); a codec is not `Send`, so neither is the sink. Each
+/// chunk costs one `decode` call and, if frames came out, one publication and at most
+/// one wake. The codec is reset when the session disconnects, so a partial frame never
+/// joins bytes from a later connection.
 ///
-/// A codec that panics does not take the ingest thread with it: the chunk gets a
-/// [`CODEC_PANIC_KIND`] frame with `Severity::Error`, the codec is reset, and if the
-/// reset panics too, the sink stops decoding.
+/// Nothing a codec does takes the ingest thread with it. A factory that fails to make
+/// the codec gets a [`CODEC_ERROR_KIND`] frame (`Severity::Error`) over the first chunk,
+/// and the sink decodes nothing more. A codec that panics gets the same kind of frame
+/// over the chunk it panicked on and is reset; if the reset panics too, the sink stops
+/// decoding.
 pub struct CodecSink {
-    codec: Box<dyn Codec>,
+    codec: Slot,
     store: FrameStore,
     waker: Option<Box<dyn Fn() + Send>>,
     offset: u64,
     scratch: Vec<Frame>,
-    broken: bool,
 }
 
 impl fmt::Debug for CodecSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let codec = match &self.codec {
+            Slot::Pending(_) => "pending",
+            Slot::Ready(_) => "ready",
+            Slot::Broken => "broken",
+        };
         f.debug_struct("CodecSink")
+            .field("codec", &codec)
             .field("offset", &self.offset)
             .field("store", &self.store)
-            .field("broken", &self.broken)
             .finish_non_exhaustive()
     }
 }
@@ -420,13 +461,27 @@ impl CodecSink {
         store: FrameStore,
         waker: Option<Box<dyn Fn() + Send>>,
     ) -> Self {
+        Self::with_slot(Slot::Ready(codec), store, waker)
+    }
+
+    /// Decode with a codec `factory` makes on the first chunk, on the thread that runs
+    /// the sink, so the codec never crosses threads. Otherwise the same as
+    /// [`new`](Self::new).
+    pub fn from_factory(
+        factory: Arc<dyn CodecFactory>,
+        store: FrameStore,
+        waker: Option<Box<dyn Fn() + Send>>,
+    ) -> Self {
+        Self::with_slot(Slot::Pending(factory), store, waker)
+    }
+
+    fn with_slot(codec: Slot, store: FrameStore, waker: Option<Box<dyn Fn() + Send>>) -> Self {
         Self {
             codec,
             store,
             waker,
             offset: 0,
             scratch: Vec::new(),
-            broken: false,
         }
     }
 
@@ -459,14 +514,39 @@ impl CodecSink {
     }
 }
 
+fn error_frame(raw: Range<u64>, at: Instant, message: String, summary: String) -> Frame {
+    Frame::new(CODEC_ERROR_KIND, raw, at)
+        .with_field("error", message)
+        .with_severity(Severity::Error)
+        .with_summary(summary)
+}
+
 impl ChunkSink for CodecSink {
     fn on_chunk(&mut self, bytes: &[u8], at: Instant) {
         let offset = self.offset;
         self.offset += bytes.len() as u64;
-        if self.broken {
-            return;
+        if let Slot::Pending(factory) = &self.codec {
+            let failure = match catch_unwind(AssertUnwindSafe(|| factory.create())) {
+                Ok(Ok(codec)) => {
+                    self.codec = Slot::Ready(codec);
+                    None
+                }
+                Ok(Err(err)) => Some(err.to_string()),
+                Err(payload) => Some(panic_message(payload.as_ref())),
+            };
+            if let Some(message) = failure {
+                tracing::error!(%message, "the codec could not be made; decoding stops");
+                let summary = format!("the codec could not be made: {message}");
+                self.scratch
+                    .push(error_frame(offset..self.offset, at, message, summary));
+                self.codec = Slot::Broken;
+                self.record();
+                return;
+            }
         }
-        let codec = &mut self.codec;
+        let Slot::Ready(codec) = &mut self.codec else {
+            return;
+        };
         let scratch = &mut self.scratch;
         let decoded = catch_unwind(AssertUnwindSafe(|| {
             codec.decode(bytes, at, offset, scratch);
@@ -474,29 +554,28 @@ impl ChunkSink for CodecSink {
         if let Err(payload) = decoded {
             let message = panic_message(payload.as_ref());
             tracing::error!(%message, "a codec panicked while decoding");
-            self.scratch.push(
-                Frame::new(CODEC_PANIC_KIND, offset..self.offset, at)
-                    .with_field("error", message.clone())
-                    .with_severity(Severity::Error)
-                    .with_summary(format!("the codec panicked: {message}")),
-            );
-            let codec = &mut self.codec;
-            if catch_unwind(AssertUnwindSafe(|| codec.reset())).is_err() {
-                tracing::error!("the codec panicked again while resetting; decoding stops");
-                self.broken = true;
-            }
+            let summary = format!("the codec panicked: {message}");
+            self.scratch
+                .push(error_frame(offset..self.offset, at, message, summary));
+            self.reset_codec();
         }
         self.record();
     }
 
     fn on_disconnect(&mut self) {
-        if self.broken {
+        self.reset_codec();
+    }
+}
+
+impl CodecSink {
+    /// Reset a codec in use; one that panics doing so is dropped and decoding stops.
+    fn reset_codec(&mut self) {
+        let Slot::Ready(codec) = &mut self.codec else {
             return;
-        }
-        let codec = &mut self.codec;
+        };
         if catch_unwind(AssertUnwindSafe(|| codec.reset())).is_err() {
             tracing::error!("the codec panicked while resetting; decoding stops");
-            self.broken = true;
+            self.codec = Slot::Broken;
         }
     }
 }
@@ -684,7 +763,7 @@ mod tests {
         sink.on_chunk(b"ok", at);
         let snap = reader.snapshot();
         let kinds: Vec<_> = snap.frames().map(|(_, f)| f.kind.to_string()).collect();
-        assert_eq!(kinds, ["chunk", CODEC_PANIC_KIND, "chunk"]);
+        assert_eq!(kinds, ["chunk", CODEC_ERROR_KIND, "chunk"]);
         let error = snap.get(FrameId(1)).unwrap();
         assert_eq!(error.raw, 2..5);
         assert_eq!(error.severity, Severity::Error);
@@ -693,5 +772,88 @@ mod tests {
             Some("bad byte")
         );
         assert_eq!(resets.load(Ordering::Relaxed), 1);
+    }
+
+    /// Counts the codecs it makes, and the thread each was made on.
+    struct Counting {
+        made: Arc<AtomicUsize>,
+        threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+        fail: bool,
+    }
+
+    impl CodecFactory for Counting {
+        fn info(&self) -> CodecInfo {
+            CodecInfo::default()
+        }
+
+        fn create(&self) -> Result<Box<dyn Codec>, CodecError> {
+            if self.fail {
+                return Err(CodecError::Internal("no plugin today".into()));
+            }
+            self.made.fetch_add(1, Ordering::Relaxed);
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            Ok(Box::new(PerChunk {
+                resets: Arc::new(AtomicUsize::new(0)),
+                panic_on: None,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_factory_makes_the_codec_on_the_first_chunk_on_the_sink_thread() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: Arc<dyn CodecFactory> = Arc::new(Counting {
+            made: Arc::clone(&made),
+            threads: Arc::clone(&threads),
+            fail: false,
+        });
+        let store = FrameStore::default();
+        let reader = store.reader();
+        // Only the factory and the store cross to the thread; the codec is made there.
+        let sink_thread = std::thread::spawn(move || {
+            let mut sink = CodecSink::from_factory(factory, store, None).starting_at(10);
+            sink.on_disconnect();
+            sink.on_chunk(b"ab", Instant::now());
+            sink.on_chunk(b"c", Instant::now());
+            std::thread::current().id()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(made.load(Ordering::Relaxed), 1);
+        assert_eq!(*threads.lock().unwrap(), [sink_thread]);
+        let ranges: Vec<_> = reader
+            .snapshot()
+            .frames()
+            .map(|(_, f)| f.raw.clone())
+            .collect();
+        assert_eq!(ranges, [10..12, 12..13]);
+    }
+
+    #[test]
+    fn a_factory_that_fails_leaves_one_error_frame() {
+        let factory: Arc<dyn CodecFactory> = Arc::new(Counting {
+            made: Arc::new(AtomicUsize::new(0)),
+            threads: Arc::default(),
+            fail: true,
+        });
+        let mut sink = CodecSink::from_factory(factory, FrameStore::default(), None);
+        let reader = sink.reader();
+        sink.on_chunk(b"abc", Instant::now());
+        sink.on_chunk(b"def", Instant::now());
+        sink.on_disconnect();
+        let snap = reader.snapshot();
+        assert_eq!(snap.count(), 1);
+        let error = snap.get(FrameId(0)).unwrap();
+        assert_eq!(error.kind, CODEC_ERROR_KIND);
+        assert_eq!(error.raw, 0..3);
+        assert_eq!(
+            error.field("error").and_then(|v| v.as_str()),
+            Some("no plugin today")
+        );
+        assert_eq!(sink.offset(), 6);
     }
 }
