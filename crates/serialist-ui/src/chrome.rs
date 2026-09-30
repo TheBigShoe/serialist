@@ -1,6 +1,6 @@
 //! The pieces the window's chrome is built from, so every panel, toolbar and list shares
-//! one rhythm: an 8 px grid, 28 px rows and headers, 11 px uppercase labels in the
-//! theme's muted text, icon buttons that are ghost until pressed, and borders only where a
+//! one rhythm: an 8 px grid, 28 px rows and headers (40 px for a row with a second
+//! line), 11 px uppercase labels in the theme's muted text, icon buttons that are ghost until pressed, and borders only where a
 //! dock or a toolbar ends (the theme's `border`, which the bridge fills from Zed's
 //! `border.variant`).
 
@@ -8,6 +8,9 @@ use crate::prelude::*;
 
 /// The height of every list row: devices, commands, scripts, decoded frames.
 pub const ROW_HEIGHT: Pixels = px(28.);
+/// The height of a list row with a second, muted line under its title (a port and its
+/// details). Headers that sit among such rows keep [`ROW_HEIGHT`].
+pub const TWO_LINE_ROW_HEIGHT: Pixels = px(40.);
 /// The height of a panel header and of the session toolbar.
 pub const HEADER_HEIGHT: Pixels = px(28.);
 /// The height of the status bar.
