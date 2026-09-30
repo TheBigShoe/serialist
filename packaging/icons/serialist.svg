@@ -1,41 +1,83 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Serialist app icon. Original artwork, licensed like the rest of the project
+  Serialist app icon: Pulse S. Original artwork, licensed like the rest of the project
   (MIT OR Apache-2.0).
 
-  A terminal prompt chevron followed by a digital signal trace on a dark rounded
-  square. The square fills the whole 1024 canvas; render.sh insets it for each
-  platform (macOS wants roughly 10% transparent margin, Windows and Linux less).
+  A UART frame folded into the letter S and drawn as one scope trace. The idle line
+  comes in along the bottom, climbs through the start edge, runs back through the data
+  bits, climbs again and runs out as the stop bit into a hot beam spot at the top right.
+  The tail is dim because its phosphor has already faded. The turns are rounded, as a
+  real edge has a rise time; that also keeps it reading as an S rather than a 5. Mint
+  over cyan on deep navy, over a faint graticule. The glow is eight stacked strokes, so
+  the file needs no SVG filters, masks or patterns and renders the same everywhere.
+
+  The square fills the whole 1024 canvas; render.sh insets it for each platform (macOS
+  wants roughly 10% transparent margin, Windows and Linux less). The old chevron-and-
+  signal mark is classic.svg. How it was chosen: candidates/.
 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
   <title>Serialist</title>
   <defs>
-    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+    <radialGradient id="tile" gradientUnits="userSpaceOnUse" cx="512" cy="430" r="720">
       <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="0.55" stop-color="#111a2c"/>
       <stop offset="1" stop-color="#0a0f19"/>
+    </radialGradient>
+    <radialGradient id="grat" gradientUnits="userSpaceOnUse" cx="512" cy="512" r="470">
+      <stop offset="0" stop-color="#8fb4ff" stop-opacity="0.16"/>
+      <stop offset="0.7" stop-color="#8fb4ff" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#8fb4ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="trace" gradientUnits="userSpaceOnUse" x1="180" y1="0" x2="844" y2="0">
+      <stop offset="0" stop-color="#4cc9f0" stop-opacity="0"/>
+      <stop offset="0.3" stop-color="#4cc9f0"/>
+      <stop offset="0.75" stop-color="#5df0c6"/>
     </linearGradient>
-    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#5df0c6"/>
-      <stop offset="1" stop-color="#22c39c"/>
+    <linearGradient id="hot" gradientUnits="userSpaceOnUse" x1="180" y1="0" x2="844" y2="0">
+      <stop offset="0.2" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.6" stop-color="#eafff8" stop-opacity="0.85"/>
     </linearGradient>
-    <linearGradient id="signal" gradientUnits="userSpaceOnUse" x1="452" y1="0" x2="822" y2="0">
-      <stop offset="0" stop-color="#e6edf9"/>
-      <stop offset="1" stop-color="#e6edf9" stop-opacity="0.45"/>
-    </linearGradient>
+    <radialGradient id="spot" gradientUnits="userSpaceOnUse" cx="844" cy="292" r="150">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.18" stop-color="#d9fff3" stop-opacity="0.9"/>
+      <stop offset="0.45" stop-color="#5df0c6" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#5df0c6" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Blocky like a square wave, with rounded turns (a real edge has a rise time),
+         which is also what keeps it reading as an S rather than a 5. -->
+    <path id="s" d="M180 732H586A90 90 0 0 0 676 642V602A90 90 0 0 0 586 512H438A90 90 0 0 1 348 422V382A90 90 0 0 1 438 292H844"/>
+    <radialGradient id="sheen" gradientUnits="userSpaceOnUse" cx="512" cy="-120" r="760">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
   </defs>
 
-  <rect width="1024" height="1024" rx="230" ry="230" fill="url(#body)"/>
-  <rect x="3" y="3" width="1018" height="1018" rx="227" ry="227" fill="none"
-        stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#sheen)"/>
 
-  <g transform="translate(512 512) scale(1.12) translate(-524 -512)">
-  <!-- The prompt. -->
-  <path d="M 226 376 L 376 512 L 226 648" fill="none" stroke="url(#prompt)"
-        stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Graticule: 128 px divisions, minor ticks on the axes, faded toward the rim. -->
+  <path fill="none" stroke="url(#grat)" stroke-width="3" d="M128 64V960M256 64V960M384 64V960M512 64V960M640 64V960M768 64V960M896 64V960M64 128H960M64 256H960M64 384H960M64 512H960M64 640H960M64 768H960M64 896H960"/>
+  <path fill="none" stroke="url(#grat)" stroke-width="3" d="M64 500v24M96 500v24M160 500v24M192 500v24M224 500v24M288 500v24M320 500v24M352 500v24M416 500v24M448 500v24M480 500v24M544 500v24M576 500v24M608 500v24M672 500v24M704 500v24M736 500v24M800 500v24M832 500v24M864 500v24M928 500v24M960 500v24M500 64h24M500 96h24M500 160h24M500 192h24M500 224h24M500 288h24M500 320h24M500 352h24M500 416h24M500 448h24M500 480h24M500 544h24M500 576h24M500 608h24M500 672h24M500 704h24M500 736h24M500 800h24M500 832h24M500 864h24M500 928h24M500 960h24"/>
 
-  <!-- The line: a signal that idles low, pulses, and keeps going. -->
-  <path d="M 452 628 H 500 V 396 H 604 V 628 H 708 V 396 H 822" fill="none"
-        stroke="url(#signal)" stroke-width="52" stroke-linecap="round"
-        stroke-linejoin="round"/>
+  <g transform="translate(512 512) scale(1.06) translate(-512 -512)">
+  <!-- The trace: eight halo layers that fall off exponentially, the beam, its hot core. -->
+  <g fill="none" stroke="url(#trace)" stroke-linecap="round" stroke-linejoin="round">
+    <use xlink:href="#s" stroke-width="286" stroke-opacity="0.02"/>
+    <use xlink:href="#s" stroke-width="246" stroke-opacity="0.02"/>
+    <use xlink:href="#s" stroke-width="210" stroke-opacity="0.033"/>
+    <use xlink:href="#s" stroke-width="180" stroke-opacity="0.05"/>
+    <use xlink:href="#s" stroke-width="154" stroke-opacity="0.07"/>
+    <use xlink:href="#s" stroke-width="132" stroke-opacity="0.095"/>
+    <use xlink:href="#s" stroke-width="114" stroke-opacity="0.12"/>
+    <use xlink:href="#s" stroke-width="98" stroke-opacity="0.16"/>
+    <use xlink:href="#s" stroke-width="86"/>
+    <use xlink:href="#s" stroke="url(#hot)" stroke-width="24"/>
   </g>
+
+  <!-- Beam spot. -->
+  <circle cx="844" cy="292" r="150" fill="url(#spot)"/>
+
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
 </svg>
