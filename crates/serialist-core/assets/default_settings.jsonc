@@ -10,7 +10,8 @@
 {
   // ---- Buffer font: the terminal text ----
 
-  // Font family name. null uses the bundled monospace font.
+  // Font family name. null uses the platform's monospace font: Menlo on macOS, Cascadia
+  // Mono on Windows, DejaVu Sans Mono on Linux.
   "buffer_font_family": null,
   // Size in points.
   "buffer_font_size": 15.0,
@@ -26,6 +27,7 @@
 
   // ---- UI font: panels, tabs and the status line ----
 
+  // Font family name. null uses the system UI font.
   "ui_font_family": null,
   "ui_font_size": 16.0,
   "ui_font_weight": 400,
@@ -58,10 +60,11 @@
   "display": {
     // Timestamp gutter: "off" | "absolute" | "relative" | "delta".
     "timestamps": "off",
-    // strftime-style format for absolute timestamps.
+    // strftime-style format for absolute timestamps, in the gutter and in text exports.
     "timestamp_format": "%H:%M:%S%.3f",
     // How received bytes are shown: "text" | "hex" | "hex_ascii".
     "view": "text",
+    // Bytes per row in the hex views, 1 to 256.
     "hex_bytes_per_row": 16,
     // Render CR, LF and ESC as dim glyphs.
     "show_control_chars": false,
@@ -99,12 +102,28 @@
   },
 
   // ---- Device profiles ----
-  // The first profile whose "match" fits a port applies when it is connected.
-  // "match" keys, all optional: "vid" and "pid" (hex string such as "0x0e8d", or a
-  // number), "product", "manufacturer" and "serial_number" (case-insensitive
-  // substrings), "path" (exact port path or a prefix of it). A profile may set
-  // "baud", "data_bits", "parity", "stop_bits", "flow_control", "plugin", "eol",
-  // "on_connect" (a script path) and "name" (shown in the Devices panel).
+  // The first profile whose "match" fits a port applies when it is connected. A key a
+  // profile leaves out falls back to the global setting.
+  //
+  // "match" keys, all optional (a profile with none matches every port):
+  //   "vid", "pid"     USB ids: a hex string such as "0x0e8d", or a number.
+  //   "product", "manufacturer", "serial_number"
+  //                    case-insensitive substrings of the port's USB strings.
+  //   "path"           the port path exactly, or a prefix of it (there are no globs).
+  //
+  // A profile may set:
+  //   "name"           shown in the Devices panel in place of the USB product string.
+  //   "baud"           any positive integer. Without it: default_baud.
+  //   "data_bits"      5, 6, 7 or 8 ("five" to "eight" also work). Default 8.
+  //   "parity"         "none" | "odd" | "even" | "mark" | "space". Default "none".
+  //   "stop_bits"      1 or 2 ("one" and "two" also work). Default 1.
+  //   "flow_control"   "none" | "hardware" (RTS/CTS) | "software" (XON/XOFF). Default "none".
+  //   "eol"            what Enter appends for this device: "none" | "cr" | "lf" | "crlf".
+  //                    Without it: line_ending.
+  //   "plugin"         the codec plugin to activate for this device, by the name it
+  //                    describes, such as "airoha-race".
+  //   "on_connect"     a Lua script to run once the device has connected, as a path
+  //                    relative to the scripts folder.
   //
   // Example:
   //   { "match": { "vid": "0x0e8d", "product": "Airoha" },
