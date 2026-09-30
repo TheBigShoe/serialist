@@ -1238,7 +1238,8 @@ impl SessionView {
     /// What an export in `format` writes if taken now: the selected lines (or hex
     /// rows) if there is a selection, else what a paused view shows, else everything
     /// retained. Text follows the display: lines, or hex rows in hex view, stamped as
-    /// the gutter is. Raw is the stream bytes under the same choice, whole lines at a
+    /// the gutter is (absolute stamps in `display.timestamp_format`, which is read when
+    /// the job is taken). Raw is the stream bytes under the same choice, whole lines at a
     /// time; with no selection it ignores Clear, which hides lines, not bytes.
     pub fn export_job(&self, format: ExportFormat, cx: &App) -> ExportJob {
         let terminal = self.terminal.read(cx);
@@ -1257,17 +1258,23 @@ impl SessionView {
                 range.start.line..end
             });
         let lines = selected.clone().unwrap_or(span.range());
-        let timestamps = export_timestamps(terminal.timestamps());
+        // Stamped as the gutter is: the same mode and, for absolute stamps, the format
+        // the settings name.
+        let mut options =
+            TextOptions::default().with_timestamps(export_timestamps(terminal.timestamps()));
+        if let Some(config) = cx.try_global::<Config>() {
+            options = options.with_timestamp_format(config.timestamp_format());
+        }
         match (format, terminal.display_mode()) {
             (ExportFormat::Text, DisplayMode::Text) => ExportJob::Text {
                 snapshot,
                 lines,
-                options: TextOptions::default().with_timestamps(timestamps),
+                options,
             },
             (ExportFormat::Text, DisplayMode::Hex) => ExportJob::HexText {
                 hex: self.scrollback.hex.inner.clone(),
                 rows: lines,
-                timestamps,
+                options,
             },
             (ExportFormat::Raw, _) => {
                 let range = match (selected, self.pause) {
@@ -1537,7 +1544,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        FakeFeed, allow_engine_threads, displayed, fake_session, open_test_window, run_until,
+        FakeFeed, TestDir, allow_engine_threads, displayed, fake_session, open_test_window,
+        run_until,
     };
 
     fn open_session_view(
@@ -1814,5 +1822,98 @@ mod tests {
             panic!("a raw job");
         };
         assert_eq!(range, 0..14, "raw export still has the cleared bytes");
+    }
+
+    /// The lines of the file a text export job writes.
+    fn export_lines(
+        cx: &mut TestAppContext,
+        view: &Entity<SessionView>,
+        path: &std::path::Path,
+    ) -> (ExportJob, Vec<String>) {
+        let job = view.read_with(cx, |v, cx| v.export_job(ExportFormat::Text, cx));
+        job.run(path).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        (job, text.lines().map(str::to_owned).collect())
+    }
+
+    fn set_timestamps(cx: &mut TestAppContext, view: &Entity<SessionView>, mode: TimestampMode) {
+        view.update(cx, |v, cx| {
+            v.terminal().update(cx, |t, cx| t.set_timestamps(mode, cx));
+        });
+    }
+
+    fn install_format(cx: &mut TestAppContext, dir: &TestDir, format: &str) {
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{ "display": {{ "timestamp_format": "{format}" }} }}"#),
+        )
+        .unwrap();
+        let paths = serialist_core::settings::ConfigPaths::new(dir.path());
+        cx.update(|cx| crate::config::install(Config::load(paths, false), cx));
+    }
+
+    #[gpui_test]
+    fn an_absolute_stamped_export_uses_the_configured_format(cx: &mut TestAppContext) {
+        let dir = TestDir::new("export-format");
+        let (_window, view, feed) = open_session_view(cx);
+        feed.connected("virtual:echo");
+        feed.data(b"one\r\ntwo\r\n");
+        run_until(cx, "the lines", |cx| texts(cx, &view).len() == 3);
+        set_timestamps(cx, &view, TimestampMode::Absolute);
+        let pattern = |pattern: &str| regex::Regex::new(pattern).unwrap();
+
+        // With no configuration the stamps are the default format, the time of day.
+        let (job, lines) = export_lines(cx, &view, &dir.join("default.txt"));
+        assert!(matches!(job, ExportJob::Text { .. }));
+        let default = pattern(r"^\[\d\d:\d\d:\d\d\.\d{3}\] (Connected to virtual:echo|one|two)$");
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| default.is_match(line)), "{lines:?}");
+
+        // The configured format is what an absolute export is stamped with.
+        install_format(cx, &dir, "T%S%.3f");
+        let (job, lines) = export_lines(cx, &view, &dir.join("configured.txt"));
+        let ExportJob::Text { options, .. } = &job else {
+            panic!("a text job");
+        };
+        assert_eq!(options.timestamp_format.as_deref(), Some("T%S%.3f"));
+        let configured = pattern(r"^\[T\d\d\.\d{3}\] (Connected to virtual:echo|one|two)$");
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines.iter().all(|line| configured.is_match(line)),
+            "{lines:?}"
+        );
+
+        // Hex rows are stamped the same way.
+        view.update(cx, |v, cx| {
+            v.terminal()
+                .update(cx, |t, cx| t.set_display_mode(DisplayMode::Hex, cx));
+        });
+        let (job, rows) = export_lines(cx, &view, &dir.join("hex.txt"));
+        let ExportJob::HexText { options, .. } = &job else {
+            panic!("a hex job");
+        };
+        assert_eq!(options.timestamp_format.as_deref(), Some("T%S%.3f"));
+        let hex_row = pattern(r"^\[T\d\d\.\d{3}\] [0-9a-f]{8}  ");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| hex_row.is_match(row)), "{rows:?}");
+
+        // Other kinds of stamp do not use the format, and a changed format applies to
+        // the next export.
+        view.update(cx, |v, cx| {
+            v.terminal()
+                .update(cx, |t, cx| t.set_display_mode(DisplayMode::Text, cx));
+        });
+        set_timestamps(cx, &view, TimestampMode::Relative);
+        let (_, lines) = export_lines(cx, &view, &dir.join("relative.txt"));
+        let relative = pattern(r"^\[\+\d+\.\d{6}\] ");
+        assert!(
+            lines.iter().all(|line| relative.is_match(line)),
+            "{lines:?}"
+        );
+        install_format(cx, &dir, "%S");
+        set_timestamps(cx, &view, TimestampMode::Absolute);
+        let (_, lines) = export_lines(cx, &view, &dir.join("seconds.txt"));
+        let seconds = pattern(r"^\[\d\d\] ");
+        assert!(lines.iter().all(|line| seconds.is_match(line)), "{lines:?}");
     }
 }
