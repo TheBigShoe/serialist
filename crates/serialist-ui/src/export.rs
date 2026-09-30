@@ -5,7 +5,9 @@
 //! [`Snapshot::write_text_counted`], hex rows through the store's [`write_lines`] (the
 //! same stamps, the same counts), raw bytes straight from the store's pages with
 //! [`Snapshot::raw`]. What a text export wrote, lines and bytes, comes back as the
-//! store's [`TextExportReport`].
+//! store's [`TextExportReport`]. Both text jobs carry a full [`TextOptions`], so what
+//! stamps a line (the mode, and for absolute stamps the `strftime` format from
+//! `display.timestamp_format`) is decided when the job is taken, in the session view.
 //!
 //! Every export goes to a temporary file next to the target and is renamed into place
 //! only once fully written and synced, so a failed export never leaves a partial file
@@ -20,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serialist_core::store::write_lines;
-use serialist_core::{HexView, LineId, Snapshot, TextExportReport, TextOptions, Timestamps};
+use serialist_core::{HexView, LineId, Snapshot, TextExportReport, TextOptions};
 
 use crate::status::{file_name, format_bytes};
 
@@ -61,11 +63,12 @@ pub enum ExportJob {
         lines: Range<LineId>,
         options: TextOptions,
     },
-    /// Hex rows `rows` as displayed, stamped like text lines.
+    /// Hex rows `rows` as displayed, stamped like text lines: `options` are the same as
+    /// for [`ExportJob::Text`], so absolute stamps use the configured format.
     HexText {
         hex: HexView,
         rows: Range<LineId>,
-        timestamps: Timestamps,
+        options: TextOptions,
     },
     /// Stream bytes `range`, clipped to what the snapshot retains.
     Raw {
@@ -87,15 +90,10 @@ impl ExportJob {
                 snapshot.write_text_counted(lines.clone(), options.clone(), &mut out)
             })
             .map(|report| format!("Exported {} lines to {name}", report.lines)),
-            ExportJob::HexText {
-                hex,
-                rows,
-                timestamps,
-            } => {
-                let options = TextOptions::default().with_timestamps(*timestamps);
-                write_report(path, |out| write_lines(hex, rows.clone(), options, out))
-                    .map(|report| format!("Exported {} hex rows to {name}", report.lines))
-            }
+            ExportJob::HexText { hex, rows, options } => write_report(path, |out| {
+                write_lines(hex, rows.clone(), options.clone(), out)
+            })
+            .map(|report| format!("Exported {} hex rows to {name}", report.lines)),
             ExportJob::Raw { snapshot, range } => {
                 let evicted = evicted_bytes(snapshot, range);
                 export_raw(path, snapshot, range.clone()).map(|bytes| {
@@ -200,7 +198,7 @@ fn create_temp_sibling(path: &Path) -> io::Result<(PathBuf, File)> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use serialist_core::{Direction, Epoch, LineSource, Store, StoreConfig};
+    use serialist_core::{Direction, Epoch, LineSource, Store, StoreConfig, Timestamps};
 
     use super::*;
     use crate::test_support::TestDir;
@@ -286,7 +284,7 @@ mod tests {
         let job = ExportJob::HexText {
             hex: hex.clone(),
             rows: LineId(0)..LineId(2),
-            timestamps: Timestamps::None,
+            options: TextOptions::default(),
         };
         assert_eq!(job.run(&path), Ok("Exported 2 hex rows to dump.txt".into()));
         let expected = format!(
@@ -311,7 +309,7 @@ mod tests {
         let job = |timestamps| ExportJob::HexText {
             hex: hex.clone(),
             rows: LineId(0)..LineId(2),
-            timestamps,
+            options: TextOptions::default().with_timestamps(timestamps),
         };
         // Row 0 starts in the line that arrived at 1.5 s, row 1 in the one at 2 s.
         job(Timestamps::Relative).run(&path).unwrap();
@@ -324,6 +322,63 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             format!("[+0.000000] {first}\n[+0.500000] {second}\n")
         );
+    }
+
+    #[test]
+    fn absolute_stamps_use_the_format_the_job_carries() {
+        let dir = TestDir::new("export-format");
+        // A known wall clock, so the seconds can be checked in any time zone (offsets
+        // are whole minutes).
+        let epoch = Epoch {
+            instant: Instant::now(),
+            wall: std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000),
+        };
+        let snapshot = sample(epoch).snapshot();
+        let options = TextOptions::default()
+            .with_timestamps(Timestamps::Absolute)
+            .with_timestamp_format("%S%.3f");
+        let path = dir.join("stamped.txt");
+
+        let text = ExportJob::Text {
+            snapshot: snapshot.clone(),
+            lines: LineId(0)..LineId(4),
+            options: options.clone(),
+        };
+        text.run(&path).unwrap();
+        let second = snapshot.line(LineId(1)).unwrap().text;
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("[41.500] one\n[42.000] {second}\n[42.250] AT\n[43.000] par\n")
+        );
+
+        // The same options stamp hex rows.
+        let hex = snapshot.hex_view(16);
+        let rows = ExportJob::HexText {
+            hex: hex.clone(),
+            rows: LineId(0)..LineId(2),
+            options,
+        };
+        rows.run(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!(
+                "[41.500] {}\n[42.000] {}\n",
+                hex.line(LineId(0)).unwrap().text,
+                hex.line(LineId(1)).unwrap().text
+            )
+        );
+
+        // Without a format the default applies: the time of day.
+        let default = ExportJob::Text {
+            snapshot,
+            lines: LineId(0)..LineId(1),
+            options: TextOptions::default().with_timestamps(Timestamps::Absolute),
+        };
+        default.run(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let stamp = text.split(']').next().unwrap();
+        assert_eq!(stamp.len(), "[hh:mm:ss.mmm".len(), "{text}");
+        assert!(stamp.ends_with(":41.500"), "{text}");
     }
 
     #[test]

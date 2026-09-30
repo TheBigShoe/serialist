@@ -77,8 +77,26 @@
   "default_baud": 115200,
   // What Enter appends when sending: "none" | "cr" | "lf" | "crlf".
   "line_ending": "crlf",
-  // Show what you type in the scrollback.
+  // Show what you type in the scrollback. In inline mode the text appears as you type
+  // it, as a Tx line of its own (Backspace takes the last character back until Enter).
   "local_echo": false,
+
+  // ---- Inline interactive mode ----
+  // Inline mode sends every keystroke to the port as it is typed, like picocom.
+  "inline": {
+    // What Backspace sends: "del" (0x7f, what most terminals and Linux devices expect)
+    // or "bs" (0x08, what some bootloaders expect). Ctrl-Backspace sends the other one.
+    "backspace": "del",
+    // The keystroke that leaves inline mode instead of being sent, in GPUI's keystroke
+    // syntax: "ctrl-]", "ctrl-alt-x", "f12". Press it twice quickly to send it to the
+    // device. A key that types a character needs ctrl, alt or cmd with it.
+    "escape_chord": "ctrl-]",
+    // A paste is written in chunks of this many bytes (1 to 1048576)...
+    "paste_chunk_bytes": 64,
+    // ...this many milliseconds apart (0 to 10000), for bootloaders that drop bytes
+    // when they are sent too fast. 0 sends the chunks back to back.
+    "paste_chunk_delay_ms": 10
+  },
 
   // ---- Device profiles ----
   // The first profile whose "match" fits a port applies when it is connected.

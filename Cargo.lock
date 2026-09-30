@@ -6635,7 +6635,6 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "gpui-kit",
- "jsonc-parser",
  "parking_lot",
  "proptest",
  "regex",

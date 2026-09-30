@@ -1,6 +1,8 @@
 //! The configuration applied to the running app: real loaders from `serialist-core`
 //! over a temporary config directory, installed into headless windows.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -308,6 +310,52 @@ fn font_features_weight_and_fallbacks_reach_the_font(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui_test]
+fn a_format_only_change_redraws_the_terminal_at_once(cx: &mut TestAppContext) {
+    let (window, view) = open_terminal(cx);
+    view.update(cx, |t, cx| {
+        t.set_timestamps(serialist_core::TimestampMode::Absolute, cx)
+    });
+    let dir = ConfigDir::new("format-redraw")
+        .with_settings(r#"{ "display": { "timestamp_format": "%H:%M" } }"#);
+    load(cx, &dir);
+    draw(cx, window);
+
+    let redraws = Rc::new(Cell::new(0usize));
+    cx.update(|cx| {
+        let redraws = redraws.clone();
+        cx.observe(&view, move |_, _| redraws.set(redraws.get() + 1))
+            .detach();
+    });
+    let reload = |cx: &mut TestAppContext| {
+        cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+        cx.run_until_parked();
+    };
+
+    // Only the format changes: not the fonts, not the palette. The terminal repaints
+    // without waiting for a line to arrive.
+    dir.write_settings(r#"{ "display": { "timestamp_format": "%H:%M:%S%.6f" } }"#);
+    reload(cx);
+    assert_eq!(
+        cx.update(|cx| cx.global::<Config>().timestamp_format().to_owned()),
+        "%H:%M:%S%.6f"
+    );
+    assert_eq!(redraws.get(), 1, "one repaint for the new format");
+
+    // The same format again, or a reload about something else, repaints nothing.
+    reload(cx);
+    dir.write_settings(
+        r#"{ "default_baud": 9600, "display": { "timestamp_format": "%H:%M:%S%.6f" } }"#,
+    );
+    reload(cx);
+    assert_eq!(redraws.get(), 1, "an unchanged format does not repaint");
+
+    // Changing it back is a change again.
+    dir.write_settings(r#"{ "display": { "timestamp_format": "%H:%M" } }"#);
+    reload(cx);
+    assert_eq!(redraws.get(), 2);
+}
+
 // --- Themes ------------------------------------------------------------------------
 
 #[gpui_test]
@@ -551,6 +599,42 @@ fn a_broken_settings_file_keeps_the_last_good_settings_and_shows_why(cx: &mut Te
     dir.write_settings(r#"{ "buffer_font_size": 21 }"#);
     cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
     assert_eq!(workspace.read_with(cx, |w, cx| w.config_notice(cx)), None);
+}
+
+#[gpui_test]
+fn the_inline_settings_come_from_the_core_settings(cx: &mut TestAppContext) {
+    let (_window, _view) = open_terminal(cx);
+    let dir = ConfigDir::new("inline-settings").with_settings(
+        r#"{ "inline": { "backspace": "bs", "escape_chord": "ctrl-b",
+                         "paste_chunk_bytes": 8, "paste_chunk_delay_ms": 30 } }"#,
+    );
+    load(cx, &dir);
+    let loaded = config(cx);
+    assert!(loaded.problems().is_empty(), "{:?}", loaded.problems());
+    let inline = loaded.inline();
+    assert_eq!(inline.backspace, 0x08);
+    assert_eq!(inline.escape_chord, Keystroke::parse("ctrl-b").unwrap());
+    assert_eq!(inline.paste_chunk_bytes, 8);
+    assert_eq!(inline.paste_chunk_delay, Duration::from_millis(30));
+    assert_eq!(loaded.settings().inline.backspace.byte(), 0x08);
+
+    // A reload that drops the object goes back to the defaults; a bad value keeps the
+    // last good settings and says why, as for any other key.
+    dir.write_settings("{}");
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    assert_eq!(
+        cx.update(|cx| cx.global::<Config>().inline().backspace),
+        0x7f
+    );
+    dir.write_settings(r#"{ "inline": { "backspace": "0x20" } }"#);
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    let kept = config(cx);
+    assert_eq!(kept.inline().backspace, 0x7f, "the last good settings");
+    let notice = kept.notice().expect("the status line says why");
+    assert!(
+        notice.is_error && notice.text.contains("inline.backspace"),
+        "{notice:?}"
+    );
 }
 
 // --- Keymap ------------------------------------------------------------------------

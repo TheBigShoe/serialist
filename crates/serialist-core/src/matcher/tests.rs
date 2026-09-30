@@ -439,3 +439,165 @@ fn debug_output_names_the_state() {
     assert_eq!(expectation.pattern(), "^OK");
     assert_eq!(expectation.timeout(), Duration::from_secs(60));
 }
+
+#[test]
+fn a_match_reports_where_it_sits_in_the_line() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect(r"(\w+)=(\d+)(x)?");
+    // The arrow is three bytes, so byte ranges and character counts differ.
+    rig.feed("\u{2192} temp=41 ok\r\n".as_bytes());
+    let Some(ExpectResult::Matched {
+        text,
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "\u{2192} temp=41 ok");
+    assert_eq!(range, 4..11);
+    assert_eq!(&text[range], "temp=41");
+    assert_eq!(
+        capture_ranges,
+        [Some(4..11), Some(4..8), Some(9..11), None],
+        "the whole match, each group, and the group that sat out"
+    );
+    for (captured, range) in captures.iter().zip(&capture_ranges) {
+        assert_eq!(
+            captured.as_deref(),
+            range.clone().map(|range| &text[range]),
+            "each range slices out its capture"
+        );
+    }
+}
+
+#[test]
+fn the_first_match_in_the_line_is_the_one_reported() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect(r"\d+");
+    rig.feed(b"a 12 b 345\r\n");
+    let Some(ExpectResult::Matched {
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(range, 2..4);
+    assert_eq!(captures, [Some("12".to_owned())]);
+    assert_eq!(capture_ranges, [Some(2..4)]);
+}
+
+#[test]
+fn a_pattern_that_matches_nothing_in_particular_has_an_empty_range() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect("^");
+    rig.feed(b"anything\r\n");
+    let Some(ExpectResult::Matched {
+        text,
+        captures,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "anything");
+    assert_eq!(range, 0..0);
+    assert_eq!(captures, [Some(String::new())]);
+    assert_eq!(capture_ranges, [Some(0..0)]);
+}
+
+#[test]
+fn ranges_follow_the_smart_case_regex_and_the_decoded_text() {
+    let mut rig = Rig::new();
+    // No capital in the pattern, so it ignores case; the line's text is what the parser
+    // made of it, with the escape sequences gone, not the raw bytes.
+    let expectation = rig.expect("ready");
+    rig.feed(b"\x1b[32mSystem READY\x1b[0m\r\n");
+    let Some(ExpectResult::Matched {
+        text,
+        range,
+        capture_ranges,
+        ..
+    }) = expectation.try_wait()
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!(text, "System READY");
+    assert_eq!(range, 7..12);
+    assert_eq!(&text[range.clone()], "READY");
+    assert_eq!(capture_ranges, [Some(range)]);
+}
+
+impl Rig {
+    /// Text typed in line, as the ingest thread applies it.
+    fn type_inline(&mut self, text: &str) {
+        self.store.append_local_inline(text, Direction::Tx);
+        self.handle.advance(self.store.end(), Instant::now());
+    }
+
+    /// Typed text taken back, as the ingest thread applies it.
+    fn truncate(&mut self, chars: usize) {
+        if self.store.truncate_local_line(chars) > 0 {
+            self.handle.retreat(self.store.end(), Instant::now());
+        }
+    }
+}
+
+#[test]
+fn typing_does_not_interrupt_a_line_the_matchers_are_waiting_for() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect("^ok$");
+    rig.feed(b"o");
+    // A whole local line would end "o" here, unmatched. Typing leaves it alone.
+    rig.type_inline("x");
+    assert_eq!(expectation.try_wait(), None);
+    rig.feed(b"k\r\n");
+    let (line, text, _) = matched(expectation.try_wait());
+    assert_eq!((line, text.as_str()), (LineId(0), "ok"));
+}
+
+#[test]
+fn typed_lines_are_never_matched() {
+    let mut rig = Rig::new();
+    let expectation = rig.expect("ok");
+    rig.type_inline("ok\nok");
+    rig.feed(b"nothing\r\n");
+    rig.feed(b"nope\r\n");
+    assert_eq!(expectation.try_wait(), None);
+    rig.feed(b"ok\r\n");
+    // Only the received "ok" counts, though two typed lines say "ok" before it.
+    let (line, text, _) = matched(expectation.try_wait());
+    assert_eq!(text, "ok");
+    assert_eq!(
+        rig.store.snapshot().line(line).unwrap().direction,
+        Direction::Rx
+    );
+}
+
+#[test]
+fn an_expectation_registered_over_typed_text_that_is_taken_back_still_sees_the_next_line() {
+    let mut rig = Rig::new();
+    rig.type_inline("ab");
+    // Registered while the typed line has id 0, so it starts at line 1...
+    let expectation = rig.expect("^OK$");
+    // ...which is where the line that arrives next lands only if the typed one stays.
+    rig.truncate(2);
+    rig.feed(b"OK\r\n");
+    let (line, text, _) = matched(expectation.try_wait());
+    assert_eq!((line, text.as_str()), (LineId(0), "OK"));
+
+    // With the typed line kept, the reply is line 1 and counts all the same.
+    let mut rig = Rig::new();
+    rig.type_inline("ab");
+    let expectation = rig.expect("^OK$");
+    rig.feed(b"OK\r\n");
+    let (line, _, _) = matched(expectation.try_wait());
+    assert_eq!(line, LineId(1));
+}

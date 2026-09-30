@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2ab4a63ed236cb7f17e70630b1c9f37cf5f39897c72f305c3d79d882d3a17cda # shrinks to scenario = Scenario { bytes: [35, 61, 61, 90, 69, 35, 61, 54, 107, 32, 42, 44, 42, 107, 49, 121, 115, 107, 58, 61, 76, 42, 46], ops: [(1, Type("a"))], cuts: [22] }, max_line = 22

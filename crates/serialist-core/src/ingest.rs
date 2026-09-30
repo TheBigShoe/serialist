@@ -69,6 +69,15 @@
 //! before the session event the thread is about to handle, so a sent-command echo
 //! always lands before the reply it caused.
 //!
+//! # Typing in line
+//!
+//! [`IngestHandle::append_local_inline`] and [`IngestHandle::truncate_local_line`] echo
+//! what a user types, key by key, without ending the received line in progress. They
+//! are queued and ordered exactly like `append_local`, and the store's rules for them
+//! (which line the text goes to, where it sits among received lines, what ends it) are
+//! in the [`store`](crate::store) module docs under "Typing in line". A received line
+//! is never matched early or interrupted by them.
+//!
 //! # Matchers
 //!
 //! [`IngestHandle::matchers`] hands out a [`MatcherHandle`], through which any thread can
@@ -180,6 +189,10 @@ pub struct IngestStats {
 
 enum Command {
     Local(String, Direction, Instant),
+    /// Text typed in line; see [`Store::append_local_inline_at`].
+    LocalInline(String, Direction, Instant),
+    /// Characters taken back from the line typed in line.
+    TruncateLocal(usize),
     Stop,
 }
 
@@ -274,6 +287,29 @@ impl IngestHandle {
     ) -> Result<(), IngestStopped> {
         self.commands
             .send(Command::Local(text.into(), direction, Instant::now()))
+            .map_err(|_| IngestStopped)
+    }
+
+    /// Queue text typed in line, stamped now: it is appended to the local line being
+    /// typed (or starts one), and a `\n` in it ends that line. A received line in
+    /// progress is left alone and the typed text follows it. See [`Store::append_local_inline`]
+    /// for the rules; this is that call made on the ingest thread, in order with received
+    /// data and other local lines.
+    pub fn append_local_inline(
+        &self,
+        text: impl Into<String>,
+        direction: Direction,
+    ) -> Result<(), IngestStopped> {
+        self.commands
+            .send(Command::LocalInline(text.into(), direction, Instant::now()))
+            .map_err(|_| IngestStopped)
+    }
+
+    /// Queue taking back up to `chars` characters from the end of the line being typed in
+    /// line; a no-op if none is open. See [`Store::truncate_local_line`].
+    pub fn truncate_local_line(&self, chars: usize) -> Result<(), IngestStopped> {
+        self.commands
+            .send(Command::TruncateLocal(chars))
             .map_err(|_| IngestStopped)
     }
 
@@ -477,6 +513,19 @@ impl Worker {
             Command::Local(text, direction, at) => {
                 self.store.append_local_at(&text, direction, at);
                 self.local_lines_stored();
+                Flow::Continue
+            }
+            Command::LocalInline(text, direction, at) => {
+                self.store.append_local_inline_at(&text, direction, at);
+                self.local_lines_stored();
+                Flow::Continue
+            }
+            Command::TruncateLocal(chars) => {
+                if self.store.truncate_local_line(chars) > 0 {
+                    self.shared
+                        .matchers
+                        .retreat(self.store.end(), Instant::now());
+                }
                 Flow::Continue
             }
             Command::Stop => Flow::Stop,

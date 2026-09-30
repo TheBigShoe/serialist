@@ -27,7 +27,9 @@
 //!   and notices (`Tx` and `Notice` lines) are never matched, so `expect("AT")` is not
 //!   satisfied by your own echo. A line still waiting for its LF is not matched until it
 //!   ends; a line the parser ends early at its length cap is. A received line that a
-//!   local line interrupts is committed unmatched.
+//!   local line interrupts is committed unmatched. Text typed in line
+//!   ([`IngestHandle::append_local_inline`](crate::IngestHandle::append_local_inline))
+//!   does not interrupt: the line in progress carries on and is matched when it ends.
 //! - **Only lines appended after registration.** An expectation starts at the line the
 //!   ingest thread will store next; everything already stored, including a line that had
 //!   begun but not ended, is never matched. This is why the order is register, then send.
@@ -39,6 +41,11 @@
 //!   line), and a line can satisfy any number of expectations at once.
 //! - **Captures**: [`ExpectResult::Matched::captures`] is the regex's capture list, group
 //!   0 (the whole match) first, `None` for a group that did not take part.
+//! - **Where it matched**: [`ExpectResult::Matched::range`] is the byte range of the
+//!   whole match within [`text`](ExpectResult::Matched::text), and
+//!   [`capture_ranges`](ExpectResult::Matched::capture_ranges) the range of every group
+//!   in the same order as `captures`, so a highlight needs no second pass with the
+//!   pattern. The first match in the line is the one reported.
 //!
 //! # Timing
 //!
@@ -64,6 +71,7 @@
 //! needs an option to test the line in progress; it is not here yet.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -92,6 +100,12 @@ pub enum ExpectResult {
         text: String,
         /// The regex's captures, whole match first.
         captures: Vec<Option<String>>,
+        /// Where the whole match sits in `text`, in bytes. Empty for a pattern that
+        /// matched nothing in particular, such as `^` (then `text[range]` is `""`).
+        range: Range<usize>,
+        /// Where each capture sits in `text`, in the order of `captures` (the whole
+        /// match first, `None` for a group that did not take part).
+        capture_ranges: Vec<Option<Range<usize>>>,
         /// From registering the expectation to the chunk holding the line arriving.
         elapsed: Duration,
     },
@@ -248,12 +262,9 @@ impl MatcherHandle {
     /// lines it finished to the pending expectations, then expire the overdue ones.
     pub(crate) fn on_append(&self, store: &Store, report: &AppendReport, at: Instant) {
         let mut registry = self.core.registry.lock();
-        // The line in progress is the newest one and is not handed over until it ends.
-        let ended = if report.incomplete {
-            LineId(report.changed.end.0.saturating_sub(1))
-        } else {
-            report.changed.end
-        };
+        // The line in progress, and any local line typed after it, are not handed over
+        // until they are in the index: only lines before `committed_end` have ended.
+        let ended = report.committed_end;
         if !registry.entries.is_empty() && report.changed.start < ended {
             let snapshot = store.snapshot();
             let mut lines = Vec::new();
@@ -270,22 +281,25 @@ impl MatcherHandle {
                         // Too late to count. Reported as a timeout at the next expiry.
                         return true;
                     }
-                    if !entry.regex.is_match(&line.text) {
+                    let Some(caps) = entry.regex.captures(&line.text) else {
                         return true;
-                    }
-                    let captures = entry
-                        .regex
-                        .captures(&line.text)
-                        .map(|caps| {
-                            caps.iter()
-                                .map(|group| group.map(|m| m.as_str().to_owned()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    };
+                    let captures = caps
+                        .iter()
+                        .map(|group| group.map(|m| m.as_str().to_owned()))
+                        .collect();
+                    let capture_ranges: Vec<Option<Range<usize>>> =
+                        caps.iter().map(|group| group.map(|m| m.range())).collect();
                     slot.resolve(ExpectResult::Matched {
                         line: line.id,
                         text: line.text.clone(),
                         captures,
+                        range: capture_ranges
+                            .first()
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_default(),
+                        capture_ranges,
                         elapsed: at.saturating_duration_since(entry.registered),
                     });
                     false
@@ -301,6 +315,18 @@ impl MatcherHandle {
     pub(crate) fn advance(&self, end: LineId, now: Instant) {
         let mut registry = self.core.registry.lock();
         registry.end = registry.end.max(end);
+        registry.expire(now);
+    }
+
+    /// Local lines typed in line were taken back: the store's end moved down to `end`, so
+    /// lines that arrive from now on take ids from there. Expectations registered while
+    /// those lines existed would otherwise start too late and miss the next line.
+    pub(crate) fn retreat(&self, end: LineId, now: Instant) {
+        let mut registry = self.core.registry.lock();
+        registry.end = registry.end.min(end);
+        for entry in &mut registry.entries {
+            entry.start = entry.start.min(end);
+        }
         registry.expire(now);
     }
 

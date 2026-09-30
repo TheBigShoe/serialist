@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{RecvTimeoutError, unbounded};
 use serialist_core::{
-    ChunkSink, ConnectionInfo, Direction, Ingest, IngestHandle, LineId, LineSource, LinkState,
-    SerialConfig, Session, SessionConfig, Store, StoreConfig, StyledLine,
+    ChunkSink, ConnectionInfo, Direction, ExpectResult, Ingest, IngestHandle, LineId, LineSource,
+    LinkState, SerialConfig, Session, SessionConfig, Store, StoreConfig, StyledLine,
 };
 use serialist_sim::{
     FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier, LinkConfig, SimWorld,
@@ -320,4 +320,165 @@ fn an_unplugged_device_reports_its_error() {
     assert_eq!(last.direction, Direction::Notice);
     assert_eq!(last.text, format!("Disconnected: {error}"));
     drop(session);
+}
+
+/// Poll the newest snapshot until `done` accepts its lines.
+fn wait_for_lines(
+    handle: &IngestHandle,
+    what: &str,
+    done: impl Fn(&[(Direction, String, bool)]) -> bool,
+) -> Vec<(Direction, String, bool)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = handle.snapshot();
+        let mut all = Vec::new();
+        snap.lines(snap.first_line()..snap.end(), &mut all);
+        let shown: Vec<_> = all
+            .into_iter()
+            .map(|l| (l.direction, l.text, l.complete))
+            .collect();
+        if done(&shown) {
+            return shown;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {shown:?}"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn line(direction: Direction, text: &str, complete: bool) -> (Direction, String, bool) {
+    (direction, text.to_owned(), complete)
+}
+
+#[test]
+fn typed_text_is_echoed_key_by_key_around_the_devices_own_echo() {
+    // The raw echo device sends back exactly what it is sent, so the received line "hi"
+    // grows as the keys are typed, and the local echo is a line of its own beside it.
+    let world = SimWorld::new();
+    let id = virtual_port_id(SimWorld::ECHO);
+    let session =
+        Session::open(world.factory(), SessionConfig::new(id, serial(115_200))).expect("open");
+    let handle = Ingest::spawn(
+        session.events(),
+        Store::default(),
+        Vec::new(),
+        Box::new(|| {}),
+    );
+    wait_for_lines(&handle, "the connect notice", |l| l.len() == 1);
+    let expectation = handle
+        .matchers()
+        .expect("^hi$", Duration::from_secs(5))
+        .expect("a valid pattern");
+
+    // Typed and written, like the UI: the echo first, then the byte.
+    let type_key = |key: &str| {
+        handle
+            .append_local_inline(key, Direction::Tx)
+            .expect("ingest running");
+        session
+            .write(key.as_bytes().to_vec())
+            .expect("session open");
+    };
+    type_key("h");
+    let shown = wait_for_lines(&handle, "the device's echo of h", |l| l.len() == 3);
+    assert_eq!(
+        shown[1..],
+        [
+            line(Direction::Tx, "h", false),
+            line(Direction::Rx, "h", false)
+        ],
+        "the typed line was ended by the received byte that came after it"
+    );
+
+    // A received line in progress is not ended by typing: the typed text follows it.
+    type_key("i");
+    let shown = wait_for_lines(&handle, "the device's echo of i", |l| {
+        l.len() == 4 && l[2].1 == "hi"
+    });
+    assert_eq!(
+        shown[1..],
+        [
+            line(Direction::Tx, "h", false),
+            line(Direction::Rx, "hi", false),
+            line(Direction::Tx, "i", false),
+        ]
+    );
+
+    // Enter closes the typed line, and the device's CRLF ends the received one.
+    handle
+        .append_local_inline("\n", Direction::Tx)
+        .expect("ingest running");
+    session.write(b"\r\n".to_vec()).expect("session open");
+    let shown = wait_for_lines(&handle, "the line to end", |l| l[2].2);
+    assert_eq!(
+        shown[1..],
+        [
+            line(Direction::Tx, "h", false),
+            line(Direction::Rx, "hi", true),
+            line(Direction::Tx, "i", true),
+        ]
+    );
+    // The received line was matched whole, though typing went on beside it.
+    let ExpectResult::Matched {
+        line: matched,
+        text,
+        range,
+        ..
+    } = expectation
+        .wait_timeout(Duration::from_secs(5))
+        .expect("matched")
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!((matched, text.as_str(), range), (LineId(2), "hi", 0..2));
+
+    session.close();
+    let store = handle.join().expect("the ingest thread ran cleanly");
+    let last = lines(&store).pop().expect("lines");
+    assert_eq!(last.text, "Disconnected");
+}
+
+#[test]
+fn taking_typed_text_back_leaves_the_line_ids_expectations_wait_on_intact() {
+    let world = SimWorld::new();
+    let id = virtual_port_id(SimWorld::ECHO);
+    let session =
+        Session::open(world.factory(), SessionConfig::new(id, serial(115_200))).expect("open");
+    let handle = Ingest::spawn(
+        session.events(),
+        Store::default(),
+        Vec::new(),
+        Box::new(|| {}),
+    );
+    wait_for_lines(&handle, "the connect notice", |l| l.len() == 1);
+
+    handle
+        .append_local_inline("ab", Direction::Tx)
+        .expect("ingest running");
+    wait_for_lines(&handle, "the typed line", |l| l.len() == 2);
+    // Registered while the typed line exists, so it starts after it...
+    let expectation = handle
+        .matchers()
+        .expect("^OK$", Duration::from_secs(5))
+        .expect("a valid pattern");
+    // ...which is then taken back, so the reply takes its id, and still counts.
+    handle.truncate_local_line(5).expect("ingest running");
+    wait_for_lines(&handle, "the line to go", |l| l.len() == 1);
+    session.write(b"OK\r\n".to_vec()).expect("session open");
+    let ExpectResult::Matched {
+        line: matched,
+        text,
+        ..
+    } = expectation
+        .wait_timeout(Duration::from_secs(5))
+        .expect("matched")
+    else {
+        panic!("expected a match");
+    };
+    assert_eq!((matched, text.as_str()), (LineId(1), "OK"));
+
+    session.close();
+    handle.join().expect("the ingest thread ran cleanly");
 }
