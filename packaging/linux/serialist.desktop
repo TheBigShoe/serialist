@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Serialist
+GenericName=Serial Terminal
+Comment=A native, GPU-rendered serial terminal
+Exec=serialist
+Icon=serialist
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=serial;uart;tty;terminal;rs232;usb;baud;
+StartupNotify=true
+StartupWMClass=serialist
