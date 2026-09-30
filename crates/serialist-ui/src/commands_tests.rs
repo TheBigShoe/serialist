@@ -21,7 +21,7 @@ use crate::prelude::*;
 use crate::session_view::SessionView;
 use crate::test_support::{
     TestDir, allow_engine_threads, displayed, open_test_window, run_until, step, type_line,
-    wait_connected,
+    wait_connected, wait_for_lines,
 };
 use crate::workspace::{AppOptions, Workspace};
 
@@ -341,16 +341,23 @@ fn a_matched_reply_is_highlighted_and_timed(cx: &mut TestAppContext) {
     let status = workspace.read_with(cx, |w, cx| w.status_line(cx)).unwrap();
     assert_eq!(status.notice.map(|n| n.text), Some(text));
 
-    let shown = lines(cx, &view);
+    // The notice and the mark land when the expectation resolves; the echo and the
+    // marked line are in the view's snapshot only after its next wake, so wait for them.
+    let marks = view.read_with(cx, |v, cx| v.terminal().read(cx).marks().clone());
+    assert_eq!(marks.len(), 1);
+    let shown = wait_for_lines(cx, &view, "the echo and the marked reply", |lines| {
+        lines
+            .iter()
+            .any(|line| line.direction == Direction::Tx && line.text == "AT+VER?")
+            && lines.iter().any(|line| line.id == marks[0].line)
+    });
     assert!(
-        shown.contains(&(Direction::Tx, "AT+VER?".into())),
+        shown
+            .iter()
+            .any(|line| line.direction == Direction::Tx && line.text == "AT+VER?"),
         "echoed even with local echo off: {shown:?}"
     );
-    let (marks, source) = view.read_with(cx, |v, cx| {
-        let terminal = v.terminal().read(cx);
-        (terminal.marks().clone(), terminal.source().clone())
-    });
-    assert_eq!(marks.len(), 1);
+    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
     let marked = source.line(marks[0].line).expect("the marked line");
     assert_eq!(marked.direction, Direction::Rx);
     assert_eq!(marked.text, "+VER: 1.0.0");

@@ -1594,6 +1594,27 @@ mod tests {
             sent += chunk.len() as u64;
             feed.data(chunk.as_bytes());
         }
+        // Let the ingest thread take in the whole burst before the view looks at any of
+        // it, waiting in real time without running the view's tasks. However slowly it
+        // gets through them, nothing acknowledges its wake meanwhile, so the wake it
+        // rang for the first event is the only one: the count below does not depend on
+        // how the ingest thread and the test's frames happen to interleave.
+        let deadline = std::time::Instant::now() + crate::test_support::ENGINE_WAIT;
+        // (The wake rings when the batch it belongs to is done, so wait for that too.)
+        while view.read_with(cx, |v, _| {
+            v.ingest_stats()
+                .is_none_or(|s| s.chunks < 200 || s.wakes < 1)
+        }) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ingest thread never took in the burst"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.read_with(cx, |v, _| v.ingest_stats().unwrap().wakes),
+            1
+        );
         run_until(cx, "all 200 chunks shown", |cx| received(cx, &view) == sent);
 
         let lines = texts(cx, &view);
@@ -1738,6 +1759,13 @@ mod tests {
                 }
             );
             assert_eq!(view.status_line().state, "Connection lost");
+        });
+        // Ingest sets the link state before it stores the notice line, so the view can
+        // know the link is gone a wake before its snapshot has the notice.
+        run_until(cx, "the disconnect notice", |cx| {
+            texts(cx, &view).last().is_some_and(|(direction, text)| {
+                *direction == Direction::Notice && text == "Disconnected: device disconnected"
+            })
         });
         let lines = texts(cx, &view);
         assert_eq!(

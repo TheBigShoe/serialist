@@ -407,6 +407,58 @@ pub(crate) fn displayed(cx: &mut TestAppContext, view: &Entity<SessionView>) -> 
     })
 }
 
+/// Wait until the lines the session's terminal displays satisfy `done`, and return them.
+///
+/// What the terminal shows is the view's snapshot, which follows the ingest thread's
+/// publications on the next doorbell wake, a frame later at the earliest. A test that
+/// acts (types, sends, feeds bytes) and then reads the lines must wait for the state it
+/// is about to assert rather than assume the wake has happened: the wait here is on the
+/// condition, never on time, so it holds however slowly the ingest thread runs.
+pub(crate) fn wait_for_lines(
+    cx: &mut TestAppContext,
+    view: &Entity<SessionView>,
+    what: &str,
+    mut done: impl FnMut(&[StyledLine]) -> bool,
+) -> Vec<StyledLine> {
+    let deadline = Instant::now() + ENGINE_WAIT;
+    loop {
+        cx.run_until_parked();
+        let lines = displayed(cx, view);
+        if done(&lines) {
+            return lines;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {ENGINE_WAIT:?} waiting for {what}; the terminal shows {:?}",
+            lines
+                .iter()
+                .map(|line| (line.direction, line.text.as_str(), line.complete))
+                .collect::<Vec<_>>()
+        );
+        cx.executor().advance_clock(FRAME);
+    }
+}
+
+/// Wait until the view's snapshot holds at least `total` received bytes. For a line the
+/// device echoes in pieces, this is the wait that means "all of it has arrived", where a
+/// received line with the right text may still be missing its line ending.
+pub(crate) fn wait_for_received(cx: &mut TestAppContext, view: &Entity<SessionView>, total: u64) {
+    let mut seen = 0;
+    let deadline = Instant::now() + ENGINE_WAIT;
+    loop {
+        cx.run_until_parked();
+        seen = seen.max(view.read_with(cx, |v, _| v.snapshot().raw_range().end));
+        if seen >= total {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {ENGINE_WAIT:?} waiting for {total} received bytes; the view has {seen}"
+        );
+        cx.executor().advance_clock(FRAME);
+    }
+}
+
 /// A received line with exactly this text among the newest 1000 displayed.
 pub(crate) fn has_rx_line(cx: &mut TestAppContext, view: &Entity<SessionView>, text: &str) -> bool {
     view.read_with(cx, |v, cx| {

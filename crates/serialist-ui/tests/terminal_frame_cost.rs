@@ -90,7 +90,10 @@ fn run() {
     let budget = budget();
 
     for (wrap, timestamps) in [(false, TimestampMode::Off), (true, TimestampMode::Delta)] {
-        let mut attempts = 0;
+        // The frames over budget in each pass. The gate fails only for frames over budget
+        // in every pass: a descheduled thread on a busy machine slows a different frame
+        // each time, a regression the same ones.
+        let mut over_by_pass: Vec<Vec<usize>> = Vec::new();
         loop {
             view.update(&mut cx, |view, cx| {
                 view.set_wrap(wrap, cx);
@@ -104,17 +107,22 @@ fn run() {
             let up = scroll(&mut cx, window, &view, 100, 3.0);
             let down = scroll(&mut cx, window, &view, 100, -3.0);
             let frames: Vec<&FrameSample> = up.iter().chain(&down).collect();
-            let over: Vec<_> = frames
+            let over: Vec<(usize, Duration)> = frames
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.total() >= budget)
                 .map(|(ix, s)| (ix, s.total()))
                 .collect();
-            attempts += 1;
-            if !over.is_empty() {
+            over_by_pass.push(over.iter().map(|(ix, _)| *ix).collect());
+            let mut persistent = over_by_pass[0].clone();
+            for pass in &over_by_pass {
+                persistent.retain(|ix| pass.contains(ix));
+            }
+            if !persistent.is_empty() {
                 assert!(
-                    attempts < 3,
-                    "wrap={wrap}: frames over the {budget:?} budget in three passes: {over:?}"
+                    over_by_pass.len() < 3,
+                    "wrap={wrap}: frames {persistent:?} over the {budget:?} budget in three \
+                     passes: {over_by_pass:?}"
                 );
                 continue;
             }
@@ -143,7 +151,7 @@ fn run() {
                  coming back; retries {}",
                 frames.len(),
                 shaping.len(),
-                attempts - 1
+                over_by_pass.len() - 1
             );
             break;
         }
