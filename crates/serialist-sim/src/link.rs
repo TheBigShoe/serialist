@@ -521,8 +521,8 @@ impl VirtualLink {
 
     /// [`VirtualLink::connect`] on `clock`: the release schedule, latency, jitter, read
     /// timeouts, device ticks and unplug timing all run on its time. Pass a
-    /// [`ManualClock`](crate::ManualClock) to make a test's timing exact; the
-    /// [`Clock`] docs describe how to drive one.
+    /// [`ManualClock`](crate::ManualClock) to make a test's timing exact; its docs
+    /// describe how to drive one.
     pub fn connect_with_clock(
         device: Box<dyn SimDevice>,
         cfg: LinkConfig,
