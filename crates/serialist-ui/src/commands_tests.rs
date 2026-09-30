@@ -324,13 +324,30 @@ fn a_hex16_parameter_is_asked_for_encoded_and_remembered(cx: &mut TestAppContext
     assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
 }
 
-/// Click the dialog footer's button `id` and let the dialog finish what that starts.
+/// Click the dialog footer's button `id`, once it is at rest, and let the dialog finish
+/// what that starts.
+///
+/// A click is aimed at where the button was in the last frame, so it lands only if the
+/// button stays there until the mouse is released. Frames are driven on the test clock
+/// until two in a row put the button in the same place; only then is it clicked. (The
+/// test window reduces motion, so a dialog does not slide under the pointer; this is the
+/// check that nothing else moves the button either, and it fails by name, not by timeout,
+/// if something does.)
 fn click_dialog_button(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) {
-    cx.update_window(window, |_, window, cx| {
-        window.render_frame(cx);
-        window.click(id, cx);
-    })
-    .unwrap();
+    let mut last = None;
+    run_until(cx, &format!("the {id} button to hold still"), |cx| {
+        let now = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find(id).map(|button| button.bounds())
+            })
+            .unwrap();
+        let at_rest = now.is_some() && now == last;
+        last = now;
+        at_rest
+    });
+    cx.update_window(window, |_, window, cx| window.click(id, cx))
+        .unwrap();
     cx.run_until_parked();
 }
 
@@ -357,6 +374,7 @@ fn the_parameter_dialogs_buttons_send_or_dismiss(cx: &mut TestAppContext) {
     })
     .unwrap();
     click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    step(cx, 5);
     assert!(dialog_is_open(cx, window), "Send refuses a bad value");
     assert!(prompt.read_with(cx, |p, _| p.errors()[0].is_some()));
     assert!(received.lock().is_empty());
@@ -379,12 +397,15 @@ fn the_parameter_dialogs_buttons_send_or_dismiss(cx: &mut TestAppContext) {
     })
     .unwrap();
     click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    // The dialog closes as the click is handled (Confirm sends and closes in one go); the
+    // frame reaches the device later, through the engine's writer thread. Each is waited
+    // for on its own observable.
+    run_until(cx, "the dialog to close", |cx| !dialog_is_open(cx, window));
+    assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
     run_until(cx, "the frame at the device", |_| {
         received.lock().len() == 6
     });
     assert_eq!(*received.lock(), [0x05, 0x5A, 0x02, 0x00, 0x34, 0x12]);
-    run_until(cx, "the dialog to close", |cx| !dialog_is_open(cx, window));
-    assert!(workspace.read_with(cx, |w, _| w.param_prompt().is_none()));
 }
 
 #[gpui_test]
@@ -434,11 +455,13 @@ fn the_command_forms_save_button_writes_the_file_and_cancel_does_not(cx: &mut Te
     })
     .unwrap();
     click_dialog_button(cx, window, dialog_footer::OK_BUTTON);
+    run_until(cx, "the form to say what is wrong", |cx| {
+        editor.read_with(cx, |e, _| e.error().is_some())
+    });
     assert!(
         dialog_is_open(cx, window),
         "a bad value keeps the form open"
     );
-    assert!(editor.read_with(cx, |e, _| e.error().is_some()));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
 
     // Save writes the file and closes the form.
