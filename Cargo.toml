@@ -44,6 +44,11 @@ proptest = "1"
 criterion = "0.5"
 insta = "1"
 
+# Scripting (milestone 4): Lua 5.4 built from source, driven by a current-thread tokio
+# runtime on the script thread.
+mlua = { version = "0.12", features = ["lua54", "vendored", "async"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

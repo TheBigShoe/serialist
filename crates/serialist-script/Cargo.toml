@@ -1,6 +1,6 @@
 [package]
 name = "serialist-script"
-description = "Lua scripting host for Serialist (milestone 4)."
+description = "Lua scripting host for Serialist: scripts that drive a session without blocking the UI."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,12 @@ authors.workspace = true
 
 [dependencies]
 serialist-core.workspace = true
+mlua.workspace = true
+tokio.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serialist-sim.workspace = true
