@@ -16,7 +16,7 @@ Options:
   --virtual [NAME]    List the simulated devices next to the real ports; with a
                       NAME, also open virtual:<NAME> at startup in a tab of its
                       own. Repeatable. Built-ins: echo, echo-lines, at, firehose,
-                      firehose-ansi, race
+                      firehose-ansi, race, menu (a boot menu for VT mode)
                       Ports named with --port and --virtual open in the order
                       given, the first one in front; with none, the tabs open at
                       the last quit reopen (the restore_session setting)
