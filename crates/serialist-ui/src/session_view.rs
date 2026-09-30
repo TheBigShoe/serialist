@@ -1,203 +1,32 @@
-//! The session view: scrollback, follow-tail and the compose bar for one open port.
+//! The session view: scrollback, follow-tail, pause, export, recording and the compose
+//! bar for one open port.
 //!
-//! Milestone 0 renders the scrollback as a `uniform_list` of text rows. Milestone 1
-//! replaces it with the custom terminal element over the page store; the batching and
-//! follow-tail behaviour here carry over.
+//! This file is rendering and wiring only; what is shown lives in
+//! [`SessionModel`](crate::session_model::SessionModel). Milestone 0 renders the
+//! scrollback as a `uniform_list` of text rows; milestone 1 replaces it with the custom
+//! terminal element over the page store, and the batching, follow-tail, pause and
+//! capture behaviour carry over.
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use serialist_core::{PortId, SerialConfig, SessionEvent, SessionStats, TransportError};
+use serialist_core::{PortId, SerialConfig};
 
 use crate::actions::{JumpToBottom, context};
+use crate::capture::{Recorder, RecorderStats, RecordingSlot};
 use crate::compose::{ComposeBar, ComposeEvent};
 use crate::drain::drain_into;
-use crate::line_buffer::{LineBuffer, LineKind, LineSplitter, RxText};
+use crate::export::{ExportFormat, ExportJob};
+use crate::line_buffer::LineKind;
 use crate::prelude::*;
 use crate::session_handle::SessionHandle;
+use crate::session_model::{
+    DrainState, Notice, RecordingStatus, SessionModel, SessionUpdate, file_name, format_bytes,
+    prepare_updates,
+};
 
 const ROW_HEIGHT: Pixels = px(18.);
-
-/// A session event after the drain worker has turned received bytes into text; this,
-/// not [`SessionEvent`], is what reaches the main thread.
-#[derive(Debug)]
-pub enum SessionUpdate {
-    Connected {
-        description: String,
-    },
-    /// Every `Data` chunk between two other events, split into lines.
-    Received(RxText),
-    Disconnected {
-        error: Option<TransportError>,
-    },
-    WriteFailed(TransportError),
-}
-
-/// The drain worker's `prepare` step: runs of `Data` chunks go through the splitter
-/// together, and every other event keeps its place in the order.
-pub(crate) fn prepare_updates(
-    splitter: &mut LineSplitter,
-    events: Vec<SessionEvent>,
-) -> Vec<SessionUpdate> {
-    fn flush(
-        splitter: &mut LineSplitter,
-        chunks: &mut Vec<Arc<[u8]>>,
-        out: &mut Vec<SessionUpdate>,
-    ) {
-        if !chunks.is_empty() {
-            out.push(SessionUpdate::Received(
-                splitter.split(chunks.iter().map(|chunk| &chunk[..])),
-            ));
-            chunks.clear();
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut chunks = Vec::new();
-    for event in events {
-        let update = match event {
-            SessionEvent::Data { bytes, .. } => {
-                chunks.push(bytes);
-                continue;
-            }
-            SessionEvent::Connected { description } => SessionUpdate::Connected { description },
-            SessionEvent::Disconnected { error } => SessionUpdate::Disconnected { error },
-            SessionEvent::WriteFailed(error) => SessionUpdate::WriteFailed(error),
-        };
-        flush(splitter, &mut chunks, &mut out);
-        out.push(update);
-    }
-    flush(splitter, &mut chunks, &mut out);
-    out
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConnectionState {
-    /// Opened, waiting for the session's `Connected` event.
-    Connecting,
-    Connected,
-    Disconnected {
-        /// `None` after an orderly close.
-        error: Option<String>,
-    },
-}
-
-impl ConnectionState {
-    pub fn label(&self) -> &'static str {
-        match self {
-            ConnectionState::Connecting => "Connecting",
-            ConnectionState::Connected => "Connected",
-            ConnectionState::Disconnected { error: None } => "Disconnected",
-            ConnectionState::Disconnected { error: Some(_) } => "Connection lost",
-        }
-    }
-
-    pub fn is_disconnected(&self) -> bool {
-        matches!(self, ConnectionState::Disconnected { .. })
-    }
-}
-
-/// The text of the status line for one session, kept apart from rendering so tests can
-/// check what the user sees.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatusLine {
-    pub state: &'static str,
-    /// The transport's description, or the port and settings before it is known.
-    pub title: String,
-    /// The line settings, when the title does not already carry them.
-    pub settings: Option<String>,
-    pub rx: String,
-    pub tx: String,
-}
-
-/// Everything the view shows, without GPUI, so event handling tests as plain Rust.
-#[derive(Clone, Debug)]
-pub struct SessionModel {
-    pub port: PortId,
-    pub serial: SerialConfig,
-    /// The transport's own label, known once `Connected` arrives.
-    pub description: Option<String>,
-    pub state: ConnectionState,
-    pub stats: SessionStats,
-    pub buffer: LineBuffer,
-}
-
-impl SessionModel {
-    pub fn new(port: PortId, serial: SerialConfig) -> Self {
-        Self {
-            port,
-            serial,
-            description: None,
-            state: ConnectionState::Connecting,
-            stats: SessionStats::default(),
-            buffer: LineBuffer::default(),
-        }
-    }
-
-    /// What the status line names the session by.
-    pub fn title(&self) -> String {
-        self.description
-            .clone()
-            .unwrap_or_else(|| format!("{} @ {}", self.port, self.serial.summary()))
-    }
-
-    /// Apply one update. Returns whether anything visible changed.
-    pub fn apply(&mut self, update: SessionUpdate) -> bool {
-        match update {
-            SessionUpdate::Connected { description } => {
-                self.buffer
-                    .push_line(LineKind::Info, &format!("Connected to {description}"));
-                self.description = Some(description);
-                self.state = ConnectionState::Connected;
-            }
-            SessionUpdate::Received(rx) => return self.buffer.apply_rx(rx),
-            SessionUpdate::Disconnected { error: None } if self.state.is_disconnected() => {
-                // `close()` reports an orderly disconnect after we already showed one
-                // (local disconnect, or a lost device we then closed).
-                return false;
-            }
-            SessionUpdate::Disconnected { error } => {
-                let error = error.map(|e| e.to_string());
-                match &error {
-                    Some(error) => self
-                        .buffer
-                        .push_line(LineKind::Error, &format!("Disconnected: {error}")),
-                    None => self.buffer.push_line(LineKind::Info, "Disconnected"),
-                }
-                self.state = ConnectionState::Disconnected { error };
-            }
-            SessionUpdate::WriteFailed(error) => {
-                self.buffer
-                    .push_line(LineKind::Error, &format!("Write failed: {error}"));
-            }
-        }
-        true
-    }
-
-    /// The status line's text for this session.
-    pub fn status_line(&self) -> StatusLine {
-        let title = self.title();
-        let settings = self.serial.summary();
-        StatusLine {
-            state: self.state.label(),
-            // Serial transports already put the line settings in their description.
-            settings: (!title.contains(&settings)).then_some(settings),
-            title,
-            rx: format!("RX {}", format_bytes(self.stats.rx_bytes)),
-            tx: format!("TX {}", format_bytes(self.stats.tx_bytes)),
-        }
-    }
-
-    /// The user asked to disconnect. Returns false if already disconnected.
-    pub fn disconnect_locally(&mut self) -> bool {
-        if self.state.is_disconnected() {
-            return false;
-        }
-        self.buffer.push_line(LineKind::Info, "Disconnected");
-        self.state = ConnectionState::Disconnected { error: None };
-        true
-    }
-}
 
 /// Whether to keep following new output after a wheel event. Scrolling up always
 /// detaches; scrolling down re-attaches once the list sits at its end; a list too short
@@ -211,25 +40,24 @@ pub(crate) fn follow_after_scroll(following: bool, delta_y: f32, at_end: Option<
     }
 }
 
-/// Byte counts for the status line: exact below 1 KiB, one decimal above.
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
+/// Where the save dialog starts.
+fn default_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub struct SessionView {
     model: SessionModel,
     /// `None` once disconnected; the scrollback stays readable.
     session: Option<Box<dyn SessionHandle>>,
+    /// Shared with the drain worker, which writes the active recording.
+    recording: RecordingSlot,
+    next_recording_id: u64,
+    /// Recorded bytes last shown, so idle wakes repaint only when it moves.
+    last_recorded: Option<u64>,
     compose: Entity<ComposeBar>,
     scroll: UniformListScrollHandle,
     follow_tail: bool,
@@ -257,16 +85,30 @@ impl SessionView {
             cx.subscribe_in(&compose, window, |this, _, event, _, cx| match event {
                 ComposeEvent::Submit { text, bytes } => this.send(text, bytes.clone(), cx),
             });
-        // Joining the session's threads can take a read timeout's worth of time, so a
-        // dropped view hands the session to the background executor to close.
+        // Joining the session's threads can take a read timeout's worth of time, and a
+        // recording needs its final flush, so a dropped view hands both to the
+        // background executor.
         let release = cx.on_release(|this, cx| {
             if let Some(session) = this.session.take() {
                 cx.background_spawn(async move { session.close() }).detach();
             }
+            if let Some(status) = this.model.recording.take() {
+                let slot = this.recording.clone();
+                cx.background_spawn(async move {
+                    if let Some(recorder) = slot.take(status.id) {
+                        let _ = recorder.finish();
+                    }
+                })
+                .detach();
+            }
         });
+        let recording = RecordingSlot::default();
         let drain = drain_into(
             session.events(),
-            LineSplitter::default(),
+            DrainState {
+                recording: recording.clone(),
+                ..DrainState::default()
+            },
             prepare_updates,
             cx,
             |this: &mut Self, updates, cx| this.apply_updates(updates, cx),
@@ -275,6 +117,9 @@ impl SessionView {
         Self {
             model: SessionModel::new(port, serial),
             session: Some(session),
+            recording,
+            next_recording_id: 0,
+            last_recorded: None,
             compose,
             scroll: UniformListScrollHandle::new(),
             follow_tail: true,
@@ -286,6 +131,11 @@ impl SessionView {
 
     pub fn model(&self) -> &SessionModel {
         &self.model
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_mut(&mut self) -> &mut SessionModel {
+        &mut self.model
     }
 
     pub fn compose(&self) -> &Entity<ComposeBar> {
@@ -315,6 +165,17 @@ impl SessionView {
             changed |= self.model.apply(update);
         }
         changed |= self.refresh_stats();
+        // The recording's byte count moves on the drain worker; repaint when it does.
+        let recorded = self
+            .model
+            .recording
+            .as_ref()
+            .and_then(|status| status.stats.as_ref())
+            .map(|stats| stats.bytes());
+        if recorded != self.last_recorded {
+            self.last_recorded = recorded;
+            changed = true;
+        }
         if lost {
             self.close_session(cx);
         }
@@ -339,7 +200,8 @@ impl SessionView {
     }
 
     fn after_append(&self) {
-        if self.follow_tail {
+        // Paused rows never move, so there is nothing new to follow.
+        if self.follow_tail && !self.model.is_paused() {
             self.scroll.scroll_to_bottom();
         }
     }
@@ -362,7 +224,7 @@ impl SessionView {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
-        self.model.buffer.clear();
+        self.model.clear();
         self.follow_tail = true;
         cx.notify();
     }
@@ -376,6 +238,7 @@ impl SessionView {
     }
 
     fn close_session(&mut self, cx: &mut Context<Self>) {
+        self.stop_recording(cx);
         if let Some(session) = self.session.take() {
             self.model.stats = session.stats();
             cx.background_spawn(async move { session.close() }).detach();
@@ -390,6 +253,227 @@ impl SessionView {
 
     fn jump_to_bottom_action(&mut self, _: &JumpToBottom, _: &mut Window, cx: &mut Context<Self>) {
         self.jump_to_bottom(cx);
+    }
+
+    pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        if self.model.is_paused() {
+            self.resume(cx);
+        } else {
+            self.pause(cx);
+        }
+    }
+
+    /// Pin what is on screen. The session, the drain and the live buffer carry on.
+    pub fn pause(&mut self, cx: &mut Context<Self>) {
+        if self.model.pause() {
+            cx.notify();
+        }
+    }
+
+    /// Show the live buffer again, following its tail.
+    pub fn resume(&mut self, cx: &mut Context<Self>) {
+        if self.model.resume() {
+            self.jump_to_bottom(cx);
+        }
+    }
+
+    fn file_stem(&self) -> String {
+        let port: String = self
+            .model
+            .port
+            .as_str()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        format!("serialist-{}", port.trim_matches('-'))
+    }
+
+    /// Ask for a file name with the platform's save dialog, then call `then` with it.
+    fn prompt_for_path(
+        &mut self,
+        suggested_name: String,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, PathBuf, &mut Context<Self>) + 'static,
+    ) {
+        let answer = cx.prompt_for_new_path(&default_directory(), Some(&suggested_name));
+        cx.spawn(async move |this, cx| {
+            let outcome = match answer.await {
+                Ok(Ok(Some(path))) => Ok(path),
+                // Cancelled, or the dialog went away.
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(error)) => Err(error),
+            };
+            this.update(cx, |view, cx| {
+                match outcome {
+                    Ok(path) => then(view, path, cx),
+                    Err(error) => {
+                        view.model.notice = Some(Notice::error(format!(
+                            "Could not open the save dialog: {error}"
+                        )));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Ask where to export, then export. The file's extension picks the format;
+    /// `preferred` is the suggestion and the fallback for unknown extensions.
+    pub fn export(&mut self, preferred: ExportFormat, cx: &mut Context<Self>) {
+        let suggested = format!("{}.{}", self.file_stem(), preferred.extension());
+        self.prompt_for_path(suggested, cx, move |view, path, cx| {
+            let format = ExportFormat::from_path(&path).unwrap_or(preferred);
+            view.export_to(path, format, cx).detach();
+        });
+    }
+
+    /// Export to `path`: the displayed rows as text (the pinned rows when paused), or the
+    /// raw capture. The content is taken now; the file is written in the background, and
+    /// the outcome lands in the status line.
+    pub fn export_to(
+        &mut self,
+        path: PathBuf,
+        format: ExportFormat,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let job = match format {
+            ExportFormat::Text => ExportJob::Text(self.model.displayed_text()),
+            ExportFormat::Raw => ExportJob::Raw {
+                chunks: self.model.raw.snapshot(),
+                evicted: self.model.raw.evicted_bytes(),
+            },
+        };
+        cx.spawn(async move |this, cx| {
+            let outcome = cx.background_spawn(async move { job.run(&path) }).await;
+            this.update(cx, |view, cx| {
+                view.model.notice = Some(match outcome {
+                    Ok(summary) => Notice::info(summary),
+                    Err(error) => Notice::error(error),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    /// Stop the recording, or ask for a file and start one.
+    pub fn toggle_record(&mut self, cx: &mut Context<Self>) {
+        match &self.model.recording {
+            Some(status) if status.stats.is_some() => self.stop_recording(cx),
+            // Still opening the file; the next press stops it.
+            Some(_) => {}
+            None if self.session.is_none() => {
+                self.model.notice = Some(Notice::error("Not connected; nothing to record"));
+                cx.notify();
+            }
+            None => {
+                let suggested = format!("{}-recording.bin", self.file_stem());
+                self.prompt_for_path(suggested, cx, |view, path, cx| {
+                    view.start_recording(path, cx);
+                });
+            }
+        }
+    }
+
+    /// Append every received chunk to `path` from now on, until stopped, disconnected
+    /// or closed. The file is opened on the background executor.
+    pub fn start_recording(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.model.recording.is_some() || self.session.is_none() {
+            return;
+        }
+        self.next_recording_id += 1;
+        let id = self.next_recording_id;
+        self.model.recording = Some(RecordingStatus {
+            id,
+            path: path.clone(),
+            stats: None,
+        });
+        let slot = self.recording.clone();
+        let name = file_name(&path);
+        cx.spawn(async move |this, cx| {
+            let opened = cx
+                .background_spawn(async move {
+                    let recorder = Recorder::create(&path).map_err(|error| error.to_string())?;
+                    let stats = recorder.stats();
+                    if let Some(displaced) = slot.install(id, recorder) {
+                        let _ = displaced.finish();
+                    }
+                    Ok(stats)
+                })
+                .await;
+            this.update(cx, |view, cx| view.recording_opened(id, name, opened, cx))
+                .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn recording_opened(
+        &mut self,
+        id: u64,
+        name: String,
+        opened: Result<Arc<RecorderStats>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_current = self.model.recording.as_ref().is_some_and(|s| s.id == id);
+        match opened {
+            Ok(stats) if is_current => {
+                if let Some(status) = &mut self.model.recording {
+                    status.stats = Some(stats);
+                }
+                // The session may have ended while the file was opening.
+                if self.session.is_none() {
+                    self.stop_recording(cx);
+                }
+            }
+            // Stopped while opening: close the file that was just installed.
+            Ok(_) => self.finish_recording(id, name, cx),
+            Err(error) => {
+                if is_current {
+                    self.model.recording = None;
+                }
+                self.model.notice = Some(Notice::error(format!(
+                    "Could not record to {name}: {error}"
+                )));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stop recording with a final flush. Safe to call when not recording.
+    pub fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(status) = self.model.recording.take() else {
+            return;
+        };
+        // Still opening: `recording_opened` sees the status gone and closes the file.
+        if status.stats.is_some() {
+            self.finish_recording(status.id, status.file_name(), cx);
+        }
+        cx.notify();
+    }
+
+    fn finish_recording(&mut self, id: u64, name: String, cx: &mut Context<Self>) {
+        let slot = self.recording.clone();
+        cx.spawn(async move |this, cx| {
+            let finished = cx
+                .background_spawn(async move { slot.take(id).map(Recorder::finish) })
+                .await;
+            let notice = match finished {
+                Some(Ok(bytes)) => {
+                    Notice::info(format!("Recorded {} to {name}", format_bytes(bytes)))
+                }
+                Some(Err(error)) => Notice::error(format!("Recording to {name} failed: {error}")),
+                None => return,
+            };
+            this.update(cx, |view, cx| {
+                view.model.notice = Some(notice);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn on_scroll_wheel(
@@ -410,7 +494,7 @@ impl SessionView {
     fn render_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<Div> {
         let theme = cx.theme();
         range
-            .filter_map(|ix| self.model.buffer.row(ix))
+            .filter_map(|ix| self.model.displayed_row(ix))
             .map(|row| {
                 let color = match row.kind {
                     LineKind::Rx => theme.foreground,
@@ -428,14 +512,75 @@ impl SessionView {
             })
             .collect()
     }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let paused = self.model.is_paused();
+        let recording = self.model.recording.is_some();
+        h_flex()
+            .flex_none()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("pause")
+                    .label(if paused { "Resume" } else { "Pause" })
+                    .tooltip("Freeze the view while data keeps arriving")
+                    .small()
+                    .ghost()
+                    .toggled(paused)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))),
+            )
+            .child(
+                Button::new("export-text")
+                    .label("Export…")
+                    .tooltip("Save the displayed lines (.txt) or the raw capture (.bin)")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Text, cx))),
+            )
+            .child(
+                Button::new("export-raw")
+                    .label("Export raw…")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.export(ExportFormat::Raw, cx))),
+            )
+            .child(
+                Button::new("record")
+                    .label(if recording {
+                        "Stop recording"
+                    } else {
+                        "Record…"
+                    })
+                    .tooltip("Append every received byte to a file")
+                    .small()
+                    .ghost()
+                    .toggled(recording)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_record(cx))),
+            )
+            .when(paused, |bar| {
+                bar.child(
+                    div()
+                        .ml_auto()
+                        .text_xs()
+                        .text_color(theme.warning)
+                        .child("Paused: showing a snapshot, still receiving"),
+                )
+            })
+    }
 }
 
 impl Render for SessionView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let toolbar = self.render_toolbar(cx);
         let theme = cx.theme();
         let scrollback = uniform_list(
             "scrollback",
-            self.model.buffer.len(),
+            self.model.displayed_len(),
             cx.processor(|this, range: Range<usize>, _window, cx| this.render_rows(range, cx)),
         )
         .track_scroll(&self.scroll)
@@ -452,6 +597,7 @@ impl Render for SessionView {
             .on_action(cx.listener(Self::jump_to_bottom_action))
             .size_full()
             .bg(theme.background)
+            .child(toolbar)
             .child(
                 div()
                     .id("scrollback-area")
@@ -483,130 +629,20 @@ impl Render for SessionView {
 mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
-    use std::time::Instant;
+
+    use serialist_core::TransportError;
 
     use super::*;
     use crate::drain::FRAME;
+    use crate::session_model::ConnectionState;
     use crate::test_support::{fake_session, open_test_window};
 
-    fn rows(model: &SessionModel) -> Vec<(LineKind, String)> {
-        model
+    fn rows(view: &SessionView) -> Vec<(LineKind, String)> {
+        view.model()
             .buffer
             .rows()
             .map(|r| (r.kind, r.text.to_owned()))
             .collect()
-    }
-
-    fn data(bytes: &[u8]) -> SessionEvent {
-        SessionEvent::Data {
-            bytes: Arc::from(bytes),
-            received_at: Instant::now(),
-        }
-    }
-
-    /// Run events through the worker step and the model, as the drain loop does.
-    fn apply(
-        model: &mut SessionModel,
-        splitter: &mut LineSplitter,
-        events: Vec<SessionEvent>,
-    ) -> bool {
-        prepare_updates(splitter, events)
-            .into_iter()
-            .fold(false, |changed, update| model.apply(update) | changed)
-    }
-
-    #[test]
-    fn prepare_merges_data_runs_and_keeps_event_order() {
-        let mut splitter = LineSplitter::default();
-        let updates = prepare_updates(
-            &mut splitter,
-            vec![
-                SessionEvent::Connected {
-                    description: "d".into(),
-                },
-                data(b"a\nb"),
-                data(b"c\n"),
-                SessionEvent::WriteFailed(TransportError::Disconnected),
-                data(b"tail"),
-            ],
-        );
-        let summary: Vec<String> = updates
-            .iter()
-            .map(|u| match u {
-                SessionUpdate::Connected { .. } => "connected".to_owned(),
-                SessionUpdate::Received(rx) => format!("rx {:?} {:?}", rx.lines, rx.partial),
-                SessionUpdate::Disconnected { .. } => "disconnected".to_owned(),
-                SessionUpdate::WriteFailed(_) => "write failed".to_owned(),
-            })
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                "connected",
-                r#"rx ["a", "bc"] """#,
-                "write failed",
-                r#"rx [] "tail""#,
-            ]
-        );
-    }
-
-    #[test]
-    fn model_tracks_connection_state() {
-        let mut splitter = LineSplitter::default();
-        let mut model = SessionModel::new(PortId::new("virtual:echo"), SerialConfig::default());
-        assert_eq!(model.title(), "virtual:echo @ 115200 8N1");
-        assert!(apply(
-            &mut model,
-            &mut splitter,
-            vec![SessionEvent::Connected {
-                description: "virtual:echo".into()
-            }]
-        ));
-        assert_eq!(model.state, ConnectionState::Connected);
-        assert_eq!(model.title(), "virtual:echo");
-        assert!(apply(&mut model, &mut splitter, vec![data(b"hi\r\n")]));
-        assert!(
-            !apply(&mut model, &mut splitter, vec![data(b"")]),
-            "empty chunks change nothing"
-        );
-        assert!(apply(
-            &mut model,
-            &mut splitter,
-            vec![SessionEvent::Disconnected {
-                error: Some(TransportError::Disconnected)
-            }]
-        ));
-        assert_eq!(
-            model.state,
-            ConnectionState::Disconnected {
-                error: Some("device disconnected".into())
-            }
-        );
-        assert!(
-            !apply(
-                &mut model,
-                &mut splitter,
-                vec![SessionEvent::Disconnected { error: None }]
-            ),
-            "the close that follows a lost device is not shown twice"
-        );
-        assert_eq!(
-            rows(&model),
-            [
-                (LineKind::Info, "Connected to virtual:echo".into()),
-                (LineKind::Rx, "hi".into()),
-                (LineKind::Error, "Disconnected: device disconnected".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn local_disconnect_is_shown_once() {
-        let mut model = SessionModel::new(PortId::new("p"), SerialConfig::default());
-        assert!(model.disconnect_locally());
-        assert!(!model.disconnect_locally());
-        assert!(!model.apply(SessionUpdate::Disconnected { error: None }));
-        assert_eq!(rows(&model), [(LineKind::Info, "Disconnected".into())]);
     }
 
     #[test]
@@ -632,16 +668,6 @@ mod tests {
             follow_after_scroll(true, 0.0, Some(false)),
             "sideways keeps state"
         );
-    }
-
-    #[test]
-    fn bytes_are_formatted_for_the_status_line() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(1023), "1023 B");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        assert_eq!(format_bytes(1536), "1.5 KiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MiB");
-        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     fn open_session_view(
@@ -771,14 +797,13 @@ mod tests {
         cx.executor().advance_clock(FRAME);
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
-            let model = view.model();
             assert_eq!(
-                model.state,
+                view.model().state,
                 ConnectionState::Disconnected {
                     error: Some("device disconnected".into())
                 }
             );
-            let rows = rows(model);
+            let rows = rows(view);
             assert_eq!(
                 rows[rows.len() - 2..],
                 [
