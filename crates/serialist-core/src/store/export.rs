@@ -1,11 +1,14 @@
-//! Text export from a snapshot.
+//! Text export from any line source: a snapshot's lines, a hex view's rows, a test
+//! double. [`write_lines`] is the one implementation, and the one place the timestamp
+//! formats live; [`Snapshot::write_text`] and its counting twin are thin wrappers.
 
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::ops::Range;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::snapshot::Snapshot;
-use crate::text::{Direction, LineId, LineSource};
+use crate::text::{Direction, Epoch, LineId, LineSource};
 
 /// How each exported line is stamped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -20,7 +23,7 @@ pub enum Timestamps {
     Delta,
 }
 
-/// Options for [`Snapshot::text`].
+/// Options for [`Snapshot::text`] and [`write_lines`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextOptions {
     pub timestamps: Timestamps,
@@ -57,6 +60,96 @@ impl TextOptions {
     }
 }
 
+/// What an export wrote.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextExportReport {
+    /// Lines written: those in the range that the options kept.
+    pub lines: usize,
+    /// Bytes written, timestamps and line ends included.
+    pub bytes: u64,
+}
+
+/// Slab of lines fetched from a source at a time, so a source with a faster bulk
+/// `lines` is used, and memory stays flat however large the export.
+const SLAB: usize = 4096;
+
+/// The lines of `source` in `range` (clipped to what it retains) as text, one per line,
+/// each ending in `\n`, stamped and filtered as `options` say, streamed to `out`. Wrap
+/// files in a `BufWriter`. Works for anything that is a [`LineSource`]: a hex view's
+/// rows get the same stamps as a snapshot's lines, and are all kept (they are `Rx`).
+///
+/// A stamp is `[2026-09-29T21:53:44.123456Z] ` (absolute UTC), `[+12.345678] ` (seconds
+/// since the source's epoch) or `[+0.000123] ` (seconds since the previous line
+/// written; the first gets zero). Skipped lines do not move the delta.
+pub fn write_lines<W: Write + ?Sized>(
+    source: &dyn LineSource,
+    range: Range<LineId>,
+    options: TextOptions,
+    out: &mut W,
+) -> io::Result<TextExportReport> {
+    let epoch = source.epoch();
+    let end = range.end.min(source.end());
+    let mut id = range.start.max(source.first_line());
+    let mut report = TextExportReport::default();
+    let mut previous = None;
+    let mut lines = Vec::new();
+    let mut stamp = String::new();
+    while id < end {
+        let slab_end = id.offset(SLAB).min(end);
+        lines.clear();
+        source.lines(id..slab_end, &mut lines);
+        id = slab_end;
+        for line in &lines {
+            let keep = match line.direction {
+                Direction::Rx => true,
+                Direction::Tx => options.include_tx,
+                Direction::Notice => options.include_notices,
+            };
+            if !keep {
+                continue;
+            }
+            stamp.clear();
+            write_stamp(
+                &mut stamp,
+                options.timestamps,
+                &epoch,
+                previous,
+                line.received_at,
+            );
+            previous = Some(line.received_at);
+            out.write_all(stamp.as_bytes())?;
+            out.write_all(line.text.as_bytes())?;
+            out.write_all(b"\n")?;
+            report.lines += 1;
+            report.bytes += (stamp.len() + line.text.len() + 1) as u64;
+        }
+    }
+    Ok(report)
+}
+
+/// The stamp for a line that arrived at `at`, given the previous line written.
+fn write_stamp(
+    out: &mut String,
+    timestamps: Timestamps,
+    epoch: &Epoch,
+    previous: Option<Instant>,
+    at: Instant,
+) {
+    // Formatting into a String cannot fail.
+    let _ = match timestamps {
+        Timestamps::None => Ok(()),
+        Timestamps::Absolute => write!(out, "[{}] ", format_utc(epoch.wall_time(at))),
+        Timestamps::Relative => {
+            let since = at.saturating_duration_since(epoch.instant);
+            write!(out, "[+{}] ", format_secs(since))
+        }
+        Timestamps::Delta => {
+            let since = previous.map_or(Duration::ZERO, |p| at.saturating_duration_since(p));
+            write!(out, "[+{}] ", format_secs(since))
+        }
+    };
+}
+
 impl Snapshot {
     /// The lines in `range` (clipped to what is retained) as text, one per line, each
     /// ending in `\n`. The styled text, not the raw bytes: escapes are gone and CR
@@ -69,53 +162,25 @@ impl Snapshot {
     }
 
     /// [`Snapshot::text`] streamed to `out`, for exports too large to build in memory.
-    /// Wrap files in a `BufWriter`.
+    /// Wrap files in a `BufWriter`. See [`Snapshot::write_text_counted`] for the counts.
     pub fn write_text<W: Write>(
         &self,
         range: Range<LineId>,
         options: TextOptions,
         out: &mut W,
     ) -> io::Result<()> {
-        let start = range.start.max(self.first_line());
-        let end = range.end.min(self.end());
-        let epoch = self.epoch();
-        let mut previous = None;
-        let mut id = start;
-        while id < end {
-            let Some(line) = self.line(id) else {
-                id = id.next();
-                continue;
-            };
-            id = id.next();
-            let keep = match line.direction {
-                Direction::Rx => true,
-                Direction::Tx => options.include_tx,
-                Direction::Notice => options.include_notices,
-            };
-            if !keep {
-                continue;
-            }
-            match options.timestamps {
-                Timestamps::None => {}
-                Timestamps::Absolute => {
-                    write!(out, "[{}] ", format_utc(epoch.wall_time(line.received_at)))?;
-                }
-                Timestamps::Relative => {
-                    let since = line.received_at.saturating_duration_since(epoch.instant);
-                    write!(out, "[+{}] ", format_secs(since))?;
-                }
-                Timestamps::Delta => {
-                    let since = previous.map_or(Duration::ZERO, |p| {
-                        line.received_at.saturating_duration_since(p)
-                    });
-                    write!(out, "[+{}] ", format_secs(since))?;
-                }
-            }
-            previous = Some(line.received_at);
-            out.write_all(line.text.as_bytes())?;
-            out.write_all(b"\n")?;
-        }
-        Ok(())
+        self.write_text_counted(range, options, out).map(drop)
+    }
+
+    /// [`Snapshot::write_text`] that reports how many lines and bytes it wrote, for a
+    /// status message ("Exported 1204 lines"). It is [`write_lines`] over this snapshot.
+    pub fn write_text_counted<W: Write>(
+        &self,
+        range: Range<LineId>,
+        options: TextOptions,
+        out: &mut W,
+    ) -> io::Result<TextExportReport> {
+        write_lines(self, range, options, out)
     }
 }
 

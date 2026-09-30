@@ -86,7 +86,7 @@ use crate::text::{Direction, Epoch, LineId, Style, StyleRun};
 use buf::{AppendBuf, AppendWriter};
 use index::{BLOCK_LINES, Block, BlockWriter, LineFlags};
 
-pub use export::{TextOptions, Timestamps, format_utc};
+pub use export::{TextExportReport, TextOptions, Timestamps, format_utc, write_lines};
 pub use hex::{HexStyles, HexView};
 pub use search::smart_case_insensitive;
 pub use snapshot::{RawIter, Snapshot};
