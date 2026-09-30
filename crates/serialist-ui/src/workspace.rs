@@ -9,7 +9,7 @@ use serialist_core::{
     TransportFactory,
 };
 
-use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleRecord, context};
+use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
 use crate::config::{self, Config};
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::export::ExportFormat;
@@ -322,6 +322,14 @@ impl Workspace {
         }
     }
 
+    /// The session view handles the toggle when it holds the focus; this is for when
+    /// another panel does.
+    fn toggle_inline(&mut self, _: &ToggleInline, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(session) = &self.session {
+            session.update(cx, |view, cx| view.toggle_mode(window, cx));
+        }
+    }
+
     fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(session) = &self.session {
             return session.clone().into_any_element();
@@ -378,11 +386,27 @@ impl Workspace {
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
         };
         let status = session.status_line();
+        let inline = session.mode() == crate::inline::Mode::Inline;
         line.child(
             h_flex()
                 .gap_1p5()
                 .child(dot(state_color))
                 .child(status.state),
+        )
+        .child(
+            div()
+                .id("status-mode")
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(if inline { theme.warning } else { theme.border })
+                .text_color(if inline {
+                    theme.warning
+                } else {
+                    theme.muted_foreground
+                })
+                .child(status.mode),
         )
         .child(
             div()
@@ -399,6 +423,11 @@ impl Workspace {
             div()
                 .text_color(theme.warning)
                 .child(SharedString::from(paused))
+        }))
+        .children(status.paste.map(|paste| {
+            div()
+                .text_color(theme.info)
+                .child(SharedString::from(paste))
         }))
         .children(status.recording.map(|recording| {
             h_flex()
@@ -477,6 +506,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::pause))
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::toggle_record))
+            .on_action(cx.listener(Self::toggle_inline))
             .size_full()
             .when_some(ui_font, |this, font| this.font(font))
             .bg(background)

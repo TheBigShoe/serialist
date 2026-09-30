@@ -39,6 +39,7 @@ use crate::fonts::{
     FontParts, FontRole, TerminalFont, UiFont, build_font, clamp_font_size, clamp_line_height,
     installed_families, substitute_missing_family,
 };
+use crate::inline::InlineSettings;
 use crate::keymap;
 use crate::prelude::*;
 use crate::status::Notice;
@@ -138,6 +139,8 @@ pub struct Config {
     terminal_font: TerminalFont,
     ui_font: UiFont,
     palette: TerminalPalette,
+    /// The `inline.*` settings, which the UI reads from the settings files itself.
+    inline: InlineSettings,
     problems: Vec<ConfigProblem>,
     /// Bumped by every install, so a view can tell a reload from a repeat.
     generation: u64,
@@ -170,6 +173,7 @@ impl Config {
             terminal_font: TerminalFont::default(),
             ui_font: UiFont::default(),
             palette: TerminalPalette::default(),
+            inline: InlineSettings::default(),
             problems: Vec::new(),
             generation: 0,
         };
@@ -220,6 +224,11 @@ impl Config {
 
     pub fn palette(&self) -> &TerminalPalette {
         &self.palette
+    }
+
+    /// The `inline.*` settings: Backspace, the escape chord and paste pacing.
+    pub fn inline(&self) -> &InlineSettings {
+        &self.inline
     }
 
     pub fn generation(&self) -> u64 {
@@ -293,15 +302,26 @@ impl Config {
         );
         let problems = match loaded {
             Ok(settings) => {
-                let warnings = settings
+                // `inline.*` is read here rather than by the core loader, which reports
+                // the keys as unknown.
+                let mut warnings: Vec<ConfigProblem> = settings
                     .warnings
                     .iter()
+                    .filter(|warning| !is_inline_key(&warning.key))
                     .map(|warning| ConfigProblem {
                         piece: ConfigPiece::Settings,
                         is_error: false,
                         message: warning.to_string(),
                     })
                     .collect();
+                let (inline, inline_problems) =
+                    InlineSettings::from_value(inline_value(&self.paths).as_ref());
+                self.inline = inline;
+                warnings.extend(inline_problems.into_iter().map(|message| ConfigProblem {
+                    piece: ConfigPiece::Settings,
+                    is_error: false,
+                    message: format!("{}: {message}", self.paths.settings.display()),
+                }));
                 self.settings = Arc::new(settings);
                 warnings
             }
@@ -423,6 +443,41 @@ impl Config {
             &self.terminal_font,
         )
     }
+}
+
+fn is_inline_key(key: &str) -> bool {
+    key == "inline" || key.starts_with("inline.")
+}
+
+/// The `inline` object of the user's and the project's settings files, merged key by
+/// key with the project's winning, as the core loader merges every other key. The files
+/// already parsed (the core loader read them first), so a file that no longer does is
+/// skipped.
+fn inline_value(paths: &ConfigPaths) -> Option<serde_json::Value> {
+    let mut merged: Option<serde_json::Value> = None;
+    let files = std::iter::once(&paths.settings).chain(paths.project_settings.as_ref());
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let parsed = jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+            &text,
+            &jsonc_parser::ParseOptions::default(),
+        );
+        let Some(inline) = parsed
+            .ok()
+            .and_then(|mut value| value.get_mut("inline").map(std::mem::take))
+        else {
+            continue;
+        };
+        match (&mut merged, inline) {
+            (Some(serde_json::Value::Object(base)), serde_json::Value::Object(overlay)) => {
+                base.extend(overlay);
+            }
+            (slot, inline) => *slot = Some(inline),
+        }
+    }
+    merged
 }
 
 fn settings_error(error: &SettingsError) -> ConfigProblem {
