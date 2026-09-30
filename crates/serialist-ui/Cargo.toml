@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# WebAssembly codec plugins (plugin.wasm) in the plugins folder: serialist-plugins' `wasm`
+# feature, which brings wasmtime.
+wasm = ["serialist-plugins/wasm"]
+
 [dependencies]
 serialist-core.workspace = true
 serialist-plugins.workspace = true

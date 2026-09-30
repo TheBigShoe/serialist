@@ -6,17 +6,21 @@
 //!
 //! [`CodecSet`] lives in [`Config`](crate::config::Config): the built-in codecs from
 //! [`serialist_plugins::builtin_registry`], made once, plus one codec per plugin folder
-//! under the config directory's `plugins/` (`plugins/<name>/plugin.lua`), registered under
-//! the folder's name. A folder named like a built-in (`plugins/airoha-race/`) replaces
-//! it; `plugins/airoha-race-lua/` sits beside it.
+//! under the config directory's `plugins/` (`plugins/<name>/plugin.lua`, or
+//! `plugin.wasm` and `plugin.toml` with the `wasm` feature), registered under the
+//! folder's name. A folder named like a built-in (`plugins/airoha-race/`) replaces it;
+//! `plugins/airoha-race-lua/` sits beside it. (`serialist_plugins::load_plugins` registers
+//! under the name a plugin describes; the app keys by folder so two versions of one
+//! protocol can be compared, and loads each folder itself for that.)
 //!
-//! A plugin is loaded from its text: the file is read once and a [`LuaCodecFactory`] made
-//! from the source, so the factory is a snapshot of the plugin as it loaded. A later edit
-//! that does not load (a syntax error, a `describe` that fails) is reported as a problem
-//! and the last good version stays registered and keeps running, however many codecs it
-//! still has to make. A reload keeps the factory (the same `Arc`) of every plugin whose
-//! text did not change, and of every built-in, so a session can tell by pointer whether
-//! a reload concerns the codec it runs.
+//! A plugin is loaded from what its files held when read: a [`LuaCodecFactory`] is made
+//! from the source text, and a WebAssembly factory keeps the component it compiled, so
+//! the factory is a snapshot of the plugin as it loaded. A later edit that does not load
+//! (a syntax error, a `describe` that fails) is reported as a problem and the last good
+//! version stays registered and keeps running, however many codecs it still has to make.
+//! A reload keeps the factory (the same `Arc`) of every plugin whose files hash the same,
+//! and of every built-in, so a session can tell by pointer whether a reload concerns the
+//! codec it runs.
 //!
 //! # Running a session's codec
 //!
@@ -70,9 +74,68 @@ pub struct PluginCodec {
     pub entry: PathBuf,
     /// The name the plugin describes itself by, which may differ from the folder's.
     pub described: String,
-    /// The text it was loaded from, to tell an edit from a save that changed nothing.
-    source: Arc<str>,
+    /// A hash of the files it was loaded from, to tell an edit from a save that changed
+    /// nothing.
+    fingerprint: u64,
     pub factory: Arc<dyn CodecFactory>,
+}
+
+/// A hash of `parts`, for [`PluginCodec::fingerprint`].
+fn fingerprint(parts: &[&[u8]]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A plugin freshly loaded: the fingerprint of its files and its factory.
+type Loaded = (u64, Arc<dyn CodecFactory>);
+
+/// Read a plugin folder's files and, unless they hash to `unchanged`, load it. `Ok(None)`
+/// means the files are the ones already loaded.
+fn load_plugin(
+    dir: &serialist_plugins::PluginDir,
+    unchanged: Option<u64>,
+    limits: LuaLimits,
+) -> Result<Option<Loaded>, String> {
+    match dir.kind {
+        PluginKind::Lua => {
+            let text = fs::read_to_string(&dir.entry).map_err(|error| error.to_string())?;
+            let print = fingerprint(&[text.as_bytes()]);
+            if unchanged == Some(print) {
+                return Ok(None);
+            }
+            // Made from the text read now, so later edits to the file cannot change it.
+            let origin = dir.entry.display().to_string();
+            let factory = LuaCodecFactory::from_source(&origin, &text, limits)
+                .map_err(|error| error.to_string())?;
+            Ok(Some((print, Arc::new(factory))))
+        }
+        PluginKind::Wasm => {
+            let wasm = fs::read(&dir.entry).map_err(|error| error.to_string())?;
+            let manifest = fs::read(dir.dir.join("plugin.toml")).unwrap_or_default();
+            let print = fingerprint(&[&wasm, &manifest]);
+            if unchanged == Some(print) {
+                return Ok(None);
+            }
+            load_wasm(dir).map(|factory| Some((print, factory)))
+        }
+    }
+}
+
+/// A WebAssembly plugin folder, compiled once: the factory keeps the compiled code.
+#[cfg(feature = "wasm")]
+fn load_wasm(dir: &serialist_plugins::PluginDir) -> Result<Arc<dyn CodecFactory>, String> {
+    serialist_plugins::wasm::load_plugin_dir(&dir.dir)
+        .map(|factory| Arc::new(factory) as Arc<dyn CodecFactory>)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "wasm"))]
+fn load_wasm(_: &serialist_plugins::PluginDir) -> Result<Arc<dyn CodecFactory>, String> {
+    Err("WebAssembly plugins need Serialist built with the `wasm` feature".to_owned())
 }
 
 impl std::fmt::Debug for PluginCodec {
@@ -177,45 +240,30 @@ impl CodecSet {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let previous = self.plugins.iter().find(|plugin| plugin.name == name);
-            let mut fail = |message: String| {
-                problems.push(PluginProblem {
-                    path: dir.entry.clone(),
-                    message,
-                    kept_previous: previous.is_some(),
-                });
-                previous.cloned()
-            };
-            let loaded = match dir.kind {
-                PluginKind::Lua => match fs::read_to_string(&dir.entry) {
-                    Err(error) => fail(error.to_string()),
-                    Ok(text) => match previous {
-                        Some(previous) if *previous.source == *text => Some(previous.clone()),
-                        _ => {
-                            let origin = dir.entry.display().to_string();
-                            match LuaCodecFactory::from_source(&origin, &text, limits) {
-                                Ok(factory) => {
-                                    let described = factory.info().name;
-                                    tracing::info!(plugin = %name, %described, "plugin loaded");
-                                    Some(PluginCodec {
-                                        factory: Arc::new(NamedFactory {
-                                            name: name.clone(),
-                                            inner: Arc::new(factory),
-                                        }),
-                                        name: name.clone(),
-                                        entry: dir.entry.clone(),
-                                        described,
-                                        source: Arc::from(text),
-                                    })
-                                }
-                                Err(error) => fail(error.to_string()),
-                            }
-                        }
-                    },
-                },
-                // WebAssembly plugins are loaded by `serialist_plugins::load_plugins`, which
-                // registers under the described name; this build keys plugins by folder
-                // and has no per-folder loader for them.
-                _ => fail("WebAssembly plugins are not supported by this build yet".to_owned()),
+            let loaded = match load_plugin(&dir, previous.map(|p| p.fingerprint), limits) {
+                Ok(None) => previous.cloned(),
+                Ok(Some((fingerprint, inner))) => {
+                    let described = inner.info().name;
+                    tracing::info!(plugin = %name, %described, "plugin loaded");
+                    Some(PluginCodec {
+                        factory: Arc::new(NamedFactory {
+                            name: name.clone(),
+                            inner,
+                        }),
+                        name: name.clone(),
+                        entry: dir.entry.clone(),
+                        described,
+                        fingerprint,
+                    })
+                }
+                Err(message) => {
+                    problems.push(PluginProblem {
+                        path: dir.entry.clone(),
+                        message,
+                        kept_previous: previous.is_some(),
+                    });
+                    previous.cloned()
+                }
             };
             plugins.extend(loaded);
         }
@@ -932,6 +980,52 @@ mod tests {
         selection.set(serialist_plugins::builtin_registry().get("text-lines"));
         slot.on_chunk(b"ok\n", Instant::now());
         assert_eq!(reader.snapshot().last().unwrap().kind, "line");
+    }
+
+    /// The committed WebAssembly RACE plugin, built from `examples/plugins`.
+    const RACE_WASM: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../serialist-plugins/tests/fixtures/plugins/airoha-race-wasm"
+    );
+
+    #[test]
+    fn webassembly_plugins_load_by_folder_with_the_wasm_feature() {
+        let dir = crate::test_support::TestDir::new("codec-set-wasm");
+        let root = dir.join("plugins");
+        let folder = root.join("race-wasm");
+        fs::create_dir_all(&folder).unwrap();
+        for file in ["plugin.wasm", "plugin.toml"] {
+            fs::copy(format!("{RACE_WASM}/{file}"), folder.join(file)).unwrap();
+        }
+        let mut set = CodecSet::builtin();
+        let problems = set.reload_plugins(&root, LuaLimits::default());
+        if cfg!(feature = "wasm") {
+            assert!(problems.is_empty(), "{problems:?}");
+            let factory = set
+                .registry()
+                .get("race-wasm")
+                .expect("registered by folder");
+            assert_eq!(set.plugins()[0].described, "airoha-race");
+            let mut codec = factory.create().unwrap();
+            let mut frames = Vec::new();
+            let bytes = race_chunk(0x5D, 0x0F40, b"boot");
+            codec.decode(&bytes, Instant::now(), 0, &mut frames);
+            assert_eq!(frames[0].kind, "log");
+            // Unchanged files keep the compiled factory.
+            assert!(set.reload_plugins(&root, LuaLimits::default()).is_empty());
+            assert!(Arc::ptr_eq(
+                &factory,
+                &set.registry().get("race-wasm").unwrap()
+            ));
+        } else {
+            assert_eq!(problems.len(), 1);
+            assert!(
+                problems[0].message.contains("`wasm` feature"),
+                "{}",
+                problems[0]
+            );
+            assert!(!set.registry().contains("race-wasm"));
+        }
     }
 
     #[test]

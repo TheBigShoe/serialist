@@ -57,6 +57,11 @@ include = ["packaging/windows/main.wxs"]
 # GPUI and its platform layer arrive through `serialist-ui` (gpui-kit depends on
 # `gpui-pre-platform` with `font-kit`), and the binary reaches them through
 # `serialist_ui::prelude`, so neither is listed here.
+[features]
+default = []
+# Load WebAssembly codec plugins (plugin.wasm) from the plugins folder; brings wasmtime.
+wasm = ["serialist-ui/wasm"]
+
 [dependencies]
 serialist-core.workspace = true
 serialist-script.workspace = true
