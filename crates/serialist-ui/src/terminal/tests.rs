@@ -925,6 +925,20 @@ impl Pass {
         self.up.iter().chain(&self.down)
     }
 
+    /// The frames (by index in the pass, which scrolls the same way every time) over
+    /// budget in every one of `attempts`: what a slow machine cannot explain. A frame
+    /// stretched by a descheduled thread is a different frame in each pass, while a
+    /// regression slows the same ones every time.
+    fn persistent(attempts: &[Vec<(usize, Duration)>]) -> Vec<usize> {
+        let mut every: Vec<usize> = attempts
+            .first()
+            .map_or_else(Vec::new, |over| over.iter().map(|(ix, _)| *ix).collect());
+        for over in attempts {
+            every.retain(|ix| over.iter().any(|(other, _)| other == ix));
+        }
+        every
+    }
+
     fn over_budget(&self, budget: Duration) -> Vec<(usize, Duration)> {
         self.frames()
             .enumerate()
@@ -979,8 +993,10 @@ fn measure_pass(
 /// with a no-op text system, so this measures everything the element does (fetching,
 /// cache lookups, layout, run conversion, rectangles, scene building) except CoreText's
 /// own shaping; the shaped-line counts bound that part. A pass with a frame over budget
-/// is repeated from a cold cache, up to three times, so a descheduled test thread on a
-/// busy machine does not fail the gate while a real regression still does.
+/// is repeated from a cold cache, up to three times, and the gate fails only for frames
+/// over budget in every pass: a descheduled test thread on a busy machine slows different
+/// frames each time and does not fail the gate, while a real regression, which slows the
+/// same frames every time, still does.
 #[gpui_test]
 fn a_million_lines_cost_what_a_screen_costs(cx: &mut TestAppContext) {
     let source = Arc::new(SyntheticLines::new(1_000_000));
@@ -995,14 +1011,15 @@ fn a_million_lines_cost_what_a_screen_costs(cx: &mut TestAppContext) {
         let mut attempts = Vec::new();
         let pass = loop {
             let pass = measure_pass(cx, window, &view, &source, wrap, timestamps);
-            let over = pass.over_budget(budget);
-            if over.is_empty() {
+            attempts.push(pass.over_budget(budget));
+            let persistent = Pass::persistent(&attempts);
+            if persistent.is_empty() {
                 break pass;
             }
-            attempts.push(over);
             assert!(
                 attempts.len() < 3,
-                "wrap={wrap}: frames over the {budget:?} budget in three passes: {attempts:?}"
+                "wrap={wrap}: frames {persistent:?} over the {budget:?} budget in three \
+                 passes: {attempts:?}"
             );
         };
         for (frame, (_, fetched, _)) in pass.frames().enumerate() {
@@ -1024,7 +1041,7 @@ fn a_million_lines_cost_what_a_screen_costs(cx: &mut TestAppContext) {
         // Visible with `cargo test -- --nocapture`.
         eprintln!(
             "terminal frame cost, 1M lines, {rows} rows, wrap={wrap}, retries {}: {}",
-            attempts.len(),
+            attempts.len() - 1,
             pass.summary()
         );
     }
