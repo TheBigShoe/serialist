@@ -15,6 +15,7 @@ pub mod session;
 pub mod settings;
 pub mod store;
 pub mod text;
+pub mod theme;
 pub mod transport;
 
 #[cfg(test)]
@@ -40,6 +41,9 @@ pub use store::{
 pub use text::{
     Color, Direction, Epoch, LineId, LineSource, SearchMatch, Searcher, Style, StyleFlags,
     StyleRun, StyledLine,
+};
+pub use theme::{
+    Appearance, PlayerColors, Rgba, SyntaxStyle, Theme, ThemeFamily, ThemeRegistry, ThemeWarning,
 };
 pub use transport::{
     ControlLine, Transport, TransportError, TransportFactory, TransportReader, TransportWriter,
