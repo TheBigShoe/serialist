@@ -1,0 +1,65 @@
+// Serialist default key bindings for macOS, in Zed's keymap format: a list of sections,
+// each with an optional key context and a map of keystrokes to actions. Your keymap.json
+// is applied after this one, so its bindings win. Bind a key to null to unbind it.
+[
+  {
+    "bindings": {
+      "cmd-q": "serialist::Quit"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-k": "terminal::Clear",
+      "cmd-w": "serial::Disconnect",
+      "cmd-p": "terminal::Pause",
+      "cmd-s": "terminal::Export",
+      "cmd-shift-r": "terminal::ToggleRecord"
+    }
+  },
+  {
+    "context": "DevicesPanel",
+    "bindings": {
+      "down": "devices::SelectNext",
+      "up": "devices::SelectPrevious",
+      "enter": "serial::Connect"
+    }
+  },
+  {
+    "context": "ComposeBar > Input",
+    "bindings": {
+      "up": "compose::HistoryPrevious",
+      "down": "compose::HistoryNext"
+    }
+  },
+  {
+    "context": "ComposeBar",
+    "bindings": {
+      "cmd-e": "compose::CycleLineEnding"
+    }
+  },
+  {
+    "context": "Terminal",
+    "bindings": {
+      "cmd-c": "terminal::Copy",
+      "cmd-a": "terminal::SelectAll",
+      "cmd-f": "terminal::Search",
+      "alt-z": "terminal::ToggleWrap",
+      "alt-t": "terminal::CycleTimestamps",
+      "alt-h": "terminal::ToggleHexView",
+      "cmd-alt-i": "terminal::ToggleFrameStats",
+      "pageup": "terminal::PageUp",
+      "pagedown": "terminal::PageDown",
+      "home": "terminal::ScrollToTop",
+      "end": "terminal::JumpToBottom",
+      "cmd-up": "terminal::ScrollToTop",
+      "cmd-down": "terminal::JumpToBottom"
+    }
+  },
+  {
+    "context": "TerminalSearch",
+    "bindings": {
+      "escape": "terminal::DismissSearch"
+    }
+  }
+]
