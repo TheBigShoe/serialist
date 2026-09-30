@@ -1,6 +1,7 @@
 //! The window's root view: the Devices and Commands panels on the left, the session in
-//! the center, the status line along the bottom. The workspace owns sessions; panels
-//! only ask for them.
+//! the center, the Decoded panel and the Script console on the right, the status line
+//! along the bottom. The workspace owns sessions; panels only ask for them, and the
+//! Decoded panel and the Script console follow the session the workspace hands them.
 //!
 //! Saved commands reach the session through here: the Commands panel's
 //! [`CommandsPanelEvent::Send`] and every [`commands::Send`](crate::actions::commands::Send)
@@ -30,6 +31,7 @@ use crate::actions::scripts::{ClearConsole, Run as RunScript, RunInline, Stop as
 use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
 use crate::config::{self, Config};
+use crate::decoded_panel::DecodedPanel;
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
@@ -71,7 +73,7 @@ pub fn init(cx: &mut App) {
 
 /// Open the main window titled "Serialist" with a [`Workspace`] as its root view.
 pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Workspace>> {
-    let bounds = Bounds::centered(None, size(px(1100.), px(720.)), cx);
+    let bounds = Bounds::centered(None, size(px(1320.), px(780.)), cx);
     let window_options = WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("Serialist".into()),
@@ -100,6 +102,8 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
 pub struct Workspace {
     devices: Entity<DevicesPanel>,
     commands: Entity<CommandsPanel>,
+    /// The Decoded panel, at the top of the right dock.
+    decoded: Entity<DecodedPanel>,
     /// The Script console in the right dock.
     console: Entity<ScriptConsole>,
     /// The saved commands scripts send by name, kept current on every reload.
@@ -167,6 +171,7 @@ impl Workspace {
                     this.connect(port.clone(), serial.clone(), window, cx);
                 }
             });
+        let decoded = cx.new(|cx| DecodedPanel::new(window, cx));
         let console = cx.new(|cx| ScriptConsole::new(window, cx));
         let console_events =
             cx.subscribe_in(&console, window, |this, _, event, window, cx| match event {
@@ -218,6 +223,7 @@ impl Workspace {
         Self {
             devices,
             commands,
+            decoded,
             console,
             script_commands,
             history,
@@ -313,6 +319,10 @@ impl Workspace {
 
     pub fn console(&self) -> &Entity<ScriptConsole> {
         &self.console
+    }
+
+    pub fn decoded(&self) -> &Entity<DecodedPanel> {
+        &self.decoded
     }
 
     pub fn history(&self) -> &Entity<PersistentHistory> {
@@ -629,6 +639,10 @@ impl Workspace {
                 let weak = view.downgrade();
                 self.console
                     .update(cx, |console, cx| console.set_session(Some(weak), cx));
+                let decoded_view = view.clone();
+                self.decoded.update(cx, |decoded, cx| {
+                    decoded.set_session(Some(decoded_view), window, cx);
+                });
                 self.devices
                     .update(cx, |devices, cx| devices.set_connected(Some(port), cx));
                 self.session = Some(view);
@@ -793,6 +807,13 @@ impl Workspace {
                 .text_color(theme.info)
                 .child(SharedString::from(script))
         }))
+        .children(status.codec.map(|codec| {
+            div()
+                .id("status-codec")
+                .flex_none()
+                .text_color(theme.info)
+                .child(SharedString::from(codec))
+        }))
         .children(status.recording.map(|recording| {
             h_flex()
                 .gap_1p5()
@@ -901,9 +922,18 @@ impl Render for Workspace {
                         .child(resizable_panel().child(center))
                         .child(
                             resizable_panel()
-                                .size(px(320.))
-                                .size_range(px(220.)..px(720.))
-                                .child(self.console.clone()),
+                                .size(px(400.))
+                                .size_range(px(220.)..px(960.))
+                                .child(
+                                    v_resizable("right-dock")
+                                        .child(
+                                            resizable_panel()
+                                                .size(px(380.))
+                                                .size_range(px(120.)..px(1200.))
+                                                .child(self.decoded.clone()),
+                                        )
+                                        .child(resizable_panel().child(self.console.clone())),
+                                ),
                         ),
                 ),
             )
