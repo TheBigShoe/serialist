@@ -1,12 +1,22 @@
-//! A hex dump of the retained raw bytes as a [`LineSource`].
+//! A hex dump of the retained raw bytes as a [`LineSource`] and [`Searcher`].
 
 use std::fmt::Write as _;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::search::{Query, drive, note_scanned};
 use super::snapshot::Snapshot;
 use crate::text::{
-    Color, Direction, Epoch, LineId, LineSource, Style, StyleFlags, StyleRun, StyledLine,
+    Color, Direction, Epoch, LineId, LineSource, SearchMatch, Searcher, Style, StyleFlags,
+    StyleRun, StyledLine,
 };
+
+/// Rows per window when a hex search runs backward. A row costs about a microsecond to
+/// render, so a window is about a millisecond of work between checks of `cancel`.
+const BACKWARD_WINDOW: u64 = 1024;
+
+/// Rows between checks of `cancel` while scanning forward.
+const CANCEL_STRIDE: usize = 64;
 
 /// Styles for the three columns of a hex row. The three must differ so the runs stay
 /// separate for the element to color.
@@ -68,6 +78,15 @@ impl Snapshot {
     }
 }
 
+/// One rendered row: what [`LineSource::line`] returns minus the identity and the time.
+struct Row {
+    text: String,
+    runs: Vec<StyleRun>,
+    /// The retained stream offsets the row shows.
+    raw: Range<u64>,
+    complete: bool,
+}
+
 impl HexView {
     pub fn bytes_per_row(&self) -> usize {
         self.bytes_per_row
@@ -82,6 +101,28 @@ impl HexView {
     pub fn row_range(&self, row: LineId) -> Range<u64> {
         let bpr = self.bytes_per_row as u64;
         row.0 * bpr..(row.0 + 1) * bpr
+    }
+
+    /// Row `id` rendered, without the arrival time (a search does not need it).
+    fn row(&self, id: LineId) -> Option<Row> {
+        let retained = self.snap.raw_range();
+        let full = self.row_range(id);
+        let start = full.start.max(retained.start);
+        let end = full.end.min(retained.end);
+        if start >= end {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(self.bytes_per_row);
+        for slice in self.snap.raw(start..end) {
+            bytes.extend_from_slice(slice);
+        }
+        let (text, runs) = self.render(id, &bytes, (start - full.start) as usize);
+        Some(Row {
+            text,
+            runs,
+            raw: start..end,
+            complete: end == full.end,
+        })
     }
 
     fn render(&self, row: LineId, bytes: &[u8], skip: usize) -> (String, Vec<StyleRun>) {
@@ -149,31 +190,86 @@ impl LineSource for HexView {
     }
 
     fn line(&self, id: LineId) -> Option<StyledLine> {
-        let retained = self.snap.raw_range();
-        let full = self.row_range(id);
-        let start = full.start.max(retained.start);
-        let end = full.end.min(retained.end);
-        if start >= end {
-            return None;
-        }
-        let mut bytes = Vec::with_capacity(self.bytes_per_row);
-        for slice in self.snap.raw(start..end) {
-            bytes.extend_from_slice(slice);
-        }
-        let (text, runs) = self.render(id, &bytes, (start - full.start) as usize);
+        let row = self.row(id)?;
         let p = &self.snap.p;
         Some(StyledLine {
             id,
-            text,
-            runs,
+            text: row.text,
+            runs: row.runs,
             direction: Direction::Rx,
-            received_at: p.instant(p.ns_at_raw(start)),
-            raw: start..end,
-            complete: end == full.end,
+            received_at: p.instant(p.ns_at_raw(row.raw.start)),
+            raw: row.raw,
+            complete: row.complete,
         })
     }
 
     fn epoch(&self) -> Epoch {
         self.snap.epoch()
+    }
+}
+
+impl HexView {
+    /// [`Searcher::search`] restricted to the rows `range` (clipped to the retained rows),
+    /// with the same guarantees as [`Snapshot::search_in`]: no match outside `range`, and
+    /// no row outside it is rendered or scanned.
+    pub fn search_in(
+        &self,
+        pattern: &str,
+        range: Range<LineId>,
+        from: LineId,
+        backward: bool,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SearchMatch>, String> {
+        let query = Query::per_line(pattern)?;
+        let bounds = range.start.0.max(self.first_line().0)..range.end.0.min(self.end().0);
+        Ok(drive(
+            bounds,
+            from.0,
+            backward,
+            limit,
+            BACKWARD_WINDOW,
+            cancel,
+            |rows, limit, out| {
+                for (n, id) in rows.enumerate() {
+                    if out.len() >= limit
+                        || (n % CANCEL_STRIDE == 0 && cancel.load(Ordering::Relaxed))
+                    {
+                        break;
+                    }
+                    note_scanned(1);
+                    if let Some(row) = self.row(LineId(id)) {
+                        query.match_line(row.text.as_bytes(), id, limit, out);
+                    }
+                }
+            },
+        ))
+    }
+}
+
+/// Searches the text of the rows: the offset column (`00000010`), the hex column
+/// (`0d 0a`, including the extra space between groups of eight) and the ASCII column
+/// (`|OK..|`). The pattern is a regex with the store's smart-case rule, and the
+/// direction, `from`, `limit` and `cancel` rules of [`Snapshot`]'s search, so the two
+/// behave alike. A match lies within one row; `range` is a byte range in that row's
+/// `text`, so it can be drawn over the row's runs. As for text lines, a pattern that can
+/// match the empty string reports empty matches.
+impl Searcher for HexView {
+    fn search(
+        &self,
+        pattern: &str,
+        from: LineId,
+        backward: bool,
+        limit: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<SearchMatch>, String> {
+        self.search_in(
+            pattern,
+            self.first_line()..self.end(),
+            from,
+            backward,
+            limit,
+            cancel,
+        )
     }
 }
