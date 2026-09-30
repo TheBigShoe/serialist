@@ -13,7 +13,7 @@ actions!(
         Quit,
         /// Open settings.json, writing the commented template first if there is none.
         OpenSettings,
-        /// Open keymap.json, writing an empty one first if there is none.
+        /// Open keymap.json, writing the commented template first if there is none.
         OpenKeymap,
         /// Open the themes folder, creating it first if needed.
         OpenThemesFolder,
@@ -58,6 +58,63 @@ actions!(
 );
 actions!(serial, [Connect, Disconnect]);
 actions!(devices, [SelectNext, SelectPrevious]);
+
+/// The Commands panel's actions and [`commands::Send`](Send), in a module of their own:
+/// `SelectNext` and `SelectPrevious` are also the Devices panel's.
+pub mod commands {
+    use serialist_core::CommandRef;
+
+    use crate::prelude::*;
+
+    actions!(
+        commands,
+        [
+            /// Move the Commands panel's selection down.
+            SelectNext,
+            /// Move the Commands panel's selection up.
+            SelectPrevious,
+            /// Send the command selected in the Commands panel.
+            SendSelected,
+            /// Edit the command selected in the Commands panel.
+            EditSelected,
+            /// Open the command editor for a new command.
+            NewCommand,
+            /// Ask for a name and create an empty collection.
+            NewCollection,
+        ]
+    );
+
+    /// Send a saved command, named by its collection, group and name. Each command with a
+    /// `keybinding` is bound to one of these; a keymap file can bind one too:
+    /// `["commands::Send", { "collection": "AT basics", "group": "Basics", "name": "AT" }]`.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, JsonSchema, Action)]
+    #[action(namespace = commands)]
+    #[serde(deny_unknown_fields)]
+    #[schemars(crate = "crate::prelude::schemars")]
+    pub struct Send {
+        pub collection: String,
+        pub group: String,
+        pub name: String,
+    }
+
+    impl Send {
+        /// The command this sends.
+        pub fn reference(&self) -> CommandRef {
+            CommandRef::new(&self.collection, &self.group, &self.name)
+        }
+    }
+
+    impl From<&CommandRef> for Send {
+        fn from(reference: &CommandRef) -> Self {
+            Self {
+                collection: reference.collection.clone(),
+                group: reference.group.clone(),
+                name: reference.name.clone(),
+            }
+        }
+    }
+}
+
 actions!(
     compose,
     [
@@ -75,6 +132,7 @@ pub mod context {
     pub const DEVICES_PANEL: &str = "DevicesPanel";
     pub const SESSION_VIEW: &str = "SessionView";
     pub const COMPOSE_BAR: &str = "ComposeBar";
+    pub const COMMANDS_PANEL: &str = "CommandsPanel";
     pub const TERMINAL: &str = "Terminal";
     /// The terminal in inline mode, in place of `Terminal`: keys go to the port except
     /// the ones bound here.
@@ -147,22 +205,6 @@ pub fn init(cx: &mut App) {
     ])]);
 }
 
-/// A keymap.json that binds nothing, for [`OpenKeymap`] to start from.
-pub const KEYMAP_TEMPLATE: &str = "\
-// Serialist key bindings, in Zed's keymap format. These are applied after the
-// bundled defaults, so they win. Bind a keystroke to null to unbind it.
-//
-// [
-//   {
-//     \"context\": \"Workspace\",
-//     \"bindings\": {
-//       \"cmd-k\": \"terminal::Clear\"
-//     }
-//   }
-// ]
-[]
-";
-
 fn paths(cx: &App) -> Option<serialist_core::settings::ConfigPaths> {
     cx.try_global::<Config>()
         .map(|config| config.paths().clone())
@@ -181,22 +223,12 @@ pub fn open_settings(cx: &mut App) {
     }
 }
 
-/// Write an empty keymap if there is none, then open it.
+/// Write the commented keymap template (the bundled defaults, commented out) if there
+/// is no keymap file, then open it.
 pub fn open_keymap(cx: &mut App) {
     let Some(paths) = paths(cx) else { return };
-    let prepared = std::fs::create_dir_all(&paths.dir).and_then(|()| {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&paths.keymap)
-        {
-            Ok(mut file) => std::io::Write::write_all(&mut file, KEYMAP_TEMPLATE.as_bytes()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(error),
-        }
-    });
-    match prepared {
-        Ok(()) => config::open_path(&paths.keymap, cx),
+    match paths.ensure_keymap_file() {
+        Ok(_) => config::open_path(&paths.keymap, cx),
         Err(error) => report("keymap.json", error),
     }
 }

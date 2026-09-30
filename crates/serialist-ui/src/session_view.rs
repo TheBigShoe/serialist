@@ -41,6 +41,16 @@
 //! actions. Paste goes out in paced chunks from an async task that leaving inline mode
 //! cancels.
 //!
+//! # Saved commands
+//!
+//! [`SessionView::send_command`] encodes a saved command with the session's line
+//! ending, echoes it as a `Tx` line (whatever the local echo setting), registers its
+//! `expect` with the ingest thread's matchers *before* writing, then writes. A task
+//! polls the expectation each frame: a match highlights the matched text in the
+//! terminal and says `Version: OK in 12 ms` in the status line; a timeout adds a notice
+//! line and says so in the status line too. Parameter values sent are remembered for
+//! the session.
+//!
 //! # Pause, clear, export, record
 //!
 //! Pause freezes the terminal's end at the current snapshot's end; snapshots keep
@@ -51,14 +61,16 @@
 //! from a snapshot on a background thread. Recording is a sink installed with the ingest
 //! thread and switched through a [`RecordingSlot`], so it starts and stops mid-session.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serialist_core::{
-    ChunkSink, ConnectionInfo, Direction, Ingest, IngestHandle, IngestPanicked, IngestStats,
-    LineEnding, LineId, LineSource, LinkState, PortId, SerialConfig, SessionStats, Snapshot, Store,
+    ChunkSink, Command, CommandRef, ConnectionInfo, Direction, ExpectResult, Expectation, Ingest,
+    IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId, LineSource, LinkState,
+    ParamValues, Payload, PortId, SearchMatch, SerialConfig, SessionStats, Snapshot, Store,
     TextOptions, Timestamps,
 };
 
@@ -67,6 +79,7 @@ use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
 use crate::compose::{ComposeBar, ComposeEvent};
 use crate::config::Config;
 use crate::export::{ExportFormat, ExportJob};
+use crate::history::PersistentHistory;
 use crate::inline::{
     EchoLine, EncodedKey, EscapeChord, InlineSettings, KeyEncoder, Mode, PasteProgress, is_chord,
     paste_bytes,
@@ -87,6 +100,43 @@ pub const FRAME: Duration = Duration::from_millis(8);
 /// How often the view reads counters that move without new lines (TX, a recording's
 /// bytes).
 pub const HOUSEKEEPING: Duration = Duration::from_millis(250);
+
+/// How often a pending expectation is looked at: about a frame.
+pub const EXPECT_POLL: Duration = FRAME;
+
+/// What the session view tells the workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionViewEvent {
+    /// "Save as command" in the compose bar: open the editor on `text`.
+    SaveAsCommand { text: String },
+}
+
+/// What a sent command's echo line says: text payloads as sent without the line ending,
+/// hex and codec payloads as the bytes in hex.
+fn command_echo(command: &Command, bytes: &[u8], session_eol: LineEnding) -> String {
+    match &command.payload {
+        Payload::Text(_) => {
+            let eol = command.eol.unwrap_or(session_eol).bytes();
+            let body = bytes.strip_suffix(eol).unwrap_or(bytes);
+            String::from_utf8_lossy(body).into_owned()
+        }
+        Payload::Hex(_) | Payload::Codec { .. } => bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// Where in `text` the pattern matched, for the highlight: the first match of the
+/// expectation's regex (compiled the same way the matcher does), else the whole line.
+fn match_range(pattern: &str, text: &str) -> Range<usize> {
+    serialist_core::matcher::compile_pattern(pattern)
+        .ok()
+        .and_then(|regex| regex.find(text).map(|found| found.range()))
+        .filter(|range| !range.is_empty())
+        .unwrap_or(0..text.len())
+}
 
 /// The `inline.*` settings in force, or the defaults without the app's configuration.
 fn inline_settings(cx: &App) -> InlineSettings {
@@ -194,11 +244,17 @@ pub struct SessionView {
     compose: Entity<ComposeBar>,
     mode: Mode,
     inline: InlineState,
+    /// Parameter values last sent per command, to prefill the next prompt.
+    remembered: HashMap<CommandRef, ParamValues>,
+    /// The workspace's persisted compose history, which sent lines are added to.
+    history: Option<Entity<PersistentHistory>>,
     focus_handle: FocusHandle,
     _wake: Task<()>,
     _housekeeping: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<SessionViewEvent> for SessionView {}
 
 impl Focusable for SessionView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -239,7 +295,15 @@ impl SessionView {
         });
         let compose_events =
             cx.subscribe_in(&compose, window, |this, _, event, _, cx| match event {
-                ComposeEvent::Submit { text, bytes } => this.send(text, bytes.clone(), cx),
+                ComposeEvent::Submit { text, bytes } => {
+                    if let Some(history) = &this.history {
+                        history.update(cx, |history, cx| history.push(text, cx));
+                    }
+                    this.send(text, bytes.clone(), cx);
+                }
+                ComposeEvent::SaveAsCommand { text } => {
+                    cx.emit(SessionViewEvent::SaveAsCommand { text: text.clone() });
+                }
             });
         // Joining the session's and the ingest thread can take a read timeout's worth of
         // time, and a recording needs its final flush, so a dropped view hands all three
@@ -343,6 +407,8 @@ impl SessionView {
             compose,
             mode: Mode::Command,
             inline: InlineState::default(),
+            remembered: HashMap::new(),
+            history: None,
             focus_handle: cx.focus_handle(),
             _wake: wake,
             _housekeeping: housekeeping,
@@ -625,6 +691,147 @@ impl SessionView {
     /// The line ending the compose bar sends, which inline Enter sends too.
     pub fn line_ending(&self, cx: &App) -> LineEnding {
         self.compose.read(cx).line_ending()
+    }
+
+    /// Share the workspace's persisted history: the compose bar starts from it, and
+    /// every line sent is added to it.
+    pub fn set_history(&mut self, history: Entity<PersistentHistory>, cx: &mut Context<Self>) {
+        let entries = history.read(cx).entries_oldest_first();
+        self.compose
+            .update(cx, |compose, cx| compose.set_history_entries(entries, cx));
+        self.history = Some(history);
+    }
+
+    // --- Saved commands --------------------------------------------------------------
+
+    /// The parameter values last sent with `reference` in this session.
+    pub fn remembered_params(&self, reference: &CommandRef) -> Option<&ParamValues> {
+        self.remembered.get(reference)
+    }
+
+    /// Send a saved command: encode it with `params` and the session's line ending,
+    /// echo it as a `Tx` line, register its expectation, then write it. The outcome
+    /// lands in the status line, and a matched reply is highlighted.
+    pub fn send_command(
+        &mut self,
+        reference: &CommandRef,
+        command: &Command,
+        params: &ParamValues,
+        cx: &mut Context<Self>,
+    ) {
+        let name = command.name.clone();
+        if !params.is_empty() {
+            self.remembered.insert(reference.clone(), params.clone());
+        }
+        let session_eol = self.line_ending(cx);
+        let bytes = match command.encode(params, session_eol) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("{name}: {error}")));
+                cx.notify();
+                return;
+            }
+        };
+        let Some((session, ingest)) = self.live() else {
+            self.notice = Some(Notice::error(format!("Not connected; not sent: {name}")));
+            cx.notify();
+            return;
+        };
+        // A saved command is always echoed: it is the record of what was sent.
+        let _ = ingest.append_local(command_echo(command, &bytes, session_eol), Direction::Tx);
+        // Registered before the write, so the reply cannot arrive unwatched.
+        let expectation = command.expect.as_ref().map(|expect| {
+            ingest
+                .matchers()
+                .expect(&expect.pattern, expect.timeout())
+                .map(|expectation| (expectation, expect.timeout_ms))
+        });
+        if session.write(bytes).is_err() {
+            let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
+        }
+        tracing::debug!(command = %reference, "sent saved command");
+        match expectation {
+            Some(Ok((expectation, timeout_ms))) => {
+                self.await_reply(name, expectation, timeout_ms, cx);
+            }
+            Some(Err(error)) => {
+                self.notice = Some(Notice::error(format!(
+                    "{name}: the expected reply is not a valid pattern: {error}"
+                )));
+            }
+            None => self.notice = Some(Notice::info(format!("Sent {name}"))),
+        }
+        cx.notify();
+    }
+
+    /// Poll `expectation` each frame until it resolves, then report it. The matcher
+    /// resolves it on the ingest thread, so polling never blocks.
+    fn await_reply(
+        &mut self,
+        name: String,
+        expectation: Expectation,
+        timeout_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some(Notice::info(format!("{name}: waiting for a reply…")));
+        cx.spawn(async move |this, cx| {
+            loop {
+                if let Some(result) = expectation.try_wait() {
+                    let pattern = expectation.pattern().to_owned();
+                    this.update(cx, |view, cx| {
+                        view.reply(&name, &pattern, timeout_ms, result, cx);
+                    })
+                    .ok();
+                    return;
+                }
+                if this.upgrade().is_none() {
+                    expectation.cancel();
+                    return;
+                }
+                cx.background_executor().timer(EXPECT_POLL).await;
+            }
+        })
+        .detach();
+    }
+
+    fn reply(
+        &mut self,
+        name: &str,
+        pattern: &str,
+        timeout_ms: u64,
+        result: ExpectResult,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            ExpectResult::Matched {
+                line,
+                text,
+                elapsed,
+                ..
+            } => {
+                let range = match_range(pattern, &text);
+                self.terminal.update(cx, |terminal, cx| {
+                    terminal.add_mark(SearchMatch { line, range }, cx);
+                });
+                self.notice = Some(Notice::info(format!(
+                    "{name}: OK in {} ms",
+                    elapsed.as_millis()
+                )));
+            }
+            ExpectResult::TimedOut { .. } => {
+                let message = format!("{name}: no response within {timeout_ms} ms");
+                if let Some(ingest) = &self.ingest {
+                    let _ = ingest.append_local(message.clone(), Direction::Notice);
+                }
+                self.notice = Some(Notice::error(message));
+            }
+            ExpectResult::Closed => {
+                self.notice = Some(Notice::info(format!(
+                    "{name}: the session ended before a reply"
+                )));
+            }
+        }
+        cx.notify();
     }
 
     // --- Inline mode -----------------------------------------------------------------

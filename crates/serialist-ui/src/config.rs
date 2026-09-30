@@ -12,7 +12,12 @@
 //! view its display defaults, the Devices panel its profiles, the workspace the notice.
 //!
 //! A [`ConfigWatcher`] reports saves; a foreground task drains its channel, reloads the
-//! piece that changed (settings, keymap or themes) and installs the result.
+//! piece that changed (settings, keymap, themes or saved commands) and installs the
+//! result.
+//!
+//! Saved commands ([`CommandStore`]) live here too, because their keybindings are part
+//! of the key bindings: every install that changes the keymap or the commands rebinds,
+//! with the commands' bindings layered after the keymap's (see [`keymap::apply`]).
 //!
 //! # Failures
 //!
@@ -31,8 +36,9 @@ use crossbeam_channel::RecvTimeoutError;
 use serialist_core::config_watch::{ConfigEvent, ConfigWatcher};
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    Appearance, FontSpec, Keymap, PortInfo, Rgba as CoreRgba, SerialConfig, Settings,
-    SettingsError, Theme as ZedTheme, ThemeRegistry, load_keymap, load_settings,
+    Appearance, CommandCollection, CommandStore, FontSpec, Keymap, PortInfo, Rgba as CoreRgba,
+    SerialConfig, Settings, SettingsError, Theme as ZedTheme, ThemeRegistry, load_keymap,
+    load_settings,
 };
 
 use crate::fonts::{
@@ -135,6 +141,12 @@ pub struct Config {
     settings: Arc<Settings>,
     /// The bundled default bindings followed by the user's.
     keymap: Arc<Keymap>,
+    /// The saved commands: the user's and the project's collections and the bundled
+    /// examples.
+    commands: Arc<CommandStore>,
+    /// Read from `paths` (not just the bundled defaults), so files there may be written:
+    /// the compose history, a saved command.
+    loaded: bool,
     themes: Arc<ThemeRegistry>,
     theme: Arc<ZedTheme>,
     /// The window appearance `"mode": "system"` follows.
@@ -171,6 +183,8 @@ impl Config {
             theme: Arc::new(themes.default_for(Appearance::Dark).clone()),
             settings,
             keymap: Arc::new(Keymap::bundled_default()),
+            commands: Arc::new(bundled_commands()),
+            loaded: false,
             themes,
             system_dark: true,
             terminal_font: TerminalFont::default(),
@@ -188,11 +202,13 @@ impl Config {
     pub fn load(paths: ConfigPaths, system_dark: bool) -> Self {
         let mut config = Self::bundled(paths);
         config.system_dark = system_dark;
+        config.loaded = true;
         // Themes first, so the settings resolve their theme against the user's files
         // rather than warning that it is missing from the bundled ones.
         config.reload_themes();
         config.reload_keymap();
         config.reload_settings();
+        config.reload_commands();
         config
     }
 
@@ -206,6 +222,17 @@ impl Config {
 
     pub fn keymap(&self) -> &Arc<Keymap> {
         &self.keymap
+    }
+
+    /// The saved commands.
+    pub fn commands(&self) -> &Arc<CommandStore> {
+        &self.commands
+    }
+
+    /// Whether this configuration was read from its directory, rather than being the
+    /// bundled defaults alone. Only then does the app write files there.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     /// The resolved Zed theme for the current appearance.
@@ -351,6 +378,32 @@ impl Config {
         self.set_problems(ConfigPiece::Keymap, problems);
     }
 
+    /// Read the saved-command collections again. Loading never fails; a file that
+    /// cannot be used is left out and reported.
+    pub fn reload_commands(&mut self) {
+        let store = if self.loaded {
+            CommandStore::load(&self.paths)
+        } else {
+            bundled_commands()
+        };
+        let problems = store
+            .warnings()
+            .iter()
+            .map(|warning| ConfigProblem {
+                piece: ConfigPiece::Commands,
+                is_error: false,
+                message: warning.to_string(),
+            })
+            .collect();
+        self.commands = Arc::new(store);
+        self.set_problems(ConfigPiece::Commands, problems);
+    }
+
+    /// Use `store` as the saved commands, as a reload would.
+    pub fn set_commands(&mut self, store: CommandStore) {
+        self.commands = Arc::new(store);
+    }
+
     /// Read the themes folder again.
     pub fn reload_themes(&mut self) {
         self.themes = Arc::new(ThemeRegistry::load_from(&self.paths));
@@ -448,6 +501,13 @@ impl Config {
     }
 }
 
+/// The bundled example collection alone, for a configuration read from nowhere.
+fn bundled_commands() -> CommandStore {
+    let mut store = CommandStore::empty();
+    store.set_collection(CommandCollection::bundled_examples());
+    store
+}
+
 fn is_inline_key(key: &str) -> bool {
     key == "inline" || key.starts_with("inline.")
 }
@@ -542,15 +602,19 @@ pub fn open_path(path: &Path, cx: &mut App) {
 }
 
 /// Install `config`: gpui-kit's theme and fonts, the key bindings (only when the
-/// keymap changed), then the global, which notifies every observer.
+/// keymap or the saved commands changed), then the global, which notifies every
+/// observer.
 pub fn install(mut config: Config, cx: &mut App) {
     let previous = cx.try_global::<Config>();
     config.generation = previous.map_or(1, |previous| previous.generation + 1);
-    let rebind = previous.is_none_or(|previous| !Arc::ptr_eq(&previous.keymap, &config.keymap));
+    let rebind = previous.is_none_or(|previous| {
+        !Arc::ptr_eq(&previous.keymap, &config.keymap)
+            || !Arc::ptr_eq(&previous.commands, &config.commands)
+    });
     config.check_fonts(cx);
     theme_bridge::apply_kit_theme(config.kit_theme(), cx);
     if rebind {
-        let problems = keymap::apply(&config.keymap, cx)
+        let problems = keymap::apply(&config.keymap, &config.commands, cx)
             .into_iter()
             .map(|message| ConfigProblem {
                 piece: ConfigPiece::Bindings,
@@ -580,8 +644,7 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
         ConfigPiece::Settings | ConfigPiece::Fonts => config.reload_settings(),
         ConfigPiece::Keymap | ConfigPiece::Bindings => config.reload_keymap(),
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
-        // The commands store reload is wired by the milestone 3 UI work.
-        ConfigPiece::Commands => {}
+        ConfigPiece::Commands => config.reload_commands(),
     });
 }
 
@@ -591,6 +654,7 @@ pub fn reload_all(cx: &mut App) {
         config.reload_themes();
         config.reload_keymap();
         config.reload_settings();
+        config.reload_commands();
     });
 }
 
