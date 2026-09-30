@@ -173,6 +173,12 @@ impl ManualClock {
         }
     }
 
+    /// The current time on this clock (the same as [`Clock::now`], without importing
+    /// the trait).
+    pub fn now(&self) -> Instant {
+        self.state.lock().now
+    }
+
     /// Move time forward by `by` and wake every waiting thread. Saturates far in the
     /// future rather than overflowing.
     pub fn advance(&self, by: Duration) {
@@ -252,7 +258,7 @@ impl Default for ManualClock {
 
 impl Clock for ManualClock {
     fn now(&self) -> Instant {
-        self.state.lock().now
+        ManualClock::now(self)
     }
 
     fn wait(&self, wakeup: &Arc<Wakeup>, seen: u64, deadline: Option<Instant>) {
