@@ -27,7 +27,9 @@
 //!   and notices (`Tx` and `Notice` lines) are never matched, so `expect("AT")` is not
 //!   satisfied by your own echo. A line still waiting for its LF is not matched until it
 //!   ends; a line the parser ends early at its length cap is. A received line that a
-//!   local line interrupts is committed unmatched.
+//!   local line interrupts is committed unmatched. Text typed in line
+//!   ([`IngestHandle::append_local_inline`](crate::IngestHandle::append_local_inline))
+//!   does not interrupt: the line in progress carries on and is matched when it ends.
 //! - **Only lines appended after registration.** An expectation starts at the line the
 //!   ingest thread will store next; everything already stored, including a line that had
 //!   begun but not ended, is never matched. This is why the order is register, then send.
@@ -260,12 +262,9 @@ impl MatcherHandle {
     /// lines it finished to the pending expectations, then expire the overdue ones.
     pub(crate) fn on_append(&self, store: &Store, report: &AppendReport, at: Instant) {
         let mut registry = self.core.registry.lock();
-        // The line in progress is the newest one and is not handed over until it ends.
-        let ended = if report.incomplete {
-            LineId(report.changed.end.0.saturating_sub(1))
-        } else {
-            report.changed.end
-        };
+        // The line in progress, and any local line typed after it, are not handed over
+        // until they are in the index: only lines before `committed_end` have ended.
+        let ended = report.committed_end;
         if !registry.entries.is_empty() && report.changed.start < ended {
             let snapshot = store.snapshot();
             let mut lines = Vec::new();
@@ -316,6 +315,18 @@ impl MatcherHandle {
     pub(crate) fn advance(&self, end: LineId, now: Instant) {
         let mut registry = self.core.registry.lock();
         registry.end = registry.end.max(end);
+        registry.expire(now);
+    }
+
+    /// Local lines typed in line were taken back: the store's end moved down to `end`, so
+    /// lines that arrive from now on take ids from there. Expectations registered while
+    /// those lines existed would otherwise start too late and miss the next line.
+    pub(crate) fn retreat(&self, end: LineId, now: Instant) {
+        let mut registry = self.core.registry.lock();
+        registry.end = registry.end.min(end);
+        for entry in &mut registry.entries {
+            entry.start = entry.start.min(end);
+        }
         registry.expire(now);
     }
 

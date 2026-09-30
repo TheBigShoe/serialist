@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::buf::AppendBuf;
 use super::index::{self, Block, DecRef, LineFlags};
-use super::{B, P, PAGE_SIZE, Published, StoreStats, TailText};
+use super::{B, LocalTail, P, PAGE_SIZE, Published, StoreStats, Tail, TailText};
 use crate::text::{Direction, Epoch, LineId, LineSource, Style, StyleRun, StyledLine};
 
 /// A consistent view of the store: a fixed line range and raw range, with the pages and
@@ -49,6 +49,22 @@ impl Snapshot {
         self.p.stats
     }
 
+    /// One past the last line in the index. Lines from here on are still open and may
+    /// change in a later snapshot: the received line in progress, if there is one, and
+    /// then the local lines typed in line that have not entered the index (see
+    /// [`Store::append_local_inline`](super::Store::append_local_inline)). Lines before
+    /// it never change. Equal to [`LineSource::end`] when nothing is open.
+    pub fn committed_end(&self) -> LineId {
+        LineId(self.p.committed_end)
+    }
+
+    /// Whether `other` is the same publication as this snapshot: nothing was published
+    /// between the two. Cheaper than, and stricter than, comparing [`StoreStats`], which
+    /// cannot see a line being typed change its text without changing its length.
+    pub fn is_same_publication(&self, other: &Snapshot) -> bool {
+        Arc::ptr_eq(&self.p, &other.p)
+    }
+
     /// The text of line `id` as bytes, borrowed where possible (plain lines inside one
     /// page, decoded lines) and gathered into `scratch` otherwise.
     pub(super) fn line_text<'a>(&'a self, id: u64, scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
@@ -56,14 +72,16 @@ impl Snapshot {
         if id < p.first_line || id >= p.end_line {
             return None;
         }
-        if id == p.committed_end {
-            let tail = p.tail.as_ref()?;
-            return Some(match &tail.text {
-                TailText::Plain { lead, len } => {
-                    let start = tail.start + lead;
-                    gather(p, start..start + *len as u64, scratch)
-                }
-                TailText::Decoded(d) => d.0.as_bytes(),
+        if id >= p.committed_end {
+            return Some(match p.open_line(id)? {
+                OpenLine::Received(tail) => match &tail.text {
+                    TailText::Plain { lead, len } => {
+                        let start = tail.start + lead;
+                        gather(p, start..start + *len as u64, scratch)
+                    }
+                    TailText::Decoded(d) => d.0.as_bytes(),
+                },
+                OpenLine::Typed(local) => local.text.as_bytes(),
             });
         }
         let (block, local) = p.block(id);
@@ -162,8 +180,38 @@ impl Published {
         block.ns(local.min(n.saturating_sub(1)))
     }
 
-    fn tail_line(&self, id: LineId) -> Option<StyledLine> {
-        let tail = self.tail.as_ref()?;
+    /// The open line with id `id`, which is at or past `committed_end`: the received line
+    /// in progress, then the typed lines.
+    pub(super) fn open_line(&self, id: u64) -> Option<OpenLine<'_>> {
+        let k = usize::try_from(id.checked_sub(self.committed_end)?).ok()?;
+        match &self.tail {
+            Some(tail) if k == 0 => Some(OpenLine::Received(tail)),
+            Some(_) => self.local.get(k - 1).map(OpenLine::Typed),
+            None => self.local.get(k).map(OpenLine::Typed),
+        }
+    }
+
+    fn open_styled_line(&self, id: LineId) -> Option<StyledLine> {
+        match self.open_line(id.0)? {
+            OpenLine::Received(tail) => Some(self.tail_line(id, tail)),
+            OpenLine::Typed(local) => {
+                let text = local.text.to_string();
+                let runs = default_runs(text.len());
+                Some(StyledLine {
+                    id,
+                    text,
+                    runs,
+                    direction: local.direction,
+                    received_at: self.instant(local.ns),
+                    // Local lines have no bytes of their own; this is where they sit.
+                    raw: self.raw_len..self.raw_len,
+                    complete: local.complete,
+                })
+            }
+        }
+    }
+
+    fn tail_line(&self, id: LineId, tail: &Tail) -> StyledLine {
         let (text, runs) = match &tail.text {
             TailText::Plain { lead, len } => {
                 let start = tail.start + lead;
@@ -173,7 +221,7 @@ impl Published {
             }
             TailText::Decoded(d) => (d.0.clone(), d.1.clone()),
         };
-        Some(StyledLine {
+        StyledLine {
             id,
             text,
             runs,
@@ -181,8 +229,16 @@ impl Published {
             received_at: self.instant(tail.ns),
             raw: tail.start..self.raw_len,
             complete: false,
-        })
+        }
     }
+}
+
+/// A line that is not in the index yet.
+pub(super) enum OpenLine<'a> {
+    /// The received line in progress.
+    Received(&'a Tail),
+    /// A local line typed in line.
+    Typed(&'a LocalTail),
 }
 
 fn default_runs(len: usize) -> Vec<StyleRun> {
@@ -225,8 +281,8 @@ impl LineSource for Snapshot {
         if n < p.first_line || n >= p.end_line {
             return None;
         }
-        if n == p.committed_end {
-            return p.tail_line(id);
+        if n >= p.committed_end {
+            return p.open_styled_line(id);
         }
         let (block, local) = p.block(n);
         let flags: LineFlags = block.flags(local);

@@ -1273,3 +1273,484 @@ fn glyphs_stay_within_the_budget() {
         "normal 1999\u{240d}\u{240a}"
     );
 }
+
+// --- Typing in line ----------------------------------------------------------------
+
+type Summary = (Direction, String, bool, Range<u64>);
+
+/// Direction, text, completeness and raw range of every line, open ones included.
+fn summary(store: &Store) -> Vec<Summary> {
+    let snap = store.snapshot();
+    let mut lines = Vec::new();
+    snap.lines(snap.first_line()..snap.end(), &mut lines);
+    lines
+        .into_iter()
+        .map(|l| (l.direction, l.text, l.complete, l.raw))
+        .collect()
+}
+
+fn tx(text: &str, complete: bool, at: u64) -> Summary {
+    (Direction::Tx, text.to_owned(), complete, at..at)
+}
+
+fn rx(text: &str, complete: bool, raw: Range<u64>) -> Summary {
+    (Direction::Rx, text.to_owned(), complete, raw)
+}
+
+#[test]
+fn typed_text_grows_one_line_in_place_until_it_is_closed() {
+    let mut store = Store::default();
+    assert_eq!(
+        store.append_local_inline("l", Direction::Tx),
+        LineId(0)..LineId(1)
+    );
+    assert_eq!(summary(&store), [tx("l", false, 0)], "shown as it is typed");
+    assert_eq!(store.end(), LineId(1));
+    assert_eq!(store.snapshot().committed_end(), LineId(0), "still open");
+
+    assert_eq!(
+        store.append_local_inline("s", Direction::Tx),
+        LineId(0)..LineId(1),
+        "the same line"
+    );
+    assert_eq!(summary(&store), [tx("ls", false, 0)]);
+    assert_eq!(store.stats().end_line, LineId(1));
+
+    // A line end closes it and it enters the index.
+    assert_eq!(
+        store.append_local_inline("\n", Direction::Tx),
+        LineId(0)..LineId(1)
+    );
+    assert_eq!(summary(&store), [tx("ls", true, 0)]);
+    assert_eq!(store.snapshot().committed_end(), LineId(1));
+
+    // The next text is a new line.
+    store.append_local_inline("pwd", Direction::Tx);
+    assert_eq!(summary(&store), [tx("ls", true, 0), tx("pwd", false, 0)]);
+    // One call can hold several lines; the last stays open.
+    store.append_local_inline("\nwho\nam", Direction::Tx);
+    assert_eq!(
+        summary(&store),
+        [
+            tx("ls", true, 0),
+            tx("pwd", true, 0),
+            tx("who", true, 0),
+            tx("am", false, 0)
+        ]
+    );
+    for line in summary(&store) {
+        assert!(!line.1.contains(['\n', '\r']));
+    }
+}
+
+#[test]
+fn a_line_end_alone_never_makes_an_empty_line() {
+    let mut store = Store::default();
+    assert_eq!(
+        store.append_local_inline("\n", Direction::Tx),
+        LineId(0)..LineId(0),
+        "nothing open"
+    );
+    assert_eq!(
+        store.append_local_inline("", Direction::Tx),
+        LineId(0)..LineId(0)
+    );
+    assert_eq!(
+        store.append_local_inline("\r\x1b\u{7}", Direction::Tx),
+        LineId(0)..LineId(0),
+        "controls alone type nothing"
+    );
+    assert_eq!(store.end(), LineId(0));
+    assert!(summary(&store).is_empty());
+    // After a line is closed, another line end does nothing either.
+    store.append_local_inline("a\n\n\n", Direction::Tx);
+    assert_eq!(summary(&store), [tx("a", true, 0)]);
+}
+
+#[test]
+fn controls_are_dropped_and_tabs_expand_from_the_current_column() {
+    let mut store = Store::default();
+    store.append_local_inline("ab\tc", Direction::Tx);
+    store.append_local_inline("\r\x1b[x\t", Direction::Tx);
+    // The second tab starts at column 11 ("ab", six spaces, "c[x") and stops at 16.
+    assert_eq!(TAB_WIDTH, 8);
+    assert_eq!(summary(&store), [tx("ab      c[x     ", false, 0)]);
+    // Typed a piece at a time, the tab still lands on the same stop.
+    let mut pieces = Store::default();
+    for piece in ["a", "b", "\t", "c"] {
+        pieces.append_local_inline(piece, Direction::Tx);
+    }
+    assert_eq!(
+        summary(&pieces),
+        [tx(&format!("ab{}c", " ".repeat(TAB_WIDTH - 2)), false, 0)]
+    );
+    // Rx is treated as a notice, as `append_local` does.
+    let mut store = Store::default();
+    store.append_local_inline("hm", Direction::Rx);
+    assert_eq!(summary(&store)[0].0, Direction::Notice);
+}
+
+#[test]
+fn a_received_line_in_progress_is_left_alone_and_the_typed_text_follows_it() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"prompt> ", at);
+    let ids = store.append_local_inline("ls", Direction::Tx);
+    assert_eq!(ids, LineId(1)..LineId(2), "after the received line's id 0");
+    assert_eq!(
+        summary(&store),
+        [rx("prompt> ", false, 0..8), tx("ls", false, 8)],
+        "the received line is not ended: it is still incomplete"
+    );
+    assert_eq!(store.snapshot().committed_end(), LineId(0));
+    assert_eq!(store.end(), LineId(2));
+
+    // More of the received line continues it, and the typed line stays after it.
+    let report = store.append(b"more", at);
+    assert!(report.incomplete);
+    assert_eq!(report.committed_end, LineId(0));
+    assert_eq!(
+        summary(&store),
+        [rx("prompt> more", false, 0..12), tx("ls", false, 12)]
+    );
+
+    // Typing goes on in the same line.
+    store.append_local_inline("x", Direction::Tx);
+    assert_eq!(summary(&store)[1], tx("lsx", false, 12));
+
+    // The received line ends: it is in the index, complete, and the typed line follows
+    // it. The typed line is still the one being typed.
+    let report = store.append(b"\r\n", at);
+    assert_eq!(report.committed_end, LineId(1));
+    assert!(!report.incomplete);
+    assert_eq!(
+        summary(&store),
+        [rx("prompt> more", true, 0..14), tx("lsx", false, 14)]
+    );
+    assert_eq!(store.snapshot().committed_end(), LineId(1));
+    store.append_local_inline("y", Direction::Tx);
+    assert_eq!(summary(&store)[1], tx("lsxy", false, 14), "still open");
+
+    // A new received line ends it: the typed line enters the index, as typed so far.
+    let report = store.append(b"file\r\n", at);
+    assert_eq!(report.committed_end, LineId(3));
+    assert_eq!(
+        summary(&store),
+        [
+            rx("prompt> more", true, 0..14),
+            tx("lsxy", false, 14),
+            rx("file", true, 14..20),
+        ]
+    );
+    // It is history now: typing starts a new line, and taking back does nothing.
+    assert_eq!(store.truncate_local_line(2), 0);
+    store.append_local_inline("z", Direction::Tx);
+    assert_eq!(summary(&store)[3], tx("z", false, 20));
+}
+
+#[test]
+fn closed_lines_wait_behind_a_received_line_and_enter_the_index_when_it_ends() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"> ", at);
+    store.append_local_inline("ls\npwd\nwh", Direction::Tx);
+    assert_eq!(
+        summary(&store),
+        [
+            rx("> ", false, 0..2),
+            tx("ls", true, 2),
+            tx("pwd", true, 2),
+            tx("wh", false, 2)
+        ]
+    );
+    assert_eq!(
+        store.snapshot().committed_end(),
+        LineId(0),
+        "all open lines"
+    );
+
+    let report = store.append(b"\r\nout", at);
+    // The received line and the closed typed lines are final; the open typed line
+    // precedes the line "out" started, so it entered the index too.
+    assert_eq!(
+        summary(&store),
+        [
+            rx("> ", true, 0..4),
+            tx("ls", true, 4),
+            tx("pwd", true, 4),
+            tx("wh", false, 4),
+            rx("out", false, 4..7),
+        ]
+    );
+    assert_eq!(report.committed_end, LineId(4));
+    assert_eq!(report.changed, LineId(0)..LineId(5));
+    assert_eq!(report.new_lines, 1);
+    assert_eq!(store.snapshot().committed_end(), LineId(4));
+}
+
+#[test]
+fn a_typed_line_stays_open_when_the_received_line_ends_exactly_at_a_chunk_end() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"> ", at);
+    store.append_local_inline("ls", Direction::Tx);
+    store.append(b"\r\n", at);
+    assert_eq!(summary(&store), [rx("> ", true, 0..4), tx("ls", false, 4)]);
+    // Nothing has been received since, so it can still be extended and taken back.
+    store.append_local_inline("s", Direction::Tx);
+    assert_eq!(summary(&store)[1], tx("lss", false, 4));
+    assert_eq!(store.truncate_local_line(1), 1);
+    assert_eq!(summary(&store)[1], tx("ls", false, 4));
+}
+
+#[test]
+fn received_text_between_keystrokes_splits_the_typed_text_in_order() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append_local_inline("ab", Direction::Tx);
+    store.append(b"log 1\r\n", at);
+    store.append_local_inline("cd", Direction::Tx);
+    store.append(b"log 2\r\n", at);
+    assert_eq!(
+        summary(&store),
+        [
+            tx("ab", false, 0),
+            rx("log 1", true, 0..7),
+            tx("cd", false, 7),
+            rx("log 2", true, 7..14),
+        ]
+    );
+}
+
+#[test]
+fn a_local_line_ends_the_open_typed_line_and_follows_it() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append_local_inline("ab", Direction::Tx);
+    let ids = store.append_local("Disconnected", Direction::Notice);
+    assert_eq!(ids, LineId(1)..LineId(2), "only the new lines");
+    assert_eq!(
+        summary(&store),
+        [
+            tx("ab", false, 0),
+            (Direction::Notice, "Disconnected".into(), true, 0..0)
+        ]
+    );
+    // With a received line in progress: it ends, then the typed lines, then the new one.
+    store.append(b"rx", at);
+    store.append_local_inline("cd\ne", Direction::Tx);
+    store.append_local("echo", Direction::Tx);
+    assert_eq!(
+        summary(&store),
+        [
+            tx("ab", false, 0),
+            (Direction::Notice, "Disconnected".into(), true, 0..0),
+            rx("rx", false, 0..2),
+            tx("cd", true, 2),
+            tx("e", false, 2),
+            tx("echo", true, 2),
+        ]
+    );
+    // Typing after a local line is a new line.
+    store.append_local_inline("f", Direction::Tx);
+    assert_eq!(summary(&store).last(), Some(&tx("f", false, 2)));
+}
+
+#[test]
+fn truncating_takes_characters_from_the_open_line_only() {
+    let mut store = Store::default();
+    assert_eq!(store.truncate_local_line(1), 0, "nothing typed");
+    store.append_local_inline("abc", Direction::Tx);
+    assert_eq!(store.truncate_local_line(1), 1);
+    assert_eq!(summary(&store), [tx("ab", false, 0)]);
+    store.append_local_inline("\u{e9}\u{20ac}", Direction::Tx);
+    assert_eq!(store.truncate_local_line(2), 2, "characters, not bytes");
+    assert_eq!(summary(&store), [tx("ab", false, 0)]);
+    // More than there is: the line goes, and nothing else does.
+    store.append_local_inline("\nkeep\nxy", Direction::Tx);
+    assert_eq!(store.truncate_local_line(9), 2);
+    assert_eq!(summary(&store), [tx("ab", true, 0), tx("keep", true, 0)]);
+    assert_eq!(store.end(), LineId(2));
+    // A closed line is history.
+    assert_eq!(store.truncate_local_line(1), 0);
+    assert_eq!(store.truncate_local_line(0), 0);
+    assert_eq!(summary(&store), [tx("ab", true, 0), tx("keep", true, 0)]);
+}
+
+#[test]
+fn truncating_a_line_behind_a_received_line_in_progress() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"> ", at);
+    store.append_local_inline("ls", Direction::Tx);
+    assert_eq!(store.truncate_local_line(1), 1);
+    assert_eq!(summary(&store), [rx("> ", false, 0..2), tx("l", false, 2)]);
+    assert_eq!(store.truncate_local_line(1), 1);
+    assert_eq!(summary(&store), [rx("> ", false, 0..2)]);
+    assert_eq!(store.end(), LineId(1));
+    // With the typed line gone, the received line ends as if nothing was typed.
+    let report = store.append(b"\r\n", at);
+    assert_eq!(report.committed_end, LineId(1));
+    assert_eq!(summary(&store), [rx("> ", true, 0..4)]);
+    assert_eq!(store.snapshot().committed_end(), store.end());
+}
+
+#[test]
+fn typed_lines_are_lines_to_read_search_and_export() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"boot ok\r\nprompt> ", at);
+    store.append_local_inline("reboot", Direction::Tx);
+    let snap = store.snapshot();
+    assert_eq!(snap.line_count(), 3);
+    assert_eq!(snap.line(LineId(2)).unwrap().text, "reboot");
+    assert!(snap.line(LineId(3)).is_none());
+    assert_eq!(snap.first_line()..snap.end(), LineId(0)..LineId(3));
+    // Searching finds a typed line in progress and the received one before it.
+    let cancel = AtomicBool::new(false);
+    let hits = snap
+        .search("o", LineId(2), true, 10, &cancel)
+        .unwrap()
+        .iter()
+        .map(|m| (m.line, m.range.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hits,
+        [
+            (LineId(2), 4..5),
+            (LineId(2), 3..4),
+            (LineId(1), 2..3),
+            (LineId(0), 5..6),
+            (LineId(0), 2..3),
+            (LineId(0), 1..2),
+        ]
+    );
+    // The text export writes it, and raw export is the received bytes alone.
+    assert_eq!(
+        snap.text(snap.first_line()..snap.end(), TextOptions::default()),
+        "boot ok\nprompt> \nreboot\n"
+    );
+    assert_eq!(
+        snap.raw(0..u64::MAX)
+            .flatten()
+            .copied()
+            .collect::<Vec<u8>>(),
+        b"boot ok\r\nprompt> "
+    );
+    assert_eq!(snap.stats().raw_len, 17);
+    // An old snapshot is a value: it does not change as typing goes on.
+    store.append_local_inline("!", Direction::Tx);
+    assert_eq!(snap.line(LineId(2)).unwrap().text, "reboot");
+    assert_eq!(store.snapshot().line(LineId(2)).unwrap().text, "reboot!");
+    assert!(!snap.is_same_publication(&store.snapshot()));
+    assert!(store.snapshot().is_same_publication(&store.snapshot()));
+}
+
+#[test]
+fn a_pile_of_typed_lines_behind_one_received_line_is_bounded() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"never ends", at);
+    for i in 0..=MAX_QUEUED_INLINE_LINES {
+        store.append_local_inline(&format!("line {i}\n"), Direction::Tx);
+    }
+    // One past the bound: the received line was ended (incomplete), as a whole local
+    // line would, and everything typed entered the index.
+    let lines = summary(&store);
+    assert_eq!(lines[0], rx("never ends", false, 0..10));
+    assert_eq!(lines.len(), MAX_QUEUED_INLINE_LINES + 2);
+    assert_eq!(
+        store.snapshot().committed_end(),
+        store.end(),
+        "nothing waits"
+    );
+    // Later bytes start a new line.
+    store.append(b"next\r\n", at);
+    assert_eq!(summary(&store).last(), Some(&rx("next", true, 10..16)));
+
+    // The same for a long pile of text rather than many lines: a line ends at the line
+    // limit, so this is one full line and the start of another.
+    let mut store = Store::default();
+    store.append(b"never ends", at);
+    store.append_local_inline(&"x".repeat(MAX_QUEUED_INLINE_BYTES + 1), Direction::Tx);
+    let lines = summary(&store);
+    assert_eq!(lines[0], rx("never ends", false, 0..10));
+    assert_eq!(lines.len(), 3);
+    assert_eq!(store.snapshot().committed_end(), LineId(2));
+    assert!(!lines[2].2, "the last is still open");
+}
+
+#[test]
+fn a_typed_line_is_ended_at_the_line_limit_like_a_received_one() {
+    let mut store = Store::new(StoreConfig {
+        max_line_bytes: 64,
+        ..StoreConfig::default()
+    });
+    let limit = 64usize.max(crate::ansi::MIN_LINE_BYTES);
+    store.append_local_inline(&"y".repeat(2 * limit + 5), Direction::Tx);
+    let lines = summary(&store);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].1.len(), limit);
+    assert_eq!(lines[1].1.len(), limit);
+    assert_eq!(lines[2].1.len(), 5);
+    // A line ended by the limit is not "complete", the way a received one is not.
+    assert!(!lines[0].2);
+    assert_eq!(store.snapshot().committed_end(), LineId(2));
+    assert!(!store.snapshot().line(LineId(2)).unwrap().complete);
+}
+
+#[test]
+fn typed_lines_are_evicted_like_any_other_local_line() {
+    let mut store = Store::with_budget(0);
+    let budget = store.budget();
+    let padding = "z".repeat(600);
+    for i in 0..10_000 {
+        store.append_local_inline(&format!("typed line number {i} {padding}\n"), Direction::Tx);
+        assert!(store.stats().memory <= budget);
+    }
+    let stats = store.stats();
+    assert!(stats.evicted_lines > 0);
+    assert_eq!(stats.end_line, LineId(10_000));
+    let snap = store.snapshot();
+    let last = snap.line(LineId(9_999)).unwrap();
+    assert!(last.text.starts_with("typed line number 9999"));
+    assert!(snap.line(LineId(0)).is_none(), "the oldest went");
+}
+
+#[test]
+fn typed_lines_count_against_the_budget_while_they_wait() {
+    let mut store = Store::with_budget(0);
+    let at = t0(&store);
+    let idle = store.stats().memory;
+    store.append(b"prompt", at);
+    let with_prompt = store.stats().memory;
+    store.append_local_inline(&"q".repeat(10_000), Direction::Tx);
+    let waiting = store.stats().memory;
+    assert!(
+        waiting >= with_prompt + 10_000,
+        "{waiting} vs {with_prompt} ({idle} idle)"
+    );
+    // Once the line is in the index the text is stored once, and the waiting copies
+    // are released.
+    store.append_local_inline("\n", Direction::Tx);
+    store.append(b"\r\n", at);
+    assert_eq!(store.snapshot().committed_end(), store.end());
+    assert!(store.stats().memory >= with_prompt);
+}
+
+#[test]
+fn hex_rows_and_raw_ranges_ignore_typed_lines() {
+    let mut store = Store::default();
+    let at = t0(&store);
+    store.append(b"abc", at);
+    store.append_local_inline("typed", Direction::Tx);
+    store.append(b"def\r\n", at);
+    let snap = store.snapshot();
+    assert_eq!(
+        summary(&store),
+        [rx("abcdef", true, 0..8), tx("typed", false, 8)]
+    );
+    let hex = snap.hex_view(8);
+    assert_eq!(hex.end(), LineId(1));
+    assert_eq!(snap.raw_range(), 0..8);
+}
