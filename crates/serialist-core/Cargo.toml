@@ -7,15 +7,31 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# No #[bench] functions; this keeps `cargo bench -- --quick` from reaching libtest,
+# which rejects criterion's flags.
+bench = false
+
 [dependencies]
 crossbeam-channel.workspace = true
 futures-core = "0.3"
+memchr.workspace = true
 nusb.workspace = true
 parking_lot.workspace = true
+regex.workspace = true
 serde.workspace = true
 serialport.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+vte.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+# A dev-dependency cycle is fine: integration tests and benches link the same
+# serialist-core the simulator does. Unit tests must not use it.
+serialist-sim.workspace = true
+
+[[bench]]
+name = "store"
+harness = false
