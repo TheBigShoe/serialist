@@ -1,12 +1,14 @@
 //! The window's chrome against the real engine: the session toolbar's overflow menu, the
 //! docks' breakpoints and saved widths, the Decoded panel following the codec, the
-//! command palette, and the Devices list scrolling above its fixed footer.
+//! command palette, the Devices list scrolling above its fixed footer, and its two-line
+//! rows.
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{PortId, PortInfo, PortKind, UsbInfo};
 use serialist_sim::{AtDevice, EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::keys;
+use crate::chrome::{ROW_HEIGHT, TWO_LINE_ROW_HEIGHT};
 use crate::config::{self, Config};
 use crate::devices_panel::DeviceRow;
 use crate::docks::{CENTER_MIN, DockPanel, DockSide, RAIL_WIDTH};
@@ -31,12 +33,24 @@ fn open(
     ports: &[&str],
     size: (f32, f32),
 ) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_selecting(cx, world, dir, ports, None, size)
+}
+
+/// [`open`], with `select` chosen in Devices (before its port is listed, as `--port` does).
+fn open_selecting(
+    cx: &mut TestAppContext,
+    world: &SimWorld,
+    dir: Option<&TestDir>,
+    ports: &[&str],
+    select: Option<&str>,
+    size: (f32, f32),
+) -> (AnyWindowHandle, Entity<Workspace>) {
     allow_engine_threads(cx);
     let options = AppOptions {
         port_source: world.port_source(),
         transport_factory: world.transport_factory(),
         baud: None,
-        select_port: None,
+        select_port: select.map(PortId::new),
         open_ports: ports.iter().map(|port| PortId::new(*port)).collect(),
         store: None,
     };
@@ -395,6 +409,15 @@ fn the_devices_list_scrolls_above_its_footer(cx: &mut TestAppContext) {
         footer.bottom() <= panel.bottom() + px(0.5),
         "{footer:?} in {panel:?}"
     );
+    // A port is a two-line row; the group's header is still a one-line one.
+    let header = bounds(cx, "device-group-simulated".into()).expect("the group header");
+    assert_eq!(header.size.height, ROW_HEIGHT);
+    let DeviceRow::Entry(first) = rows[1] else {
+        panic!("a port follows the header");
+    };
+    let first_row = bounds(cx, ("device-row", first).into()).expect("the first port's row");
+    assert_eq!(first_row.size.height, TWO_LINE_ROW_HEIGHT);
+    assert_eq!(first_row.top(), header.bottom(), "rows follow one another");
     let hidden = bounds(cx, ("device-row", last).into());
     assert!(
         hidden.is_none_or(|row| row.top() >= footer.top()),
@@ -449,4 +472,224 @@ fn the_devices_list_scrolls_above_its_footer(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(devices.read_with(cx, |d, _| d.simulated_is_open()));
+}
+
+/// Where the parts of a Devices row are, as drawn.
+struct RowParts {
+    row: Bounds<Pixels>,
+    name: Bounds<Pixels>,
+    chip: Bounds<Pixels>,
+    details: Bounds<Pixels>,
+    port: Bounds<Pixels>,
+    usb: Bounds<Pixels>,
+    summary: Bounds<Pixels>,
+    actions: Bounds<Pixels>,
+}
+
+fn row_parts(cx: &mut TestAppContext, window: AnyWindowHandle, ix: usize) -> RowParts {
+    cx.update_window(window, |_, window, _| {
+        let bounds = |id: &'static str| window.find((id, ix)).bounds();
+        RowParts {
+            row: bounds("device-row"),
+            name: bounds("device-name"),
+            chip: bounds("device-plugin"),
+            details: bounds("device-detail"),
+            port: bounds("device-port"),
+            usb: bounds("device-usb"),
+            summary: bounds("device-summary"),
+            actions: bounds("device-actions"),
+        }
+    })
+    .unwrap()
+}
+
+fn assert_inside(inner: Bounds<Pixels>, outer: Bounds<Pixels>, what: &str) {
+    let slack = px(0.5);
+    assert!(
+        inner.left() >= outer.left() - slack
+            && inner.right() <= outer.right() + slack
+            && inner.top() >= outer.top() - slack
+            && inner.bottom() <= outer.bottom() + slack,
+        "{what}: {inner:?} is not inside {outer:?}"
+    );
+}
+
+#[gpui_test]
+fn a_device_row_keeps_its_two_lines_apart(cx: &mut TestAppContext) {
+    // A long product name and a long port id on a USB device a profile gives a codec:
+    // the first line holds the name and the chip, the second the port, its ids and the
+    // settings of the selected row, and none of them may touch another.
+    let dir = TestDir::new("chrome-device-row");
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{ "devices": [ { "name": "Airoha Headphones Charging Case Development Board",
+                            "match": { "vid": "0x0e8d", "pid": "0x2000" },
+                            "plugin": "airoha-race" } ] }"#,
+    )
+    .unwrap();
+    let world = SimWorld::new();
+    let port = PortId::new("/dev/cu.usbmodem-AIROHA-CASE-2000-0001");
+    world.add_device(
+        PortInfo {
+            id: port.clone(),
+            kind: PortKind::Usb(UsbInfo {
+                vid: 0x0e8d,
+                pid: 0x2000,
+                serial_number: None,
+                manufacturer: None,
+                product: Some("Airoha Headphones Charging Case".into()),
+            }),
+            display_name: "Airoha Headphones Charging Case".into(),
+        },
+        LinkConfig::default(),
+        || Box::new(EchoDevice::new()),
+    );
+    let (window, workspace) = open(cx, &world, Some(&dir), &[], WIDE);
+    let devices = workspace.read_with(cx, |w, _| w.devices().clone());
+    let ports = world.port_source().snapshot().len();
+    run_until(cx, "every port listed", |cx| {
+        devices.read_with(cx, |d, _| d.list().len() == ports)
+    });
+    cx.update_window(window, |_, window, cx| {
+        devices.update(cx, |d, cx| d.select_port(port.clone(), window, cx));
+    })
+    .unwrap();
+    draw(cx, window);
+    let ix = devices
+        .read_with(cx, |d, _| {
+            d.list().entries().iter().position(|e| e.info.id == port)
+        })
+        .expect("the adapter is listed");
+
+    let at_rest = row_parts(cx, window, ix);
+    let RowParts {
+        row,
+        name,
+        chip,
+        details,
+        port: port_text,
+        usb,
+        summary,
+        actions,
+    } = &at_rest;
+    assert_eq!(row.size.height, TWO_LINE_ROW_HEIGHT);
+    for (part, what) in [
+        (name, "the name"),
+        (chip, "the chip"),
+        (details, "the details"),
+        (actions, "the actions"),
+    ] {
+        assert_inside(*part, *row, what);
+    }
+    for (part, what) in [
+        (port_text, "the port id"),
+        (usb, "the USB ids"),
+        (summary, "the settings"),
+    ] {
+        assert_inside(*part, *details, what);
+    }
+
+    // The first line: the name, then the chip, and the name keeps a readable width (it
+    // was squeezed to "Airoha..." beside the chip and the settings on one line).
+    assert!(
+        name.right() <= chip.left() + px(0.5),
+        "the name {name:?} runs into the chip {chip:?}"
+    );
+    assert!(
+        name.size.width >= px(100.),
+        "the name is squeezed: {name:?}"
+    );
+    assert!(chip.size.width > px(0.), "the chip has a width: {chip:?}");
+    // The second line lies under it, without touching it.
+    assert!(
+        details.top() >= name.bottom() - px(0.5) && details.top() >= chip.bottom() - px(0.5),
+        "the details {details:?} overlap the first line {name:?}"
+    );
+    // In the details the port id gives way first; the ids and the settings stay whole, in
+    // order, apart.
+    assert!(
+        port_text.size.width >= px(40.),
+        "the port id is squeezed: {port_text:?}"
+    );
+    assert!(
+        port_text.right() <= usb.left() && usb.right() <= summary.left(),
+        "{port_text:?} {usb:?} {summary:?} are not in order"
+    );
+    assert!(summary.size.width > px(0.) && usb.size.width > px(0.));
+    // The hover actions are on the first line, at the row's right end.
+    assert!(
+        actions.bottom() <= details.top() + px(0.5),
+        "the actions {actions:?} reach the second line {details:?}"
+    );
+    assert!(actions.right() >= row.right() - px(0.5));
+
+    // Hovering brings the actions up over the chip's place without moving anything.
+    cx.update_window(window, |_, window, cx| {
+        window.hover(("device-row", ix), cx);
+    })
+    .unwrap();
+    draw(cx, window);
+    let hovered = row_parts(cx, window, ix);
+    for (before, after, what) in [
+        (at_rest.row, hovered.row, "row"),
+        (at_rest.name, hovered.name, "name"),
+        (at_rest.chip, hovered.chip, "chip"),
+        (at_rest.details, hovered.details, "details"),
+        (at_rest.port, hovered.port, "port"),
+        (at_rest.summary, hovered.summary, "summary"),
+        (at_rest.actions, hovered.actions, "actions"),
+    ] {
+        assert_eq!(before, after, "hovering moves the {what}");
+    }
+
+    // Enter connects the selected port, as before; the row then shows its settings
+    // when it is not the selected one.
+    press(cx, window, "enter");
+    wait_connected(cx, &workspace);
+    cx.update_window(window, |_, window, cx| {
+        devices.update(cx, |d, cx| {
+            d.select_port(PortId::new("virtual:echo"), window, cx)
+        });
+    })
+    .unwrap();
+    draw(cx, window);
+    cx.update_window(window, |_, window, _| {
+        assert!(
+            window.try_find(("device-summary", ix)).is_some(),
+            "a connected row keeps its settings when another is selected"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_test]
+fn a_port_selected_before_it_is_listed_scrolls_into_view(cx: &mut TestAppContext) {
+    // More ports than the panel's list shows, the selected one last: it is chosen before
+    // the list has a row for it, and scrolls into view when its row appears.
+    let world = SimWorld::new();
+    for name in ["zz-one", "zz-two", "zz-three", "zz-four"] {
+        world.add_virtual(name, name, LinkConfig::default(), || {
+            Box::new(EchoDevice::new())
+        });
+    }
+    let (window, workspace) = open_selecting(cx, &world, None, &[], Some("virtual:zz-four"), WIDE);
+    let devices = workspace.read_with(cx, |w, _| w.devices().clone());
+    let ports = world.port_source().snapshot().len();
+    run_until(cx, "every port listed", |cx| {
+        devices.read_with(cx, |d, _| d.list().len() == ports)
+    });
+    draw(cx, window);
+    let last = devices
+        .read_with(cx, |d, _| d.list().selected_index())
+        .expect("the selected port is listed");
+    cx.update_window(window, |_, window, _| {
+        let footer = window.find("devices-footer").bounds();
+        let panel = window.find("devices-panel").bounds();
+        let row = window.find(("device-row", last)).bounds();
+        assert!(
+            row.bottom() <= footer.top() + px(0.5) && row.top() >= panel.top(),
+            "the selected row {row:?} is not above the footer at {footer:?}"
+        );
+    })
+    .unwrap();
 }

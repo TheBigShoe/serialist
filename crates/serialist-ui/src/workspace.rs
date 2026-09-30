@@ -2176,7 +2176,7 @@ impl Workspace {
                     self.devices.clone().into(),
                     self.commands.clone().into(),
                     "left-dock-split",
-                    px(280.),
+                    px(340.),
                 ),
                 DockSide::Right => (
                     self.decoded.clone().into(),
