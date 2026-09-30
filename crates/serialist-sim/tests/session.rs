@@ -1,31 +1,28 @@
 //! `serialist_core::Session` running against simulated devices over virtual links.
 //!
-//! Rate and latency assertions use the reader thread's `received_at` stamps, never the
-//! test thread's clock, so a stalled test thread cannot skew them. The tests that
-//! measure time or burn CPU hold [`HEAVY`], so on a small CI runner the 32 MiB firehose
-//! never competes with a rate measurement.
+//! Timing is asserted exactly, on a world built with `SimWorld::with_clock` and a
+//! [`ManualClock`]; `common` describes the pattern. The session's reader thread blocks in
+//! `read` with its timeout, which the link measures on the manual clock, so these tests
+//! settle two threads per link: the device thread and the session's reader. The reader
+//! stamps `received_at` from real time, so rates come from byte counts at known clock
+//! times instead.
 
 mod common;
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use serialist_core::{ControlLine, PortId, Session, SessionConfig, SessionEvent, TransportError};
 use serialist_sim::{
     AtDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier, LinkConfig,
-    PACED_LOOKAHEAD, SimWorld, virtual_port_id,
+    ManualClock, SimWorld, virtual_port_id,
 };
 
-use common::{collect_until, next_event, serial};
-
-static HEAVY: Mutex<()> = Mutex::new(());
-
-/// Serialise the timing-sensitive and CPU-heavy tests in this binary.
-fn heavy() -> MutexGuard<'static, ()> {
-    HEAVY.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use common::{
+    MS, UnplugOnPanic, advance_to, close_on, collect_until, committed, next_event, released,
+    released_switching, serial, take_data, wait_for,
+};
 
 fn open(world: &SimWorld, id: &PortId, baud: u32) -> Session {
     let cfg = SessionConfig::new(id.clone(), serial(baud));
@@ -39,18 +36,17 @@ fn expect_connected(events: &Receiver<SessionEvent>) -> String {
     }
 }
 
-/// Collect events until `Disconnected`, returning the data bytes, the error, and when
-/// the event arrived.
+/// Collect events until `Disconnected`, returning the data bytes and the error.
 fn drain_to_disconnect(
     events: &Receiver<SessionEvent>,
     verifier: Option<&mut FirehoseVerifier>,
     limit: Duration,
-) -> (u64, Option<TransportError>, Instant) {
-    let deadline = Instant::now() + limit;
+) -> (u64, Option<TransportError>) {
+    let deadline = std::time::Instant::now() + limit;
     let mut bytes = 0u64;
     let mut verifier = verifier;
     loop {
-        let timeout = deadline.saturating_duration_since(Instant::now());
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
         match events
             .recv_timeout(timeout)
             .expect("no Disconnected in time")
@@ -61,43 +57,10 @@ fn drain_to_disconnect(
                     v.feed(&chunk);
                 }
             }
-            SessionEvent::Disconnected { error } => return (bytes, error, Instant::now()),
+            SessionEvent::Disconnected { error } => return (bytes, error),
             other => panic!("unexpected {other:?}"),
         }
     }
-}
-
-/// The first `Data` event's reader timestamp.
-fn first_data(events: &Receiver<SessionEvent>) -> Instant {
-    match next_event(events) {
-        SessionEvent::Data { received_at, .. } => received_at,
-        other => panic!("expected Data, got {other:?}"),
-    }
-}
-
-/// Bytes per second the reader received in `from..to`, by its own timestamps. Consumes
-/// events up to the first one stamped at or after `to`.
-fn data_rate(events: &Receiver<SessionEvent>, from: Instant, to: Instant) -> f64 {
-    let mut bytes = 0u64;
-    loop {
-        let SessionEvent::Data {
-            bytes: chunk,
-            received_at,
-        } = next_event(events)
-        else {
-            panic!("unexpected event");
-        };
-        if received_at >= to {
-            return bytes as f64 / (to - from).as_secs_f64();
-        }
-        if received_at >= from {
-            bytes += chunk.len() as u64;
-        }
-    }
-}
-
-fn within(got: f64, want: f64, tolerance: f64) -> bool {
-    (got - want).abs() / want <= tolerance
 }
 
 #[test]
@@ -117,7 +80,7 @@ fn echo_round_trip() {
         next_event(&events),
         SessionEvent::Disconnected { error: None }
     ));
-    assert!(events.recv_timeout(Duration::from_millis(200)).is_err());
+    assert!(events.try_recv().is_err(), "nothing after Disconnected");
 }
 
 #[test]
@@ -162,54 +125,43 @@ fn at_conversation() {
 
 #[test]
 fn firehose_at_3_mbaud_is_complete_and_on_rate() {
-    skip_unless_wall_clock_timing!();
-    let _heavy = heavy();
-    let world = SimWorld::empty();
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::empty_with_clock(clock.clone());
     let id = world.add_virtual("hose", "Firehose", LinkConfig::default(), || {
         Box::new(FirehoseDevice::new(FirehoseConfig::new(
             FirehoseContent::Mixed,
         )))
     });
     let session = open(&world, &id, 3_000_000);
+    let _unplug = UnplugOnPanic(world.link(&id).expect("link is up"));
     let events = session.events();
     expect_connected(&events);
+    clock.settle(2);
+    let t0 = clock.now();
 
+    // Two seconds in 100 ms windows. 3 Mbaud 8N1 is 300 000 bytes/s in 300-byte packets:
+    // 30 000 bytes a window, less one packet for the 1 ms latency in the first.
     let mut verifier = FirehoseVerifier::new(FirehoseContent::Mixed);
-    let measure = Duration::from_secs(2);
-    let mut first: Option<Instant> = None;
-    let mut in_window = 0u64;
-    loop {
-        let SessionEvent::Data { bytes, received_at } = next_event(&events) else {
-            panic!("unexpected event");
-        };
-        verifier.feed(&bytes);
-        let t0 = *first.get_or_insert(received_at);
-        let since = received_at - t0;
-        if since >= measure {
-            break;
-        }
-        // The first chunk marks t0; count what arrived after it.
-        if since > Duration::ZERO {
-            in_window += bytes.len() as u64;
-        }
+    let mut received = 0;
+    for window in 1..=20u32 {
+        let elapsed = 100 * MS * window;
+        advance_to(&clock, t0 + elapsed, 4 * MS, 2);
+        let data = take_data(&events);
+        verifier.feed(&data);
+        received += data.len();
+        assert_eq!(received, released(3_000_000, elapsed), "after {elapsed:?}");
+        assert_eq!(session.stats().rx_bytes, received as u64);
     }
-    session.close();
-
-    let rate = in_window as f64 / measure.as_secs_f64();
+    assert_eq!(received, 599_700);
     let report = verifier.report();
     assert!(report.is_clean(), "{report:?}");
     // Mixed records average about 650 bytes, so 2 s at 300 kB/s is roughly 900 of them.
     assert!(report.records > 500, "{report:?}");
-    // 3 Mbaud 8N1 is 300_000 bytes/s.
-    assert!(
-        within(rate, 300_000.0, 0.10),
-        "achieved {rate:.0} B/s, want 300000 +/- 10%"
-    );
+    close_on(&clock, session, MS);
 }
 
 #[test]
 fn firehose_32_mib_unpaced_loses_nothing() {
-    let _heavy = heavy();
     const TOTAL: u64 = 32 * 1024 * 1024;
     let world = SimWorld::empty();
     let id = world.add_virtual("hose-fast", "Fast firehose", LinkConfig::unpaced(), || {
@@ -226,7 +178,7 @@ fn firehose_32_mib_unpaced_loses_nothing() {
     expect_connected(&events);
 
     let mut verifier = FirehoseVerifier::new(FirehoseContent::Mixed);
-    let (bytes, error, _) =
+    let (bytes, error) =
         drain_to_disconnect(&events, Some(&mut verifier), Duration::from_secs(120));
     assert!(
         matches!(error, Some(TransportError::Disconnected)),
@@ -246,46 +198,52 @@ fn firehose_32_mib_unpaced_loses_nothing() {
 
 #[test]
 fn unplug_mid_stream_disconnects_promptly_without_gaps() {
-    let _heavy = heavy();
-    let world = SimWorld::new();
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::with_clock(clock.clone());
     let id = virtual_port_id(SimWorld::FIREHOSE);
     let session = open(&world, &id, 1_000_000);
     let link = world.link(&id).expect("link is up");
+    let _unplug = UnplugOnPanic(link.clone());
     let events = session.events();
     expect_connected(&events);
+    clock.settle(2);
+    let t0 = clock.now();
 
     let mut verifier = FirehoseVerifier::new(FirehoseContent::Text);
-    let head = collect_until(&events, |r| r.len() >= 5_000);
+    advance_to(&clock, t0 + 60 * MS, 4 * MS, 2);
+    let head = take_data(&events);
+    assert_eq!(head.len(), released(1_000_000, 60 * MS));
     verifier.feed(&head);
-    let unplugged_at = Instant::now();
     assert!(world.unplug(&id));
-    let (tail, error, disconnected_at) =
-        drain_to_disconnect(&events, Some(&mut verifier), Duration::from_secs(5));
+    // Disconnected arrives with the clock standing still. Everything released had
+    // already been read; the look-ahead in flight is lost.
+    let (tail, error) = drain_to_disconnect(&events, Some(&mut verifier), Duration::from_secs(5));
     assert!(
         matches!(error, Some(TransportError::Disconnected)),
         "{error:?}"
     );
-    let latency = disconnected_at - unplugged_at;
-    assert!(
-        latency < Duration::from_millis(100),
-        "Disconnected {latency:?} after unplug"
-    );
+    assert_eq!(tail, 0);
+    assert_eq!(clock.now(), t0 + 60 * MS);
 
     // What arrived is gap-free, and every byte on the wire is accounted for.
-    let total = head.len() as u64 + tail;
     let stats = link.stats();
-    assert_eq!(total, stats.device_to_host_bytes - stats.lost_on_unplug);
-    assert_eq!(session.stats().rx_bytes, total);
+    assert_eq!(
+        stats.device_to_host_bytes as usize,
+        committed(1_000_000, 60 * MS)
+    );
+    assert_eq!(
+        stats.lost_on_unplug as usize,
+        committed(1_000_000, 60 * MS) - head.len()
+    );
+    assert_eq!(session.stats().rx_bytes, head.len() as u64);
     assert!(verifier.report().is_clean(), "{:?}", verifier.report());
 
     assert!(!session.is_connected());
     assert!(session.write(b"AT\r".to_vec()).is_err());
     assert!(session.set_control(ControlLine::Dtr, true).is_err());
+    // Its reader has already stopped, so closing needs no time to pass.
     session.close();
-    assert!(
-        events.recv_timeout(Duration::from_millis(200)).is_err(),
-        "nothing after Disconnected"
-    );
+    assert!(events.try_recv().is_err(), "nothing after Disconnected");
 
     // Gone from the factory until plugged back in; then it starts over from record 0.
     let cfg = SessionConfig::new(id.clone(), serial(1_000_000));
@@ -295,107 +253,117 @@ fn unplug_mid_stream_disconnects_promptly_without_gaps() {
     ));
     assert!(world.plug(&id));
     let again = Session::open(world.factory(), cfg).unwrap();
+    let _unplug_again = UnplugOnPanic(world.link(&id).expect("link is up again"));
     let events = again.events();
     expect_connected(&events);
+    clock.settle(2);
+    let t1 = clock.now();
+    advance_to(&clock, t1 + 30 * MS, 4 * MS, 2);
+    let fresh_data = take_data(&events);
+    assert_eq!(fresh_data.len(), released(1_000_000, 30 * MS));
     let mut fresh = FirehoseVerifier::new(FirehoseContent::Text);
-    fresh.feed(&collect_until(&events, |r| r.len() >= 2_000));
+    fresh.feed(&fresh_data);
     assert!(fresh.report().is_clean() && fresh.report().records > 0);
+    close_on(&clock, again, MS);
 }
 
 #[test]
-fn unplug_at_9600_baud_disconnects_within_100ms() {
-    let _heavy = heavy();
-    let world = SimWorld::new();
+fn unplug_at_9600_baud_disconnects_without_the_clock_moving() {
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::with_clock(clock.clone());
     let id = virtual_port_id(SimWorld::FIREHOSE);
     let session = open(&world, &id, 9_600);
+    let link = world.link(&id).expect("link is up");
+    let _unplug = UnplugOnPanic(link.clone());
     let events = session.events();
     expect_connected(&events);
-    // At 960 bytes/s the firehose's 16 KiB batches are 17 s of data each.
-    collect_until(&events, |r| r.len() >= 100);
-    let unplugged_at = Instant::now();
+    clock.settle(2);
+    let t0 = clock.now();
+
+    // At 960 bytes/s the firehose's 16 KiB batches are 17 s of data each; only one
+    // look-ahead of it is on the wire at a time.
+    advance_to(&clock, t0 + 200 * MS, 4 * MS, 2);
+    let head = take_data(&events);
+    assert_eq!(head.len(), released(9_600, 200 * MS));
     assert!(world.unplug(&id));
-    let (_, error, disconnected_at) = drain_to_disconnect(&events, None, Duration::from_secs(5));
+    let (tail, error) = drain_to_disconnect(&events, None, Duration::from_secs(5));
     assert!(matches!(error, Some(TransportError::Disconnected)));
-    let latency = disconnected_at - unplugged_at;
-    assert!(
-        latency < Duration::from_millis(100),
-        "Disconnected {latency:?} after unplug at 9600 baud"
+    assert_eq!(tail, 0);
+    assert_eq!(clock.now(), t0 + 200 * MS);
+    assert_eq!(
+        link.stats().lost_on_unplug as usize,
+        committed(9_600, 200 * MS) - head.len()
     );
+    session.close();
 }
 
 #[test]
-fn idle_session_reader_does_not_spin() {
-    skip_unless_wall_clock_timing!();
-    let world = SimWorld::new();
+fn idle_session_reader_reads_once_per_timeout() {
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::with_clock(clock.clone());
     let id = virtual_port_id(SimWorld::ECHO);
     let mut cfg = SessionConfig::new(id.clone(), serial(115_200));
-    cfg.read_timeout = Duration::from_millis(10);
+    cfg.read_timeout = 10 * MS;
     let session = Session::open(world.factory(), cfg).unwrap();
     let link = world.link(&id).unwrap();
+    let _unplug = UnplugOnPanic(link.clone());
+    clock.settle(2);
     let before = link.stats().host_read_calls;
-    let started = Instant::now();
-    thread::sleep(Duration::from_secs(1));
-    let calls = link.stats().host_read_calls - before;
-    let per_second = calls as f64 / started.elapsed().as_secs_f64();
-    assert!(
-        per_second < 200.0,
-        "{per_second:.0} reads/s at a 10 ms timeout"
-    );
-    // About 100/s with 1 ms timers, 64/s on Windows' 15.6 ms tick.
-    assert!(
-        per_second > 20.0,
-        "{per_second:.0} reads/s: reader is stalling"
-    );
+
+    // One second in 1 ms steps: the reader's read times out every 10 ms and it reads
+    // again at once. A reader that spun, or woke early, would show more calls.
+    advance_to(&clock, clock.now() + Duration::from_secs(1), MS, 2);
+    assert_eq!(link.stats().host_read_calls - before, 100);
     assert_eq!(session.stats().rx_chunks, 0);
 
-    // Nothing queued, so close is bounded by about one read timeout.
-    let started = Instant::now();
-    session.close();
-    assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "close took {:?}",
-        started.elapsed()
-    );
+    // Nothing queued, so close only waits for the reader's current read to time out.
+    close_on(&clock, session, 10 * MS);
 }
 
 #[test]
 fn reconfigure_through_the_session_changes_the_link_rate() {
-    skip_unless_wall_clock_timing!();
-    let _heavy = heavy();
-    let world = SimWorld::new();
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::with_clock(clock.clone());
     let id = virtual_port_id(SimWorld::FIREHOSE);
     let session = open(&world, &id, 1_000_000);
     let link = world.link(&id).unwrap();
+    let _unplug = UnplugOnPanic(link.clone());
     let events = session.events();
     expect_connected(&events);
+    clock.settle(2);
+    let t0 = clock.now();
 
-    // 1 Mbaud: skip 50 ms of start-up, then measure 500 ms.
-    let t0 = first_data(&events);
-    let from = t0 + Duration::from_millis(50);
-    let fast = data_rate(&events, from, from + Duration::from_millis(500));
+    advance_to(&clock, t0 + 100 * MS, 4 * MS, 2);
+    let mut received = take_data(&events).len();
+    assert_eq!(received, released(1_000_000, 100 * MS));
 
-    // A stalled test thread must not matter: rates come from the reader's timestamps,
-    // and the slow window is placed after the change was observed to take effect.
-    thread::sleep(Duration::from_millis(100));
     session.reconfigure(serial(500_000)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while link.link_config().serial.baud != 500_000 {
-        assert!(
-            Instant::now() < deadline,
-            "reconfigure never reached the link"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    let applied = Instant::now();
-    // Bytes already on the wire (at most one look-ahead) still go at the old rate.
-    let from = applied + PACED_LOOKAHEAD + Duration::from_millis(20);
-    let slow = data_rate(&events, from, from + Duration::from_millis(500));
+    // The writer thread applies it; the link sees it before the session does.
+    wait_for(Duration::from_secs(5), "reconfigure to apply", || {
+        session.serial_config().baud == 500_000
+    });
+    assert_eq!(link.link_config().serial.baud, 500_000);
+    clock.settle(2);
+    // Bytes already on the wire (one look-ahead at 1 Mbaud) keep the old rate; the new
+    // rate follows them back to back.
+    let before = link.stats().device_to_host_bytes as usize;
+    assert_eq!(before, committed(1_000_000, 100 * MS));
 
-    assert!(within(fast, 100_000.0, 0.1), "before: {fast:.0} B/s");
-    assert!(within(slow, 50_000.0, 0.1), "after: {slow:.0} B/s");
-    assert_eq!(session.serial_config().baud, 500_000);
+    let mut per_window = Vec::new();
+    for window in 2..=4u32 {
+        let elapsed = 100 * MS * window;
+        advance_to(&clock, t0 + elapsed, 4 * MS, 2);
+        let got = take_data(&events).len();
+        received += got;
+        per_window.push(got);
+        let want = released_switching(before, 1_000_000, 500_000, elapsed);
+        assert_eq!(received, want, "after {elapsed:?}");
+    }
+    // 10 000 bytes per 100 ms before; 5 000 once the old look-ahead is out.
+    assert_eq!(per_window, [6_650, 5_000, 5_000]);
     assert_eq!(session.config().serial.baud, 1_000_000);
     assert_eq!(session.port(), &id);
+    close_on(&clock, session, MS);
 }
 
 #[test]
@@ -406,9 +374,7 @@ fn control_lines_reach_the_link() {
     let link = world.link(&id).unwrap();
     session.set_control(ControlLine::Dtr, false).unwrap();
     session.set_control(ControlLine::Rts, false).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while link.control_line(ControlLine::Dtr) || link.control_line(ControlLine::Rts) {
-        assert!(Instant::now() < deadline, "control lines never changed");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait_for(Duration::from_secs(2), "control lines to change", || {
+        !link.control_line(ControlLine::Dtr) && !link.control_line(ControlLine::Rts)
+    });
 }
