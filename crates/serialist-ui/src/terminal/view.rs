@@ -1,0 +1,886 @@
+//! The terminal view: the entity that owns what the terminal shows and how, and renders
+//! the search bar, the [`TerminalElement`], the scrollbar and the overlays.
+//!
+//! The view never copies lines. It holds `Arc`s to the sources and draws whatever they
+//! say is retained; pause is a frozen end id, hex view is a second source, selection is
+//! a pair of line ids and columns, and search results are line ids and byte ranges.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
+
+use crate::actions::{
+    self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
+    SearchNext, SearchPrevious, SelectAll, ToggleFrameStats, ToggleHexView, ToggleWrap, context,
+};
+use crate::prelude::*;
+use crate::terminal::element::{
+    CellMetrics, Highlights, Hit, ShapeCache, TerminalElement, TerminalInputs,
+};
+use crate::terminal::layout::Span;
+use crate::terminal::palette::TerminalPalette;
+use crate::terminal::scroll::TerminalScrollHandle;
+use crate::terminal::search::{MAX_MATCHES, SearchResults};
+use crate::terminal::selection::{Selection, SelectionMode, SelectionPoint, word_at};
+use crate::terminal::stats::{FrameStats, FrameSummary};
+use crate::terminal::timestamps::{Clock, TimestampMode};
+
+/// Which source is on screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayMode {
+    #[default]
+    Text,
+    /// The hex source, when one is set.
+    Hex,
+}
+
+/// Where each source stood when the view was paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frozen {
+    text: LineId,
+    hex: Option<LineId>,
+}
+
+struct InFlight {
+    cancel: Arc<AtomicBool>,
+    _task: Task<()>,
+}
+
+struct SearchBar {
+    input: Entity<InputState>,
+    open: bool,
+    results: SearchResults,
+    in_flight: Option<InFlight>,
+    generation: u64,
+}
+
+pub struct TerminalView {
+    text_source: Arc<dyn LineSource>,
+    text_searcher: Option<Arc<dyn Searcher>>,
+    hex_source: Option<Arc<dyn LineSource>>,
+    hex_searcher: Option<Arc<dyn Searcher>>,
+    display: DisplayMode,
+    frozen: Option<Frozen>,
+    scroll: TerminalScrollHandle,
+    selection: Option<Selection>,
+    selecting: bool,
+    wrap: bool,
+    timestamps: TimestampMode,
+    palette: Rc<TerminalPalette>,
+    /// Bumped whenever what the element draws from changes wholesale, dropping its
+    /// caches.
+    generation: u64,
+    clock: Clock,
+    cache: Rc<RefCell<ShapeCache>>,
+    stats: Rc<RefCell<FrameStats>>,
+    show_frame_stats: bool,
+    search: SearchBar,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl TerminalView {
+    pub fn new(source: Arc<dyn LineSource>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search (regex)"));
+        let input_events =
+            cx.subscribe_in(&input, window, |this, input, event, _, cx| match event {
+                InputEvent::Change => {
+                    let query = input.read(cx).value().to_string();
+                    this.run_search(query, cx);
+                }
+                InputEvent::PressEnter { shift: false, .. } => this.search_next(cx),
+                InputEvent::PressEnter { shift: true, .. } => this.search_previous(cx),
+                InputEvent::Focus | InputEvent::Blur => {}
+            });
+        let clock = Clock::local(source.epoch());
+        Self {
+            text_source: source,
+            text_searcher: None,
+            hex_source: None,
+            hex_searcher: None,
+            display: DisplayMode::Text,
+            frozen: None,
+            scroll: TerminalScrollHandle::new(),
+            selection: None,
+            selecting: false,
+            wrap: false,
+            timestamps: TimestampMode::Off,
+            palette: Rc::new(TerminalPalette::default()),
+            generation: 1,
+            clock,
+            cache: Rc::default(),
+            stats: Rc::default(),
+            show_frame_stats: false,
+            search: SearchBar {
+                input,
+                open: false,
+                results: SearchResults::default(),
+                in_flight: None,
+                generation: 0,
+            },
+            focus_handle: cx.focus_handle(),
+            _subscriptions: vec![input_events],
+        }
+    }
+
+    // --- Sources -------------------------------------------------------------------
+
+    /// The source on screen: the text source, or the hex source in hex view.
+    pub fn source(&self) -> &Arc<dyn LineSource> {
+        match (self.display, &self.hex_source) {
+            (DisplayMode::Hex, Some(hex)) => hex,
+            _ => &self.text_source,
+        }
+    }
+
+    fn searcher(&self) -> Option<&Arc<dyn Searcher>> {
+        match self.display {
+            DisplayMode::Text => self.text_searcher.as_ref(),
+            DisplayMode::Hex => self.hex_searcher.as_ref(),
+        }
+    }
+
+    /// Show a different text source, such as a new session's store.
+    pub fn set_source(&mut self, source: Arc<dyn LineSource>, cx: &mut Context<Self>) {
+        self.clock = Clock::local(source.epoch());
+        self.text_source = source;
+        if self.display == DisplayMode::Text {
+            self.source_changed(cx);
+        }
+    }
+
+    pub fn set_searcher(&mut self, searcher: Option<Arc<dyn Searcher>>, cx: &mut Context<Self>) {
+        self.text_searcher = searcher;
+        cx.notify();
+    }
+
+    /// The hex dump of the same session, which the store provides.
+    pub fn set_hex_source(
+        &mut self,
+        source: Option<Arc<dyn LineSource>>,
+        searcher: Option<Arc<dyn Searcher>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.hex_source = source;
+        self.hex_searcher = searcher;
+        if self.hex_source.is_none() && self.display == DisplayMode::Hex {
+            self.display = DisplayMode::Text;
+            self.source_changed(cx);
+        } else if self.display == DisplayMode::Hex {
+            self.source_changed(cx);
+        }
+        cx.notify();
+    }
+
+    pub fn display_mode(&self) -> DisplayMode {
+        self.display
+    }
+
+    pub fn has_hex_source(&self) -> bool {
+        self.hex_source.is_some()
+    }
+
+    /// Swap between text and hex. Ids mean different things in each, so the selection
+    /// goes, the view follows the tail again, and an open search reruns.
+    pub fn toggle_hex(&mut self, cx: &mut Context<Self>) {
+        if self.hex_source.is_none() {
+            return;
+        }
+        self.display = match self.display {
+            DisplayMode::Text => DisplayMode::Hex,
+            DisplayMode::Hex => DisplayMode::Text,
+        };
+        self.source_changed(cx);
+    }
+
+    fn source_changed(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.selection = None;
+        self.selecting = false;
+        self.scroll.reset();
+        if self.search.open {
+            let query = self.search.results.query.clone();
+            self.run_search(query, cx);
+        } else {
+            self.cancel_search();
+            self.search.results.clear();
+        }
+        cx.notify();
+    }
+
+    /// The store appended lines: repaint. Following the tail happens in layout.
+    pub fn lines_appended(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+    }
+
+    // --- Display settings ------------------------------------------------------------
+
+    pub fn palette(&self) -> &TerminalPalette {
+        &self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
+        self.palette = Rc::new(palette);
+        self.generation += 1;
+        cx.notify();
+    }
+
+    pub fn wrap(&self) -> bool {
+        self.wrap
+    }
+
+    pub fn set_wrap(&mut self, wrap: bool, cx: &mut Context<Self>) {
+        if self.wrap != wrap {
+            self.wrap = wrap;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        self.set_wrap(!self.wrap, cx);
+    }
+
+    pub fn timestamps(&self) -> TimestampMode {
+        self.timestamps
+    }
+
+    pub fn set_timestamps(&mut self, mode: TimestampMode, cx: &mut Context<Self>) {
+        self.timestamps = mode;
+        cx.notify();
+    }
+
+    pub fn cycle_timestamps(&mut self, cx: &mut Context<Self>) {
+        self.set_timestamps(self.timestamps.next(), cx);
+    }
+
+    pub fn shows_frame_stats(&self) -> bool {
+        self.show_frame_stats
+    }
+
+    pub fn toggle_frame_stats(&mut self, cx: &mut Context<Self>) {
+        self.show_frame_stats = !self.show_frame_stats;
+        cx.notify();
+    }
+
+    /// Costs of the last 60 frames the element drew.
+    pub fn frame_summary(&self) -> FrameSummary {
+        self.stats.borrow().summary()
+    }
+
+    pub fn frame_stats(&self) -> std::cell::Ref<'_, FrameStats> {
+        self.stats.borrow()
+    }
+
+    /// How many shaped lines the element's cache holds.
+    pub fn shaped_lines_cached(&self) -> usize {
+        self.cache.borrow().shaped_len()
+    }
+
+    /// The cell grid of the last frame, once one was drawn.
+    pub fn cell_metrics(&self) -> Option<CellMetrics> {
+        self.cache.borrow().metrics()
+    }
+
+    // --- Scrolling -------------------------------------------------------------------
+
+    pub fn scroll_handle(&self) -> &TerminalScrollHandle {
+        &self.scroll
+    }
+
+    pub fn is_following_tail(&self) -> bool {
+        self.scroll.is_following()
+    }
+
+    pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    pub fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
+        self.scroll.scroll_to_top();
+        cx.notify();
+    }
+
+    pub fn page_up(&mut self, cx: &mut Context<Self>) {
+        self.scroll.page_up();
+        cx.notify();
+    }
+
+    pub fn page_down(&mut self, cx: &mut Context<Self>) {
+        self.scroll.page_down();
+        cx.notify();
+    }
+
+    /// Scroll by pixels; positive moves toward older lines.
+    pub fn scroll_by(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        self.scroll.scroll_by(f32::from(delta));
+        cx.notify();
+    }
+
+    // --- Pause -----------------------------------------------------------------------
+
+    /// Freeze the view at the lines retained now. The sources keep growing; the view
+    /// draws `first_line()..frozen_end` and follows the frozen end, so nothing on screen
+    /// moves except when eviction takes the oldest lines. Returns false if already
+    /// paused.
+    pub fn pause(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.frozen.is_some() {
+            return false;
+        }
+        self.frozen = Some(Frozen {
+            text: self.text_source.end(),
+            hex: self.hex_source.as_ref().map(|hex| hex.end()),
+        });
+        cx.notify();
+        true
+    }
+
+    /// Show the live tail again. Returns false if not paused.
+    pub fn resume(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.frozen.take().is_none() {
+            return false;
+        }
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+        true
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.frozen.is_some()
+    }
+
+    /// The end the element draws to while paused, for the source on screen.
+    pub fn frozen_end(&self) -> Option<LineId> {
+        let frozen = self.frozen?;
+        match (self.display, &self.hex_source) {
+            (DisplayMode::Hex, Some(_)) => frozen.hex,
+            _ => Some(frozen.text),
+        }
+    }
+
+    /// Lines appended to the text source since the pause.
+    pub fn lines_since_pause(&self) -> Option<u64> {
+        let frozen = self.frozen?;
+        Some(self.text_source.end().0.saturating_sub(frozen.text.0))
+    }
+
+    /// The lines on display: retained, cut at the frozen end while paused. An export
+    /// reads these from the source on a background thread.
+    pub fn displayed_span(&self) -> Span {
+        let source = self.source();
+        let end = source.end();
+        Span::new(
+            source.first_line(),
+            self.frozen_end().map_or(end, |frozen| frozen.min(end)),
+        )
+    }
+
+    // --- Selection -------------------------------------------------------------------
+
+    pub fn selection(&self) -> Option<Selection> {
+        self.selection
+    }
+
+    pub fn set_selection(&mut self, selection: Option<Selection>, cx: &mut Context<Self>) {
+        self.selection = selection;
+        cx.notify();
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.selection = Selection::all(self.displayed_span());
+        cx.notify();
+    }
+
+    /// The selected text, read now. For a large selection prefer [`Self::copy`], which
+    /// reads on the background executor.
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        Some(selection.text(self.source().as_ref(), self.displayed_span()))
+    }
+
+    /// Copy the selection to the clipboard. The text is gathered on the background
+    /// executor, so copying a million selected lines does not stall the UI.
+    pub fn copy(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let Some(selection) = self.selection else {
+            return Task::ready(());
+        };
+        let source = self.source().clone();
+        let span = self.displayed_span();
+        cx.spawn(async move |_, cx| {
+            let text = cx
+                .background_spawn(async move { selection.text(source.as_ref(), span) })
+                .await;
+            cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+        })
+    }
+
+    pub(crate) fn is_selecting(&self) -> bool {
+        self.selecting
+    }
+
+    fn word_unit(&self, point: SelectionPoint) -> std::ops::Range<SelectionPoint> {
+        let text = self
+            .source()
+            .line(point.line)
+            .map(|line| line.text)
+            .unwrap_or_default();
+        let word = word_at(&text, point.column);
+        SelectionPoint::new(point.line, word.start)..SelectionPoint::new(point.line, word.end)
+    }
+
+    fn line_unit(line: LineId) -> std::ops::Range<SelectionPoint> {
+        SelectionPoint::new(line, 0)..SelectionPoint::end_of(line)
+    }
+
+    pub(crate) fn mouse_down(
+        &mut self,
+        hit: Hit,
+        clicks: usize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.selecting = true;
+        self.selection = match clicks {
+            0 | 1 => match self.selection {
+                Some(mut selection) if extend => {
+                    selection.extend_to(hit.caret, |point| point..point);
+                    Some(selection)
+                }
+                _ => Some(Selection::new(hit.caret, hit.caret)),
+            },
+            2 => Some(Selection::unit(
+                self.word_unit(hit.cell),
+                SelectionMode::Word,
+            )),
+            _ => Some(Selection::unit(
+                Self::line_unit(hit.cell.line),
+                SelectionMode::Line,
+            )),
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn mouse_drag(&mut self, hit: Hit, cx: &mut Context<Self>) {
+        let Some(mode) = self.selection.map(|selection| selection.mode) else {
+            return;
+        };
+        let (point, unit) = match mode {
+            SelectionMode::Character => (hit.caret, hit.caret..hit.caret),
+            SelectionMode::Word => (hit.cell, self.word_unit(hit.cell)),
+            SelectionMode::Line => (hit.cell, Self::line_unit(hit.cell.line)),
+        };
+        if let Some(selection) = &mut self.selection {
+            let before = *selection;
+            selection.extend_to(point, |_| unit);
+            if *selection != before {
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn mouse_up(&mut self, cx: &mut Context<Self>) {
+        self.selecting = false;
+        // A click without a drag places nothing worth keeping.
+        if self.selection.is_some_and(|selection| selection.is_empty()) {
+            self.selection = None;
+        }
+        cx.notify();
+    }
+
+    // --- Search ----------------------------------------------------------------------
+
+    pub fn search_results(&self) -> &SearchResults {
+        &self.search.results
+    }
+
+    pub fn is_search_open(&self) -> bool {
+        self.search.open
+    }
+
+    pub fn search_input(&self) -> &Entity<InputState> {
+        &self.search.input
+    }
+
+    /// Open the search bar and focus its field.
+    pub fn deploy_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let reopening = !self.search.open;
+        self.search.open = true;
+        self.search
+            .input
+            .update(cx, |input, cx| input.focus(window, cx));
+        // The field keeps its text while closed; bring its matches back.
+        let query = self.search.input.read(cx).value().to_string();
+        if reopening && !query.is_empty() {
+            self.run_search(query, cx);
+        }
+        cx.notify();
+    }
+
+    /// Close the search bar: cancel a search in flight, drop the highlights, and give
+    /// focus back to the terminal.
+    pub fn dismiss_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search.open = false;
+        self.cancel_search();
+        self.search.results.clear();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_search(&mut self) {
+        if let Some(in_flight) = self.search.in_flight.take() {
+            in_flight.cancel.store(true, Ordering::Relaxed);
+        }
+        self.search.results.pending = false;
+    }
+
+    /// The cancel flag of the search in flight, if any.
+    pub fn search_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.search
+            .in_flight
+            .as_ref()
+            .map(|in_flight| in_flight.cancel.clone())
+    }
+
+    /// Search for `query` on the background executor, newest lines first. A search
+    /// still running for an older query is cancelled through its flag, so typing never
+    /// waits on a search.
+    pub fn run_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.cancel_search();
+        self.search.generation += 1;
+        self.search.results.clear();
+        self.search.results.query = query.clone();
+        let span = self.displayed_span();
+        let Some(searcher) = self.searcher().cloned() else {
+            cx.notify();
+            return;
+        };
+        if query.is_empty() || span.is_empty() {
+            cx.notify();
+            return;
+        }
+        let generation = self.search.generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let from = LineId(span.end.0 - 1);
+        let task = cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move {
+                    let found = searcher.search(&query, from, true, MAX_MATCHES, &flag);
+                    (found, flag.load(Ordering::Relaxed))
+                })
+                .await;
+            this.update(cx, |view, cx| view.search_finished(generation, found, cx))
+                .ok();
+        });
+        self.search.results.pending = true;
+        self.search.in_flight = Some(InFlight {
+            cancel,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    fn search_finished(
+        &mut self,
+        generation: u64,
+        (found, cancelled): (Result<Vec<SearchMatch>, String>, bool),
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.search.generation || cancelled {
+            return;
+        }
+        self.search.in_flight = None;
+        match found {
+            Ok(matches) => {
+                let top = self.scroll.position().line;
+                self.search.results.finish(matches, top);
+                self.reveal_active();
+            }
+            Err(error) => self.search.results.fail(error),
+        }
+        cx.notify();
+    }
+
+    fn reveal_active(&self) {
+        if let Some(found) = self.search.results.active_match() {
+            self.scroll.reveal(found.line);
+        }
+    }
+
+    pub fn search_next(&mut self, cx: &mut Context<Self>) {
+        if self.search.results.select_next().is_some() {
+            self.reveal_active();
+            cx.notify();
+        }
+    }
+
+    pub fn search_previous(&mut self, cx: &mut Context<Self>) {
+        if self.search.results.select_previous().is_some() {
+            self.reveal_active();
+            cx.notify();
+        }
+    }
+
+    // --- Actions ---------------------------------------------------------------------
+
+    fn copy_action(&mut self, _: &actions::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selection.is_some() {
+            self.copy(cx).detach();
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn select_all_action(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all(cx);
+    }
+
+    fn search_action(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
+        self.deploy_search(window, cx);
+    }
+
+    fn dismiss_search_action(
+        &mut self,
+        _: &DismissSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.search.open {
+            self.dismiss_search(window, cx);
+        } else {
+            cx.propagate();
+        }
+    }
+
+    fn search_next_action(&mut self, _: &SearchNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.search_next(cx);
+    }
+
+    fn search_previous_action(
+        &mut self,
+        _: &SearchPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_previous(cx);
+    }
+
+    fn toggle_wrap_action(&mut self, _: &ToggleWrap, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_wrap(cx);
+    }
+
+    fn cycle_timestamps_action(
+        &mut self,
+        _: &CycleTimestamps,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_timestamps(cx);
+    }
+
+    fn toggle_hex_action(&mut self, _: &ToggleHexView, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_hex(cx);
+    }
+
+    fn toggle_frame_stats_action(
+        &mut self,
+        _: &ToggleFrameStats,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_frame_stats(cx);
+    }
+
+    fn page_up_action(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_up(cx);
+    }
+
+    fn page_down_action(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.page_down(cx);
+    }
+
+    fn scroll_to_top_action(&mut self, _: &ScrollToTop, _: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_to_top(cx);
+    }
+
+    fn jump_to_bottom_action(&mut self, _: &JumpToBottom, _: &mut Window, cx: &mut Context<Self>) {
+        self.jump_to_bottom(cx);
+    }
+
+    // --- Rendering -------------------------------------------------------------------
+
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let results = &self.search.results;
+        let label = results.count_label();
+        let label_color = if results.error.is_some() {
+            theme.danger
+        } else {
+            theme.muted_foreground
+        };
+        h_flex()
+            .key_context(context::TERMINAL_SEARCH)
+            .on_action(cx.listener(Self::dismiss_search_action))
+            .flex_none()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div().flex_1().child(
+                    Input::new(&self.search.input)
+                        .id("terminal-search-input")
+                        .small(),
+                ),
+            )
+            .child(
+                div()
+                    .id("terminal-search-count")
+                    .min_w(px(72.))
+                    .text_xs()
+                    .text_color(label_color)
+                    .child(label),
+            )
+            .child(
+                Button::new("terminal-search-previous")
+                    .label("↑")
+                    .tooltip("Previous match (shift-enter)")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.search_previous(cx))),
+            )
+            .child(
+                Button::new("terminal-search-next")
+                    .label("↓")
+                    .tooltip("Next match (enter)")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.search_next(cx))),
+            )
+            .child(
+                Button::new("terminal-search-close")
+                    .label("✕")
+                    .tooltip("Close (escape)")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| this.dismiss_search(window, cx))),
+            )
+    }
+
+    fn render_frame_stats(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let summary = self.frame_summary();
+        v_flex()
+            .id("terminal-frame-stats")
+            .absolute()
+            .top_2()
+            .right_4()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.background.opacity(0.85))
+            .border_1()
+            .border_color(theme.border)
+            .font_family(theme.mono_font_family.clone())
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .children(summary.lines())
+    }
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let font = font(theme.mono_font_family.clone());
+        let font_size = theme.mono_font_size;
+        let search_open = self.search.open;
+        let highlights = if search_open {
+            Highlights {
+                matches: self.search.results.matches.clone(),
+                active: self.search.results.active,
+            }
+        } else {
+            Highlights::default()
+        };
+        let element = TerminalElement::new(TerminalInputs {
+            view: cx.entity(),
+            source: self.source().clone(),
+            frozen_end: self.frozen_end(),
+            scroll: self.scroll.clone(),
+            cache: self.cache.clone(),
+            stats: self.stats.clone(),
+            palette: self.palette.clone(),
+            generation: self.generation,
+            font,
+            font_size,
+            wrap: self.wrap,
+            timestamps: self.timestamps,
+            clock: self.clock,
+            selection: self.selection,
+            highlights,
+            focus: self.focus_handle.clone(),
+        });
+        let following = self.scroll.is_following();
+        let search_bar = search_open.then(|| self.render_search_bar(cx));
+        let frame_stats = self.show_frame_stats.then(|| self.render_frame_stats(cx));
+
+        v_flex()
+            .id("terminal")
+            .key_context(context::TERMINAL)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::copy_action))
+            .on_action(cx.listener(Self::select_all_action))
+            .on_action(cx.listener(Self::search_action))
+            .on_action(cx.listener(Self::search_next_action))
+            .on_action(cx.listener(Self::search_previous_action))
+            .on_action(cx.listener(Self::toggle_wrap_action))
+            .on_action(cx.listener(Self::cycle_timestamps_action))
+            .on_action(cx.listener(Self::toggle_hex_action))
+            .on_action(cx.listener(Self::toggle_frame_stats_action))
+            .on_action(cx.listener(Self::page_up_action))
+            .on_action(cx.listener(Self::page_down_action))
+            .on_action(cx.listener(Self::scroll_to_top_action))
+            .on_action(cx.listener(Self::jump_to_bottom_action))
+            .size_full()
+            .children(search_bar)
+            .child(
+                div()
+                    .id("terminal-area")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(element)
+                    .child(Scrollbar::vertical(&self.scroll).id("terminal-scrollbar"))
+                    .children(frame_stats)
+                    .when(!following, |area| {
+                        area.child(
+                            div().absolute().bottom_3().right_6().child(
+                                Button::new("terminal-jump-to-bottom")
+                                    .label(if self.frozen.is_some() {
+                                        "Jump to paused end"
+                                    } else {
+                                        "Jump to bottom"
+                                    })
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_to_bottom(cx);
+                                    })),
+                            ),
+                        )
+                    }),
+            )
+    }
+}

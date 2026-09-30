@@ -9,16 +9,25 @@
 
 pub mod cache;
 pub mod double;
+pub mod element;
 pub mod layout;
 pub mod palette;
+pub mod scroll;
 pub mod search;
 pub mod selection;
 pub mod stats;
 pub mod timestamps;
+pub mod view;
 
+#[cfg(test)]
+mod tests;
+
+pub use element::{CellMetrics, Highlights, TerminalElement, TerminalInputs};
 pub use layout::{ScrollPosition, Span};
 pub use palette::TerminalPalette;
+pub use scroll::TerminalScrollHandle;
 pub use search::SearchResults;
 pub use selection::{Selection, SelectionMode, SelectionPoint};
 pub use stats::{FrameSample, FrameStats, FrameSummary};
 pub use timestamps::{Clock, TimestampMode};
+pub use view::{DisplayMode, TerminalView};
