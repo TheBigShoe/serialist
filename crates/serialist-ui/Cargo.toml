@@ -15,6 +15,8 @@ serialist-sim.workspace = true
 gpui-kit.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
+regex.workspace = true
+chrono.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
