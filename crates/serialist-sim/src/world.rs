@@ -71,7 +71,7 @@ impl SimWorld {
         world
     }
 
-    /// A world with no devices.
+    /// A world with no devices. `SimWorld::default()` is the same; only `new` adds the built-ins.
     pub fn empty() -> Self {
         Self::default()
     }
