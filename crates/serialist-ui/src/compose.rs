@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 
 use crate::actions::{CycleLineEnding, HistoryNext, HistoryPrevious, context};
+use crate::config::Config;
 use crate::prelude::*;
 
 /// What Enter appends to the typed text: the settings type, so a `line_ending` setting
@@ -230,6 +231,7 @@ impl ComposeBar {
 
 impl Render for ComposeBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let toolbar = Config::toolbar_background(cx);
         let theme = cx.theme();
         h_flex()
             .key_context(context::COMPOSE_BAR)
@@ -242,6 +244,7 @@ impl Render for ComposeBar {
             .py_1p5()
             .border_t_1()
             .border_color(theme.border)
+            .when_some(toolbar, |bar, background| bar.bg(background))
             .child(
                 div()
                     .flex_1()

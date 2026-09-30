@@ -888,6 +888,7 @@ impl TerminalView {
     // --- Rendering -------------------------------------------------------------------
 
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let toolbar = Config::toolbar_background(cx);
         let theme = cx.theme();
         let results = &self.search.results;
         let label = results.count_label();
@@ -906,6 +907,7 @@ impl TerminalView {
             .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .when_some(toolbar, |bar, background| bar.bg(background))
             .child(
                 div().flex_1().child(
                     Input::new(&self.search.input)

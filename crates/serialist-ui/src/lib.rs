@@ -24,6 +24,8 @@ pub mod theme_bridge;
 pub mod workspace;
 
 #[cfg(test)]
+mod config_tests;
+#[cfg(test)]
 mod gate;
 #[cfg(test)]
 mod stream_tests;

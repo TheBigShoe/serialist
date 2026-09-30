@@ -332,6 +332,11 @@ impl SessionView {
         &self.port
     }
 
+    /// The line settings the port was opened with.
+    pub fn serial(&self) -> &SerialConfig {
+        &self.serial
+    }
+
     pub fn state(&self) -> &ConnectionState {
         &self.state
     }

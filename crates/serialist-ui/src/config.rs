@@ -224,6 +224,18 @@ impl Config {
         self.theme.is_dark()
     }
 
+    /// A Zed theme key with no gpui-kit counterpart, such as `toolbar.background`,
+    /// for the views that paint it themselves.
+    pub fn color(&self, key: &str) -> Option<Hsla> {
+        self.theme.color(key).map(hsla)
+    }
+
+    /// The `toolbar.background` of the compose bar and the search bar, if the theme
+    /// sets one.
+    pub fn toolbar_background(cx: &App) -> Option<Hsla> {
+        cx.try_global::<Config>()?.color("toolbar.background")
+    }
+
     pub fn problems(&self) -> &[ConfigProblem] {
         &self.problems
     }
