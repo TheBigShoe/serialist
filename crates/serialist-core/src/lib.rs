@@ -20,7 +20,10 @@ pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
 pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 pub use discovery::RealPortSource;
-pub use ingest::{ChunkSink, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped};
+pub use ingest::{
+    ChunkSink, ConnectionInfo, Ingest, IngestHandle, IngestPanicked, IngestStats, IngestStopped,
+    LinkState,
+};
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
 pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
