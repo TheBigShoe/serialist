@@ -509,6 +509,20 @@ impl DecodedPanel {
         };
         let generation = view.read(cx).decoded_generation();
         if self.seen == Some(generation) {
+            // No new frames, but the terminal's timestamp mode (or the format) may have
+            // changed, which the time column follows.
+            let time = view.read(cx).frame_time(cx);
+            self.table.update(cx, |table, cx| {
+                let delegate = table.delegate_mut();
+                let changed = delegate
+                    .time
+                    .as_ref()
+                    .is_none_or(|old| old.mode != time.mode || old.format != time.format);
+                if changed {
+                    delegate.time = Some(time);
+                    cx.notify();
+                }
+            });
             return;
         }
         self.seen = Some(generation);
