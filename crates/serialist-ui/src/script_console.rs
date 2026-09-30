@@ -11,12 +11,18 @@
 //!
 //! The panel only shows and asks. Runs belong to the session view (one script thread
 //! per session, runs queued one at a time), and the workspace passes the panel's
-//! requests on ([`ScriptConsoleEvent`]) and the session's lines back
-//! ([`ScriptConsole::push_lines`]).
+//! requests on ([`ScriptConsoleEvent`]) to the active tab's session, and each tab's
+//! lines back ([`ScriptConsole::push_lines_to`]).
+//!
+//! The output is kept per tab: the console shows the active tab's
+//! ([`ScriptConsole::show_source`]), and the lines of a script running in a background
+//! tab go to that tab's output, which is there when the tab is active again. A tab's
+//! output outlives reconnects (it belongs to the tab, not to a session view) and goes
+//! with the tab.
 //!
 //! [`ScriptPrompt`] is the small form a script's `ui.prompt` opens in a dialog.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use serialist_script::LogLevel;
@@ -28,6 +34,7 @@ use crate::script_bridge::{ConsoleKind, ConsoleLine};
 use crate::script_files::ScriptEntry;
 use crate::session_view::SessionView;
 use crate::status::ScriptStatus;
+use crate::tabs::TabId;
 
 const ROW_HEIGHT: Pixels = px(20.);
 const SCRIPT_ROW_HEIGHT: Pixels = px(26.);
@@ -48,7 +55,12 @@ pub enum ScriptConsoleEvent {
 
 pub struct ScriptConsole {
     scripts: Arc<Vec<ScriptEntry>>,
+    /// The output shown: the output of `source`.
     lines: VecDeque<ConsoleLine>,
+    /// The tab whose output is shown; `None` with no tab open.
+    source: Option<TabId>,
+    /// The output of the tabs not shown.
+    others: HashMap<Option<TabId>, VecDeque<ConsoleLine>>,
     input: Entity<InputState>,
     output_scroll: UniformListScrollHandle,
     /// The session whose runs the header shows.
@@ -79,6 +91,8 @@ impl ScriptConsole {
         let mut console = Self {
             scripts: Arc::default(),
             lines: VecDeque::new(),
+            source: None,
+            others: HashMap::new(),
             input,
             output_scroll: UniformListScrollHandle::new(),
             session: None,
@@ -96,9 +110,25 @@ impl ScriptConsole {
         &self.scripts
     }
 
-    /// The output lines, oldest first.
+    /// The output lines shown (the active tab's), oldest first.
     pub fn lines(&self) -> &VecDeque<ConsoleLine> {
         &self.lines
+    }
+
+    /// The tab whose output is shown.
+    pub fn source(&self) -> Option<TabId> {
+        self.source
+    }
+
+    /// The output of `source`, shown or not, oldest first.
+    pub fn lines_of(&self, source: Option<TabId>) -> Vec<ConsoleLine> {
+        if source == self.source {
+            return self.lines.iter().cloned().collect();
+        }
+        self.others
+            .get(&source)
+            .map(|lines| lines.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// The output lines' text, oldest first.
@@ -140,7 +170,38 @@ impl ScriptConsole {
         cx.notify();
     }
 
-    /// Add lines to the output and scroll to them.
+    /// Show the output of `source` (the tab that became active), scrolled to its end.
+    /// The output shown until now is kept for when its tab is active again.
+    pub fn show_source(&mut self, source: Option<TabId>, cx: &mut Context<Self>) {
+        if source == self.source {
+            return;
+        }
+        let shown = std::mem::replace(
+            &mut self.lines,
+            self.others.remove(&source).unwrap_or_default(),
+        );
+        if !shown.is_empty() {
+            self.others.insert(self.source, shown);
+        }
+        self.source = source;
+        if !self.lines.is_empty() {
+            self.output_scroll
+                .scroll_to_item(self.lines.len() - 1, ScrollStrategy::Bottom);
+        }
+        cx.notify();
+    }
+
+    /// Drop the output of a tab that closed.
+    pub fn forget_source(&mut self, source: Option<TabId>, cx: &mut Context<Self>) {
+        if source == self.source {
+            self.lines.clear();
+            cx.notify();
+        } else {
+            self.others.remove(&source);
+        }
+    }
+
+    /// Add lines to the output shown and scroll to them.
     pub fn push_lines(
         &mut self,
         lines: impl IntoIterator<Item = ConsoleLine>,
@@ -159,7 +220,26 @@ impl ScriptConsole {
         cx.notify();
     }
 
-    /// Empty the output.
+    /// Add lines to the output of `source`: shown and scrolled to if it is the tab
+    /// shown, else kept (without a repaint) for when it is.
+    pub fn push_lines_to(
+        &mut self,
+        source: Option<TabId>,
+        lines: impl IntoIterator<Item = ConsoleLine>,
+        cx: &mut Context<Self>,
+    ) {
+        if source == self.source {
+            self.push_lines(lines, cx);
+            return;
+        }
+        let kept = self.others.entry(source).or_default();
+        kept.extend(lines);
+        while kept.len() > MAX_LINES {
+            kept.pop_front();
+        }
+    }
+
+    /// Empty the output shown.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.lines.clear();
         cx.notify();
@@ -318,7 +398,7 @@ impl ScriptConsole {
                 .px_3()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child("Output of scripts run on the session shows here.")
+                .child("Output of scripts run in this tab shows here.")
                 .into_any_element();
         }
         uniform_list(

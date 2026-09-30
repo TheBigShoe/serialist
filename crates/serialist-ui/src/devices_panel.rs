@@ -255,7 +255,8 @@ pub struct DevicesPanel {
     /// selection or the settings change.
     prefilled: Option<(PortId, u64)>,
     notice: Option<SharedString>,
-    connected: Option<PortId>,
+    /// The ports open in a tab, which get the green dot.
+    connected: Vec<PortId>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     /// Held for the panel's lifetime: a source may stop reporting once dropped
@@ -322,7 +323,7 @@ impl DevicesPanel {
             baud_override,
             prefilled: None,
             notice: None,
-            connected: None,
+            connected: Vec::new(),
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             _source: source,
@@ -403,11 +404,17 @@ impl DevicesPanel {
         }
     }
 
-    pub fn set_connected(&mut self, port: Option<PortId>, cx: &mut Context<Self>) {
-        if self.connected != port {
-            self.connected = port;
+    /// The ports open in a tab now, each marked with a dot.
+    pub fn set_connected(&mut self, ports: Vec<PortId>, cx: &mut Context<Self>) {
+        if self.connected != ports {
+            self.connected = ports;
             cx.notify();
         }
+    }
+
+    /// The ports marked open.
+    pub fn connected(&self) -> &[PortId] {
+        &self.connected
     }
 
     pub fn set_notice(&mut self, notice: Option<SharedString>, cx: &mut Context<Self>) {
@@ -486,7 +493,7 @@ impl DevicesPanel {
     fn render_row(&self, ix: usize, entry: &DeviceEntry, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         let selected = self.list.selected_index() == Some(ix);
-        let connected = self.connected.as_ref() == Some(&entry.info.id);
+        let connected = self.connected.contains(&entry.info.id);
         let mono = theme.mono_font_family.clone();
         let (name_color, detail_color) = if entry.present {
             (theme.foreground, theme.muted_foreground)
