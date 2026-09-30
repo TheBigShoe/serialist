@@ -789,7 +789,9 @@ mod tests {
     #[test]
     fn close_sends_queued_writes_first() {
         let (factory, _steps, probe) = mock();
-        *probe.write_delay.lock() = Duration::from_millis(20);
+        // Slow enough that the queue is still full when close() runs, but far inside the
+        // 500 ms drain limit even on a starved CI runner (5 writes here take 10 ms).
+        *probe.write_delay.lock() = Duration::from_millis(2);
         let session = Session::open(&factory, config()).unwrap();
         let events = session.events();
         for i in 0..5u8 {
