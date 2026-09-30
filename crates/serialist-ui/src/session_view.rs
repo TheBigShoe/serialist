@@ -81,7 +81,7 @@ use crate::config::Config;
 use crate::export::{ExportFormat, ExportJob};
 use crate::history::PersistentHistory;
 use crate::inline::{
-    EchoLine, EncodedKey, EscapeChord, InlineSettings, KeyEncoder, Mode, PasteProgress, is_chord,
+    EchoLine, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
     paste_bytes,
 };
 use crate::prelude::*;
@@ -139,7 +139,7 @@ fn match_range(pattern: &str, text: &str) -> Range<usize> {
 }
 
 /// The `inline.*` settings in force, or the defaults without the app's configuration.
-fn inline_settings(cx: &App) -> InlineSettings {
+fn inline_settings(cx: &App) -> InlineConfig {
     cx.try_global::<Config>()
         .map(|config| config.inline().clone())
         .unwrap_or_default()

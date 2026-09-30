@@ -29,7 +29,8 @@ mod test_util;
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
 pub use commands::{
     CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
-    CommandWarning, EditError, Expect, Param, ParamKind, ParamValues, Payload, PayloadError,
+    CommandWarning, DEFAULT_EXPECT_TIMEOUT_MS, EditError, Expect, Param, ParamKind, ParamValues,
+    Payload, PayloadError,
 };
 pub use composite::{MergedPortSource, RoutingTransportFactory, VIRTUAL_SCHEME};
 pub use config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
@@ -46,9 +47,10 @@ pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
 pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use settings::{
-    ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView, FontFeatures, FontSpec,
-    LineEnding, LineHeight, Platform, Settings, SettingsError, SettingsWarning, TerminalSettings,
-    ThemeMode, ThemeSelection, TimestampMode, UsbId, load_settings,
+    BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView,
+    FontFeatures, FontSpec, InlineSettings, LineEnding, LineHeight, Platform, Settings,
+    SettingsError, SettingsWarning, TerminalSettings, ThemeMode, ThemeSelection, TimestampMode,
+    UsbId, load_settings,
 };
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,

@@ -553,6 +553,42 @@ fn a_broken_settings_file_keeps_the_last_good_settings_and_shows_why(cx: &mut Te
     assert_eq!(workspace.read_with(cx, |w, cx| w.config_notice(cx)), None);
 }
 
+#[gpui_test]
+fn the_inline_settings_come_from_the_core_settings(cx: &mut TestAppContext) {
+    let (_window, _view) = open_terminal(cx);
+    let dir = ConfigDir::new("inline-settings").with_settings(
+        r#"{ "inline": { "backspace": "bs", "escape_chord": "ctrl-b",
+                         "paste_chunk_bytes": 8, "paste_chunk_delay_ms": 30 } }"#,
+    );
+    load(cx, &dir);
+    let loaded = config(cx);
+    assert!(loaded.problems().is_empty(), "{:?}", loaded.problems());
+    let inline = loaded.inline();
+    assert_eq!(inline.backspace, 0x08);
+    assert_eq!(inline.escape_chord, Keystroke::parse("ctrl-b").unwrap());
+    assert_eq!(inline.paste_chunk_bytes, 8);
+    assert_eq!(inline.paste_chunk_delay, Duration::from_millis(30));
+    assert_eq!(loaded.settings().inline.backspace.byte(), 0x08);
+
+    // A reload that drops the object goes back to the defaults; a bad value keeps the
+    // last good settings and says why, as for any other key.
+    dir.write_settings("{}");
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    assert_eq!(
+        cx.update(|cx| cx.global::<Config>().inline().backspace),
+        0x7f
+    );
+    dir.write_settings(r#"{ "inline": { "backspace": "0x20" } }"#);
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    let kept = config(cx);
+    assert_eq!(kept.inline().backspace, 0x7f, "the last good settings");
+    let notice = kept.notice().expect("the status line says why");
+    assert!(
+        notice.is_error && notice.text.contains("inline.backspace"),
+        "{notice:?}"
+    );
+}
+
 // --- Keymap ------------------------------------------------------------------------
 
 #[gpui_test]

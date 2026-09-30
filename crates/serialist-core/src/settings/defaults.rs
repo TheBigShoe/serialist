@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::font::{FontFeatures, LineHeight};
+use super::inline::{BackspaceKey, InlineSettings};
 use super::profile::DeviceProfile;
 use super::types::{
     DisplaySettings, DisplayView, LineEnding, Settings, ThemeSelection, TimestampMode,
@@ -72,6 +73,20 @@ defaults! {
     display_hex_bytes_per_row: usize = "display"."hex_bytes_per_row";
     display_show_control_chars: bool = "display"."show_control_chars";
     display_wrap: bool = "display"."wrap";
+    inline_backspace: BackspaceKey = "inline"."backspace";
+    inline_escape_chord: String = "inline"."escape_chord";
+    inline_paste_chunk_bytes: usize = "inline"."paste_chunk_bytes";
+    inline_paste_chunk_delay_ms: u64 = "inline"."paste_chunk_delay_ms";
+}
+
+/// The whole `inline` object, for a settings file that leaves it out.
+pub(super) fn inline() -> InlineSettings {
+    InlineSettings {
+        backspace: inline_backspace(),
+        escape_chord: inline_escape_chord(),
+        paste_chunk_bytes: inline_paste_chunk_bytes(),
+        paste_chunk_delay_ms: inline_paste_chunk_delay_ms(),
+    }
 }
 
 /// The whole `display` object, for a settings file that leaves it out.
