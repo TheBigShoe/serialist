@@ -81,8 +81,8 @@ use crate::config::Config;
 use crate::export::{ExportFormat, ExportJob};
 use crate::history::PersistentHistory;
 use crate::inline::{
-    EchoLine, EncodedKey, EscapeChord, InlineSettings, KeyEncoder, Mode, PasteProgress, is_chord,
-    paste_bytes,
+    Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
+    paste_bytes, paste_echo,
 };
 use crate::prelude::*;
 use crate::scrollback::{Floors, Scrollback};
@@ -128,18 +128,18 @@ fn command_echo(command: &Command, bytes: &[u8], session_eol: LineEnding) -> Str
     }
 }
 
-/// Where in `text` the pattern matched, for the highlight: the first match of the
-/// expectation's regex (compiled the same way the matcher does), else the whole line.
-fn match_range(pattern: &str, text: &str) -> Range<usize> {
-    serialist_core::matcher::compile_pattern(pattern)
-        .ok()
-        .and_then(|regex| regex.find(text).map(|found| found.range()))
-        .filter(|range| !range.is_empty())
-        .unwrap_or(0..text.len())
+/// What to highlight for a match at `range` in `text`: that range, or the whole line
+/// when the pattern matched nothing in particular (`^`, an empty group).
+fn highlight_range(range: Range<usize>, text: &str) -> Range<usize> {
+    if range.is_empty() {
+        0..text.len()
+    } else {
+        range
+    }
 }
 
 /// The `inline.*` settings in force, or the defaults without the app's configuration.
-fn inline_settings(cx: &App) -> InlineSettings {
+fn inline_settings(cx: &App) -> InlineConfig {
     cx.try_global::<Config>()
         .map(|config| config.inline().clone())
         .unwrap_or_default()
@@ -160,6 +160,19 @@ fn bound_in_innermost_context(keystroke: &Keystroke, stack: &[KeyContext], cx: &
         })
 }
 
+/// Echo one key into the scrollback with local echo on: text grows the `Tx` line being
+/// typed, Backspace takes its last character back, Enter ends it. Control keys and
+/// escape sequences echo as nothing.
+fn echo_key(ingest: &IngestHandle, echo: &Echo) {
+    // Nothing to do about an ingest thread that has stopped: the session is over.
+    let _ = match echo {
+        Echo::Text(text) => ingest.append_local_inline(text.as_str(), Direction::Tx),
+        Echo::Backspace => ingest.truncate_local_line(1),
+        Echo::Enter => ingest.append_local_inline("\n", Direction::Tx),
+        Echo::Nothing => Ok(()),
+    };
+}
+
 /// A paste going out in chunks.
 struct PasteJob {
     id: u64,
@@ -171,8 +184,6 @@ struct PasteJob {
 /// Inline mode's state.
 #[derive(Default)]
 struct InlineState {
-    /// Typed since the last Enter, for local echo.
-    echo: EchoLine,
     chord: EscapeChord,
     paste: Option<PasteJob>,
     next_paste: u64,
@@ -581,14 +592,15 @@ impl SessionView {
 
     /// Hand `snapshot` to the terminal if it holds anything new. Returns whether it did.
     fn show(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) -> bool {
-        let before = self.snapshot().stats();
-        let after = snapshot.stats();
-        if before == after {
+        // A snapshot of what the view already has: a wake that found nothing new. (Not
+        // the stats, which cannot see a line being typed change without changing size.)
+        if self.snapshot().is_same_publication(&snapshot) {
             return false;
         }
-        // The line that was still arriving may have grown, so it counts as changed.
-        let changed =
-            LineId(before.end_line.0.saturating_sub(1)).max(after.first_line)..after.end_line;
+        let after = snapshot.stats();
+        // The lines that were still open (the one arriving, the ones being typed) may
+        // have changed, so they count as changed along with the new ones.
+        let changed = self.snapshot().committed_end().max(after.first_line)..after.end_line;
         self.scrollback = Scrollback::with_hex_row(&snapshot, self.floors, self.hex_bytes_per_row);
         self.push_sources(cx, |terminal, cx| terminal.lines_appended(changed, cx));
         true
@@ -777,9 +789,8 @@ impl SessionView {
         cx.spawn(async move |this, cx| {
             loop {
                 if let Some(result) = expectation.try_wait() {
-                    let pattern = expectation.pattern().to_owned();
                     this.update(cx, |view, cx| {
-                        view.reply(&name, &pattern, timeout_ms, result, cx);
+                        view.reply(&name, timeout_ms, result, cx);
                     })
                     .ok();
                     return;
@@ -794,22 +805,16 @@ impl SessionView {
         .detach();
     }
 
-    fn reply(
-        &mut self,
-        name: &str,
-        pattern: &str,
-        timeout_ms: u64,
-        result: ExpectResult,
-        cx: &mut Context<Self>,
-    ) {
+    fn reply(&mut self, name: &str, timeout_ms: u64, result: ExpectResult, cx: &mut Context<Self>) {
         match result {
             ExpectResult::Matched {
                 line,
                 text,
+                range,
                 elapsed,
                 ..
             } => {
-                let range = match_range(pattern, &text);
+                let range = highlight_range(range, &text);
                 self.terminal.update(cx, |terminal, cx| {
                     terminal.add_mark(SearchMatch { line, range }, cx);
                 });
@@ -853,12 +858,11 @@ impl SessionView {
             }
             Mode::Command => {
                 self.inline.paste = None;
-                let typed = self.inline.echo.take();
-                if !typed.is_empty()
-                    && self.compose.read(cx).local_echo()
+                // What was typed and not ended with Enter stays as the line it is.
+                if self.compose.read(cx).local_echo()
                     && let Some((_, ingest)) = self.live()
                 {
-                    let _ = ingest.append_local(typed, Direction::Tx);
+                    let _ = ingest.append_local_inline("\n", Direction::Tx);
                 }
                 self.terminal
                     .update(cx, |terminal, cx| terminal.set_inline(false, cx));
@@ -939,38 +943,23 @@ impl SessionView {
         }
     }
 
-    /// Write one key's bytes, echoing it first when local echo is on: typed text
-    /// collects until Enter, which echoes the line before the line ending goes out.
+    /// Write one key's bytes, echoing it first when local echo is on: the key is typed
+    /// into the scrollback's `Tx` line as it is pressed (see [`crate::inline`]). The
+    /// echo is queued before the write, and ingest applies it before the next session
+    /// event, so it always lands before the reply it causes.
     pub fn send_key(&mut self, key: EncodedKey, cx: &mut Context<Self>) {
-        if self.live().is_none() {
+        let echo = self.compose.read(cx).local_echo();
+        let Some((session, ingest)) = self.live() else {
             self.notice = Some(Notice::error("Not connected; key not sent"));
             cx.notify();
             return;
-        }
-        let finished = if self.compose.read(cx).local_echo() {
-            let finished = self.inline.echo.key(&key.echo);
-            self.show_pending_input(cx);
-            finished
-        } else {
-            None
         };
-        let Some((session, ingest)) = self.live() else {
-            return;
-        };
-        if let Some(line) = finished.filter(|line| !line.is_empty()) {
-            let _ = ingest.append_local(line, Direction::Tx);
+        if echo {
+            echo_key(ingest, &key.echo);
         }
         if session.write(key.bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
         }
-    }
-
-    /// Show what was typed since the last Enter at the terminal's foot.
-    fn show_pending_input(&self, cx: &mut Context<Self>) {
-        let pending = SharedString::from(self.inline.echo.text().to_owned());
-        self.terminal.update(cx, |terminal, cx| {
-            terminal.set_pending_input(Some(pending), cx)
-        });
     }
 
     /// Send `text` as a paste: line breaks become what Enter sends, and the bytes go
@@ -988,14 +977,10 @@ impl SessionView {
             cx.notify();
             return;
         }
-        if self.compose.read(cx).local_echo() {
-            let lines = self.inline.echo.paste(text);
-            self.show_pending_input(cx);
-            if let Some((_, ingest)) = self.live() {
-                for line in lines.into_iter().filter(|line| !line.is_empty()) {
-                    let _ = ingest.append_local(line, Direction::Tx);
-                }
-            }
+        if self.compose.read(cx).local_echo()
+            && let Some((_, ingest)) = self.live()
+        {
+            let _ = ingest.append_local_inline(paste_echo(text), Direction::Tx);
         }
         let chunks: Vec<Vec<u8>> = bytes
             .chunks(settings.paste_chunk_bytes.max(1))
@@ -1253,7 +1238,8 @@ impl SessionView {
     /// What an export in `format` writes if taken now: the selected lines (or hex
     /// rows) if there is a selection, else what a paused view shows, else everything
     /// retained. Text follows the display: lines, or hex rows in hex view, stamped as
-    /// the gutter is. Raw is the stream bytes under the same choice, whole lines at a
+    /// the gutter is (absolute stamps in `display.timestamp_format`, which is read when
+    /// the job is taken). Raw is the stream bytes under the same choice, whole lines at a
     /// time; with no selection it ignores Clear, which hides lines, not bytes.
     pub fn export_job(&self, format: ExportFormat, cx: &App) -> ExportJob {
         let terminal = self.terminal.read(cx);
@@ -1272,17 +1258,23 @@ impl SessionView {
                 range.start.line..end
             });
         let lines = selected.clone().unwrap_or(span.range());
-        let timestamps = export_timestamps(terminal.timestamps());
+        // Stamped as the gutter is: the same mode and, for absolute stamps, the format
+        // the settings name.
+        let mut options =
+            TextOptions::default().with_timestamps(export_timestamps(terminal.timestamps()));
+        if let Some(config) = cx.try_global::<Config>() {
+            options = options.with_timestamp_format(config.timestamp_format());
+        }
         match (format, terminal.display_mode()) {
             (ExportFormat::Text, DisplayMode::Text) => ExportJob::Text {
                 snapshot,
                 lines,
-                options: TextOptions::default().with_timestamps(timestamps),
+                options,
             },
             (ExportFormat::Text, DisplayMode::Hex) => ExportJob::HexText {
                 hex: self.scrollback.hex.inner.clone(),
                 rows: lines,
-                timestamps,
+                options,
             },
             (ExportFormat::Raw, _) => {
                 let range = match (selected, self.pause) {
@@ -1552,7 +1544,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        FakeFeed, allow_engine_threads, displayed, fake_session, open_test_window, run_until,
+        FakeFeed, TestDir, allow_engine_threads, displayed, fake_session, open_test_window,
+        run_until,
     };
 
     fn open_session_view(
@@ -1829,5 +1822,98 @@ mod tests {
             panic!("a raw job");
         };
         assert_eq!(range, 0..14, "raw export still has the cleared bytes");
+    }
+
+    /// The lines of the file a text export job writes.
+    fn export_lines(
+        cx: &mut TestAppContext,
+        view: &Entity<SessionView>,
+        path: &std::path::Path,
+    ) -> (ExportJob, Vec<String>) {
+        let job = view.read_with(cx, |v, cx| v.export_job(ExportFormat::Text, cx));
+        job.run(path).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        (job, text.lines().map(str::to_owned).collect())
+    }
+
+    fn set_timestamps(cx: &mut TestAppContext, view: &Entity<SessionView>, mode: TimestampMode) {
+        view.update(cx, |v, cx| {
+            v.terminal().update(cx, |t, cx| t.set_timestamps(mode, cx));
+        });
+    }
+
+    fn install_format(cx: &mut TestAppContext, dir: &TestDir, format: &str) {
+        std::fs::write(
+            dir.join("settings.json"),
+            format!(r#"{{ "display": {{ "timestamp_format": "{format}" }} }}"#),
+        )
+        .unwrap();
+        let paths = serialist_core::settings::ConfigPaths::new(dir.path());
+        cx.update(|cx| crate::config::install(Config::load(paths, false), cx));
+    }
+
+    #[gpui_test]
+    fn an_absolute_stamped_export_uses_the_configured_format(cx: &mut TestAppContext) {
+        let dir = TestDir::new("export-format");
+        let (_window, view, feed) = open_session_view(cx);
+        feed.connected("virtual:echo");
+        feed.data(b"one\r\ntwo\r\n");
+        run_until(cx, "the lines", |cx| texts(cx, &view).len() == 3);
+        set_timestamps(cx, &view, TimestampMode::Absolute);
+        let pattern = |pattern: &str| regex::Regex::new(pattern).unwrap();
+
+        // With no configuration the stamps are the default format, the time of day.
+        let (job, lines) = export_lines(cx, &view, &dir.join("default.txt"));
+        assert!(matches!(job, ExportJob::Text { .. }));
+        let default = pattern(r"^\[\d\d:\d\d:\d\d\.\d{3}\] (Connected to virtual:echo|one|two)$");
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| default.is_match(line)), "{lines:?}");
+
+        // The configured format is what an absolute export is stamped with.
+        install_format(cx, &dir, "T%S%.3f");
+        let (job, lines) = export_lines(cx, &view, &dir.join("configured.txt"));
+        let ExportJob::Text { options, .. } = &job else {
+            panic!("a text job");
+        };
+        assert_eq!(options.timestamp_format.as_deref(), Some("T%S%.3f"));
+        let configured = pattern(r"^\[T\d\d\.\d{3}\] (Connected to virtual:echo|one|two)$");
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines.iter().all(|line| configured.is_match(line)),
+            "{lines:?}"
+        );
+
+        // Hex rows are stamped the same way.
+        view.update(cx, |v, cx| {
+            v.terminal()
+                .update(cx, |t, cx| t.set_display_mode(DisplayMode::Hex, cx));
+        });
+        let (job, rows) = export_lines(cx, &view, &dir.join("hex.txt"));
+        let ExportJob::HexText { options, .. } = &job else {
+            panic!("a hex job");
+        };
+        assert_eq!(options.timestamp_format.as_deref(), Some("T%S%.3f"));
+        let hex_row = pattern(r"^\[T\d\d\.\d{3}\] [0-9a-f]{8}  ");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| hex_row.is_match(row)), "{rows:?}");
+
+        // Other kinds of stamp do not use the format, and a changed format applies to
+        // the next export.
+        view.update(cx, |v, cx| {
+            v.terminal()
+                .update(cx, |t, cx| t.set_display_mode(DisplayMode::Text, cx));
+        });
+        set_timestamps(cx, &view, TimestampMode::Relative);
+        let (_, lines) = export_lines(cx, &view, &dir.join("relative.txt"));
+        let relative = pattern(r"^\[\+\d+\.\d{6}\] ");
+        assert!(
+            lines.iter().all(|line| relative.is_match(line)),
+            "{lines:?}"
+        );
+        install_format(cx, &dir, "%S");
+        set_timestamps(cx, &view, TimestampMode::Absolute);
+        let (_, lines) = export_lines(cx, &view, &dir.join("seconds.txt"));
+        let seconds = pattern(r"^\[\d\d\] ");
+        assert!(lines.iter().all(|line| seconds.is_match(line)), "{lines:?}");
     }
 }

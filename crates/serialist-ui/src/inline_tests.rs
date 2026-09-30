@@ -187,63 +187,149 @@ fn the_backspace_setting_and_the_line_ending_apply(cx: &mut TestAppContext) {
 }
 
 #[gpui_test]
-fn local_echo_shows_typed_lines_as_tx(cx: &mut TestAppContext) {
+fn local_echo_shows_typed_text_as_it_is_typed(cx: &mut TestAppContext) {
     let (window, view, feed) = open_view(cx, true);
     set_mode(cx, window, &view, Mode::Inline);
-    for key in ["h", "i", "x", "backspace", "left", "ctrl-c"] {
+
+    // Each key shows in a Tx line of its own the moment it is pressed.
+    press(cx, window, "h");
+    run_until(cx, "the first character", |cx| tx_lines(cx, &view) == ["h"]);
+    press(cx, window, "i");
+    press(cx, window, "x");
+    run_until(cx, "the rest", |cx| tx_lines(cx, &view) == ["hix"]);
+    // Backspace takes the last character back; keys that are not text echo as nothing.
+    for key in ["backspace", "left", "ctrl-c"] {
         press(cx, window, key);
     }
-    let pending = view.read_with(cx, |v, cx| v.terminal().read(cx).pending_input().cloned());
+    run_until(cx, "the backspace", |cx| tx_lines(cx, &view) == ["hi"]);
+    step(cx, 3);
+    assert_eq!(tx_lines(cx, &view), ["hi"]);
+    let open = displayed(cx, &view).pop().expect("lines");
     assert_eq!(
-        pending.as_deref(),
-        Some("hi"),
-        "shown at the foot until Enter"
-    );
-    assert!(
-        tx_lines(cx, &view).is_empty(),
-        "nothing echoed before Enter"
+        (open.direction, open.text.as_str(), open.complete),
+        (Direction::Tx, "hi", false),
+        "still being typed"
     );
 
+    // Enter ends the line. The reply comes after it.
     press(cx, window, "enter");
     feed.data(b"hi there\r\n");
     run_until(cx, "the reply", |cx| has_rx_line(cx, &view, "hi there"));
-    assert_eq!(tx_lines(cx, &view), ["hi"], "control keys echo as nothing");
-    let lines: Vec<(Direction, String)> = displayed(cx, &view)
+    let lines: Vec<(Direction, String, bool)> = displayed(cx, &view)
         .into_iter()
-        .map(|line| (line.direction, line.text))
+        .map(|line| (line.direction, line.text, line.complete))
         .collect();
     assert_eq!(
         lines[1..],
         [
-            (Direction::Tx, "hi".into()),
-            (Direction::Rx, "hi there".into())
+            (Direction::Tx, "hi".into(), true),
+            (Direction::Rx, "hi there".into(), true)
         ],
         "the echo lands before the reply"
     );
-    let pending = view.read_with(cx, |v, cx| v.terminal().read(cx).pending_input().cloned());
-    assert_eq!(pending, None);
 
-    // Leaving inline mode echoes what was typed since the last Enter.
+    // Leaving inline mode ends what was typed since the last Enter.
     press(cx, window, "o");
     press(cx, window, "k");
-    set_mode(cx, window, &view, Mode::Command);
     run_until(cx, "the partial line", |cx| tx_lines(cx, &view).len() == 2);
     assert_eq!(tx_lines(cx, &view), ["hi", "ok"]);
+    set_mode(cx, window, &view, Mode::Command);
+    run_until(cx, "the line to end", |cx| {
+        displayed(cx, &view)
+            .last()
+            .is_some_and(|line| line.complete)
+    });
+    // Backspace in the next session of typing does not eat into it.
+    set_mode(cx, window, &view, Mode::Inline);
+    press(cx, window, "backspace");
+    step(cx, 3);
+    assert_eq!(tx_lines(cx, &view), ["hi", "ok"]);
+}
+
+#[gpui_test]
+fn typing_over_a_prompt_does_not_end_it_and_the_typed_line_follows(cx: &mut TestAppContext) {
+    let (window, view, feed) = open_view(cx, true);
+    feed.data(b"login: ");
+    run_until(cx, "the prompt", |cx| has_rx_line(cx, &view, "login: "));
+    set_mode(cx, window, &view, Mode::Inline);
+    for key in ["r", "o", "o", "t"] {
+        press(cx, window, key);
+    }
+    run_until(cx, "the typed text", |cx| tx_lines(cx, &view) == ["root"]);
+    let lines: Vec<(Direction, String, bool)> = displayed(cx, &view)
+        .into_iter()
+        .map(|line| (line.direction, line.text, line.complete))
+        .collect();
+    assert_eq!(
+        lines[1..],
+        [
+            (Direction::Rx, "login: ".into(), false),
+            (Direction::Tx, "root".into(), false),
+        ],
+        "the prompt is still the line in progress and the typed text follows it"
+    );
+
+    // Enter, and the device answers on a new line: the prompt ends where the device
+    // ended it, with what was typed right after, and the reply after that.
+    press(cx, window, "enter");
+    feed.data(b"\r\nPassword: ");
+    run_until(cx, "the next prompt", |cx| {
+        has_rx_line(cx, &view, "Password: ")
+    });
+    let lines: Vec<(Direction, String, bool)> = displayed(cx, &view)
+        .into_iter()
+        .map(|line| (line.direction, line.text, line.complete))
+        .collect();
+    assert_eq!(
+        lines[1..],
+        [
+            (Direction::Rx, "login: ".into(), true),
+            (Direction::Tx, "root".into(), true),
+            (Direction::Rx, "Password: ".into(), false),
+        ]
+    );
+}
+
+#[gpui_test]
+fn a_pasted_text_is_echoed_line_by_line(cx: &mut TestAppContext) {
+    let (window, view, feed) = open_view(cx, true);
+    set_mode(cx, window, &view, Mode::Inline);
+    view.update(cx, |view, cx| view.paste_text("one\r\ntwo\nthr", cx));
+    run_until(cx, "the echo", |cx| {
+        tx_lines(cx, &view) == ["one", "two", "thr"]
+    });
+    let lines = displayed(cx, &view);
+    let completeness: Vec<bool> = lines[1..].iter().map(|line| line.complete).collect();
+    assert_eq!(completeness, [true, true, false], "the last is still open");
+    // What goes out is the paste with Enter for each break (CRLF here).
+    run_until(cx, "the paste to go out", |_| {
+        feed.written().concat() == b"one\r\ntwo\r\nthr"
+    });
+    // And without local echo nothing is echoed.
+    let (window, view, feed) = open_view(cx, false);
+    set_mode(cx, window, &view, Mode::Inline);
+    view.update(cx, |view, cx| view.paste_text("one\ntwo", cx));
+    run_until(cx, "the paste to go out", |_| {
+        feed.written().concat() == b"one\r\ntwo"
+    });
+    assert!(tx_lines(cx, &view).is_empty());
 }
 
 #[gpui_test]
 fn without_local_echo_nothing_is_echoed(cx: &mut TestAppContext) {
     let (window, view, feed) = open_view(cx, false);
     set_mode(cx, window, &view, Mode::Inline);
-    for key in ["h", "i", "enter"] {
+    for key in ["h", "i", "backspace", "enter"] {
         press(cx, window, key);
     }
     feed.data(b"reply\r\n");
     run_until(cx, "the reply", |cx| has_rx_line(cx, &view, "reply"));
     assert!(tx_lines(cx, &view).is_empty());
-    let pending = view.read_with(cx, |v, cx| v.terminal().read(cx).pending_input().cloned());
-    assert_eq!(pending, None);
-    assert_eq!(feed.written().len(), 3);
+    assert_eq!(feed.written().len(), 4);
+    // Leaving inline mode adds nothing either.
+    set_mode(cx, window, &view, Mode::Command);
+    step(cx, 3);
+    assert!(tx_lines(cx, &view).is_empty());
 }
 
 #[gpui_test]

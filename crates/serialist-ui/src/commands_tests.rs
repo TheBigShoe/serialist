@@ -7,11 +7,13 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{CollectionSource, CommandCollection, CommandRef, Direction, PortId};
+use serialist_core::{
+    CollectionSource, CommandCollection, CommandRef, CommandStore, Direction, PortId,
+};
 use serialist_sim::{DeviceOutput, LinkConfig, SimDevice, SimWorld};
 
 use crate::actions::keys;
-use crate::commands_panel::{Field, PayloadKind, Row};
+use crate::commands_panel::{Field, PayloadKind, Row, copy_collection};
 use crate::config::{self, Config, ConfigPiece};
 use crate::history::SAVE_DELAY;
 use crate::prelude::*;
@@ -354,6 +356,65 @@ fn a_matched_reply_is_highlighted_and_timed(cx: &mut TestAppContext) {
     assert_eq!(marks[0].range, 0..marked.text.len());
 }
 
+/// A second collection whose patterns match only part of the reply.
+const PARTS: &str = r#"{
+  "name": "Parts",
+  "groups": [
+    {
+      "name": "Modem",
+      "commands": [
+        {
+          "name": "Number",
+          "payload": { "text": "AT+VER?" },
+          "expect": { "pattern": "(\\d+)\\.(\\d+)", "timeout_ms": 2000 }
+        },
+        {
+          "name": "Anything",
+          "payload": { "text": "AT+VER?" },
+          "expect": { "pattern": "\\b", "timeout_ms": 2000 }
+        }
+      ]
+    }
+  ]
+}"#;
+
+#[gpui_test]
+fn the_highlight_is_the_range_the_matcher_found(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-expect-range");
+    std::fs::write(dir.join("commands").join("parts.json"), PARTS).unwrap();
+    let (world, _) = world();
+    let (_window, workspace, view) = open(cx, &world, &dir, "virtual:at", false);
+    let marks =
+        |cx: &mut TestAppContext| view.read_with(cx, |v, cx| v.terminal().read(cx).marks().clone());
+
+    // Only the part of the line the pattern matched is marked.
+    send_from_panel(cx, &workspace, CommandRef::new("Parts", "Modem", "Number"));
+    run_until(cx, "the reply to be matched", |cx| {
+        notice(cx, &view).is_some_and(|text| text.contains("OK in"))
+    });
+    let first = marks(cx);
+    assert_eq!(first.len(), 1);
+    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    let marked = source.line(first[0].line).expect("the marked line");
+    assert_eq!(marked.text, "+VER: 1.0.0");
+    assert_eq!(first[0].range, 6..9, "the first match, 1.0");
+    assert_eq!(&marked.text[first[0].range.clone()], "1.0");
+
+    // A pattern that matches the empty string (a word boundary, in a line with words)
+    // marks the whole line.
+    send_from_panel(
+        cx,
+        &workspace,
+        CommandRef::new("Parts", "Modem", "Anything"),
+    );
+    run_until(cx, "the second match", |cx| marks(cx).len() == 2);
+    let second = marks(cx);
+    let source = view.read_with(cx, |v, cx| v.terminal().read(cx).source().clone());
+    let marked = source.line(second[1].line).expect("the marked line");
+    assert!(!marked.text.is_empty(), "a line with a word boundary");
+    assert_eq!(second[1].range, 0..marked.text.len());
+}
+
 #[gpui_test]
 fn a_timeout_adds_a_notice_line_and_a_status_notice(cx: &mut TestAppContext) {
     let dir = config_dir("commands-timeout");
@@ -534,6 +595,96 @@ fn the_bundled_examples_are_read_only_and_copy_to_the_user(cx: &mut TestAppConte
         .expect("the copy is loaded");
     assert!(!copied.is_read_only());
     assert_eq!(copied.commands().count(), 5);
+}
+
+/// Copying a collection that has been copied before numbers the new one instead of
+/// refusing: `AT basics (copy)`, then `AT basics (copy 2)`, `AT basics (copy 3)`. A copy
+/// takes the next free number whatever else is in the store, and each is a file of its
+/// own. (The bundled examples are called "AT basics", which is what gets copied.)
+#[test]
+fn copying_a_collection_again_numbers_the_copy_instead_of_refusing() {
+    let dir = config_dir("commands-copy-twice");
+    let paths = ConfigPaths::new(dir.path());
+    let source = CommandStore::load(&paths)
+        .collection("AT basics")
+        .cloned()
+        .expect("the bundled examples");
+    assert!(source.is_read_only());
+
+    // What the watcher's reload does between two copies.
+    let reload = || CommandStore::load(&paths);
+    let first = copy_collection(&reload(), "AT basics").unwrap();
+    let second = copy_collection(&reload(), "AT basics").unwrap();
+    let third = copy_collection(&reload(), "AT basics").unwrap();
+    assert_eq!(first, "AT basics (copy)");
+    assert_eq!(second, "AT basics (copy 2)");
+    assert_eq!(third, "AT basics (copy 3)");
+
+    // Each is a writable collection of its own, with the same groups and commands, in
+    // a file of its own.
+    let store = reload();
+    for (name, file) in [
+        (&first, "at-basics-copy.json"),
+        (&second, "at-basics-copy-2.json"),
+        (&third, "at-basics-copy-3.json"),
+    ] {
+        let copy = store
+            .collection(name)
+            .unwrap_or_else(|| panic!("{name} was not written"));
+        assert!(!copy.is_read_only(), "{name}");
+        assert_eq!(copy.groups, source.groups, "{name}");
+        assert!(dir.join("commands").join(file).is_file(), "{file}");
+    }
+    assert!(
+        store.warnings().is_empty(),
+        "no conflicts: {:?}",
+        store.warnings()
+    );
+
+    // A copy of a copy is a copy like any other, named after what it copies.
+    let nested = copy_collection(&reload(), "AT basics (copy)").unwrap();
+    assert_eq!(nested, "AT basics (copy) (copy)");
+    // And a name that does not exist is refused with a plain message.
+    assert_eq!(
+        copy_collection(&reload(), "Nothing"),
+        Err("there is no collection called `Nothing`".to_owned())
+    );
+}
+
+#[gpui_test]
+fn copying_the_examples_twice_says_which_copy_each_is(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-copy-notices");
+    let (world, _) = world();
+    let (_window, workspace, _view) = open(cx, &world, &dir, "virtual:at", false);
+    let panel = workspace.read_with(cx, |w, _| w.commands().clone());
+    let notice = |cx: &mut TestAppContext| {
+        panel.read_with(cx, |p, _| p.notice().map(|notice| notice.text.clone()))
+    };
+
+    panel.update(cx, |panel, cx| panel.copy_to_user("AT basics", cx));
+    assert_eq!(
+        notice(cx).as_deref(),
+        Some("Copied AT basics to AT basics (copy)")
+    );
+    // The watcher's reload brings the copy into the store, so the next copy sees it.
+    cx.update(|cx| config::reload(ConfigPiece::Commands, cx));
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| panel.copy_to_user("AT basics", cx));
+    assert_eq!(
+        notice(cx).as_deref(),
+        Some("Copied AT basics to AT basics (copy 2)")
+    );
+    cx.update(|cx| config::reload(ConfigPiece::Commands, cx));
+    cx.run_until_parked();
+    let store = cx.update(|cx| cx.global::<Config>().commands().clone());
+    for name in ["AT basics (copy)", "AT basics (copy 2)"] {
+        assert!(store.collection(name).is_some(), "{name}");
+    }
+    // The panel lists both.
+    let names = row_names(cx, &workspace);
+    for name in ["# AT basics (copy)", "# AT basics (copy 2)"] {
+        assert!(names.iter().any(|row| row == name), "{name} in {names:?}");
+    }
 }
 
 #[gpui_test]

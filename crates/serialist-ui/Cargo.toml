@@ -21,11 +21,9 @@ parking_lot.workspace = true
 regex.workspace = true
 chrono.workspace = true
 tracing.workspace = true
-# The `inline` settings object is read from the settings files here, and the
-# `commands::Send` action takes its fields from JSON.
+# The `commands::Send` action takes its fields from JSON.
 serde.workspace = true
 serde_json.workspace = true
-jsonc-parser.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

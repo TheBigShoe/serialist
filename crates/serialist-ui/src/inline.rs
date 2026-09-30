@@ -42,15 +42,19 @@
 //!
 //! # Local echo
 //!
-//! With local echo on, typed text is echoed into the scrollback as a `Tx` line when
-//! Enter sends it (or when inline mode ends). The store's local lines always start a
-//! line of their own, so echoing key by key would split the device's own line at every
-//! keystroke; until Enter the terminal shows the pending text in a strip at its foot.
-//! Control keys echo as nothing and Backspace takes back the last character.
+//! With local echo on, what is typed appears in the scrollback as it is typed: each
+//! key's [`Echo`] goes to the session's ingest thread, which types it into a `Tx` line
+//! with [`IngestHandle::append_local_inline`](serialist_core::IngestHandle::append_local_inline).
+//! Text grows the line, Backspace takes the last character back
+//! ([`truncate_local_line`](serialist_core::IngestHandle::truncate_local_line)), Enter
+//! ends the line, and control keys echo as nothing. A received line in progress (a
+//! prompt without its newline) is not interrupted: the typed line follows it, and a
+//! line the device prints between two keystrokes splits what was typed in two. The
+//! store's module docs give the exact rules under "Typing in line". Leaving inline mode
+//! ends the line being typed.
 
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use serialist_core::LineEnding;
 
 use crate::prelude::*;
@@ -93,18 +97,20 @@ impl Mode {
 
 // --- Settings ----------------------------------------------------------------------
 
-/// The `inline.*` settings.
+/// The `inline.*` settings as the UI uses them: [`serialist_core::InlineSettings`] (which
+/// parses and validates the `inline` object) with the escape chord turned into a
+/// keystroke and the delay into a `Duration`.
 ///
 /// ```jsonc
 /// "inline": {
-///   "backspace": "0x7f",        // or "0x08", or the numbers 127 and 8
+///   "backspace": "del",         // or "bs" (0x08)
 ///   "escape_chord": "ctrl-]",   // leaves inline mode; press twice to send it
 ///   "paste_chunk_bytes": 64,    // paste is written in chunks this size...
 ///   "paste_chunk_delay_ms": 10  // ...this far apart, for bootloaders that drop bytes
 /// }
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InlineSettings {
+pub struct InlineConfig {
     /// What Backspace sends: 0x7f (DEL) or 0x08 (BS).
     pub backspace: u8,
     /// Leaves inline mode instead of being sent.
@@ -115,81 +121,34 @@ pub struct InlineSettings {
     pub paste_chunk_delay: Duration,
 }
 
-impl Default for InlineSettings {
+/// The chord the settings default to, for when a configured one cannot be parsed.
+const DEFAULT_CHORD: &str = "ctrl-]";
+
+impl Default for InlineConfig {
     fn default() -> Self {
+        Self::from_settings(&serialist_core::InlineSettings::default())
+    }
+}
+
+impl InlineConfig {
+    /// The values `settings` holds. The core settings already checked the chord's
+    /// syntax; a chord GPUI still cannot parse falls back to `ctrl-]`.
+    pub fn from_settings(settings: &serialist_core::InlineSettings) -> Self {
+        let escape_chord = Keystroke::parse(&settings.escape_chord).unwrap_or_else(|_| {
+            tracing::warn!(
+                chord = %settings.escape_chord,
+                "inline.escape_chord is not a keystroke; using {DEFAULT_CHORD}"
+            );
+            Keystroke::parse(DEFAULT_CHORD).expect("the default chord parses")
+        });
         Self {
-            backspace: 0x7f,
-            escape_chord: Keystroke::parse("ctrl-]").expect("a valid chord"),
-            paste_chunk_bytes: 64,
-            paste_chunk_delay: Duration::from_millis(10),
+            backspace: settings.backspace.byte(),
+            escape_chord,
+            paste_chunk_bytes: settings.paste_chunk_bytes.max(1),
+            paste_chunk_delay: settings.paste_chunk_delay(),
         }
     }
 }
-
-impl InlineSettings {
-    /// The settings an `inline` object (already merged across the settings layers)
-    /// describes, over the defaults, and a message for every value that could not be
-    /// used (the default stays for that key).
-    pub fn from_value(value: Option<&Value>) -> (Self, Vec<String>) {
-        let mut settings = Self::default();
-        let mut problems = Vec::new();
-        let Some(value) = value else {
-            return (settings, problems);
-        };
-        let Some(object) = value.as_object() else {
-            if !value.is_null() {
-                problems.push("inline: expected an object".to_owned());
-            }
-            return (settings, problems);
-        };
-        for (key, value) in object {
-            match key.as_str() {
-                "backspace" => match parse_backspace(value) {
-                    Some(byte) => settings.backspace = byte,
-                    None => problems.push(format!(
-                        "inline.backspace: expected \"0x7f\" or \"0x08\", got {value}"
-                    )),
-                },
-                "escape_chord" => match value.as_str().map(Keystroke::parse) {
-                    Some(Ok(chord)) => settings.escape_chord = chord,
-                    _ => problems.push(format!(
-                        "inline.escape_chord: expected a keystroke such as \"ctrl-]\", got {value}"
-                    )),
-                },
-                "paste_chunk_bytes" => match value.as_u64() {
-                    Some(bytes) if bytes > 0 => {
-                        settings.paste_chunk_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-                    }
-                    _ => problems.push(format!(
-                        "inline.paste_chunk_bytes: expected a positive whole number, got {value}"
-                    )),
-                },
-                "paste_chunk_delay_ms" => match value.as_u64() {
-                    Some(ms) => settings.paste_chunk_delay = Duration::from_millis(ms),
-                    None => problems.push(format!(
-                        "inline.paste_chunk_delay_ms: expected a whole number, got {value}"
-                    )),
-                },
-                other => problems.push(format!("unknown setting `inline.{other}` is ignored")),
-            }
-        }
-        (settings, problems)
-    }
-}
-
-fn parse_backspace(value: &Value) -> Option<u8> {
-    let byte = match value {
-        Value::Number(number) => u8::try_from(number.as_u64()?).ok()?,
-        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
-            "0x7f" | "del" | "delete" | "127" => 0x7f,
-            "0x08" | "0x8" | "bs" | "backspace" | "8" => 0x08,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    matches!(byte, 0x08 | 0x7f).then_some(byte)
-}
-
 // --- Encoding ----------------------------------------------------------------------
 
 /// What a key does to the local echo.
@@ -449,62 +408,25 @@ impl EscapeChord {
 
 // --- Local echo --------------------------------------------------------------------
 
-/// The line typed since the last Enter, echoed into the scrollback when it is sent.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct EchoLine {
-    text: String,
-}
-
-impl EchoLine {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    /// Apply one key. Returns the finished line when the key is Enter.
-    pub fn key(&mut self, echo: &Echo) -> Option<String> {
-        match echo {
-            Echo::Text(text) => {
-                self.text.push_str(text);
-                None
-            }
-            Echo::Backspace => {
-                self.text.pop();
-                None
-            }
-            Echo::Enter => Some(std::mem::take(&mut self.text)),
-            Echo::Nothing => None,
-        }
-    }
-
-    /// Apply pasted text: every line break finishes a line. Returns the finished lines.
-    pub fn paste(&mut self, text: &str) -> Vec<String> {
-        let mut lines = Vec::new();
-        let mut chars = text.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\r' | '\n' => {
-                    if c == '\r' && chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    lines.push(std::mem::take(&mut self.text));
+/// The text that echoes a paste of `text` in the scrollback: `text` with every line break
+/// (CRLF, LF or a lone CR, as [`paste_bytes`] sends them) as one `\n`, which ends the
+/// echoed line. The store drops other control characters and expands tabs.
+pub fn paste_echo(text: &str) -> String {
+    let mut echo = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' | '\n' => {
+                if c == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
-                c if c.is_control() => {}
-                c => self.text.push(c),
+                echo.push('\n');
             }
+            c => echo.push(c),
         }
-        lines
     }
-
-    /// The pending text, leaving the line empty.
-    pub fn take(&mut self) -> String {
-        std::mem::take(&mut self.text)
-    }
+    echo
 }
-
 // --- Paste -------------------------------------------------------------------------
 
 /// The bytes a paste of `text` sends: its UTF-8 with every line break (CRLF, LF or CR)
@@ -749,34 +671,48 @@ mod tests {
     }
 
     #[test]
-    fn echo_follows_the_keys() {
+    fn keys_say_what_they_do_to_the_echo() {
         let encoder = KeyEncoder::default();
-        let mut line = EchoLine::default();
-        for source in ["a", "t", "left", "ctrl-c", "escape", "x", "backspace", "i"] {
-            let encoded = encoder.encode(&key(source)).unwrap();
-            assert_eq!(line.key(&encoded.echo), None);
-        }
-        assert_eq!(line.text(), "ati");
-        let alt = encoder.encode(&key("alt-b")).unwrap();
+        let echo = |source: &str| encoder.encode(&typed(source, source)).unwrap().echo;
+        assert_eq!(echo("a"), Echo::Text("a".into()));
         assert_eq!(
-            alt.echo,
+            encoder.encode(&key("space")).unwrap().echo,
+            Echo::Text(" ".into())
+        );
+        assert_eq!(
+            encoder.encode(&typed("shift-a", "A")).unwrap().echo,
+            Echo::Text("A".into())
+        );
+        assert_eq!(
+            encoder.encode(&key("backspace")).unwrap().echo,
+            Echo::Backspace
+        );
+        assert_eq!(encoder.encode(&key("enter")).unwrap().echo, Echo::Enter);
+        for control in ["left", "ctrl-c", "escape", "tab", "f5", "ctrl-backspace"] {
+            assert_eq!(
+                encoder.encode(&key(control)).unwrap().echo,
+                Echo::Nothing,
+                "{control}"
+            );
+        }
+        assert_eq!(
+            encoder.encode(&key("alt-b")).unwrap().echo,
             Echo::Nothing,
             "an alt chord is a control sequence"
         );
-        let enter = encoder.encode(&key("enter")).unwrap();
-        assert_eq!(line.key(&enter.echo), Some("ati".to_owned()));
-        assert!(line.is_empty());
     }
 
     #[test]
-    fn pasted_text_finishes_lines_at_every_break() {
-        let mut line = EchoLine::default();
-        line.key(&Echo::Text("> ".into()));
+    fn a_pastes_echo_ends_a_line_at_every_break() {
         assert_eq!(
-            line.paste("one\r\ntwo\nthree\rfo\tur"),
-            ["> one", "two", "three"]
+            paste_echo("one\r\ntwo\nthree\rfour"),
+            "one\ntwo\nthree\nfour"
         );
-        assert_eq!(line.text(), "four", "control characters echo as nothing");
+        assert_eq!(paste_echo("tail\n"), "tail\n");
+        assert_eq!(paste_echo("\r\n\r\n"), "\n\n");
+        assert_eq!(paste_echo("x\n\ry"), "x\n\ny", "LF then CR is two breaks");
+        assert_eq!(paste_echo("caf\u{e9}\t!"), "caf\u{e9}\t!");
+        assert_eq!(paste_echo(""), "");
     }
 
     #[test]
@@ -817,43 +753,38 @@ mod tests {
     }
 
     #[test]
-    fn inline_settings_parse_with_defaults_and_problems() {
-        let (defaults, problems) = InlineSettings::from_value(None);
-        assert_eq!(defaults, InlineSettings::default());
-        assert!(problems.is_empty());
+    fn the_config_follows_the_core_settings() {
+        let defaults = InlineConfig::default();
         assert_eq!(defaults.backspace, 0x7f);
         assert_eq!(defaults.escape_chord, key("ctrl-]"));
         assert_eq!(defaults.paste_chunk_bytes, 64);
         assert_eq!(defaults.paste_chunk_delay, Duration::from_millis(10));
-
-        let value = serde_json::json!({
-            "backspace": "0x08",
-            "escape_chord": "ctrl-a",
-            "paste_chunk_bytes": 16,
-            "paste_chunk_delay_ms": 25,
-        });
-        let (settings, problems) = InlineSettings::from_value(Some(&value));
-        assert!(problems.is_empty(), "{problems:?}");
-        assert_eq!(settings.backspace, 0x08);
-        assert_eq!(settings.escape_chord, key("ctrl-a"));
-        assert_eq!(settings.paste_chunk_bytes, 16);
-        assert_eq!(settings.paste_chunk_delay, Duration::from_millis(25));
-
-        let value = serde_json::json!({ "backspace": 8 });
-        assert_eq!(InlineSettings::from_value(Some(&value)).0.backspace, 0x08);
-
-        let value = serde_json::json!({
-            "backspace": "0x20",
-            "paste_chunk_bytes": 0,
-            "colour": true,
-        });
-        let (settings, problems) = InlineSettings::from_value(Some(&value));
         assert_eq!(
-            settings,
-            InlineSettings::default(),
-            "bad values keep the default"
+            defaults,
+            InlineConfig::from_settings(&serialist_core::Settings::default().inline)
         );
-        assert_eq!(problems.len(), 3, "{problems:?}");
+
+        let settings = serialist_core::Settings::from_jsonc(
+            r#"{ "inline": { "backspace": "bs", "escape_chord": "ctrl-a",
+                             "paste_chunk_bytes": 16, "paste_chunk_delay_ms": 25 } }"#,
+        )
+        .unwrap();
+        let config = InlineConfig::from_settings(&settings.inline);
+        assert_eq!(config.backspace, 0x08);
+        assert_eq!(config.escape_chord, key("ctrl-a"));
+        assert_eq!(config.paste_chunk_bytes, 16);
+        assert_eq!(config.paste_chunk_delay, Duration::from_millis(25));
+
+        // A chord GPUI cannot parse (the core would have refused it) falls back to the
+        // default.
+        let odd = serialist_core::InlineSettings {
+            escape_chord: "ctrl-a-b".to_owned(),
+            ..serialist_core::InlineSettings::default()
+        };
+        assert_eq!(
+            InlineConfig::from_settings(&odd).escape_chord,
+            key("ctrl-]")
+        );
     }
 
     #[test]

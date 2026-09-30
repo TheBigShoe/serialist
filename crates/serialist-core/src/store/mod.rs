@@ -49,6 +49,61 @@
 //!   [`Snapshot::write_text`] the same without the report, and [`Snapshot::text`] the
 //!   result as a `String`. [`Snapshot::raw`] streams the raw bytes.
 //!
+//! # Local lines
+//!
+//! Lines that are not received bytes (a sent-command echo, a connect notice) are
+//! *local*. [`Store::append_local`] inserts whole ones: it ends the received line in
+//! progress (marked incomplete, its bytes untouched) so later bytes start a new line
+//! after the local ones.
+//!
+//! # Typing in line
+//!
+//! Inline interactive mode echoes each keystroke as it is typed, which a whole-line API
+//! cannot do without splitting the device's own line at every key.
+//! [`Store::append_local_inline`] instead grows a local line in place, and
+//! [`Store::truncate_local_line`] takes characters back. The rules, exactly:
+//!
+//! 1. **Text goes to the newest typed line while it is open.** A typed line is *open*
+//!    from its first character until it is closed by a `\n` in the typed text (it is
+//!    then complete), or cut short: by another direction's text, by reaching
+//!    [`StoreConfig::max_line_bytes`] like a received line, or by what is described in
+//!    rule 3. `append_local_inline` appends to the newest typed line if it is open,
+//!    else starts a new one. CRs and other control characters are dropped and tabs
+//!    expanded to the next stop of the line as it stands. It never makes an empty line:
+//!    a `\n` with nothing open does nothing.
+//! 2. **A received line in progress is left alone.** Its bytes, parse and matching are
+//!    unaffected and later bytes still continue it: typing does not end it, the way
+//!    [`Store::append_local`] does. The typed text is a line of its own that *follows*
+//!    it. While the received line is in progress the typed lines are shown right after
+//!    it, taking the next ids, but are not in the index: when the received line ends,
+//!    the closed typed lines enter the index right after it, and the open one carries
+//!    on being typed. With no received line in progress a closed line enters the index
+//!    at once and an open one stays out, growing, after the last line.
+//! 3. **What cuts an open line short.** A received line *starting* after it (any byte
+//!    that begins a new line; bytes that continue a line in progress do not count), or
+//!    [`Store::append_local`] adding lines. It enters the index as typed so far, marked
+//!    incomplete, and typing then starts a new line. So a device that prints between
+//!    two keystrokes splits what was typed into lines, in the order things happened.
+//! 4. **Ids and order.** A typed line takes its place among the received lines from the
+//!    stream position it was typed at: right after the received line in progress at
+//!    that point, or, with none, after the last line ended. Its id is fixed when it is
+//!    first typed and does not change when it enters the index. The lines, and which are
+//!    in the index, come out the same however the received bytes are cut into chunks
+//!    (the parser's own property, extended; see `tests/typing.rs`), and a line in the
+//!    index never changes.
+//! 5. **Truncation** removes characters from the end of the open line only (counted in
+//!    characters), and the line goes when none are left. A line in the index, or closed,
+//!    is history and is not touched.
+//! 6. **Bounds.** Typed lines waiting behind one received line are limited
+//!    ([`MAX_QUEUED_INLINE_LINES`] lines, [`MAX_QUEUED_INLINE_BYTES`] bytes); past that
+//!    the received line is ended as `append_local` would end it, so the typed lines can
+//!    enter the index.
+//!
+//! Until then typed lines exist only in the published record, after the line in
+//! progress. [`Snapshot`] shows them like any other line, with `complete` false while
+//! open, and [`Snapshot::committed_end`] (or [`AppendReport::committed_end`]) says where
+//! the lines that can still change begin.
+//!
 //! # Memory model
 //!
 //! Everything below counts against one byte budget (default 256 MiB,
@@ -147,6 +202,12 @@ const P: u64 = PAGE_SIZE as u64;
 const FIXED_OVERHEAD: usize = 4096;
 /// History the minimum budget keeps room for beyond the unevictable parts.
 const HISTORY_HEADROOM: usize = 1024 * 1024;
+/// Typed lines that may wait behind a received line in progress (see "Typing in line").
+pub const MAX_QUEUED_INLINE_LINES: usize = 64;
+/// Bytes of typed text that may wait behind a received line in progress. Well inside
+/// the megabyte of history headroom that [`StoreConfig::min_budget`] keeps, which is what
+/// lets the minimum budget ignore them.
+pub const MAX_QUEUED_INLINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -218,13 +279,18 @@ impl StoreConfig {
 /// What one append did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendReport {
-    /// Lines created or changed: from the line that was in progress before (if any)
-    /// through the newest line.
+    /// Lines created or changed: from the first line that was still open before (the
+    /// line in progress or a typed local line), through the newest line.
     pub changed: Range<LineId>,
     /// How many line ids are new.
     pub new_lines: usize,
-    /// The newest line is still waiting for its LF.
+    /// A received line is still waiting for its LF.
     pub incomplete: bool,
+    /// One past the last line in the index. Lines from here on are still open: the
+    /// received line in progress, if there is one, and local lines typed in line (see
+    /// [`Store::append_local_inline`]) that have not entered the index. Everything before
+    /// it is final.
+    pub committed_end: LineId,
     /// Lines evicted to stay within budget.
     pub evicted_lines: usize,
     /// Raw bytes evicted to stay within budget.
@@ -267,7 +333,8 @@ impl StoreStats {
 pub(crate) struct Published {
     epoch: Epoch,
     first_line: u64,
-    /// One past the last line in the index; the line in progress, if any, has this id.
+    /// One past the last line in the index; the line in progress, if any, has this id,
+    /// and the local lines typed in line follow it (or take this id, with none).
     committed_end: u64,
     end_line: u64,
     /// Where the line after the committed ones starts.
@@ -280,7 +347,31 @@ pub(crate) struct Published {
     text_pages: Arc<[Arc<AppendBuf<u8>>]>,
     first_text_seq: u64,
     tail: Option<Tail>,
+    /// Local lines typed in line that are not in the index yet, oldest first.
+    local: Arc<[LocalTail]>,
     stats: StoreStats,
+}
+
+/// A local line typed in line, before it enters the index.
+struct InlineLine {
+    text: String,
+    direction: Direction,
+    /// When its first character was typed, in ns since the epoch.
+    ns: u64,
+    /// More text may be appended to it. At most the newest line is open.
+    open: bool,
+    /// It was ended by a line end, as opposed to being cut short (by the line limit, by
+    /// text of another direction, or by what came after it).
+    complete: bool,
+}
+
+/// An [`InlineLine`] as published.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalTail {
+    ns: u64,
+    direction: Direction,
+    text: Arc<str>,
+    complete: bool,
 }
 
 /// The line in progress as published.
@@ -410,6 +501,17 @@ struct Writer {
     text_dir: Arc<[Arc<AppendBuf<u8>>]>,
     tail_bytes: usize,
     evicted_lines: u64,
+    // Local lines typed in line (see "Typing in line" in the module docs).
+    inline: Vec<InlineLine>,
+    /// `inline` waits behind the received line in progress. It is set whenever there
+    /// are typed lines and the parser has a line in progress, and clears when that line
+    /// ends: [`Writer::commit_rx`] is where the typed lines then follow it.
+    inline_behind: bool,
+    /// `inline` as published; rebuilt when `inline_dirty`.
+    inline_pub: Arc<[LocalTail]>,
+    inline_dirty: bool,
+    /// The longest a typed line grows before it is ended, like a received one.
+    max_inline_line: usize,
 }
 
 impl Default for Store {
@@ -464,6 +566,13 @@ impl Store {
             text_dir: Arc::new([]),
             tail_bytes: 0,
             evicted_lines: 0,
+            inline: Vec::new(),
+            inline_behind: false,
+            inline_pub: Arc::new([]),
+            inline_dirty: false,
+            max_inline_line: config
+                .max_line_bytes
+                .clamp(MIN_LINE_BYTES, MAX_LINE_BYTES_LIMIT),
         };
         let mut store = Self {
             budget,
@@ -506,9 +615,14 @@ impl Store {
         self.budget
     }
 
-    /// One past the newest line, counting the line in progress.
+    /// One past the newest line, counting the line in progress and the local lines typed
+    /// in line that are not in the index yet.
     pub fn end(&self) -> LineId {
-        LineId(self.w.next_line + u64::from(self.parser.current().is_some()))
+        LineId(
+            self.w.next_line
+                + u64::from(self.parser.current().is_some())
+                + self.w.inline.len() as u64,
+        )
     }
 
     /// Append one received chunk that arrived at `at`: store the bytes, parse them once,
@@ -521,6 +635,7 @@ impl Store {
                 changed: LineId(old_end)..LineId(old_end),
                 new_lines: 0,
                 incomplete: self.parser.current().is_some(),
+                committed_end: LineId(old_next),
                 evicted_lines: 0,
                 evicted_bytes: 0,
             };
@@ -529,13 +644,21 @@ impl Store {
         self.w.chunk_ns = ns;
         if self.parser.current().is_none() {
             self.w.line_ns = ns;
+            // A typed line still open starts a line of its own before these bytes do.
+            self.w.commit_inline(true);
         }
         self.w.write_raw(bytes);
         let w = &mut self.w;
         self.parser.feed(bytes, |line| w.commit_rx(line));
         if let Some(line) = self.parser.current() {
             self.w.check_tail(line);
+            // A typed line that a received line ended in this chunk (and so no longer
+            // waits behind it) precedes the line these bytes started.
+            if !self.w.inline_behind {
+                self.w.commit_inline(true);
+            }
         }
+        self.w.inline_behind = !self.w.inline.is_empty() && self.parser.current().is_some();
         // Count the copy of the line in progress this append will publish, so eviction
         // makes room for it.
         self.w.tail_bytes = self
@@ -549,6 +672,7 @@ impl Store {
             changed: LineId(old_next.max(self.w.first_line))..LineId(end),
             new_lines: (end - old_end) as usize,
             incomplete: self.parser.current().is_some(),
+            committed_end: LineId(self.w.next_line),
             evicted_lines,
             evicted_bytes,
         }
@@ -565,6 +689,10 @@ impl Store {
     /// LF is ended first (marked incomplete), so later bytes start a new line after the
     /// local ones. Local lines have an empty raw range positioned at the current end of
     /// the raw stream. `Direction::Rx` is treated as `Notice`.
+    ///
+    /// Text typed in line (see [`Store::append_local_inline`]) that has not entered the
+    /// index yet does so first, so these lines follow it, as they follow it in time.
+    /// The returned ids are those of the new lines only.
     pub fn append_local_at(
         &mut self,
         text: &str,
@@ -577,6 +705,8 @@ impl Store {
         };
         let w = &mut self.w;
         self.parser.break_line(|line| w.commit_rx(line));
+        w.commit_inline(true);
+        w.inline_behind = false;
         let ns = w.ns(at);
         let first = w.next_line;
         for piece in local_lines(text) {
@@ -596,6 +726,81 @@ impl Store {
         LineId(first.max(self.w.first_line))..LineId(end)
     }
 
+    /// Type `text` into the local line being typed in line, stamped now. See
+    /// [`Store::append_local_inline_at`].
+    pub fn append_local_inline(&mut self, text: &str, direction: Direction) -> Range<LineId> {
+        self.append_local_inline_at(text, direction, Instant::now())
+    }
+
+    /// Type `text` into a local line, stamped `at`, so that what a user types shows as
+    /// it is typed without interrupting the received line in progress.
+    ///
+    /// The text is appended to the newest typed line while that is open, else it starts
+    /// a new one; a `\n` closes the open line (and does nothing if none is open, and
+    /// never makes an empty line); CRs and other control characters are dropped and tabs
+    /// expanded. A received line in progress is left alone: the typed line is shown right
+    /// after it and enters the index when it ends. The rules in full, and how the lines
+    /// are ordered and committed, are in the module docs ("Typing in line").
+    /// `Direction::Rx` is treated as `Notice`.
+    ///
+    /// Returns the ids of the lines the text went into (empty if it changed nothing).
+    /// Ids do not change when a line later enters the index.
+    pub fn append_local_inline_at(
+        &mut self,
+        text: &str,
+        direction: Direction,
+        at: Instant,
+    ) -> Range<LineId> {
+        let direction = match direction {
+            Direction::Rx => Direction::Notice,
+            other => other,
+        };
+        let ns = self.w.ns(at);
+        // The id of `inline[0]`: after the committed lines and the received line in
+        // progress. It stays the id of that line when it enters the index.
+        let base = self.w.next_line + u64::from(self.parser.current().is_some());
+        let touched = self.w.type_inline(text, direction, ns);
+        self.settle_inline();
+        self.evict();
+        self.publish();
+        LineId(base + touched.start as u64)..LineId(base + touched.end as u64)
+    }
+
+    /// Take back up to `chars` characters from the end of the local line being typed in
+    /// line, if one is open, and return how many were removed. The line goes when it has
+    /// none left. A line that has entered the index (a received line started after it,
+    /// or it was closed) is history and is not touched, so this returns 0.
+    pub fn truncate_local_line(&mut self, chars: usize) -> usize {
+        let removed = self.w.truncate_inline(chars);
+        if removed > 0 {
+            self.w.inline_behind = !self.w.inline.is_empty() && self.parser.current().is_some();
+            self.publish();
+        }
+        removed
+    }
+
+    /// After typed lines changed: enter into the index what can, and bound what waits.
+    fn settle_inline(&mut self) {
+        let waiting = !self.w.inline.is_empty() && self.parser.current().is_some();
+        self.w.inline_behind = waiting;
+        if !waiting {
+            // No received line in progress: closed lines are final. An open one stays
+            // out of the index, still growing, until a received line starts after it.
+            self.w.commit_inline(false);
+            return;
+        }
+        if self.w.inline.len() > MAX_QUEUED_INLINE_LINES
+            || self.w.inline_bytes() > MAX_QUEUED_INLINE_BYTES
+        {
+            // A runaway pile behind one received line: end that line, as a whole local
+            // line would, and let the typed lines follow it.
+            let w = &mut self.w;
+            self.parser.break_line(|line| w.commit_rx(line));
+            self.w.commit_inline(false);
+            self.w.inline_behind = false;
+        }
+    }
+
     /// Bytes the store accounts for right now.
     fn memory(&self) -> usize {
         let w = &self.w;
@@ -606,6 +811,7 @@ impl Store {
             + w.text_bytes
             + w.record.capacity()
             + w.tail_bytes
+            + w.inline_heap()
             + self.parser.heap_bytes()
             + dirs
             + FIXED_OVERHEAD
@@ -654,7 +860,20 @@ impl Store {
             w.text_dir = w.text_pages.iter().map(|t| Arc::clone(&t.buf)).collect();
             w.dirs_dirty = false;
         }
-        let end_line = w.next_line + u64::from(tail.is_some());
+        if w.inline_dirty {
+            w.inline_pub = w
+                .inline
+                .iter()
+                .map(|line| LocalTail {
+                    ns: line.ns,
+                    direction: line.direction,
+                    text: Arc::from(line.text.as_str()),
+                    complete: line.complete,
+                })
+                .collect();
+            w.inline_dirty = false;
+        }
+        let end_line = w.next_line + u64::from(tail.is_some()) + w.inline_pub.len() as u64;
         let published = Published {
             epoch: w.epoch,
             first_line: w.first_line,
@@ -669,6 +888,7 @@ impl Store {
             text_pages: Arc::clone(&w.text_dir),
             first_text_seq: w.first_text_seq,
             tail,
+            local: Arc::clone(&w.inline_pub),
             stats: StoreStats {
                 first_line: LineId(w.first_line),
                 end_line: LineId(end_line),
@@ -811,8 +1031,24 @@ impl Writer {
             .then_some((lead as u8, trail as u8))
     }
 
-    /// Index a received line the parser ended.
+    /// Index a received line the parser ended, with the typed lines in their place.
+    ///
+    /// Typed lines that waited behind the line that just ended follow it now (the
+    /// closed ones enter the index; the open one stays a line still being typed).
+    /// Any typed line still open at a later received line, one that started after it,
+    /// enters the index first.
     fn commit_rx(&mut self, line: ParsedLine<'_>) {
+        if self.inline_behind {
+            self.commit_rx_line(line);
+            self.inline_behind = false;
+            self.commit_inline(false);
+        } else {
+            self.commit_inline(true);
+            self.commit_rx_line(line);
+        }
+    }
+
+    fn commit_rx_line(&mut self, line: ParsedLine<'_>) {
         let start = self.line_start;
         let end = start + line.raw_len as u64;
         let ns = self.line_ns;
@@ -838,6 +1074,129 @@ impl Writer {
         self.line_start = end;
         self.line_ns = self.chunk_ns;
         self.tail_check = TailCheck::new();
+    }
+
+    /// Move typed lines into the index, oldest first: the closed ones (which are always
+    /// the oldest), or with `all` the open one too.
+    fn commit_inline(&mut self, all: bool) {
+        let count = self
+            .inline
+            .iter()
+            .take_while(|line| all || !line.open)
+            .count();
+        if count == 0 {
+            return;
+        }
+        let lines: Vec<InlineLine> = self.inline.drain(..count).collect();
+        for line in lines {
+            let runs = [StyleRun {
+                len: line.text.len(),
+                style: Style::default(),
+            }];
+            let runs = if line.text.is_empty() {
+                &[][..]
+            } else {
+                &runs[..]
+            };
+            let dec = self.write_record(&line.text, runs);
+            let start = self.line_start;
+            let flags = LineFlags::decoded(line.direction, line.complete);
+            self.push_line(start, flags, line.ns, Some(dec));
+        }
+        self.inline_dirty = true;
+    }
+
+    /// Append `text` to the open typed line (or start one), as `Store::append_local_inline`
+    /// describes. Returns the indices in `inline` of the lines it went into.
+    fn type_inline(&mut self, text: &str, direction: Direction, ns: u64) -> Range<usize> {
+        let mut touched: Option<Range<usize>> = None;
+        let mut touch = |ix: usize| {
+            touched = Some(match touched.take() {
+                Some(range) => range.start.min(ix)..range.end.max(ix + 1),
+                None => ix..ix + 1,
+            });
+        };
+        for c in text.chars() {
+            if c == '\n' {
+                if let Some(last) = self.inline.last_mut()
+                    && last.open
+                {
+                    last.open = false;
+                    last.complete = true;
+                    touch(self.inline.len() - 1);
+                }
+                continue;
+            }
+            if c != '\t' && c.is_control() {
+                continue;
+            }
+            // The line this goes into: the open one in this direction, or a new one.
+            let continues = self
+                .inline
+                .last()
+                .is_some_and(|last| last.open && last.direction == direction);
+            if !continues {
+                if let Some(last) = self.inline.last_mut() {
+                    last.open = false;
+                }
+                self.inline.push(InlineLine {
+                    text: String::new(),
+                    direction,
+                    ns,
+                    open: true,
+                    complete: false,
+                });
+            }
+            let ix = self.inline.len() - 1;
+            let line = &mut self.inline[ix];
+            if c == '\t' {
+                let column = line.text.chars().count();
+                let next = (column / TAB_WIDTH + 1) * TAB_WIDTH;
+                line.text.extend(std::iter::repeat_n(' ', next - column));
+            } else {
+                line.text.push(c);
+            }
+            if line.text.len() >= self.max_inline_line {
+                line.open = false;
+            }
+            touch(ix);
+        }
+        if touched.is_some() {
+            self.inline_dirty = true;
+        }
+        touched.unwrap_or(0..0)
+    }
+
+    /// Remove up to `chars` characters from the end of the open typed line. Returns how
+    /// many were removed; the line goes when it has none left.
+    fn truncate_inline(&mut self, chars: usize) -> usize {
+        let Some(last) = self.inline.last_mut().filter(|last| last.open) else {
+            return 0;
+        };
+        let mut removed = 0;
+        while removed < chars && last.text.pop().is_some() {
+            removed += 1;
+        }
+        if last.text.is_empty() {
+            self.inline.pop();
+        }
+        if removed > 0 {
+            self.inline_dirty = true;
+        }
+        removed
+    }
+
+    /// Bytes of text in the typed lines.
+    fn inline_bytes(&self) -> usize {
+        self.inline.iter().map(|line| line.text.len()).sum()
+    }
+
+    /// Heap the typed lines take, published copies included.
+    fn inline_heap(&self) -> usize {
+        self.inline
+            .iter()
+            .map(|line| 2 * line.text.len() + 128)
+            .sum()
     }
 
     /// Index a line. A block is sealed the moment it fills, so the open block is never
@@ -1003,6 +1362,7 @@ impl Published {
             text_pages: Arc::new([]),
             first_text_seq: 0,
             tail: None,
+            local: Arc::new([]),
             stats: StoreStats {
                 first_line: LineId(0),
                 end_line: LineId(0),
