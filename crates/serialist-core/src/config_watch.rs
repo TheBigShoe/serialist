@@ -96,7 +96,7 @@ pub enum ConfigEvent {
     /// A `*.lua` file under the `scripts/` folder, at any depth, or a folder inside it
     /// appearing, disappearing or being renamed (see the module docs).
     Scripts,
-    /// A plugin file (`*.lua`, `*.wasm`, or a plugin's `*.json` manifest) under the
+    /// A plugin file (`*.lua`, `*.wasm`, a plugin's `plugin.toml`, or `*.json`) under the
     /// `plugins/` folder, at any depth, or a folder inside it appearing, disappearing or
     /// being renamed: the same rules as [`Scripts`](Self::Scripts), since a plugin is a
     /// folder that may be copied in whole.
@@ -119,8 +119,8 @@ struct Targets {
 const SCRIPT_EXTENSIONS: &[&str] = &["lua"];
 
 /// Extensions of the files a change to which reloads the plugins: Lua and WebAssembly
-/// entry files, and the JSON manifest a WebAssembly plugin carries.
-const PLUGIN_EXTENSIONS: &[&str] = &["lua", "wasm", "json"];
+/// entry files, the `plugin.toml` manifest a WebAssembly plugin carries, and JSON.
+const PLUGIN_EXTENSIONS: &[&str] = &["lua", "wasm", "toml", "json"];
 
 impl Targets {
     fn new(paths: &ConfigPaths) -> Self {

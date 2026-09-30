@@ -33,16 +33,17 @@
 //! text line with no line feed yet) are held until later bytes decide. The result is
 //! the same however the stream is split into chunks, apart from each frame's `at`.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use memchr::memchr2;
 use serde_json::Value as JsonValue;
 use serialist_core::codec::{
-    Codec, CodecError, CodecInfo, CommandInfo, EncodeRequest, FieldInfo, FieldType, Frame,
-    FrameKindInfo, Severity, encode_hex, parse_hex_uint,
+    Codec, CodecError, CodecFactory, CodecInfo, CommandInfo, EncodeRequest, FieldInfo, FieldType,
+    FnCodecFactory, Frame, FrameKindInfo, Severity, encode_hex, parse_hex_uint,
 };
 
-/// The codec's registry name.
+/// The name the codec describes itself by.
 pub const NAME: &str = "airoha-race";
 /// The codec's version; the Lua plugin reports the same.
 pub const VERSION: &str = "1.0.0";
@@ -285,6 +286,14 @@ pub struct AirohaRace {
 impl AirohaRace {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A factory for the reference codec, for tests that want it behind the
+    /// [`CodecFactory`] seam the plugins sit behind. The app never registers it.
+    pub fn factory() -> Arc<dyn CodecFactory> {
+        Arc::new(FnCodecFactory::new(race_info(), || {
+            Ok(Box::new(AirohaRace::new()) as Box<dyn Codec>)
+        }))
     }
 
     /// Bytes held back, waiting for later ones to decide what they are.

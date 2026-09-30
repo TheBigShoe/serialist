@@ -1,13 +1,15 @@
-//! The simplest codec: one `line` frame per received line.
+//! The simplest codec: one `line` frame per received line. A reference for tests: the app
+//! does not register it (its decoders are plugins the user installs).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use serialist_core::codec::{
-    Codec, CodecError, CodecInfo, CommandInfo, EncodeRequest, FieldInfo, FieldType, Frame,
-    FrameKindInfo,
+    Codec, CodecError, CodecFactory, CodecInfo, CommandInfo, EncodeRequest, FieldInfo, FieldType,
+    FnCodecFactory, Frame, FrameKindInfo,
 };
 
-/// The codec's registry name.
+/// The name the codec describes itself by.
 pub const NAME: &str = "text-lines";
 /// A line with no line feed after this many bytes is cut into a frame anyway.
 pub const MAX_LINE: usize = 4096;
@@ -25,6 +27,14 @@ pub struct TextLines {
 impl TextLines {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A factory for the codec, for tests that want it behind the [`CodecFactory`]
+    /// seam. The app never registers it.
+    pub fn factory() -> Arc<dyn CodecFactory> {
+        Arc::new(FnCodecFactory::new(Self::info(), || {
+            Ok(Box::new(TextLines::new()) as Box<dyn Codec>)
+        }))
     }
 
     pub fn info() -> CodecInfo {

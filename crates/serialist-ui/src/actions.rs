@@ -195,6 +195,33 @@ pub mod scripts {
     }
 }
 
+/// The plugins folder's actions and [`plugins::InstallExamplePlugin`](InstallExamplePlugin).
+pub mod plugins {
+    use crate::prelude::*;
+
+    actions!(
+        plugins,
+        [
+            /// Open the plugins folder, first writing copies of the example plugins into
+            /// its examples folder, where they decode nothing until installed.
+            OpenPluginsFolder,
+        ]
+    );
+
+    /// Install a bundled example plugin: copy its folder into the plugins folder, which
+    /// enables it. The command palette lists one per example not installed; a keymap
+    /// file binds one like this:
+    /// `["plugins::InstallExamplePlugin", { "name": "airoha-race" }]`.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, JsonSchema, Action)]
+    #[action(namespace = plugins)]
+    #[serde(deny_unknown_fields)]
+    #[schemars(crate = "crate::prelude::schemars")]
+    pub struct InstallExamplePlugin {
+        /// The example's folder name, such as `airoha-race`.
+        pub name: String,
+    }
+}
+
 actions!(
     compose,
     [
@@ -294,6 +321,15 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &OpenThemesFolder, cx| open_themes_folder(cx));
     cx.on_action(|_: &ReloadConfig, cx| config::reload_all(cx));
     cx.on_action(|_: &scripts::OpenScriptsFolder, cx| open_scripts_folder(cx));
+    cx.on_action(|_: &plugins::OpenPluginsFolder, cx| crate::plugin_files::open_plugins_folder(cx));
+    // The workspace handles this too, to say how it went in the status line; this is
+    // for a dispatch that does not reach it.
+    cx.on_action(|action: &plugins::InstallExamplePlugin, cx| {
+        let notice = crate::plugin_files::install_example(&action.name, cx);
+        if notice.is_error {
+            tracing::warn!("{}", notice.text);
+        }
+    });
     set_menus(cx);
 }
 
@@ -333,6 +369,7 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Open Settings", OpenSettings),
             MenuItem::action("Open Keymap", OpenKeymap),
             MenuItem::action("Open Themes Folder", OpenThemesFolder),
+            MenuItem::action("Open Plugins Folder", plugins::OpenPluginsFolder),
             MenuItem::action("Reload Configuration", ReloadConfig),
             MenuItem::separator(),
             MenuItem::action("Quit Serialist", Quit),

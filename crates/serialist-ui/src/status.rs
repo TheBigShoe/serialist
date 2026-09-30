@@ -44,6 +44,8 @@ impl ConnectionState {
 pub struct Notice {
     pub text: String,
     pub is_error: bool,
+    /// What a button beside the text does, when the notice offers a way out.
+    pub action: Option<NoticeAction>,
 }
 
 impl Notice {
@@ -51,6 +53,7 @@ impl Notice {
         Self {
             text: text.into(),
             is_error: false,
+            action: None,
         }
     }
 
@@ -58,6 +61,32 @@ impl Notice {
         Self {
             text: text.into(),
             is_error: true,
+            action: None,
+        }
+    }
+
+    /// This notice with a button that does `action`.
+    pub fn with_action(mut self, action: NoticeAction) -> Self {
+        self.action = Some(action);
+        self
+    }
+}
+
+/// What a notice's button does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    /// Install the bundled example plugin of this name (its folder under `plugins/`).
+    InstallExamplePlugin(String),
+    /// Open the plugins folder.
+    OpenPluginsFolder,
+}
+
+impl NoticeAction {
+    /// The button's label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            NoticeAction::InstallExamplePlugin(_) => "Install",
+            NoticeAction::OpenPluginsFolder => "Open plugins folder",
         }
     }
 }

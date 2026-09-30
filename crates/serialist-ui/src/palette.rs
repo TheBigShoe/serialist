@@ -1,5 +1,7 @@
-//! The command palette: every action the app registers, every saved command and every
-//! script in one list, narrowed as you type with the Commands panel's fuzzy matcher
+//! The command palette: every action the app registers, an entry per bundled example
+//! plugin not yet installed ("Install example plugin: Airoha RACE"), every saved command
+//! and every script in one list, narrowed as you type with the Commands panel's fuzzy
+//! matcher
 //! ([`fuzzy_match`]); Enter (or a click) runs the selected entry.
 //!
 //! The workspace opens it in a dialog (`command_palette::Toggle`, `cmd-shift-p` on macOS
@@ -19,12 +21,14 @@ use serialist_core::commands::fuzzy_match;
 
 use crate::actions::command_palette::{SelectNext, SelectPrevious};
 use crate::actions::context;
+use crate::actions::plugins::InstallExamplePlugin;
 use crate::chrome;
 use crate::config::Config;
+use crate::plugin_files;
 use crate::prelude::*;
 
 /// Namespaces whose actions the palette lists: the app's own, not gpui-kit's.
-const NAMESPACES: [&str; 8] = [
+const NAMESPACES: [&str; 9] = [
     "serialist",
     "serial",
     "terminal",
@@ -33,6 +37,7 @@ const NAMESPACES: [&str; 8] = [
     "commands",
     "tabs",
     "scripts",
+    "plugins",
 ];
 
 /// Rows the list shows before it scrolls.
@@ -139,7 +144,8 @@ pub fn target_for<'a>(
 }
 
 /// Every entry the palette lists now: the app's actions (with the keystrokes bound to
-/// them where they would run, `handles` in order of preference), then the saved
+/// them where they would run, `handles` in order of preference), then an "Install
+/// example plugin" entry per bundled example that is not installed, then the saved
 /// commands, then the scripts.
 pub fn entries(handles: &[FocusHandle], window: &Window, cx: &App) -> Vec<PaletteEntry> {
     let mut entries = Vec::new();
@@ -179,6 +185,16 @@ pub fn entries(handles: &[FocusHandle], window: &Window, cx: &App) -> Vec<Palett
             detail,
             binding,
             target: PaletteTarget::Action(action),
+        });
+    }
+    for example in plugin_files::examples_to_install(cx) {
+        entries.push(PaletteEntry {
+            label: format!("Install example plugin: {}", example.title),
+            detail: Some(example.description.to_owned()),
+            binding: None,
+            target: PaletteTarget::Action(Box::new(InstallExamplePlugin {
+                name: example.name.to_owned(),
+            })),
         });
     }
     if let Some(config) = cx.try_global::<Config>() {

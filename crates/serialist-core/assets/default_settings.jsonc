@@ -134,8 +134,11 @@
   //   "flow_control"   "none" | "hardware" (RTS/CTS) | "software" (XON/XOFF). Default "none".
   //   "eol"            what Enter appends for this device: "none" | "cr" | "lf" | "crlf".
   //                    Without it: line_ending.
-  //   "plugin"         the codec plugin to activate for this device, by the name it
-  //                    describes, such as "airoha-race".
+  //   "plugin"         the codec plugin to decode this device with: the name of its
+  //                    folder in plugins/, such as "airoha-race". No plugin is installed
+  //                    by default; while this one is not, the port connects without a
+  //                    codec and says so. The Airoha RACE example installs from the
+  //                    command palette ("Install example plugin: Airoha RACE").
   //   "on_connect"     a Lua script to run once the device has connected, as a path
   //                    relative to the scripts folder.
   //

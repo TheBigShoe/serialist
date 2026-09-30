@@ -1,6 +1,6 @@
 [package]
 name = "serialist-plugins"
-description = "Codec plugins for Serialist: built-in Rust codecs, the Lua adapter, the WebAssembly adapter, and the Airoha RACE reference plugin."
+description = "Codec plugins for Serialist: the Lua adapter, the WebAssembly adapter, plugin folders, the bundled example plugins, and the Airoha RACE reference codec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
