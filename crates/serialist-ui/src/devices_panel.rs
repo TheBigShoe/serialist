@@ -194,6 +194,9 @@ pub struct DevicesPanel {
     connected: Option<PortId>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
+    /// Held for the panel's lifetime: a source may stop reporting once dropped
+    /// (`RealPortSource` stops its hotplug monitor), even with a subscription open.
+    _source: Arc<dyn PortSource>,
     _drain: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -253,6 +256,7 @@ impl DevicesPanel {
             connected: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            _source: source,
             _drain: drain,
             _subscriptions: vec![baud_events],
         }
@@ -711,6 +715,19 @@ mod tests {
             notice.as_deref(),
             Some("Baud: \"fast\" is not a whole number")
         );
+    }
+
+    #[gpui_test]
+    fn the_panel_keeps_its_port_source_alive(cx: &mut TestAppContext) {
+        // RealPortSource stops hotplug monitoring when dropped, so the panel must own
+        // its source rather than only the subscription.
+        let source = FakePortSource::new([port("/dev/a")]);
+        let (_window, panel) = open_test_window(cx, |window, cx| {
+            DevicesPanel::new(source.clone(), SerialConfig::default(), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(Arc::strong_count(&source), 2);
+        drop(panel);
     }
 
     #[gpui_test]

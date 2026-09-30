@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use serialist_core::{
-    PortId, SerialConfig, Session, SessionClosed, SessionConfig, SessionEvent, SessionStats,
-    TransportError, TransportFactory,
+    ControlLine, PortId, SerialConfig, Session, SessionClosed, SessionConfig, SessionEvent,
+    SessionStats, TransportError, TransportFactory,
 };
 
 pub trait SessionHandle: Send + 'static {
@@ -77,6 +77,62 @@ impl SessionOpener for CoreSessionOpener {
     ) -> Result<Box<dyn SessionHandle>, TransportError> {
         let config = SessionConfig::new(port.clone(), serial.clone());
         let session = Session::open(self.factory.as_ref(), config)?;
+        // The serial layer leaves DTR and RTS as the OS had them, and many devices
+        // (Windows CDC ACM ones in particular) stay silent until DTR is high. Asserting
+        // both is the default until per-device settings arrive in milestone 2.
+        for line in [ControlLine::Dtr, ControlLine::Rts] {
+            if session.set_control(line, true).is_err() {
+                tracing::debug!(%port, ?line, "session closed before the control line was set");
+            }
+        }
         Ok(Box::new(session))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+    use serialist_sim::{DeviceOutput, LinkConfig, SimDevice, SimWorld};
+
+    use super::*;
+
+    /// Records every control-line change the host makes.
+    struct ControlProbe(Arc<Mutex<Vec<(ControlLine, bool)>>>);
+
+    impl SimDevice for ControlProbe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn on_receive(&mut self, _: &[u8], _: &mut dyn DeviceOutput) {}
+
+        fn on_control(&mut self, line: ControlLine, asserted: bool, _: &mut dyn DeviceOutput) {
+            self.0.lock().push((line, asserted));
+        }
+    }
+
+    #[test]
+    fn opening_asserts_dtr_and_rts() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let world = SimWorld::empty();
+        let probe_seen = seen.clone();
+        let id = world.add_virtual("probe", "Probe", LinkConfig::unpaced(), move || {
+            Box::new(ControlProbe(probe_seen.clone()))
+        });
+        let opener = CoreSessionOpener::new(world.transport_factory());
+        let session = opener.open(&id, &SerialConfig::default()).expect("open");
+
+        // The writer thread applies the changes; wait for the device to see both.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while seen.lock().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            *seen.lock(),
+            [(ControlLine::Dtr, true), (ControlLine::Rts, true)]
+        );
+        session.close();
     }
 }

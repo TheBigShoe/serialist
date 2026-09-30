@@ -97,6 +97,19 @@ impl ConnectionState {
     }
 }
 
+/// The text of the status line for one session, kept apart from rendering so tests can
+/// check what the user sees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusLine {
+    pub state: &'static str,
+    /// The transport's description, or the port and settings before it is known.
+    pub title: String,
+    /// The line settings, when the title does not already carry them.
+    pub settings: Option<String>,
+    pub rx: String,
+    pub tx: String,
+}
+
 /// Everything the view shows, without GPUI, so event handling tests as plain Rust.
 #[derive(Clone, Debug)]
 pub struct SessionModel {
@@ -159,6 +172,20 @@ impl SessionModel {
             }
         }
         true
+    }
+
+    /// The status line's text for this session.
+    pub fn status_line(&self) -> StatusLine {
+        let title = self.title();
+        let settings = self.serial.summary();
+        StatusLine {
+            state: self.state.label(),
+            // Serial transports already put the line settings in their description.
+            settings: (!title.contains(&settings)).then_some(settings),
+            title,
+            rx: format!("RX {}", format_bytes(self.stats.rx_bytes)),
+            tx: format!("TX {}", format_bytes(self.stats.tx_bytes)),
+        }
     }
 
     /// The user asked to disconnect. Returns false if already disconnected.

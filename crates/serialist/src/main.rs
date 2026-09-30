@@ -34,7 +34,13 @@ fn main() {
         )
         .init();
 
-    let options = wiring::app_options(&args);
+    let options = match wiring::app_options(&args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("serialist: {error:#}");
+            std::process::exit(2);
+        }
+    };
     application().run(move |cx| {
         serialist_ui::init(cx);
         if let Err(error) = serialist_ui::open_main_window(options, cx) {
