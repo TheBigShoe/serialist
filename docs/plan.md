@@ -21,6 +21,7 @@ The app is a native, GPU-rendered serial terminal that stays responsive at multi
 | 9 | Logging and search | Raw and decoded logs to file, and regex search over scrollback that stays fast at the buffer sizes above. |
 | 10 | Multiple sessions | Several ports open at once in tabs, each with its own settings, script and plugin state. |
 | 11 | Hardware-free testing | Every unit test, property test, benchmark and stress run works with no serial device attached, on all three OSes in CI. Hardware tests exist only as an opt-in tier that is never required to merge. |
+| 12 | Pause and export | Pause freezes the view while every byte keeps being captured; the port is never throttled. The status line shows how many lines and bytes arrived during the pause, and resume jumps to the live tail. Export writes the scrollback, the paused snapshot or a selection to a file as raw bytes, as text with optional timestamps, or as decoded frames in CSV or JSON. A record toggle logs raw bytes to a file continuously. |
 
 ## GPUI research findings
 
@@ -101,7 +102,7 @@ Data flows down from the port to the screen at most once per frame, while the sc
 
 Only the last two crates depend on GPUI. Dependencies point one way: app to ui to script and plugins to core.
 
-**Ownership and handoff.** The session entity holds the port configuration, the connection state, an `Arc` to the store, the channel senders for the reader, writer and ingest threads, the decoded frames, and byte counters. Pages in the store are immutable once sealed, so the terminal element reads them without a lock. Only the line index sits behind a read-write lock, and the element takes a read lock just long enough to copy the visible slice. Ingest holds the write lock once per chunk to push index entries. Session events (connected, disconnected, data arrived, frame decoded, script finished) fan out through GPUI's event emitter to whichever panels subscribe.
+**Ownership and handoff.** The session entity holds the port configuration, the connection state, an `Arc` to the store, the channel senders for the reader, writer and ingest threads, the decoded frames, and byte counters. Pages in the store are immutable once sealed, so the terminal element reads them without a lock. Only the line index sits behind a read-write lock, and the element takes a read lock just long enough to copy the visible slice. Ingest holds the write lock once per chunk to push index entries. Session events (connected, disconnected, data arrived, frame decoded, script finished) fan out through GPUI's event emitter to whichever panels subscribe. Pause is a view concern: the view pins a frozen snapshot while the store keeps appending, so the reader thread never notices a pause.
 
 ## Configuration, fonts and theming
 
@@ -179,6 +180,12 @@ One window, Zed-style: a tab per open port, collapsible docks on either side, th
 - A command has a name, a group, a payload (text, hex, or a plugin-encoded form such as a RACE id plus fields), an EOL override, parameters written as placeholders that prompt at send time, an optional expected-response regex with a timeout, and an optional keybinding.
 - Sending a command echoes it into the scrollback in a distinct TX color. A matched response is highlighted; a timeout shows inline.
 - The compose bar keeps history across sessions, and any history entry can be promoted to a saved command.
+
+**Pause and export** work the same in both modes:
+
+- Pause (default `cmd-p`) pins a frozen snapshot of the scrollback so you can scroll, select, search and export it while the session keeps capturing behind it. The status line shows `Paused, +1 240 lines, +96 KB` and updates live. Resume drops the snapshot and follows the tail again. Pausing never touches the port or flow control, because a stalled device would overflow its own buffers.
+- Export (default `cmd-s`) writes what you are looking at: the live scrollback, the paused snapshot, or the current selection. Formats are raw bytes exactly as received, text as displayed with optional per-line timestamps, and decoded frames as CSV or JSON once a plugin is active.
+- Record (default `cmd-shift-r`) toggles continuous raw logging to a file chosen once per session, with the path and byte count shown in the status line. Recording is independent of pause.
 
 Keybindings use Zed's keymap format: a JSON array of contexts and binding maps, with actions named like `serial::Connect` and `terminal::Clear`, so your muscle memory and editing habits carry over.
 
@@ -275,7 +282,7 @@ Every test, benchmark and stress run works with no serial hardware attached. The
 | Unit and property | Page store, line index, ANSI parser, codecs. The key property: splitting one byte stream at random chunk boundaries yields an identical line index and identical frames. | proptest, plain tests |
 | Fuzz | The parser and every codec against arbitrary bytes: no panics, bounded memory. | cargo-fuzz, nightly in CI |
 | Snapshot | Decoded frames for each capture fixture. The Lua and WebAssembly RACE plugins must match byte for byte. | insta |
-| Integration | A session against a simulated device: connect, send a saved command, expect a response, lose the device, reconnect, script timeouts. | virtual transport, fake port source |
+| Integration | A session against a simulated device: connect, send a saved command, expect a response, lose the device, reconnect, script timeouts, pause under a firehose with an exact resume, and export files that match the bytes received. | virtual transport, fake port source |
 | UI | Panels, keybindings, mode switching and the terminal element's visible-range math, with GPUI's test app context and no window. | gpui test-support |
 | Stress and bench | Firehose at 1 to 10 MB/s for 60 s: zero dropped bytes, memory under the cap, ingest under 10% of a core. Criterion benches for append, parse and search, failing CI past a regression threshold. | criterion, the firehose device |
 | Hardware, optional | Custom baud on real adapters and driver quirks. Marked ignored; runs only when a board is attached. | serialport |
@@ -296,7 +303,7 @@ Seven milestones, each demoable on real hardware, with the performance gate seco
 Each diamond is a gate that must pass before the next milestone starts; the highlighted milestone is where the speed requirement is settled.
 
 - Milestone 0 exists to de-risk the toolchain: the gpui-pre snapshot, gpui-kit, Xcode, and a first custom element. It ends with a simulated device's output on screen, even if ugly. A real board is a bonus, never a gate.
-- Milestone 1 is the biggest and is where the firehose harness, the criterion benches and the frame-time overlay are built. Features that follow use them.
+- Milestone 1 is the biggest and is where the firehose harness, the criterion benches and the frame-time overlay are built, and where pause, export and raw recording move from the milestone 0 line buffer onto the page store. Features that follow use them.
 - Milestones 2 and 3 make the app pleasant daily: your Zed theme and fonts, then both interaction modes.
 - Milestones 4 and 5 add the automation layer in the order users adopt it: scripts first, then codecs that scripts and saved commands can call.
 - Milestone 6 is when the second and third operating systems get CI builds, when full terminal emulation lands for U-Boot and Linux consoles, and when tabs for multiple sessions ship.
