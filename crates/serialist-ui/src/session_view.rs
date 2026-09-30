@@ -47,8 +47,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serialist_core::{
-    ChunkSink, Direction, Ingest, IngestHandle, IngestStats, LineId, LineSource, PortId,
-    SerialConfig, SessionStats, Snapshot, Store, StoreConfig, TextOptions, Timestamps,
+    ChunkSink, Direction, Ingest, IngestHandle, IngestPanicked, IngestStats, LineId, LineSource,
+    PortId, SerialConfig, SessionStats, Snapshot, Store, StoreConfig, TextOptions, Timestamps,
 };
 
 use crate::actions::context;
@@ -190,6 +190,19 @@ impl SessionView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_sinks(port, serial, session, store, Vec::new(), window, cx)
+    }
+
+    /// [`Self::new`] with more sinks on the ingest thread, after the view's own.
+    pub fn with_sinks(
+        port: PortId,
+        serial: SerialConfig,
+        session: Box<dyn SessionHandle>,
+        store: StoreConfig,
+        extra_sinks: Vec<Box<dyn ChunkSink>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let compose = cx.new(|cx| ComposeBar::new(window, cx));
         let compose_events =
             cx.subscribe_in(&compose, window, |this, _, event, _, cx| match event {
@@ -219,13 +232,15 @@ impl SessionView {
         let recording = RecordingSlot::default();
         let disconnected = Arc::new(AtomicBool::new(false));
         let (doorbell, rings) = async_channel::bounded::<()>(1);
+        let mut sinks: Vec<Box<dyn ChunkSink>> = vec![
+            Box::new(RecordingSink::new(recording.clone())),
+            Box::new(DisconnectWatch(disconnected.clone())),
+        ];
+        sinks.extend(extra_sinks);
         let ingest = Ingest::spawn(
             session.events(),
             Store::new(store),
-            vec![
-                Box::new(RecordingSink::new(recording.clone())),
-                Box::new(DisconnectWatch(disconnected.clone())),
-            ],
+            sinks,
             Box::new(move || {
                 // Full means a wake is already pending: that one will see this too.
                 let _ = doorbell.try_send(());
@@ -234,10 +249,13 @@ impl SessionView {
         let wake = cx.spawn(async move |this, cx| {
             while rings.recv().await.is_ok() {
                 if this.update(cx, |view, cx| view.wake(cx)).is_err() {
-                    break;
+                    return;
                 }
                 cx.background_executor().timer(FRAME).await;
             }
+            // The doorbell's only sender lives in the ingest thread's waker, so a closed
+            // doorbell means that thread has ended, cleanly or not.
+            this.update(cx, |view, cx| view.ingest_ended(cx)).ok();
         });
         let housekeeping = cx.spawn(async move |this, cx| {
             loop {
@@ -392,6 +410,41 @@ impl SessionView {
         if self.poll_session(cx) || shown {
             cx.notify();
         }
+    }
+
+    /// The ingest thread has ended: after the session's events ran out (the session is
+    /// gone), or because it panicked, which takes its store with it. Show what it
+    /// published last, then join it off the main thread to learn which.
+    fn ingest_ended(&mut self, cx: &mut Context<Self>) {
+        self.wake(cx);
+        let Some(ingest) = self.ingest.take() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let joined = cx
+                .background_spawn(async move { ingest.join().map(drop) })
+                .await;
+            this.update(cx, |view, cx| view.ingest_joined(joined, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn ingest_joined(&mut self, joined: Result<(), IngestPanicked>, cx: &mut Context<Self>) {
+        let Err(error) = joined else {
+            return;
+        };
+        // Nothing reaches the scrollback any more, so the session is as good as lost.
+        tracing::error!(port = %self.port, %error, "the scrollback stopped");
+        let message = error.to_string();
+        if !self.state.is_disconnected() {
+            self.state = ConnectionState::Disconnected {
+                error: Some(message.clone()),
+            };
+        }
+        self.notice = Some(Notice::error(message));
+        self.close_session(cx);
+        cx.notify();
     }
 
     /// Hand `snapshot` to the terminal if it holds anything new. Returns whether it did.
@@ -1104,6 +1157,57 @@ mod tests {
                     "Disconnected: device disconnected".into()
                 ),
             ]
+        );
+    }
+
+    /// Panics on the first chunk it is given.
+    struct Exploding;
+
+    impl ChunkSink for Exploding {
+        fn on_chunk(&mut self, _: &[u8], _: Instant) {
+            panic!("sink exploded");
+        }
+
+        fn on_disconnect(&mut self) {}
+    }
+
+    #[gpui_test]
+    fn a_panicked_ingest_thread_ends_the_session(cx: &mut TestAppContext) {
+        allow_engine_threads(cx);
+        let (session, feed) = fake_session();
+        let (_window, view) = open_test_window(cx, move |window, cx| {
+            SessionView::with_sinks(
+                PortId::new("virtual:echo"),
+                SerialConfig::default(),
+                session,
+                StoreConfig::default(),
+                vec![Box::new(Exploding)],
+                window,
+                cx,
+            )
+        });
+        feed.connected("virtual:echo");
+        feed.data(b"boom\r\n");
+        run_until(cx, "the session to end", |cx| {
+            view.read_with(cx, |v, _| v.state().is_disconnected())
+        });
+        run_until(cx, "the session to close", |_| feed.was_closed());
+
+        let expected = "the ingest thread panicked: sink exploded";
+        view.read_with(cx, |v, _| {
+            assert_eq!(
+                v.state(),
+                &ConnectionState::Disconnected {
+                    error: Some(expected.into())
+                }
+            );
+            assert_eq!(v.notice(), Some(&Notice::error(expected)));
+            assert!(v.ingest_stats().is_none(), "the handle was joined");
+        });
+        assert_eq!(
+            texts(cx, &view).last(),
+            Some(&(Direction::Rx, "boom".into())),
+            "what was stored before the panic stays on screen"
         );
     }
 
