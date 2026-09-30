@@ -10,9 +10,13 @@ authors.workspace = true
 [dependencies]
 serialist-core.workspace = true
 serialist-sim.workspace = true
-gpui.workspace = true
+# gpui-kit re-exports GPUI and its platform crate, and GPUI's macros resolve through it,
+# so GPUI is not listed separately. Code reaches all of it through `prelude`.
 gpui-kit.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
-anyhow.workspace = true
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+proptest.workspace = true
