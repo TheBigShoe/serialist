@@ -1,12 +1,13 @@
 //! GPUI views. All GPUI and gpui-kit imports go through [`prelude`] so a snapshot bump
 //! or a move to the official crate touches one file.
 //!
-//! A workspace with the Devices and Commands panels on the left, a session view in the
-//! center (the terminal element over the session's page store, and a compose bar, or
-//! the terminal alone in inline mode), the Decoded panel and the Script console on the
-//! right, and a status line. Settings, themes, fonts, key bindings and codec plugins come
-//! from Zed-format files and plugin folders through [`config`], and apply to the running
-//! app as the files change.
+//! A workspace with the Devices and Commands panels on the left, a tab per open port in
+//! the center, each holding a session view (the terminal element over the session's
+//! page store, and a compose bar, or the terminal alone in inline mode), the Decoded
+//! panel and the Script console on the right, following the active tab, and a status
+//! line. Settings, themes, fonts, key bindings and codec plugins come from Zed-format
+//! files and plugin folders through [`config`], and apply to the running app as the
+//! files change.
 
 pub mod actions;
 pub mod capture;
@@ -23,14 +24,17 @@ pub mod history;
 pub mod inline;
 pub mod keymap;
 pub mod param_prompt;
+pub mod port_settings;
 pub mod script_bridge;
 pub mod script_console;
 pub mod script_files;
 pub mod scrollback;
 pub mod session_handle;
 pub mod session_options;
+pub mod session_state;
 pub mod session_view;
 pub mod status;
+pub mod tabs;
 pub mod terminal;
 pub mod theme_bridge;
 pub mod workspace;
@@ -46,9 +50,13 @@ mod gate;
 #[cfg(test)]
 mod inline_tests;
 #[cfg(test)]
+mod port_tests;
+#[cfg(test)]
 mod script_tests;
 #[cfg(test)]
 mod stream_tests;
+#[cfg(test)]
+mod tab_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -67,6 +75,7 @@ pub use framed::{FilteredText, FramedFilter};
 pub use history::PersistentHistory;
 pub use inline::{InlineConfig, KeyEncoder, Mode, encode_key};
 pub use param_prompt::{ParamPrompt, ParamPromptEvent};
+pub use port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm, STANDARD_BAUDS};
 pub use script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, SessionScripts};
 pub use script_console::{ScriptConsole, ScriptConsoleEvent, ScriptPrompt};
 pub use script_files::{ScriptEntry, list_scripts, resolve_script};
@@ -75,8 +84,10 @@ pub use session_handle::{
     CoreSessionOpener, SessionControl, SessionHandle, SessionOpener, SharedSession,
 };
 pub use session_options::{DisplayDefaults, SessionOptions};
+pub use session_state::{SavedMode, SavedTab, SessionState};
 pub use session_view::{ActiveCodec, SessionView, SessionViewEvent};
 pub use status::{ConnectionState, Notice, PauseMark, RecordingStatus, ScriptStatus, StatusLine};
+pub use tabs::{TabId, TabLabel, TabState, TabStatus};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {
@@ -115,14 +126,17 @@ pub mod prelude {
     pub use gpui_kit::component::IndexPath;
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
     pub use gpui_kit::component::input::{Input, InputEvent, InputState};
+    pub use gpui_kit::component::popover::Popover;
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
     pub use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+    pub use gpui_kit::component::switch::Switch;
+    pub use gpui_kit::component::tab::{Tab, TabBar};
     pub use gpui_kit::component::table::{
         Column, DataTable, TableDelegate, TableEvent, TableState,
     };
     pub use gpui_kit::component::{
-        ActiveTheme, Disableable, Sizable, StyledExt, Theme, ThemeConfig, ThemeConfigColors,
-        ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,
+        ActiveTheme, Disableable, Selectable, Sizable, StyledExt, Theme, ThemeConfig,
+        ThemeConfigColors, ThemeMode, h_flex, h_resizable, resizable_panel, v_flex,
     };
     pub use gpui_kit::private::schemars::{self, JsonSchema};
 }

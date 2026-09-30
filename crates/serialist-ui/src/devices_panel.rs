@@ -10,15 +10,17 @@
 //! profile's rate. Connecting uses the profile's framing and flow control with the rate
 //! in the field.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError};
-use serialist_core::{PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig};
+use serialist_core::{LineEnding, PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig};
 
 use crate::actions::{Connect, SelectNext, SelectPrevious, context};
 use crate::config::Config;
+use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
 use crate::prelude::*;
 
 const ROW_HEIGHT: Pixels = px(44.);
@@ -242,7 +244,13 @@ pub fn parse_baud(text: &str) -> Result<u32, BaudError> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevicesPanelEvent {
-    Connect { port: PortId, serial: SerialConfig },
+    /// Open `port` with `serial`. `settings` are what the row's port settings set, when
+    /// they were opened: the session takes their line ending, echo and control levels.
+    Connect {
+        port: PortId,
+        serial: SerialConfig,
+        settings: Option<PortSettings>,
+    },
 }
 
 pub struct DevicesPanel {
@@ -255,7 +263,13 @@ pub struct DevicesPanel {
     /// selection or the settings change.
     prefilled: Option<(PortId, u64)>,
     notice: Option<SharedString>,
-    connected: Option<PortId>,
+    /// The ports open in a tab, which get the green dot.
+    connected: Vec<PortId>,
+    /// What a row's port settings set, for the next connect to that port.
+    port_settings: HashMap<PortId, PortSettings>,
+    /// The form the rows' gear opens, and the port it is open for.
+    port_form: Entity<PortSettingsForm>,
+    editing: Option<PortId>,
     focus_handle: FocusHandle,
     scroll: UniformListScrollHandle,
     /// Held for the panel's lifetime: a source may stop reporting once dropped
@@ -315,6 +329,22 @@ impl DevicesPanel {
         });
 
         let port_events = follow_port_events(source.subscribe(), window, cx);
+        let defaults = PortSettings::new(
+            SerialConfig {
+                baud: initial,
+                ..SerialConfig::default()
+            },
+            LineEnding::default(),
+            false,
+        );
+        let port_form = cx.new(|cx| PortSettingsForm::new(defaults, false, window, cx));
+        let port_form_events = cx.subscribe_in(
+            &port_form,
+            window,
+            |this, _, event: &PortSettingsEvent, window, cx| {
+                this.port_settings_changed(event, window, cx);
+            },
+        );
 
         Self {
             list: DeviceList::default(),
@@ -322,13 +352,98 @@ impl DevicesPanel {
             baud_override,
             prefilled: None,
             notice: None,
-            connected: None,
+            connected: Vec::new(),
+            port_settings: HashMap::new(),
+            port_form,
+            editing: None,
             focus_handle: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             _source: source,
             _port_events: port_events,
-            _subscriptions: vec![baud_events, config_changes],
+            _subscriptions: vec![baud_events, config_changes, port_form_events],
         }
+    }
+
+    // --- Port settings -----------------------------------------------------------------
+
+    /// The form the rows' gear opens.
+    pub fn port_form(&self) -> &Entity<PortSettingsForm> {
+        &self.port_form
+    }
+
+    /// What the next connect to `info` uses: the settings its row set, else its device
+    /// profile's (with the rate the baud field starts from) and the global line ending
+    /// and echo.
+    pub fn port_settings_for(&self, info: &PortInfo, cx: &App) -> PortSettings {
+        if let Some(settings) = self.port_settings.get(&info.id) {
+            return settings.clone();
+        }
+        let serial = SerialConfig {
+            baud: self.baud_for(info, cx),
+            ..self.serial_for(info, cx)
+        };
+        let (line_ending, local_echo) = settings_of(cx)
+            .map_or((LineEnding::default(), false), |s| {
+                (s.line_ending_for(info), s.local_echo)
+            });
+        PortSettings::new(serial, line_ending, local_echo)
+    }
+
+    /// Point the form at `port`'s row, as its gear opens it.
+    pub fn edit_port_settings(
+        &mut self,
+        port: PortId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let info = self
+            .list
+            .get(&port)
+            .map(|entry| entry.info.clone())
+            .unwrap_or_else(|| PortInfo {
+                id: port.clone(),
+                kind: PortKind::Unknown,
+                display_name: port.to_string(),
+            });
+        let settings = self.port_settings_for(&info, cx);
+        self.editing = Some(port);
+        self.port_form.update(cx, |form, cx| {
+            form.set_settings(settings, window, cx);
+            form.set_live(false, cx);
+            form.set_status(None, cx);
+        });
+    }
+
+    /// The port the form is open for.
+    pub fn editing(&self) -> Option<&PortId> {
+        self.editing.as_ref()
+    }
+
+    /// Keep what the form changed for the port it is open for; a new rate shows in the
+    /// baud field if that port is selected.
+    fn port_settings_changed(
+        &mut self,
+        event: &PortSettingsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(port) = self.editing.clone() else {
+            return;
+        };
+        let settings = self.port_form.read(cx).settings().clone();
+        if let PortSettingsEvent::Serial(serial) = event
+            && self.list.selected_id() == Some(&port)
+        {
+            let baud = serial.baud.to_string();
+            if self.baud_text(cx) != baud {
+                self.set_baud_text(&baud, window, cx);
+            }
+        }
+        self.port_form.update(cx, |form, cx| {
+            form.set_status(Some("Used by the next connect to this port".into()), cx);
+        });
+        self.port_settings.insert(port, settings);
+        cx.notify();
     }
 
     pub fn list(&self) -> &DeviceList {
@@ -403,11 +518,17 @@ impl DevicesPanel {
         }
     }
 
-    pub fn set_connected(&mut self, port: Option<PortId>, cx: &mut Context<Self>) {
-        if self.connected != port {
-            self.connected = port;
+    /// The ports open in a tab now, each marked with a dot.
+    pub fn set_connected(&mut self, ports: Vec<PortId>, cx: &mut Context<Self>) {
+        if self.connected != ports {
+            self.connected = ports;
             cx.notify();
         }
+    }
+
+    /// The ports marked open.
+    pub fn connected(&self) -> &[PortId] {
+        &self.connected
     }
 
     pub fn set_notice(&mut self, notice: Option<SharedString>, cx: &mut Context<Self>) {
@@ -446,14 +567,17 @@ impl DevicesPanel {
                 return false;
             }
         };
-        let serial = SerialConfig {
-            baud,
-            ..self.serial_for(&info, cx)
-        };
+        // The row's port settings, if they were set, over the device profile.
+        let settings = self.port_settings.get(&info.id).cloned();
+        let base = settings
+            .as_ref()
+            .map_or_else(|| self.serial_for(&info, cx), |s| s.serial.clone());
+        let serial = SerialConfig { baud, ..base };
         self.notice = None;
         cx.emit(DevicesPanelEvent::Connect {
             port: info.id,
             serial,
+            settings,
         });
         cx.notify();
         true
@@ -483,10 +607,36 @@ impl DevicesPanel {
         self.connect_selected(cx);
     }
 
+    /// The row's gear: the port settings the next connect to it uses.
+    fn render_gear(&self, ix: usize, entry: &DeviceEntry, cx: &mut Context<Self>) -> Popover {
+        let form = self.port_form.clone();
+        let port = entry.info.id.clone();
+        let set = self.port_settings.contains_key(&port);
+        Popover::new(("device-settings", ix))
+            .trigger(
+                Button::new(("device-gear", ix))
+                    .label("\u{2699}")
+                    .tooltip(if set {
+                        "Port settings (set for the next connect)"
+                    } else {
+                        "Port settings for the next connect"
+                    })
+                    .xsmall()
+                    .ghost()
+                    .selected(set),
+            )
+            .content(move |_, _, _| form.clone())
+            .on_open_change(cx.listener(move |this, open: &bool, window, cx| {
+                if *open {
+                    this.edit_port_settings(port.clone(), window, cx);
+                }
+            }))
+    }
+
     fn render_row(&self, ix: usize, entry: &DeviceEntry, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         let selected = self.list.selected_index() == Some(ix);
-        let connected = self.connected.as_ref() == Some(&entry.info.id);
+        let connected = self.connected.contains(&entry.info.id);
         let mono = theme.mono_font_family.clone();
         let (name_color, detail_color) = if entry.present {
             (theme.foreground, theme.muted_foreground)
@@ -567,7 +717,13 @@ impl DevicesPanel {
                     })
                     .when(connected, |this| {
                         this.child(div().flex_none().size_2().rounded_full().bg(theme.success))
-                    }),
+                    })
+                    .child(
+                        div()
+                            .ml_auto()
+                            .flex_none()
+                            .child(self.render_gear(ix, entry, cx)),
+                    ),
             )
             .child(details)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
@@ -873,6 +1029,7 @@ mod tests {
                     baud: 921_600,
                     ..SerialConfig::default()
                 },
+                settings: None,
             }]
         );
         let notice = panel.read_with(cx, |p, _| p.notice().cloned());
