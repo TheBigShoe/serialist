@@ -178,6 +178,9 @@ pub trait Plugin: Sized + 'static {
 ///
 /// Expands to nothing on targets other than wasm32, so a plugin crate also builds (and
 /// runs its unit tests) natively.
+// rustfmt cannot parse the generated macro's `with_types_in` argument and reindents the
+// body differently on every run.
+#[rustfmt::skip]
 #[macro_export]
 macro_rules! export_plugin {
     ($plugin:ty) => {
@@ -198,8 +201,7 @@ macro_rules! export_plugin {
 
                 fn encode(
                     request: $crate::bindings::EncodeRequest,
-                ) -> ::core::result::Result<$crate::__private::Vec<u8>, $crate::CodecError>
-                {
+                ) -> ::core::result::Result<$crate::__private::Vec<u8>, $crate::CodecError> {
                     PLUGIN.with(|plugin| {
                         $crate::Plugin::encode(plugin, &$crate::Request::new(&request))
                     })
@@ -211,7 +213,7 @@ macro_rules! export_plugin {
             }
 
             $crate::bindings::__export_world_plugin!(Exports with_types_in $crate::bindings);
-};
+        };
     };
 }
 

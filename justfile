@@ -42,3 +42,28 @@ wasm-fixtures:
 
 # Everything the CI test job runs.
 ci: fmt-check lint test
+
+# Release packaging. These run packaging/package.sh (bash; Git Bash on Windows), the same
+# script .github/workflows/release.yml calls. Each builds the release binary first and
+# writes to dist/. None of them cross-compile: run the one for the machine you are on.
+# See docs/releasing.md.
+
+# Package for this machine's OS.
+release:
+    bash packaging/package.sh
+
+# macOS: target/bundle/Serialist.app and dist/Serialist-<version>-macos-<arch>.dmg.
+release-macos:
+    bash packaging/package.sh macos
+
+# Linux: dist/*.tar.gz and dist/*.deb (needs cargo-deb).
+release-linux:
+    bash packaging/package.sh linux
+
+# Windows: dist/*.msi (needs cargo-wix and the WiX Toolset 3).
+release-windows:
+    bash packaging/package.sh windows
+
+# Regenerate the .icns, .ico and PNG icons from packaging/icons/serialist.svg (macOS only).
+icons:
+    packaging/icons/render.sh

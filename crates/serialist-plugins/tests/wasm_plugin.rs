@@ -316,10 +316,17 @@ fn reset_forgets_held_bytes_and_state() {
     assert_eq!(out[1].summary, "c");
 }
 
+/// The factory crosses to the ingest thread and the codec is made there, as
+/// `CodecSink::from_factory` does. (A `WasmCodec` could move too: it is `Send`.)
 #[test]
-fn a_wasm_codec_moves_to_the_ingest_thread() {
-    let mut codec = wasm_race_factory().create().unwrap();
+fn a_wasm_codec_is_made_on_the_thread_that_runs_it() {
+    fn send<T: Send>() {}
+    send::<WasmCodec>();
+    let mut registry = serialist_core::CodecRegistry::new();
+    registry.register(Arc::new(wasm_race_factory()));
+    let factory = registry.get("airoha-race").unwrap();
     let frames = std::thread::spawn(move || {
+        let mut codec = factory.create().unwrap();
         let mut out = Vec::new();
         codec.decode(b"hello\n", Instant::now(), 0, &mut out);
         out

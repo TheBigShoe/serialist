@@ -85,6 +85,11 @@
 //! # Threads
 //!
 //! The codec runs on the ingest thread, synchronously: no executor, no helper thread.
+//! Its VM stays on the thread that made it, so a `LuaCodec` is not `Send`: the app
+//! hands the ingest thread a [`LuaCodecFactory`] (which is `Send + Sync`) and the codec
+//! is made there, by
+//! [`CodecSink::from_factory`](serialist_core::CodecSink::from_factory) inside
+//! [`Ingest::spawn_with`](serialist_core::Ingest::spawn_with).
 
 mod convert;
 mod vm;
@@ -212,17 +217,6 @@ pub struct LuaCodec {
     /// Scratch for joining `held` and a chunk.
     input: Vec<u8>,
 }
-
-// SAFETY: mlua without its `send` feature makes `Lua` and its handles `!Send` because
-// they share the VM through non-atomic reference counts. Moving them to another thread
-// is sound when every one of those references moves together and nothing refers to
-// thread-local state. Both hold here: the VM and every handle into it (functions,
-// tables, the state table) live only inside this `LuaCodec` and never leave it (errors
-// and values are converted to Rust data first), every Rust callback registered in the
-// VM is checked to be `Send` when it is made (`vm::function`, `vm::send_hook`), and mlua
-// keeps no thread-local state for Lua 5.4. `LuaCodec` is not `Sync`, so the VM is only
-// ever used from one thread at a time.
-unsafe impl Send for LuaCodec {}
 
 impl fmt::Debug for LuaCodec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
