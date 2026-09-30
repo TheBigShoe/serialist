@@ -75,7 +75,7 @@ jobs:
 
       # No serial hardware on any runner. Hardware tests are #[ignore] and stay skipped.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
 
   licenses:
     runs-on: ubuntu-latest

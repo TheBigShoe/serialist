@@ -426,8 +426,10 @@ mod tests {
             "%3f has no dot"
         );
         assert_eq!(absolute(Some("%H:%M:%S%.6f")), "03:23:44.123456");
-        assert_eq!(absolute(Some("%H:%M:%S%.9f")), "03:23:44.123456789");
-        assert_eq!(absolute(Some("%H:%M:%S%.f")), "03:23:44.123456789");
+        // Windows system time has 100 ns ticks, so only the first seven fraction digits
+        // are portable.
+        assert!(absolute(Some("%H:%M:%S%.9f")).starts_with("03:23:44.1234567"));
+        assert!(absolute(Some("%H:%M:%S%.f")).starts_with("03:23:44.1234567"));
         assert_eq!(
             absolute(Some("%Y-%m-%d %H:%M:%S%.3f")),
             "2026-09-30 03:23:44.123",

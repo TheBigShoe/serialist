@@ -117,12 +117,19 @@ pub fn command_bindings(
                 continue;
             }
         };
-        let taken = existing
+        // The same action can be bound in several contexts (Linux binds the app chords
+        // in the inline context too); name each action once.
+        let mut taken: Vec<&str> = Vec::new();
+        for other in existing
             .iter()
             .filter(|other| other.keystrokes() == binding.keystrokes())
             .filter(|other| !other.action().partial_eq(&NoAction))
-            .map(|other| other.action().name())
-            .collect::<Vec<_>>();
+        {
+            let name = other.action().name();
+            if !taken.contains(&name) {
+                taken.push(name);
+            }
+        }
         if !taken.is_empty() {
             problems.push(format!(
                 "Command {} ({keystrokes}) conflicts with {}",
