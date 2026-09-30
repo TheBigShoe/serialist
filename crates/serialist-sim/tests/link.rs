@@ -1,4 +1,8 @@
 //! The virtual link on its own, driven through the raw transport halves.
+//!
+//! Timing assertions allow for coarse OS timers: on Windows a condvar wait wakes on the
+//! 15.6 ms timer tick, so bounds are "at least the timeout, at most timeout + 40 ms" and
+//! rates are measured over 500 ms windows or whole runs, never 100 ms.
 
 mod common;
 
@@ -8,15 +12,21 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use proptest::prelude::*;
-use serialist_core::{ControlLine, TransportError};
+use serialist_core::{ControlLine, TransportError, TransportReader};
 use serialist_sim::{
-    EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier, LinkConfig,
-    VirtualLink,
+    EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier,
+    HOST_BACKLOG_LIMIT, LinkConfig, PACED_LOOKAHEAD, VirtualLink,
 };
 
 use common::{
     BurstDevice, PanicDevice, RecorderDevice, Recording, read_exactly, read_to_disconnect, serial,
 };
+
+/// Slack for a late wake-up: more than two Windows timer ticks.
+const WAKE_SLACK: Duration = Duration::from_millis(40);
+
+/// `LinkConfig::default().max_chunk`: a read this size may have left more behind.
+const DEFAULT_MAX_CHUNK: usize = 4096;
 
 fn paced(baud: u32) -> LinkConfig {
     LinkConfig {
@@ -28,6 +38,53 @@ fn paced(baud: u32) -> LinkConfig {
 /// A 256-byte ramp repeated, so any position's expected value is known.
 fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| i as u8).collect()
+}
+
+fn firehose(max_batch: usize) -> Box<FirehoseDevice> {
+    Box::new(FirehoseDevice::new(FirehoseConfig {
+        max_batch,
+        ..FirehoseConfig::new(FirehoseContent::Text)
+    }))
+}
+
+/// Read for `span`, then until the released backlog is empty, returning each read's
+/// completion time and size.
+fn arrivals(reader: &mut dyn TransportReader, span: Duration) -> Vec<(Instant, usize)> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut out = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < span {
+        let n = reader.read(&mut buf, Duration::from_millis(10)).unwrap();
+        if n > 0 {
+            out.push((Instant::now(), n));
+        }
+    }
+    // A stalled reader leaves released bytes behind. Collect them until a read comes
+    // back short of a full chunk, so the last arrival time accounts for everything
+    // released before it.
+    loop {
+        let n = reader.read(&mut buf, Duration::from_millis(1)).unwrap();
+        if n > 0 {
+            out.push((Instant::now(), n));
+        }
+        if n < DEFAULT_MAX_CHUNK {
+            break;
+        }
+    }
+    out
+}
+
+/// Bytes per second between the first and last arrival. Whatever the link released in
+/// that interval has been read by the last arrival, so reader stalls in between do not
+/// skew it.
+fn rate(arrivals: &[(Instant, usize)]) -> f64 {
+    let (first, last) = (arrivals[0].0, arrivals[arrivals.len() - 1].0);
+    let bytes: usize = arrivals[1..].iter().map(|a| a.1).sum();
+    bytes as f64 / (last - first).as_secs_f64()
+}
+
+fn within(got: f64, want: f64, tolerance: f64) -> bool {
+    (got - want).abs() / want <= tolerance
 }
 
 #[test]
@@ -53,7 +110,7 @@ fn idle_read_times_out_after_about_the_timeout() {
         assert_eq!(t.reader.read(&mut buf, timeout).unwrap(), 0);
         let took = started.elapsed();
         assert!(
-            took >= timeout.mul_f64(0.5) && took <= timeout.mul_f64(1.5),
+            took >= timeout.mul_f64(0.5) && took <= timeout + WAKE_SLACK,
             "{timeout:?} timeout returned after {took:?}"
         );
         assert_eq!(link.stats().host_read_calls, before + 1);
@@ -76,7 +133,8 @@ fn idle_reader_loop_does_not_spin() {
         calls < 200,
         "{calls} read calls in one second at a 10 ms timeout"
     );
-    assert!(calls >= 50, "{calls} read calls: timeouts are too long");
+    // About 100 with 1 ms timers, 64 with Windows' 15.6 ms tick.
+    assert!(calls >= 30, "{calls} read calls: timeouts are far too long");
 }
 
 #[test]
@@ -113,69 +171,96 @@ fn reads_never_exceed_max_chunk() {
     assert_eq!(got, data);
 }
 
-/// Bytes read per 100 ms window, from a reader thread running for `run`.
-fn windows(reader: &mut dyn serialist_core::TransportReader, run: Duration) -> Vec<usize> {
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut arrivals = Vec::new();
-    let started = Instant::now();
-    while started.elapsed() < run {
-        let n = reader.read(&mut buf, Duration::from_millis(10)).unwrap();
-        if n > 0 {
-            arrivals.push((Instant::now(), n));
-        }
-    }
-    let t0 = arrivals[0].0;
-    let window = Duration::from_millis(100);
-    let count = ((arrivals.last().unwrap().0 - t0).as_millis() / 100) as usize;
-    let mut totals = vec![0usize; count];
-    for (at, n) in arrivals {
-        let k = ((at - t0).as_nanos() / window.as_nanos()) as usize;
-        if k < count {
+#[test]
+fn paced_rate_is_accurate_over_500ms_windows() {
+    // 1 Mbaud 8N1 = 100_000 bytes/s = 50_000 bytes per 500 ms window.
+    let (mut t, _link) = VirtualLink::connect(firehose(16 * 1024), paced(1_000_000));
+    let got = arrivals(&mut *t.reader, Duration::from_millis(1_650));
+    let t0 = got[0].0;
+    let window = Duration::from_millis(500);
+    // Skip the first 100 ms of start-up, then three whole windows.
+    let mut totals = [0usize; 3];
+    for &(at, n) in &got {
+        let since = (at - t0).saturating_sub(Duration::from_millis(100));
+        let k = (since.as_nanos() / window.as_nanos()) as usize;
+        if at - t0 >= Duration::from_millis(100) && k < totals.len() {
             totals[k] += n;
         }
     }
-    totals
-}
-
-#[test]
-fn paced_rate_is_accurate_over_100ms_windows() {
-    // 1 Mbaud 8N1 = 100_000 bytes/s = 10_000 bytes per 100 ms window.
-    let device = FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Text));
-    let (mut t, _link) = VirtualLink::connect(Box::new(device), paced(1_000_000));
-    let totals = windows(&mut *t.reader, Duration::from_millis(1250));
-    assert!(totals.len() >= 10, "{totals:?}");
-    // Skip the first window, which includes start-up.
-    for (i, &bytes) in totals.iter().enumerate().skip(1) {
-        let err = (bytes as f64 - 10_000.0).abs() / 10_000.0;
+    for (i, &bytes) in totals.iter().enumerate() {
         assert!(
-            err <= 0.05,
-            "window {i}: {bytes} bytes, {:.1}% off; all: {totals:?}",
-            err * 100.0
+            within(bytes as f64, 50_000.0, 0.05),
+            "window {i}: {bytes} bytes; all: {totals:?}"
         );
     }
+    assert!(within(rate(&got), 100_000.0, 0.02), "{:.0} B/s", rate(&got));
 }
 
 #[test]
 fn reconfigure_changes_the_rate_live() {
-    let device = FirehoseDevice::new(FirehoseConfig::new(FirehoseContent::Text));
-    let (mut t, _link) = VirtualLink::connect(Box::new(device), paced(1_000_000));
-    let fast: usize = windows(&mut *t.reader, Duration::from_millis(450))[1..]
-        .iter()
-        .sum();
+    let (mut t, _link) = VirtualLink::connect(firehose(16 * 1024), paced(1_000_000));
+    let fast = rate(&arrivals(&mut *t.reader, Duration::from_millis(500)));
     t.writer.reconfigure(&serial(500_000)).unwrap();
-    // Let the 20 ms of look-ahead already scheduled at the old rate drain.
-    let _ = windows(&mut *t.reader, Duration::from_millis(150));
-    let slow: usize = windows(&mut *t.reader, Duration::from_millis(450))[1..]
-        .iter()
-        .sum();
-    // Three 100 ms windows each: 30_000 bytes, then 15_000.
-    let within = |got: usize, want: f64| (got as f64 - want).abs() / want <= 0.1;
-    assert!(within(fast, 30_000.0), "fast phase: {fast}");
-    assert!(within(slow, 15_000.0), "slow phase: {slow}");
+    // Bytes already on the wire (at most one look-ahead) still go at the old rate.
+    let _ = arrivals(&mut *t.reader, PACED_LOOKAHEAD + Duration::from_millis(20));
+    let slow = rate(&arrivals(&mut *t.reader, Duration::from_millis(500)));
+    assert!(within(fast, 100_000.0, 0.1), "before: {fast:.0} B/s");
+    assert!(within(slow, 50_000.0, 0.1), "after: {slow:.0} B/s");
     assert!(matches!(
         t.writer.reconfigure(&serial(0)),
         Err(TransportError::Config(_))
     ));
+}
+
+#[test]
+fn one_callback_commits_at_most_one_lookahead_to_the_wire() {
+    // 9600 baud 8N1 = 960 bytes/s. The firehose hands the link 16 KiB (17 s of data)
+    // per tick; only about PACED_LOOKAHEAD of it may be on the wire at a time.
+    let (_t, link) = VirtualLink::connect(firehose(16 * 1024), paced(9_600));
+    thread::sleep(Duration::from_millis(100));
+    let on_wire = link.stats().device_to_host_bytes;
+    let limit = 960.0 * (0.1 + PACED_LOOKAHEAD.as_secs_f64() + WAKE_SLACK.as_secs_f64());
+    assert!(
+        (on_wire as f64) < limit,
+        "{on_wire} bytes committed in 100 ms"
+    );
+    assert!(on_wire > 0);
+    // The rest waits in the device's FIFO, which still counts as queued.
+    assert!(link.queued_to_host() >= 16 * 1024 - on_wire as usize);
+}
+
+#[test]
+fn queued_to_host_stays_bounded_when_the_host_stops_reading() {
+    let batch = 64 * 1024;
+    let (mut t, link) = VirtualLink::connect(firehose(batch), LinkConfig::unpaced());
+    thread::sleep(Duration::from_millis(300));
+    let first = link.queued_to_host();
+    thread::sleep(Duration::from_millis(200));
+    let second = link.queued_to_host();
+    for queued in [first, second] {
+        assert!(
+            queued <= HOST_BACKLOG_LIMIT + batch,
+            "{queued} bytes queued with nobody reading"
+        );
+    }
+    // It did fill up, so the bound was exercised.
+    assert!(
+        second >= HOST_BACKLOG_LIMIT / 2,
+        "only {second} bytes queued"
+    );
+    // Reading lets the device run again.
+    let before = link.stats().device_to_host_bytes;
+    read_exactly(
+        &mut *t.reader,
+        HOST_BACKLOG_LIMIT,
+        4096,
+        Duration::from_secs(10),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while link.stats().device_to_host_bytes == before {
+        assert!(Instant::now() < deadline, "device never resumed");
+        thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -204,14 +289,14 @@ fn host_to_device_is_paced_too() {
         spread >= Duration::from_millis(190) && spread < Duration::from_millis(400),
         "2000 bytes at 10 kB/s arrived over {spread:?}"
     );
-    // Delivered in wire packets (about 1 ms each), not one lump.
-    assert!(rec.chunks.len() >= 100, "{} chunks", rec.chunks.len());
+    // Delivered in several wire packets, not one lump.
+    assert!(rec.chunks.len() >= 10, "{} chunks", rec.chunks.len());
     let joined: Vec<u8> = rec.chunks.iter().flat_map(|c| c.1.clone()).collect();
     assert_eq!(joined, pattern(2_000));
 }
 
 #[test]
-fn unplug_delivers_queued_bytes_then_disconnects() {
+fn unplug_keeps_released_bytes_and_drops_the_rest() {
     let data = pattern(10_000);
     // 100 ms of data at 1 Mbaud, unplugged a fifth of the way through.
     let (mut t, link) =
@@ -227,10 +312,18 @@ fn unplug_delivers_queued_bytes_then_disconnects() {
         t.writer.set_control(ControlLine::Dtr, false),
         Err(TransportError::Disconnected)
     ));
+    let started = Instant::now();
     let got = read_to_disconnect(&mut *t.reader, Duration::from_secs(5));
+    let took = started.elapsed();
+    assert!(took < WAKE_SLACK, "Disconnected took {took:?} after unplug");
+
+    // What arrived is an intact prefix, and every byte on the wire is accounted for.
+    let stats = link.stats();
+    assert!(!got.is_empty() && got.len() < data.len(), "{}", got.len());
+    assert_eq!(got, data[..got.len()]);
     assert_eq!(
-        got, data,
-        "every byte the device sent before the unplug arrives"
+        got.len() as u64,
+        stats.device_to_host_bytes - stats.lost_on_unplug
     );
     let mut buf = [0u8; 8];
     assert!(matches!(
@@ -240,18 +333,43 @@ fn unplug_delivers_queued_bytes_then_disconnects() {
     assert!(link.wait_for_device_exit(Duration::from_secs(1)));
 }
 
+/// Stream at `baud`, pull the cable, and return how long the host took to see it.
+fn unplug_latency(baud: u32) -> Duration {
+    let (mut t, link) = VirtualLink::connect(firehose(16 * 1024), paced(baud));
+    read_exactly(&mut *t.reader, 50, 4096, Duration::from_secs(5));
+    let started = Instant::now();
+    link.unplug();
+    read_to_disconnect(&mut *t.reader, Duration::from_secs(5));
+    started.elapsed()
+}
+
 #[test]
-fn device_disconnect_behaves_like_unplug() {
+fn unplug_is_prompt_even_at_low_baud() {
+    for baud in [9_600, 115_200] {
+        let took = unplug_latency(baud);
+        assert!(
+            took < Duration::from_millis(100),
+            "{baud} baud: Disconnected {took:?} after unplug"
+        );
+    }
+}
+
+#[test]
+fn device_disconnect_drains_then_disconnects() {
     let data = pattern(3_000);
     let device = BurstDevice::new(data.clone()).then_disconnect();
     let (mut t, link) = VirtualLink::connect(Box::new(device), paced(1_000_000));
-    let got = read_to_disconnect(&mut *t.reader, Duration::from_secs(5));
-    assert_eq!(got, data);
-    assert!(link.is_unplugged());
+    // The device is going away: host writes fail at once...
+    thread::sleep(Duration::from_millis(5));
     assert!(matches!(
         t.writer.write_all(b"x"),
         Err(TransportError::Disconnected)
     ));
+    // ...but everything it sent before hanging up still arrives, then Disconnected.
+    let got = read_to_disconnect(&mut *t.reader, Duration::from_secs(5));
+    assert_eq!(got, data);
+    assert!(link.is_unplugged());
+    assert_eq!(link.stats().lost_on_unplug, 0);
     assert!(link.wait_for_device_exit(Duration::from_secs(1)));
 }
 

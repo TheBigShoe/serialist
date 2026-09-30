@@ -31,16 +31,18 @@ pub use devices::{AtDevice, CaptureOutput, EchoDevice};
 pub use factory::{DeviceConstructor, SimTransportFactory};
 pub use firehose::{
     FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator, FirehoseReport,
-    FirehoseVerifier, SeqGap,
+    FirehoseVerifier, MIN_TICK, SeqGap,
 };
-pub use link::{LinkHandle, PACKET_INTERVAL, VirtualLink};
+pub use link::{HOST_BACKLOG_LIMIT, LinkHandle, PACED_LOOKAHEAD, PACKET_INTERVAL, VirtualLink};
 pub use source::{SimPortSource, virtual_port, virtual_port_id};
 pub use world::SimWorld;
 
 /// Bytes a device wants to send back, plus control over the link.
 pub trait DeviceOutput {
     fn send(&mut self, bytes: &[u8]);
-    /// Simulate the device going away (USB unplug, power loss).
+    /// The device hangs up: everything it already sent still goes out at wire pace,
+    /// then the host sees `Disconnected`. Host writes fail from this call on. For an
+    /// abrupt cable pull that loses bytes in flight, use `LinkHandle::unplug`.
     fn disconnect(&mut self);
 }
 
@@ -63,9 +65,12 @@ pub trait SimDevice: Send + 'static {
     /// Return the next time this device wants to run, or `None` to sleep until data arrives;
     /// a sleeping device is ticked once more after its next `on_receive`.
     ///
-    /// A device that returns `Some(now)` runs as fast as the link accepts: the link stops
-    /// ticking it while its outgoing queue is full (about 20 ms of data on a paced link,
-    /// 1 MiB on an unpaced one), so an unlimited producer never runs away with memory.
+    /// A device that returns `Some(now)` runs as fast as the link accepts. Output goes
+    /// into the device's transmit FIFO, and the link does not tick the device again until
+    /// that FIFO has drained onto the wire, which is kept at most [`PACED_LOOKAHEAD`]
+    /// ahead on a paced link and under [`HOST_BACKLOG_LIMIT`] unread bytes on any link.
+    /// So an unlimited producer never runs away with memory, as long as each callback
+    /// sends a bounded batch.
     fn on_tick(&mut self, now: Instant, out: &mut dyn DeviceOutput) -> Option<Instant> {
         let _ = (now, out);
         None
@@ -124,9 +129,9 @@ impl LinkConfig {
 
 /// Counters a test asserts on.
 ///
-/// Byte counts are taken where bytes enter the link, before faults: bytes the host
-/// read equal `device_to_host_bytes` minus the bytes dropped in that direction.
-/// Drops and corruptions are counted across both directions.
+/// Byte counts are taken where bytes enter the wire, before faults. Bytes the host read
+/// equal `device_to_host_bytes` minus the bytes dropped in that direction minus
+/// `lost_on_unplug`. Drops and corruptions are counted across both directions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LinkStats {
     pub host_to_device_bytes: u64,
@@ -136,4 +141,7 @@ pub struct LinkStats {
     /// Calls to the host reader's `read`, including those that timed out. A reader that
     /// spins shows up here.
     pub host_read_calls: u64,
+    /// Device-to-host bytes that were on the wire but not yet delivered when the link
+    /// was unplugged. Output still in the device's FIFO is not counted anywhere.
+    pub lost_on_unplug: u64,
 }
