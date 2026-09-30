@@ -1,6 +1,6 @@
 [package]
 name = "serialist-plugins"
-description = "Codec plugins for Serialist: Lua and WebAssembly adapters, Airoha RACE reference (milestone 5)."
+description = "Codec plugins for Serialist: built-in Rust codecs, the Lua adapter, and the Airoha RACE reference plugin."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,14 @@ authors.workspace = true
 
 [dependencies]
 serialist-core.workspace = true
+memchr.workspace = true
+mlua.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serialist-sim.workspace = true
+crossbeam-channel.workspace = true
+insta.workspace = true
+proptest.workspace = true
