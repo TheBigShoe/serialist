@@ -16,9 +16,9 @@
 //!
 //! Device profiles from the settings show here: a port a profile matches is listed
 //! under the profile's `name` with a "profile" badge (and a badge naming its `plugin`,
-//! the codec the session decodes with), and selecting it fills the baud field with the
-//! profile's rate. Connecting uses the profile's framing and flow control with the rate
-//! in the field.
+//! the codec the session decodes with, greyed with a tooltip while that plugin is not
+//! installed), and selecting it fills the baud field with the profile's rate.
+//! Connecting uses the profile's framing and flow control with the rate in the field.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -518,6 +518,13 @@ impl DevicesPanel {
             .filter(|plugin| !plugin.trim().is_empty())
     }
 
+    /// Whether the plugin `name` is installed and loaded, so a session would decode with
+    /// it. The badge of one that is not is greyed, with a tooltip that says so.
+    pub fn plugin_installed(&self, name: &str, cx: &App) -> bool {
+        cx.try_global::<Config>()
+            .is_some_and(|config| config.codec_registry().contains(name.trim()))
+    }
+
     /// The line settings to open `info` with, other than the rate: its device profile's
     /// framing and flow control over 8N1.
     fn serial_for(&self, info: &PortInfo, cx: &App) -> SerialConfig {
@@ -856,6 +863,18 @@ impl DevicesPanel {
         let name = SharedString::from(self.display_name(&entry.info, cx));
         let profiled = self.has_profile(&entry.info, cx);
         let plugin = self.plugin_for(&entry.info, cx);
+        // A profile's plugin that is not installed: the session would connect without a
+        // codec, so its badge is greyed and says why.
+        let missing = plugin
+            .as_deref()
+            .filter(|plugin| !self.plugin_installed(plugin, cx))
+            .map(|plugin| {
+                SharedString::from(format!(
+                    "The {plugin} plugin is not installed: this port connects without a \
+                     codec. Install it from the command palette or put it in the plugins \
+                     folder."
+                ))
+            });
         let summary =
             (selected || connected).then(|| self.row_settings(&entry.info, selected, cx).summary());
         let port = entry.info.id.to_string();
@@ -863,6 +882,11 @@ impl DevicesPanel {
             Some(ids) => format!("{port} \u{00b7} USB {ids}"),
             None => port.clone(),
         });
+        // The chips hide while the row is hovered, so the row's tooltip says it too.
+        let tooltip = match &missing {
+            Some(missing) => SharedString::from(format!("{tooltip}\n{missing}")),
+            None => tooltip,
+        };
 
         // The chips sit at the right end of the first line. They are hidden (not moved)
         // while the row is hovered, so the actions can take their place.
@@ -876,11 +900,21 @@ impl DevicesPanel {
                 row.child(chrome::quiet_chip("profile", cx))
             })
             .when_some(plugin, |row, plugin| {
+                let color = if missing.is_some() {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().info
+                };
                 row.child(
-                    chrome::chip(cx.theme().info)
+                    chrome::chip(color)
                         .id(("device-plugin", ix))
                         .test_support()
-                        .child(SharedString::from(plugin)),
+                        .child(SharedString::from(plugin))
+                        .when_some(missing, |chip, missing| {
+                            chip.tooltip(move |window, cx| {
+                                Tooltip::new(missing.clone()).build(window, cx)
+                            })
+                        }),
                 )
             });
 
