@@ -39,6 +39,9 @@ pub enum DisplayMode {
     Hex,
 }
 
+/// Marks kept at most: the newest command responses.
+pub const MAX_MARKS: usize = 256;
+
 /// Where each source stood when the view was paused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frozen {
@@ -97,6 +100,13 @@ pub struct TerminalView {
     stats: Rc<RefCell<FrameStats>>,
     show_frame_stats: bool,
     search: SearchBar,
+    /// Inline mode: the key context is `TerminalInline` and keys go to the port.
+    inline: bool,
+    /// Typed in inline mode and not yet sent with Enter, shown at the foot.
+    pending_input: Option<SharedString>,
+    /// Highlighted text lines, such as a saved command's matched response. Sorted by
+    /// line, then start; drawn like search matches whether or not search is open.
+    marks: Arc<Vec<SearchMatch>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -163,6 +173,9 @@ impl TerminalView {
                 covered: LineId::ZERO,
                 stale: false,
             },
+            inline: false,
+            pending_input: None,
+            marks: Arc::default(),
             focus_handle: cx.focus_handle(),
             _subscriptions: vec![input_events, config_changes],
         }
@@ -379,6 +392,101 @@ impl TerminalView {
     /// The cell grid of the last frame, once one was drawn.
     pub fn cell_metrics(&self) -> Option<CellMetrics> {
         self.cache.borrow().metrics()
+    }
+
+    // --- Inline mode and marks ---------------------------------------------------------
+
+    pub fn is_inline(&self) -> bool {
+        self.inline
+    }
+
+    /// Take keys for the port (`TerminalInline`) or for the terminal's own bindings
+    /// (`Terminal`).
+    pub fn set_inline(&mut self, inline: bool, cx: &mut Context<Self>) {
+        if self.inline != inline {
+            self.inline = inline;
+            if !inline {
+                self.pending_input = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// What inline mode has typed since the last Enter.
+    pub fn pending_input(&self) -> Option<&SharedString> {
+        self.pending_input.as_ref()
+    }
+
+    pub fn set_pending_input(&mut self, text: Option<SharedString>, cx: &mut Context<Self>) {
+        let text = text.filter(|text| !text.is_empty());
+        if self.pending_input != text {
+            self.pending_input = text;
+            cx.notify();
+        }
+    }
+
+    /// The highlighted text ranges, sorted.
+    pub fn marks(&self) -> &Arc<Vec<SearchMatch>> {
+        &self.marks
+    }
+
+    /// Highlight `range` of text line `line`, keeping the newest [`MAX_MARKS`].
+    pub fn add_mark(&mut self, mark: SearchMatch, cx: &mut Context<Self>) {
+        let marks = Arc::make_mut(&mut self.marks);
+        let at =
+            marks.partition_point(|m| (m.line, m.range.start) <= (mark.line, mark.range.start));
+        marks.insert(at, mark);
+        if marks.len() > MAX_MARKS {
+            marks.remove(0);
+        }
+        cx.notify();
+    }
+
+    /// Search matches and marks together, for the element. The active search match
+    /// stays active.
+    fn highlights(&self) -> Highlights {
+        let search = self.search.open.then_some(&self.search.results);
+        // Mark line ids are text line ids.
+        let marks =
+            (self.display == DisplayMode::Text && !self.marks.is_empty()).then_some(&self.marks);
+        match (search, marks) {
+            (None, None) => Highlights::default(),
+            (Some(results), None) => Highlights {
+                matches: results.matches.clone(),
+                active: results.active,
+            },
+            (None, Some(marks)) => Highlights {
+                matches: marks.clone(),
+                active: None,
+            },
+            (Some(results), Some(marks)) => {
+                let mut merged = Vec::with_capacity(results.matches.len() + marks.len());
+                let mut active = None;
+                let (mut a, mut b) = (0, 0);
+                let key = |m: &SearchMatch| (m.line, m.range.start);
+                while a < results.matches.len() || b < marks.len() {
+                    let take_search = match (results.matches.get(a), marks.get(b)) {
+                        (Some(found), Some(mark)) => key(found) <= key(mark),
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if take_search {
+                        if results.active == Some(a) {
+                            active = Some(merged.len());
+                        }
+                        merged.push(results.matches[a].clone());
+                        a += 1;
+                    } else {
+                        merged.push(marks[b].clone());
+                        b += 1;
+                    }
+                }
+                Highlights {
+                    matches: Arc::new(merged),
+                    active,
+                }
+            }
+        }
     }
 
     // --- Scrolling -------------------------------------------------------------------
@@ -951,6 +1059,32 @@ impl TerminalView {
             )
     }
 
+    /// The strip at the foot that shows what inline mode typed since the last Enter.
+    fn render_pending_input(
+        &self,
+        text: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        div()
+            .id("terminal-pending-input")
+            .absolute()
+            .bottom_2()
+            .left_2()
+            .max_w(relative(0.8))
+            .px_2()
+            .py_0p5()
+            .rounded_sm()
+            .bg(self.palette.background)
+            .border_1()
+            .border_color(theme.border)
+            .font_family(self.font.font.family.clone())
+            .text_size(self.font.size)
+            .text_color(self.palette.tx)
+            .truncate()
+            .child(text)
+    }
+
     fn render_frame_stats(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let summary = self.frame_summary();
@@ -975,14 +1109,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let search_open = self.search.open;
-        let highlights = if search_open {
-            Highlights {
-                matches: self.search.results.matches.clone(),
-                active: self.search.results.active,
-            }
-        } else {
-            Highlights::default()
-        };
+        let highlights = self.highlights();
         let element = TerminalElement::new(TerminalInputs {
             view: cx.entity(),
             source: self.source().clone(),
@@ -1005,10 +1132,19 @@ impl Render for TerminalView {
         let following = self.scroll.is_following();
         let search_bar = search_open.then(|| self.render_search_bar(cx));
         let frame_stats = self.show_frame_stats.then(|| self.render_frame_stats(cx));
+        let pending = self
+            .pending_input
+            .clone()
+            .filter(|_| self.inline)
+            .map(|text| self.render_pending_input(text, cx));
 
         v_flex()
             .id("terminal")
-            .key_context(context::TERMINAL)
+            .key_context(if self.inline {
+                context::TERMINAL_INLINE
+            } else {
+                context::TERMINAL
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::copy_action))
             .on_action(cx.listener(Self::select_all_action))
@@ -1035,6 +1171,7 @@ impl Render for TerminalView {
                     .child(element)
                     .child(Scrollbar::vertical(&self.scroll).id("terminal-scrollbar"))
                     .children(frame_stats)
+                    .children(pending)
                     .when(!following, |area| {
                         area.child(
                             div().absolute().bottom_3().right_6().child(

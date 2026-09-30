@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serialist_core::{SessionStats, StoreStats};
 
 use crate::capture::RecorderStats;
+use crate::inline::{Mode, PasteProgress};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -130,6 +131,10 @@ pub struct StatusInputs<'a> {
     pub paused: Option<PauseMark>,
     pub recording: Option<&'a RecordingStatus>,
     pub notice: Option<&'a Notice>,
+    /// Inline or command mode.
+    pub mode: Mode,
+    /// A paste in progress in inline mode.
+    pub paste: Option<PasteProgress>,
 }
 
 /// The text of the status line for one session, kept apart from rendering so tests can
@@ -154,6 +159,10 @@ pub struct StatusLine {
     /// `REC capture.bin 1.2 MiB` while recording.
     pub recording: Option<String>,
     pub notice: Option<Notice>,
+    /// `INLINE` or `COMMAND`.
+    pub mode: &'static str,
+    /// `Pasting 128 B of 4.0 KiB` while a large paste is being sent.
+    pub paste: Option<String>,
 }
 
 impl StatusLine {
@@ -184,6 +193,8 @@ impl StatusLine {
             }),
             recording: inputs.recording.map(RecordingStatus::label),
             notice: inputs.notice.cloned(),
+            mode: inputs.mode.label(),
+            paste: inputs.paste.and_then(|paste| paste.label()),
         }
     }
 }
@@ -239,6 +250,8 @@ mod tests {
             paused: None,
             recording: None,
             notice: None,
+            mode: Mode::Command,
+            paste: None,
         }
     }
 
@@ -252,6 +265,8 @@ mod tests {
         assert_eq!(line.tx, "TX 4 B");
         assert_eq!(line.retained, "3 lines, 20 B kept");
         assert_eq!(line.evicted, None);
+        assert_eq!(line.mode, "COMMAND");
+        assert_eq!(line.paste, None);
 
         let line = StatusLine::new(inputs(&state, store(100, 150, 65536, 69632)));
         assert_eq!(line.retained, "50 lines, 4.0 KiB kept");
@@ -296,6 +311,21 @@ mod tests {
         assert_eq!(line.recording.as_deref(), Some("REC capture.bin opening…"));
         assert_eq!(line.notice, Some(Notice::error("Export failed")));
         assert_eq!(line.settings.as_deref(), Some("115200 8N1"));
+    }
+
+    #[test]
+    fn inline_mode_and_a_large_paste() {
+        let state = ConnectionState::Connected;
+        let mut status = inputs(&state, store(0, 3, 0, 20));
+        status.mode = Mode::Inline;
+        status.paste = Some(PasteProgress {
+            sent: 640,
+            total: 4096,
+            chunks: 64,
+        });
+        let line = StatusLine::new(status);
+        assert_eq!(line.mode, "INLINE");
+        assert_eq!(line.paste.as_deref(), Some("Pasting 640 B of 4.0 KiB"));
     }
 
     #[test]

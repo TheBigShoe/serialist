@@ -25,6 +25,16 @@ actions!(terminal, [Clear, JumpToBottom, Pause, Export, ToggleRecord]);
 actions!(
     terminal,
     [
+        /// Switch between inline mode (every keystroke goes to the port) and command
+        /// mode (the compose bar and saved commands).
+        ToggleInline,
+        /// In inline mode, send the clipboard to the port in paced chunks.
+        Paste,
+    ]
+);
+actions!(
+    terminal,
+    [
         /// Copy the selection to the clipboard.
         Copy,
         /// Select every retained line.
@@ -48,7 +58,16 @@ actions!(
 );
 actions!(serial, [Connect, Disconnect]);
 actions!(devices, [SelectNext, SelectPrevious]);
-actions!(compose, [HistoryPrevious, HistoryNext, CycleLineEnding]);
+actions!(
+    compose,
+    [
+        HistoryPrevious,
+        HistoryNext,
+        CycleLineEnding,
+        /// Open the command editor with the compose bar's text.
+        SaveAsCommand,
+    ]
+);
 
 /// Key contexts set by the views, referenced by the bundled keymap.
 pub mod context {
@@ -57,6 +76,9 @@ pub mod context {
     pub const SESSION_VIEW: &str = "SessionView";
     pub const COMPOSE_BAR: &str = "ComposeBar";
     pub const TERMINAL: &str = "Terminal";
+    /// The terminal in inline mode, in place of `Terminal`: keys go to the port except
+    /// the ones bound here.
+    pub const TERMINAL_INLINE: &str = "TerminalInline";
     pub const TERMINAL_SEARCH: &str = "TerminalSearch";
 }
 
@@ -77,6 +99,9 @@ pub(crate) mod keys {
     pub const SCROLL_TO_TOP: &str = "cmd-up";
     pub const SCROLL_TO_BOTTOM: &str = "cmd-down";
     pub const TOGGLE_FRAME_STATS: &str = "cmd-alt-i";
+    pub const TOGGLE_INLINE: &str = "cmd-i";
+    pub const PASTE: &str = "cmd-v";
+    pub const SAVE_AS_COMMAND: &str = "cmd-alt-s";
 }
 
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
@@ -97,6 +122,9 @@ pub(crate) mod keys {
     pub const SCROLL_TO_TOP: &str = "ctrl-home";
     pub const SCROLL_TO_BOTTOM: &str = "ctrl-end";
     pub const TOGGLE_FRAME_STATS: &str = "ctrl-alt-i";
+    pub const TOGGLE_INLINE: &str = "ctrl-i";
+    pub const PASTE: &str = "ctrl-shift-v";
+    pub const SAVE_AS_COMMAND: &str = "ctrl-alt-s";
 }
 
 /// App-level setup: remember gpui-kit's own key bindings (so a keymap reload can put
@@ -230,6 +258,16 @@ mod tests {
         assert_eq!(
             bound(terminal, keys::TOGGLE_FRAME_STATS),
             "terminal::ToggleFrameStats"
+        );
+        let inline = Some(context::TERMINAL_INLINE);
+        assert_eq!(
+            bound(workspace, keys::TOGGLE_INLINE),
+            "terminal::ToggleInline"
+        );
+        assert_eq!(bound(inline, keys::PASTE), "terminal::Paste");
+        assert_eq!(
+            bound(Some(context::COMPOSE_BAR), keys::SAVE_AS_COMMAND),
+            "compose::SaveAsCommand"
         );
     }
 }

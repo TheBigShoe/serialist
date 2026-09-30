@@ -18,7 +18,8 @@
       "ctrl-shift-w": "serial::Disconnect",
       "ctrl-p": "terminal::Pause",
       "ctrl-shift-s": "terminal::Export",
-      "ctrl-shift-r": "terminal::ToggleRecord"
+      "ctrl-shift-r": "terminal::ToggleRecord",
+      "ctrl-i": "terminal::ToggleInline"
     }
   },
   {
@@ -39,7 +40,8 @@
   {
     "context": "ComposeBar",
     "bindings": {
-      "ctrl-shift-e": "compose::CycleLineEnding"
+      "ctrl-shift-e": "compose::CycleLineEnding",
+      "ctrl-alt-s": "compose::SaveAsCommand"
     }
   },
   {
@@ -58,6 +60,27 @@
       "end": "terminal::JumpToBottom",
       "ctrl-home": "terminal::ScrollToTop",
       "ctrl-end": "terminal::JumpToBottom"
+    }
+  },
+  {
+    // Inline mode: the terminal sends every key it can encode to the port, including
+    // plain ctrl chords (ctrl-p and ctrl-q go to the device there). Bindings in this
+    // context are the exceptions: they run as actions instead of being sent.
+    "context": "TerminalInline",
+    "bindings": {
+      "ctrl-i": "terminal::ToggleInline",
+      "ctrl-shift-v": "terminal::Paste",
+      "ctrl-shift-c": "terminal::Copy",
+      "ctrl-shift-a": "terminal::SelectAll",
+      "ctrl-shift-f": "terminal::Search",
+      "ctrl-alt-i": "terminal::ToggleFrameStats",
+      "shift-pageup": "terminal::PageUp",
+      "shift-pagedown": "terminal::PageDown",
+      "ctrl-shift-k": "terminal::Clear",
+      "ctrl-shift-w": "serial::Disconnect",
+      "ctrl-shift-p": "terminal::Pause",
+      "ctrl-shift-s": "terminal::Export",
+      "ctrl-shift-r": "terminal::ToggleRecord"
     }
   },
   {

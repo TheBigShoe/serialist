@@ -14,7 +14,8 @@
       "cmd-w": "serial::Disconnect",
       "cmd-p": "terminal::Pause",
       "cmd-s": "terminal::Export",
-      "cmd-shift-r": "terminal::ToggleRecord"
+      "cmd-shift-r": "terminal::ToggleRecord",
+      "cmd-i": "terminal::ToggleInline"
     }
   },
   {
@@ -35,7 +36,8 @@
   {
     "context": "ComposeBar",
     "bindings": {
-      "cmd-e": "compose::CycleLineEnding"
+      "cmd-e": "compose::CycleLineEnding",
+      "cmd-alt-s": "compose::SaveAsCommand"
     }
   },
   {
@@ -52,6 +54,23 @@
       "pagedown": "terminal::PageDown",
       "home": "terminal::ScrollToTop",
       "end": "terminal::JumpToBottom",
+      "cmd-up": "terminal::ScrollToTop",
+      "cmd-down": "terminal::JumpToBottom"
+    }
+  },
+  {
+    // Inline mode: the terminal sends every key it can encode to the port, including
+    // plain ctrl chords. Bindings in this context are the exceptions: they run as
+    // actions instead of being sent.
+    "context": "TerminalInline",
+    "bindings": {
+      "cmd-v": "terminal::Paste",
+      "cmd-c": "terminal::Copy",
+      "cmd-a": "terminal::SelectAll",
+      "cmd-f": "terminal::Search",
+      "cmd-alt-i": "terminal::ToggleFrameStats",
+      "shift-pageup": "terminal::PageUp",
+      "shift-pagedown": "terminal::PageDown",
       "cmd-up": "terminal::ScrollToTop",
       "cmd-down": "terminal::JumpToBottom"
     }

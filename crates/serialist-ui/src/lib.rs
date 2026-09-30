@@ -13,6 +13,7 @@ pub mod config;
 pub mod devices_panel;
 pub mod export;
 pub mod fonts;
+pub mod inline;
 pub mod keymap;
 pub mod scrollback;
 pub mod session_handle;
@@ -28,6 +29,8 @@ mod config_tests;
 #[cfg(test)]
 mod gate;
 #[cfg(test)]
+mod inline_tests;
+#[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
 mod test_support;
@@ -40,6 +43,7 @@ pub use devices_panel::{
 };
 pub use export::{ExportFormat, ExportJob};
 pub use fonts::{TerminalFont, UiFont};
+pub use inline::{InlineSettings, KeyEncoder, Mode, encode_key};
 pub use scrollback::{Floored, Floors, Scrollback};
 pub use session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 pub use session_options::{DisplayDefaults, SessionOptions};
