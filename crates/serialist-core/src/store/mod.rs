@@ -27,7 +27,7 @@
 //! | Raw pages | 64 KiB each, allocated whole. Retained raw bytes plus under 64 KiB. |
 //! | Line entries | 5 bytes per line: a `u32` offset from its block's base and a flag byte, in blocks of 4096 lines. |
 //! | Timestamps | 12 bytes per change of arrival time, so about once per chunk, not per line. |
-//! | Decoded text | Only for lines the parser transformed and for local lines: a 12-byte reference, then the text and its runs (about 5 bytes per run) in 64 KiB text pages. |
+//! | Decoded text | Only for lines the parser transformed and for local lines: a 12-byte reference, then the text, two separator bytes and its runs (about 5 bytes per run) in 64 KiB text pages. |
 //! | Open block | 116 KiB while being filled; compacted to its used size when sealed. |
 //! | Line in progress | The parser's line buffer; a published copy only if the line is not plain. |
 //!
@@ -43,7 +43,7 @@
 //! | Short lines (the gate test) | 35 | 15% |
 //! | `LongLines` | 2322 | 0.9% |
 //! | `Mixed` | 710 | 12.8% |
-//! | `MixedEol` (bare CRs overwrite) | 100 | 31.7% |
+//! | `MixedEol` (bare CRs overwrite) | 100 | 32% |
 //! | `Ansi` (SGR on every word) | 155 | 98% |
 //! | `Binary` (invalid UTF-8 becomes 3-byte U+FFFD) | 264 | 122% |
 //!
@@ -779,8 +779,9 @@ impl Writer {
         index::encode_record(&mut self.record, text, runs);
         let len = self.record.len();
         if self.open_text.as_ref().is_none_or(|w| w.remaining() < len) {
-            let cap = TEXT_PAGE_SIZE.max(len);
-            let (buf, writer) = AppendBuf::new(cap);
+            let cap = TEXT_PAGE_SIZE.max(len + index::TEXT_PAGE_HEADER.len());
+            let (buf, mut writer) = AppendBuf::new(cap);
+            writer.extend(index::TEXT_PAGE_HEADER);
             if self.text_pages.is_empty() {
                 self.first_text_seq = self.next_text_seq;
             }
