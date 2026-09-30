@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
+use serialist_core::settings::ConfigPaths;
 use serialist_core::{
     Direction, LineSource, PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig,
     SessionClosed, SessionEvent, SessionStats, StoreConfig, StyledLine, TransportError, UsbInfo,
@@ -301,6 +302,26 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Install the bundled example plugin `name` into the config directory `paths` names,
+/// as the "Install example plugin" action does. The app ships with no codec active, so a
+/// test that decodes installs one first.
+pub(crate) fn install_example_plugin(paths: &ConfigPaths, name: &str) -> PathBuf {
+    let example = serialist_plugins::example_plugin(name)
+        .unwrap_or_else(|| panic!("no example plugin named {name}"));
+    paths
+        .install_example_plugin(example)
+        .expect("install the example plugin")
+}
+
+/// A config directory for a test that decodes: an empty `settings.json` and the
+/// example Airoha RACE plugin installed.
+pub(crate) fn race_config_dir(name: &str) -> TestDir {
+    let dir = TestDir::new(name);
+    std::fs::write(dir.join("settings.json"), "{}").expect("write settings.json");
+    install_example_plugin(&ConfigPaths::new(dir.path()), "airoha-race");
+    dir
 }
 
 /// The rows of a CSV file as an export writes it, quotes undone.

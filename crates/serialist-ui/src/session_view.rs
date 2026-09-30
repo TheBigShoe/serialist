@@ -102,7 +102,14 @@
 //! The ingest thread also runs the session's [`CodecSlotSink`], built on that thread
 //! ([`Ingest::spawn_with`]), which decodes with the codec the view selects (see
 //! [`codecs`](crate::codecs)): the device profile's `plugin` at opening, then the
-//! toolbar's codec menu. Decoded frames go to a [`FrameStore`](serialist_core::FrameStore)
+//! toolbar's codec menu. Codecs are plugins the user installs, and none is by default:
+//! a profile that names one that is not installed connects without a codec, the status
+//! line says which plugin is missing and offers to install it, and the session starts
+//! decoding with it once it is (see [`SessionView::want_codec`]). The codec menu shows
+//! only while a plugin is installed (or the session decodes); it also offers the bundled
+//! examples not installed yet and the plugins folder (see
+//! [`plugin_files`](crate::plugin_files)). Decoded frames go to a
+//! [`FrameStore`](serialist_core::FrameStore)
 //! whose waker rings the same doorbell, so one wake acknowledges both stores, then takes
 //! both snapshots. Per wake, with the new frames, the view:
 //!
@@ -115,9 +122,10 @@
 //! - bumps [`decoded_generation`](SessionView::decoded_generation), which the Decoded
 //!   panel follows.
 //!
-//! A saved command whose payload names a codec is encoded by it, and one whose `expect`
-//! is a frame predicate waits for a matching frame: a task polls the frame store each
-//! frame from the id it had before the write, until a frame matches or the timeout,
+//! A saved command whose payload names a codec is encoded by it (and is not sent while
+//! that plugin is not installed: the status line says to install it), and one whose
+//! `expect` is a frame predicate waits for a matching frame: a task polls the frame store
+//! each frame from the id it had before the write, until a frame matches or the timeout,
 //! and reports as a line match does.
 
 use std::collections::HashMap;
@@ -154,6 +162,7 @@ use crate::inline::{
     Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
     paste_bytes, paste_echo,
 };
+use crate::plugin_files;
 use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
 use crate::prelude::*;
 use crate::script_bridge::{
@@ -165,8 +174,8 @@ use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
 use crate::session_options::SessionOptions;
 use crate::status::{
-    ConnectionState, Notice, PauseMark, RateMeter, RecordingStatus, ScriptStatus, StatusInputs,
-    StatusLine, file_name, format_bytes,
+    ConnectionState, Notice, NoticeAction, PauseMark, RateMeter, RecordingStatus, ScriptStatus,
+    StatusInputs, StatusLine, file_name, format_bytes,
 };
 use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
@@ -200,10 +209,10 @@ impl std::fmt::Debug for ActiveCodec {
     }
 }
 
-/// The codecs of the installed configuration, or the built-ins without one.
+/// The codecs of the installed configuration: its plugins. None without one.
 fn codec_registry(cx: &App) -> Arc<CodecRegistry> {
     cx.try_global::<Config>().map_or_else(
-        || Arc::new(serialist_plugins::builtin_registry()),
+        || Arc::new(CodecRegistry::new()),
         |config| config.codec_registry().clone(),
     )
 }
@@ -211,7 +220,7 @@ fn codec_registry(cx: &App) -> Arc<CodecRegistry> {
 /// What the codec picker lists.
 fn codec_choices(cx: &App) -> Vec<String> {
     cx.try_global::<Config>().map_or_else(
-        || crate::codecs::CodecSet::builtin().choices(),
+        || crate::codecs::CodecSet::default().choices(),
         |config| config.codecs().choices(),
     )
 }
@@ -562,6 +571,9 @@ pub struct SessionView {
     /// Which codec the ingest thread runs; shared with its codec slot.
     selection: Arc<CodecSelection>,
     codec: Option<ActiveCodec>,
+    /// A codec the device profile (or the restored tab) asked for whose plugin is not
+    /// installed; selected once it is, unless a codec is picked first.
+    wanted_codec: Option<String>,
     /// Bumped whenever the frames or the codec change, for the Decoded panel.
     decoded_generation: u64,
     /// `display.decoded_inline` for this session.
@@ -816,6 +828,7 @@ impl SessionView {
             frames,
             selection,
             codec: None,
+            wanted_codec: None,
             decoded_generation: 0,
             decoded_inline,
             inline_next: FrameId::ZERO,
@@ -855,9 +868,9 @@ impl SessionView {
                 port_settings_events,
             ],
         };
-        // The device profile's codec, from the first chunk on.
+        // The device profile's codec, from the first chunk on, if its plugin is installed.
         if let Some(name) = initial_codec {
-            view.set_codec(Some(&name), cx);
+            view.want_codec(&name, cx);
         }
         view
     }
@@ -907,6 +920,33 @@ impl SessionView {
 
     pub fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// Say `notice` in the status line, in place of the last one.
+    pub fn set_notice(&mut self, notice: Notice, cx: &mut Context<Self>) {
+        self.notice = Some(notice);
+        cx.notify();
+    }
+
+    /// Do what the notice's button says (see [`NoticeAction`]), and say how it went.
+    pub fn run_notice_action(&mut self, action: &NoticeAction, cx: &mut Context<Self>) {
+        if let Some(notice) = plugin_files::run_notice_action(action, cx) {
+            self.set_notice(notice, cx);
+        }
+    }
+
+    /// Install the bundled example plugin `name` (see
+    /// [`plugin_files::install_example`]), and say how it went. The watcher loads it; if
+    /// this session was waiting for it, it starts decoding with it then.
+    pub fn install_example_plugin(&mut self, name: &str, cx: &mut Context<Self>) {
+        let notice = plugin_files::install_example(name, cx);
+        self.set_notice(notice, cx);
+    }
+
+    /// The codec a device profile (or a restored tab) asked for whose plugin is not
+    /// installed yet.
+    pub fn wanted_codec(&self) -> Option<&str> {
+        self.wanted_codec.as_deref()
     }
 
     pub fn recording(&self) -> Option<&RecordingStatus> {
@@ -1457,9 +1497,11 @@ impl SessionView {
             self.remembered.insert(reference.clone(), params.clone());
         }
         let session_eol = self.line_ending(cx);
-        // A codec payload is the codec's to encode; the rest the command's own.
+        let registry = codec_registry(cx);
+        // A codec payload is the codec's to encode; the rest the command's own. One whose
+        // plugin is not installed is not sent, and the notice offers to install it.
         let encoded = match &command.payload {
-            Payload::Codec { .. } => encode_codec_command(&codec_registry(cx), command, params),
+            Payload::Codec { .. } => encode_codec_command(&registry, command, params),
             _ => command
                 .encode(params, session_eol)
                 .map_err(|error| error.to_string()),
@@ -1467,7 +1509,13 @@ impl SessionView {
         let bytes = match encoded {
             Ok(bytes) => bytes,
             Err(error) => {
-                self.notice = Some(Notice::error(format!("{name}: {error}")));
+                let text = format!("{name}: {error}");
+                self.notice = Some(match &command.payload {
+                    Payload::Codec { codec, .. } if !registry.contains(codec) => {
+                        plugin_files::missing_plugin_notice(text, codec)
+                    }
+                    _ => Notice::error(text),
+                });
                 cx.notify();
                 return;
             }
@@ -1530,8 +1578,13 @@ impl SessionView {
                 self.await_frame(name, predicate, frames_from, sent_at, timeout_ms, cx);
             }
             (None, None) if needs_codec => {
+                let why = if registry.is_empty() {
+                    "no codec plugin is installed to decode it"
+                } else {
+                    "no codec is decoding"
+                };
                 self.notice = Some(Notice::error(format!(
-                    "Sent {name}; its reply is a decoded frame, and no codec is decoding"
+                    "Sent {name}; its reply is a decoded frame, and {why}"
                 )));
             }
             (None, None) => self.notice = Some(Notice::info(format!("Sent {name}"))),
@@ -1707,6 +1760,8 @@ impl SessionView {
     /// codec is known; an unknown one leaves decoding as it was and says so.
     pub fn set_codec(&mut self, name: Option<&str>, cx: &mut Context<Self>) -> bool {
         let name = name.filter(|name| !name.is_empty() && *name != NO_CODEC);
+        // A choice made now outranks one waiting for its plugin.
+        self.wanted_codec = None;
         match name {
             None => {
                 self.selection.set(None);
@@ -1742,11 +1797,45 @@ impl SessionView {
         true
     }
 
+    /// Decode with `name`, as a device profile's `plugin` (or a restored tab) asks: from
+    /// the next chunk if that plugin is installed. If it is not, the session goes on
+    /// without a codec, the status line names the missing plugin and offers to install
+    /// it (or the plugins folder, for a plugin the app has no example of), and the
+    /// session starts decoding with it once it is installed, unless a codec is picked
+    /// before that.
+    pub fn want_codec(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() || name == NO_CODEC {
+            self.set_codec(None, cx);
+            return;
+        }
+        if codec_registry(cx).contains(name) {
+            self.set_codec(Some(name), cx);
+            return;
+        }
+        tracing::warn!(port = %self.port, plugin = name, "the plugin is not installed; no codec");
+        self.wanted_codec = Some(name.to_owned());
+        self.notice = Some(plugin_files::missing_plugin_notice(
+            format!("The {name} plugin is not installed; connected without a codec"),
+            name,
+        ));
+        cx.notify();
+    }
+
     /// The configuration changed: if the factory of the codec this session runs was
-    /// replaced (a plugin reloaded), decode with the new one from the next chunk on. (The
+    /// replaced (a plugin reloaded), decode with the new one from the next chunk on; if
+    /// the plugin this session waits for was installed, start decoding with it. (The
     /// codec menu lists the configuration's codecs each time it opens.)
     fn codecs_changed(&mut self, cx: &mut Context<Self>) {
         let registry = codec_registry(cx);
+        if self.codec.is_none()
+            && let Some(wanted) = self.wanted_codec.clone()
+            && registry.contains(&wanted)
+        {
+            tracing::info!(port = %self.port, codec = %wanted, "the plugin was installed");
+            self.set_codec(Some(&wanted), cx);
+            return;
+        }
         let Some(codec) = &self.codec else {
             return;
         };
@@ -2429,7 +2518,12 @@ impl SessionView {
             });
         }
         if options.codec != old.codec {
-            self.set_codec(options.codec.as_deref(), cx);
+            match options.codec.as_deref() {
+                Some(name) => self.want_codec(name, cx),
+                None => {
+                    self.set_codec(None, cx);
+                }
+            }
         }
         let (new, old) = (options.display, old.display);
         if new.decoded_inline != old.decoded_inline {
@@ -3242,8 +3336,9 @@ impl SessionView {
     }
 
     /// The widths of the toolbar's labelled controls: as last drawn with the same label,
-    /// else estimated from the label's length (the first frame, a new label).
-    fn toolbar_metrics(&self, codecs: usize, window: &Window) -> ToolbarMetrics {
+    /// else estimated from the label's length (the first frame, a new label). The codec
+    /// menu has one only when `codec_menu` (see [`ToolState::shows_codec_menu`]).
+    fn toolbar_metrics(&self, codec_menu: bool, window: &Window) -> ToolbarMetrics {
         // Button labels are small text; a character is a little over half its size.
         let char_width = f32::from(window.rem_size()) * 0.875 * 0.6;
         let text = |text: &str| text.chars().count() as f32 * char_width;
@@ -3262,7 +3357,7 @@ impl SessionView {
                 .tool_widths
                 .mode
                 .unwrap_or_else(|| text("Command") + text("Inline") + 34.),
-            codec: (codecs > 1).then(|| {
+            codec: codec_menu.then(|| {
                 measured(&self.tool_widths.codec, &codec)
                     .unwrap_or_else(|| (text(&codec) + 44.).min(f32::from(CODEC_MAX_WIDTH)))
             }),
@@ -3322,6 +3417,10 @@ impl SessionView {
             hide_framed: self.hide_framed,
             codec: self.codec_name().unwrap_or(NO_CODEC).to_owned(),
             codecs: codec_choices(cx),
+            examples: plugin_files::examples_to_install(cx)
+                .into_iter()
+                .map(|example| (example.name.to_owned(), example.title.to_owned()))
+                .collect(),
         }
     }
 
@@ -3338,7 +3437,7 @@ impl SessionView {
 
     fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let state = self.tool_state(cx);
-        let metrics = self.toolbar_metrics(state.codecs.len(), window);
+        let metrics = self.toolbar_metrics(state.shows_codec_menu(), window);
         let available = self
             .width_hint
             .or(self.measured_width)
@@ -3625,7 +3724,9 @@ impl SessionView {
                         button.text_color(cx.theme().muted_foreground)
                     })
                     .tooltip("Codec: decode the stream into frames")
-                    .dropdown_menu(move |menu, _, _| codec_items(menu, &menu_state, &menu_view));
+                    .dropdown_menu(move |menu, window, cx| {
+                        codec_items(menu, &menu_state, &menu_view, window, cx)
+                    });
                 div()
                     .flex_none()
                     .child(button)
@@ -3693,6 +3794,18 @@ struct ToolState {
     codec: String,
     /// What the codec menu lists: [`NO_CODEC`] first.
     codecs: Vec<String>,
+    /// The bundled example plugins not installed, as (folder name, title).
+    examples: Vec<(String, String)>,
+}
+
+impl ToolState {
+    /// Whether the toolbar has a codec menu: while a plugin is installed and loaded, or
+    /// while the session decodes (with a plugin since removed), so it can be turned off.
+    /// With no plugin the toolbar shows nothing about codecs; the command palette offers
+    /// the examples.
+    fn shows_codec_menu(&self) -> bool {
+        self.codecs.len() > 1 || self.decoding
+    }
 }
 
 /// A menu item's click, run on the session view.
@@ -3734,8 +3847,15 @@ fn export_items(menu: PopupMenu, decoding: bool, view: &WeakEntity<SessionView>)
         )
 }
 
-/// The codec menu: the codecs to decode with, and what decoding does to the scrollback.
-fn codec_items(menu: PopupMenu, state: &ToolState, view: &WeakEntity<SessionView>) -> PopupMenu {
+/// The codec menu: the codecs to decode with, what decoding does to the scrollback, the
+/// bundled example plugins not installed yet, and the plugins folder.
+fn codec_items(
+    menu: PopupMenu,
+    state: &ToolState,
+    view: &WeakEntity<SessionView>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
     let mut menu = menu.min_w(px(220.)).label("Decode with");
     for codec in &state.codecs {
         let name = codec.clone();
@@ -3750,7 +3870,8 @@ fn codec_items(menu: PopupMenu, state: &ToolState, view: &WeakEntity<SessionView
         );
     }
     let (decoded_inline, hide_framed) = (state.decoded_inline, state.hide_framed);
-    menu.separator()
+    let mut menu = menu
+        .separator()
         .item(
             PopupMenuItem::new("Summaries in the scrollback")
                 .checked(decoded_inline)
@@ -3767,6 +3888,39 @@ fn codec_items(menu: PopupMenu, state: &ToolState, view: &WeakEntity<SessionView
                     view.set_hide_framed_bytes(!hide_framed, cx)
                 })),
         )
+        .separator();
+    if !state.examples.is_empty() {
+        let (examples, view) = (state.examples.clone(), view.clone());
+        menu = menu.submenu(INSTALL_EXAMPLE_MENU, window, cx, move |menu, _, _| {
+            example_items(menu, &examples, &view)
+        });
+    }
+    menu.item(
+        PopupMenuItem::new("Open plugins folder")
+            .icon(IconName::FolderOpen)
+            .on_click(|_, _, cx| plugin_files::open_plugins_folder(cx)),
+    )
+}
+
+/// The codec menu's submenu of the bundled example plugins not installed yet.
+pub const INSTALL_EXAMPLE_MENU: &str = "Install example plugin\u{2026}";
+
+/// One item per example plugin, `(folder name, title)`, that installs it.
+fn example_items(
+    menu: PopupMenu,
+    examples: &[(String, String)],
+    view: &WeakEntity<SessionView>,
+) -> PopupMenu {
+    examples
+        .iter()
+        .fold(menu.min_w(px(200.)), |menu, (name, title)| {
+            let name = name.clone();
+            menu.item(
+                PopupMenuItem::new(title.clone()).on_click(on_view(view, move |view, _, cx| {
+                    view.install_example_plugin(&name, cx)
+                })),
+            )
+        })
 }
 
 /// The overflow menu: the toolbar's controls that did not fit, by group.
@@ -3859,8 +4013,8 @@ fn overflow_menu(
             }
             ToolbarItem::Codec => {
                 let (state, view) = (state.clone(), view.clone());
-                menu.submenu("Codec", window, cx, move |menu, _, _| {
-                    codec_items(menu, &state, &view)
+                menu.submenu("Codec", window, cx, move |menu, window, cx| {
+                    codec_items(menu, &state, &view, window, cx)
                 })
             }
         };

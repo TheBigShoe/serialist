@@ -86,7 +86,9 @@ mod tests {
 
     #[test]
     fn saved_command_payloads_encode_through_the_registry() {
-        let registry = crate::builtin_registry();
+        let mut registry = CodecRegistry::new();
+        registry.register(crate::AirohaRace::factory());
+        registry.register(crate::TextLines::factory());
         // The command defaults to the codec's first, `race`.
         assert_eq!(
             registry.encode_payload("airoha-race", &fields(json!({ "cmd_id": "0x0F15" }))),

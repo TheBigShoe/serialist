@@ -85,12 +85,13 @@ use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    CommandRef, ParamValues, PortId, PortInfo, PortKind, PortSource, SerialConfig, StoreConfig,
-    TransportError, TransportFactory,
+    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource, SerialConfig,
+    StoreConfig, TransportError, TransportFactory,
 };
 use serialist_script::ScriptSource;
 
 use crate::actions::command_palette::Toggle as ToggleCommandPalette;
+use crate::actions::plugins::InstallExamplePlugin;
 use crate::actions::scripts::{ClearConsole, Run as RunScript, RunInline, Stop as StopScript};
 use crate::actions::tabs::{
     ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5, ActivateTab6,
@@ -98,6 +99,7 @@ use crate::actions::tabs::{
 };
 use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
 use crate::chrome;
+use crate::codecs::codec_not_installed;
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
 use crate::config::{self, Config};
 use crate::decoded_panel::DecodedPanel;
@@ -109,6 +111,7 @@ use crate::history::PersistentHistory;
 use crate::inline::Mode;
 use crate::palette::{self, CommandPalette, PaletteEvent, PaletteTarget};
 use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
+use crate::plugin_files;
 use crate::port_settings::PortSettings;
 use crate::prelude::*;
 use crate::script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, inline_source};
@@ -118,7 +121,7 @@ use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 use crate::session_options::SessionOptions;
 use crate::session_state::{STATE_VERSION, SavedTab, SessionState, state_path};
 use crate::session_view::{SessionView, SessionViewEvent};
-use crate::status::{ConnectionState, Notice, StatusLine};
+use crate::status::{ConnectionState, Notice, NoticeAction, StatusLine};
 use crate::tabs::{TabId, TabLabel, TabState, TabStatus};
 
 /// The widest a tab grows; longer names are cut with an ellipsis.
@@ -1284,7 +1287,7 @@ impl Workspace {
             }
             if let Some(restore) = &restore {
                 if let Some(codec) = &restore.codec {
-                    view.set_codec(Some(codec), cx);
+                    view.want_codec(codec, cx);
                 }
                 view.set_mode(restore.mode, window, cx);
             }
@@ -1485,6 +1488,20 @@ impl Workspace {
             let script = script.to_path_buf();
             let origin = format!("command {}", command.name);
             self.run_script_path(&script, &origin, window, cx);
+            return;
+        }
+        // A codec payload whose plugin is not installed cannot be sent: say so before
+        // asking for its parameters.
+        if let Payload::Codec { codec, .. } = &command.payload
+            && !cx
+                .try_global::<Config>()
+                .is_some_and(|config| config.codec_registry().contains(codec))
+        {
+            let notice = plugin_files::missing_plugin_notice(
+                format!("{}: {}", command.name, codec_not_installed(codec)),
+                codec,
+            );
+            session.update(cx, |view, cx| view.set_notice(notice, cx));
             return;
         }
         if command.params.is_empty() {
@@ -1838,6 +1855,31 @@ impl Workspace {
         self.toggle_palette(window, cx);
     }
 
+    fn install_example_plugin_action(
+        &mut self,
+        action: &InstallExamplePlugin,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.install_example_plugin(&action.name, cx);
+    }
+
+    /// Install the bundled example plugin `name` (the watcher then loads it), and say
+    /// how it went in the active session's status line, or the Devices panel without one.
+    pub fn install_example_plugin(&mut self, name: &str, cx: &mut Context<Self>) {
+        match self.session().cloned() {
+            Some(session) => {
+                session.update(cx, |view, cx| view.install_example_plugin(name, cx));
+            }
+            None => {
+                let notice = plugin_files::install_example(name, cx);
+                self.devices.update(cx, |devices, cx| {
+                    devices.set_notice(Some(notice.text.into()), cx)
+                });
+            }
+        }
+    }
+
     fn new_tab_action(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         self.new_tab(window, cx);
     }
@@ -2127,14 +2169,27 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Whether the right rail has the Decoded panel's icon: while a codec plugin is
+    /// installed, while the active session decodes, or while the panel is open (so it
+    /// can be closed). With no plugin installed nothing on screen is about codecs.
+    pub fn has_decoded_rail(&self, cx: &App) -> bool {
+        plugin_files::has_codecs(cx)
+            || self.docks.is_open(DockPanel::Decoded)
+            || self
+                .session()
+                .is_some_and(|session| session.read(cx).codec().is_some())
+    }
+
     /// A dock's rail: an icon per panel, pressed while the panel shows.
     fn render_rail(&self, side: DockSide, cx: &mut Context<Self>) -> Div {
+        let decoded = self.has_decoded_rail(cx);
         let theme = cx.theme();
         let (border, background) = (theme.border, theme.sidebar);
         let expanded = self.docks.is_expanded(side);
         let panels = DockPanel::ALL
             .into_iter()
             .filter(|panel| panel.side() == side)
+            .filter(|panel| *panel != DockPanel::Decoded || decoded)
             .map(|panel| {
                 let shown = self.docks.is_shown(panel);
                 chrome::toggle_button(panel.rail_id(), rail_icon(panel), shown, cx)
@@ -2340,7 +2395,13 @@ impl Workspace {
                 }
             });
 
-        // The newest notice, cut to fit, all of it in the tooltip.
+        // The newest notice, cut to fit, all of it in the tooltip, and its button (such
+        // as Install for a plugin a device profile names but that is not installed).
+        let notice_action = status
+            .notice
+            .as_ref()
+            .and_then(|notice| notice.action.clone())
+            .map(|action| notice_action_button(action, session.downgrade()));
         let notice = status.notice.clone().map(|notice| {
             let color = if notice.is_error {
                 danger
@@ -2460,7 +2521,9 @@ impl Workspace {
                     .flex_1()
                     .min_w_0()
                     .gap_2()
+                    .items_center()
                     .children(notice)
+                    .children(notice_action)
                     .children(config_notice),
             )
             .children(script)
@@ -2496,6 +2559,27 @@ fn status_notice(id: &'static str, text: String, color: Hsla) -> Stateful<Div> {
         .text_color(color)
         .child(text)
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+}
+
+/// The button after a notice that offers a way out, which runs on `session`.
+fn notice_action_button(action: NoticeAction, session: WeakEntity<SessionView>) -> Button {
+    let tooltip = match &action {
+        NoticeAction::InstallExamplePlugin(name) => {
+            format!("Install the bundled {name} example plugin into the plugins folder")
+        }
+        NoticeAction::OpenPluginsFolder => "Open the plugins folder".to_owned(),
+    };
+    Button::new("status-notice-action")
+        .label(action.label())
+        .xsmall()
+        .ghost()
+        .flex_none()
+        .tooltip(tooltip)
+        .on_click(move |_, _, cx| {
+            session
+                .update(cx, |view, cx| view.run_notice_action(&action, cx))
+                .ok();
+        })
 }
 
 /// The icon of a panel on its rail.
@@ -2587,6 +2671,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
             .on_action(cx.listener(Self::toggle_command_palette))
+            .on_action(cx.listener(Self::install_example_plugin_action))
             .on_action(cx.listener(|this, _: &ActivateTab1, window, cx| {
                 this.activate_index(0, window, cx);
             }))

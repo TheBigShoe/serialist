@@ -7,7 +7,9 @@
 // Text payloads take the escapes \r \n \t \0 \\ \xNN and {{param}} placeholders. Without
 // an "eol" key a text command ends with the session's line ending; hex commands send
 // exactly the bytes written. A "codec" payload is encoded by the codec plugin it names,
-// and its "expect" can wait for a decoded frame instead of a line.
+// and its "expect" can wait for a decoded frame instead of a line. The RACE group needs
+// the airoha-race plugin: install the example from the command palette ("Install example
+// plugin: Airoha RACE") and pick it in the session's codec menu.
 {
   "name": "AT basics",
   "groups": [
@@ -61,13 +63,13 @@
       "commands": [
         {
           "name": "RACE version",
-          "description": "Ask an Airoha RACE device (try virtual:race) for its version; the response frame answers.",
+          "description": "Ask an Airoha RACE device (try virtual:race) for its version; the response frame answers. Needs the airoha-race plugin.",
           "payload": { "codec": "airoha-race", "fields": { "command": "race_version" } },
           "expect": { "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 1000 },
         },
         {
           "name": "RACE command",
-          "description": "Any RACE command by id, encoded by the airoha-race codec; waits for the response with that id.",
+          "description": "Any RACE command by id, encoded by the airoha-race plugin; waits for the response with that id.",
           "payload": { "codec": "airoha-race", "fields": { "cmd_id": "{{id}}" } },
           "expect": { "frame": { "kind": "response", "cmd_id": "{{id}}" }, "timeout_ms": 1000 },
           "params": [
