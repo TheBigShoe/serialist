@@ -954,9 +954,14 @@ impl Render for DecodedPanel {
             .frames
             .as_ref()
             .is_some_and(|frames| !frames.is_empty());
+        let has_codecs = crate::plugin_files::has_codecs(cx);
         let theme = cx.theme();
         let body = if self.codec.is_none() && !has_frames {
-            let message = if self.session.is_some() {
+            let message = if !has_codecs {
+                "No codec plugin is installed. Decoders are plugins in the plugins folder; \
+                 install the bundled example from the command palette (\"Install example \
+                 plugin: Airoha RACE\")."
+            } else if self.session.is_some() {
                 "No codec decodes this session. Pick one from the codec menu in the session's \
                  toolbar, or name one as a device profile's \"plugin\"."
             } else {

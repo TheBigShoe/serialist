@@ -1,7 +1,10 @@
 //! Codecs, the Decoded panel, codec-encoded saved commands, plugin reload, hidden frames
 //! and decoded export against the real engine: `Session` and ingest threads over a
 //! `SimWorld` link to the simulated Airoha RACE device, with the configuration (device
-//! profiles, plugins) in a temporary config directory loaded by the real loaders.
+//! profiles, plugins) in a temporary config directory loaded by the real loaders. The app
+//! ships with no codec active, so each config directory gets the example RACE plugin
+//! installed first, as the "Install example plugin" action would; the tests of a fresh
+//! configuration without it are in `plugin_tests`.
 
 use std::fs;
 
@@ -22,8 +25,8 @@ use crate::prelude::*;
 use crate::session_view::SessionView;
 use crate::terminal::TimestampMode;
 use crate::test_support::{
-    TestDir, allow_engine_threads, displayed, open_test_window, parse_csv, run_until,
-    wait_connected,
+    TestDir, allow_engine_threads, displayed, install_example_plugin, open_test_window, parse_csv,
+    run_until, wait_connected,
 };
 use crate::workspace::{AppOptions, Workspace};
 
@@ -44,10 +47,12 @@ fn race_profile(plugin: &str) -> String {
     )
 }
 
-/// A config directory with `settings` as its settings file.
+/// A config directory with `settings` as its settings file and the example RACE plugin
+/// installed (as `plugins/airoha-race/`).
 fn config_dir(name: &str, settings: &str) -> TestDir {
     let dir = TestDir::new(name);
     fs::write(dir.join("settings.json"), settings).unwrap();
+    install_example_plugin(&ConfigPaths::new(dir.path()), "airoha-race");
     dir
 }
 
@@ -296,13 +301,10 @@ fn a_lua_plugin_decodes_the_same_and_reloads_when_saved(cx: &mut TestAppContext)
         _world,
         ..
     } = open(cx, &dir, true);
-    // The plugin is registered under its folder, beside the built-in.
+    // The plugin is registered under its folder, beside the installed example.
     let choices = cx.update(|cx| cx.global::<Config>().codecs().choices());
-    assert_eq!(
-        choices,
-        ["none", "airoha-race", "airoha-race-lua", "text-lines"]
-    );
-    wait_frames(cx, &workspace, "a log from the Rust codec", |frames| {
+    assert_eq!(choices, ["none", "airoha-race", "airoha-race-lua"]);
+    wait_frames(cx, &workspace, "a log from the example plugin", |frames| {
         frames.iter().any(is_log)
     });
 
@@ -848,6 +850,11 @@ fn a_device_profile_selects_the_codec_on_connect_and_the_devices_panel_names_it(
         )
     });
     assert_eq!(plugin.as_deref(), Some("airoha-race"));
+    assert!(
+        devices.read_with(cx, |devices, cx| devices
+            .plugin_installed("airoha-race", cx)),
+        "installed, so not greyed"
+    );
     assert_eq!(name, "RACE board");
     // The badge is drawn on the port's row.
     let badge = cx

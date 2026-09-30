@@ -14,7 +14,7 @@ use serialist_core::{
     FrameStoreReader, Ingest, IngestHandle, SerialConfig, Session, SessionConfig, Store, Value,
 };
 use serialist_plugins::race::AirohaRace;
-use serialist_plugins::{LuaCodecFactory, LuaLimits, builtin_registry, bundled_race_lua};
+use serialist_plugins::{LuaCodecFactory, LuaLimits, bundled_race_lua};
 use serialist_sim::{LinkConfig, RaceDevice, SimWorld, virtual_port_id};
 
 use common::lua_race;
@@ -159,8 +159,7 @@ fn talk_to_the_device(factory: Arc<dyn CodecFactory>, mut encoder: Box<dyn Codec
 
 #[test]
 fn the_rust_codec_talks_to_the_simulated_device() {
-    let factory = builtin_registry().get("airoha-race").unwrap();
-    talk_to_the_device(factory, Box::new(AirohaRace::new()));
+    talk_to_the_device(AirohaRace::factory(), Box::new(AirohaRace::new()));
 }
 
 #[test]

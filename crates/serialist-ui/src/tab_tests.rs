@@ -22,8 +22,8 @@ use crate::session_state::{SavedMode, SessionState, state_path};
 use crate::session_view::{HOUSEKEEPING, SessionView};
 use crate::tabs::{TabLabel, TabState};
 use crate::test_support::{
-    TestDir, allow_engine_threads, displayed, has_rx_line, open_test_window, run_until, step,
-    type_line, wait_for_received,
+    TestDir, allow_engine_threads, displayed, has_rx_line, install_example_plugin,
+    open_test_window, run_until, step, type_line, wait_for_received,
 };
 use crate::workspace::{AppOptions, Workspace};
 
@@ -569,6 +569,8 @@ fn world_with_adapter() -> SimWorld {
 #[gpui_test]
 fn the_open_tabs_come_back_at_the_next_start(cx: &mut TestAppContext) {
     let dir = TestDir::new("tab-restore");
+    // The RACE tab decodes, so the example plugin is installed.
+    install_example_plugin(&ConfigPaths::new(dir.path()), "airoha-race");
     let world = world_with_adapter();
     let (window, workspace) = open_tabs(cx, &world, Some(&dir), &["virtual:at", "virtual:race"]);
     wait_tab(cx, &workspace, "virtual:at");

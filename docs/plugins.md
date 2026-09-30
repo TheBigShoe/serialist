@@ -2,35 +2,76 @@
 
 A Serialist plugin is a **codec**: it turns the bytes a device sends into structured
 frames (a kind, named fields, a severity, a one-line summary, and the bytes the frame came
-from), and it turns a structured command into the bytes to send. Airoha RACE is the
-reference plugin and ships in three forms.
+from), and it turns a structured command into the bytes to send. **Decoders are plugins
+the user installs and enables: the app has none built in, and none is active in a fresh
+config directory.** Airoha RACE is the example plugin; the app bundles it without enabling
+it (see "Installing plugins" below).
 
-There are three ways to write a codec, all behind one Rust trait, `serialist_core::Codec`:
+There are two ways to write a codec, both behind one Rust trait, `serialist_core::Codec`:
 
 | Tier | You write | It lives in | Needs |
 |---|---|---|---|
-| Built-in Rust | Rust, inside `serialist-plugins` | compiled in: `text-lines` and `airoha-race` | nothing |
 | 1. Lua | `plugin.lua` returning `describe`, `decode` and `encode` | `plugins/<name>/plugin.lua` | nothing |
 | 2. WebAssembly | a component exporting the `serialist:codec/plugin` world, with a `plugin.toml` | `plugins/<name>/plugin.wasm` and `plugin.toml` | the `wasm` feature |
 
 `plugins/` is a folder in the config directory (`~/.config/serialist` on macOS and Linux,
-`%APPDATA%\Serialist` on Windows). Each plugin is a folder directly under it. A folder with
-a `plugin.lua` is a Lua plugin (even if it also has a `plugin.wasm`); otherwise a folder
-with a `plugin.wasm` is a WebAssembly plugin. The app registers a plugin under its
-folder's name, so `plugins/airoha-race/` replaces the built-in `airoha-race` codec and
-`plugins/airoha-race-lua/` is listed beside it. (The library function
-`serialist_plugins::load_plugins` registers under the name `describe` returns instead.)
-WebAssembly folders load only in a build with the `wasm` feature
+`%APPDATA%\Serialist` on Windows; `--config-dir` or `SERIALIST_CONFIG_DIR` moves it). Each
+plugin is a folder directly under it. A folder with a `plugin.lua` is a Lua plugin (even if
+it also has a `plugin.wasm`); otherwise a folder with a `plugin.wasm` is a WebAssembly
+plugin. The app registers a plugin under its folder's name, so `plugins/airoha-race/` is
+the codec `airoha-race` and a copy in `plugins/airoha-race-lua/` is listed beside it.
+(The library function `serialist_plugins::load_plugins` registers under the name
+`describe` returns instead.) `plugins/examples/` is not a plugin: it holds copies of the
+bundled examples. WebAssembly folders load only in a build with the `wasm` feature
 (`cargo build -p serialist --features wasm`); otherwise the folder is reported as needing it.
 
+`serialist-plugins` also has the RACE codec in Rust (`AirohaRace`) and a line codec
+(`TextLines`). They are references for the conformance tests and benchmarks, public so the
+app's tests can use them too, and never registered: no registry the app builds contains
+them.
+
 > **Status.** The plugin machinery and the app's use of it are in the tree and tested: the
-> `Codec` trait, the frame store and the ingest-thread sink in `serialist-core`; the Rust,
-> Lua and WebAssembly adapters, plugin folder discovery and codec-payload encoding in
-> `serialist-plugins`; the guest crate `serialist-plugin-sdk`; and in `serialist-ui` the
-> `plugins/` folder (loaded at startup, reloaded on save), a device profile's `plugin`, the
-> session toolbar's codec menu, the Decoded panel, summaries and hidden frames in the
-> terminal, codec payloads and frame predicates in saved commands, and CSV and JSON export
-> of decoded frames. "Using plugins in the app" below describes that UI.
+> `Codec` trait, the frame store and the ingest-thread sink in `serialist-core`; the Lua
+> and WebAssembly adapters, plugin folder discovery, the bundled examples and
+> codec-payload encoding in `serialist-plugins`; the guest crate `serialist-plugin-sdk`;
+> and in `serialist-ui` the `plugins/` folder (loaded at startup, reloaded on save),
+> installing the examples, a device profile's `plugin`, the session toolbar's codec menu,
+> the Decoded panel, summaries and hidden frames in the terminal, codec payloads and frame
+> predicates in saved commands, and CSV and JSON export of decoded frames. "Installing
+> plugins" and "Using plugins in the app" below describe that UI.
+
+## Installing plugins
+
+A fresh config directory has no plugins, so the app has no codec: the session toolbar
+shows no codec menu and the right dock's rail no Decoded icon. Everything about codecs
+appears once a plugin is installed.
+
+**Installing the bundled example.** The app bundles the Airoha RACE plugin as
+`airoha-race` (Lua, `crates/serialist-plugins/assets/plugins/airoha-race/plugin.lua`), and,
+in a build with the `wasm` feature, as `airoha-race-wasm` (the WebAssembly build of
+`examples/plugins/airoha-race-wasm`). To enable one:
+
+- the command palette (`cmd-shift-p`, `ctrl-shift-p` elsewhere) lists "Install example
+  plugin: Airoha RACE" for each bundled example not installed yet;
+- the codec menu has an "Install example plugin…" submenu with the same list, once some
+  plugin is installed;
+- a status-line notice about a missing example plugin has an Install button.
+
+Installing copies the example's folder into `plugins/<name>/` (staged and renamed into
+place, so a reload never sees it half written), and the config watcher loads it like any
+other plugin: the codec menu and the Decoded icon appear, and a session whose device
+profile named the plugin starts decoding with it. An installed example is yours to edit;
+it is not offered again while its folder exists, and installing never overwrites a folder.
+A keymap can bind one: `["plugins::InstallExamplePlugin", { "name": "airoha-race" }]`.
+
+**Opening the folder.** "Open plugins folder" (`plugins::OpenPluginsFolder`, in the palette,
+the codec menu and the Serialist menu) creates `plugins/` if needed, writes copies of the
+bundled examples into `plugins/examples/` (a folder there is left alone once it exists),
+and opens it. The copies there decode nothing; copying one up into `plugins/` enables it,
+exactly as the install action does.
+
+**A plugin of your own** is a folder you make or copy into `plugins/`; it loads when the
+watcher sees it, and saving a file in it reloads it.
 
 ## What a codec does
 
@@ -216,7 +257,7 @@ Any language that can build a component for that world will do. In Rust, use the
 **The Rust SDK.** `serialist-plugin-sdk` wraps the generated bindings in a `Plugin` trait
 (`new`, `describe`, `decode`, `encode`, and an optional `reset`), frame builders, request
 helpers (`Request::uint`, `bytes`, `str` and `check_fields`, which follow the conventions
-of the built-in codecs: integers as numbers or hex strings, bytes as hex text or a list),
+of the reference codecs: integers as numbers or hex strings, bytes as hex text or a list),
 `hex`, and `log`. `export_plugin!` exports your type as the component's world; it expands
 to nothing on other targets, so the crate also builds and unit-tests natively.
 
@@ -358,8 +399,8 @@ compiled once per plugin and kept in memory; each codec is a new instance of it,
 costs microseconds. Compiled code is not cached on disk. Loading, linking and describing
 the reference plugin takes about 60 ms in a release build.
 
-Nothing in this tree forwards the feature from the app binary, so how an app build turns
-the WebAssembly tier on is not settled here.
+The app forwards the feature: `cargo build -p serialist --features wasm` loads
+`plugin.wasm` folders and bundles the WebAssembly RACE example as `airoha-race-wasm`.
 
 ## The Airoha RACE reference plugin
 
@@ -384,22 +425,30 @@ codec (`crates/serialist-plugins/src/race.rs`), the Lua plugin and the WebAssemb
 must agree byte for byte: the same description, the same frames for every way a capture is
 cut into chunks, and the same bytes or error for every encode request.
 `crates/serialist-plugins/tests/conformance.rs` checks all three (the WebAssembly one with
-the `wasm` feature). The simulated device `serialist --virtual race` sends RACE frames mixed
-with text.
+the `wasm` feature). The Lua and WebAssembly ones are the bundled examples; the Rust one is
+the reference they are held to and is never registered in the app. The simulated device
+`serialist --virtual race` sends RACE frames mixed with text; with the example installed,
+pick `airoha-race` in its codec menu to decode them.
 
-The built-in `text-lines` codec is the simplest: one `line` frame per received line, and one
+The reference `TextLines` codec is the simplest: one `line` frame per received line, and one
 command, `line`, which sends `text` and a line ending (`eol`: `crlf` by default, `lf`, `cr`
-or `none`).
+or `none`). Like `AirohaRace`, it is for tests and is not registered in the app.
 
 ## Using plugins in the app
 
-- **Activating a codec.** A device profile in `settings.json` names one, and a session on a
-  matching port decodes with it from its first byte:
+- **Activating a codec.** A device profile in `settings.json` names one by its folder
+  name, and a session on a matching port decodes with it from its first byte if that
+  plugin is installed:
   `{ "match": { "vid": "0x0e8d", "product": "Airoha" }, "baud": 921600, "plugin": "airoha-race", "eol": "crlf" }`.
-  The Devices panel shows the profile's plugin as a badge on the port's row. The session
-  toolbar's codec menu lists `none`, the built-ins and the loaded plugins; picking one
-  switches at the next received chunk, and the frames decoded so far stay. The status bar
-  shows the codec's name in a chip, and the Decoded panel opens.
+  If it is not installed, the port connects without a codec, the status line says "The
+  airoha-race plugin is not installed; connected without a codec" with an Install button
+  (Open plugins folder for a plugin the app has no example of), and the session starts
+  decoding with it once it is installed, unless a codec was picked meanwhile. A restored
+  tab's codec works the same way. The Devices panel shows the profile's plugin as a badge
+  on the port's row, greyed with a tooltip while the plugin is not installed. The session
+  toolbar's codec menu (shown while a plugin is installed) lists `none` and the installed
+  plugins; picking one switches at the next received chunk, and the frames decoded so far
+  stay. The status bar shows the codec's name in a chip, and the Decoded panel opens.
 - **The Decoded panel** is a table in the right dock (above the Script console) of the
   session's frames: time (stamped like the terminal's gutter), direction, kind, summary,
   fields and raw hex. The kind filter lists the codec's kinds and shows the chosen kind's
@@ -428,11 +477,16 @@ or `none`).
   becomes a number, a `hex16` the text `0xNNNN`). The app encodes through
   `serialist_plugins::encode_payload` (a fresh codec instance, so a session's decoding
   state is never disturbed), sends no line ending unless the command sets `eol`, and
-  echoes the bytes as hex. `Command::encode` in `serialist-core` still returns
-  `PayloadError::CodecUnavailable` for a codec payload, since that crate knows no codecs.
+  echoes the bytes as hex. A command whose codec is not installed is not sent: the status
+  line says "RACE version: Install the airoha-race plugin to send this command" (with an
+  Install button for a bundled example), before any parameter prompt. `Command::encode` in
+  `serialist-core` still returns `PayloadError::CodecUnavailable` for a codec payload,
+  since that crate knows no codecs.
 - **Frame predicates.** A saved command's `expect` can be
   `{ "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 1000 }`. While a
   codec decodes the session, sending waits for the first frame after the send whose kind
   and listed fields equal the predicate (integers match JSON numbers or hex text, bytes
-  match hex text), with the same `OK in N ms` and timeout reporting as a `pattern`. The
-  bundled example collection has a RACE group with such commands for `virtual:race`.
+  match hex text), with the same `OK in N ms` and timeout reporting as a `pattern`. A
+  command sent while no codec decodes says its reply cannot be waited for (and that no
+  codec plugin is installed, when none is). The bundled example collection has a RACE group
+  with such commands for `virtual:race`; they need the `airoha-race` plugin.
