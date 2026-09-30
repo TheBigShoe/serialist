@@ -169,6 +169,13 @@ fn the_lua_codec_talks_to_the_simulated_device() {
     talk_to_the_device(factory, Box::new(lua_race()));
 }
 
+#[cfg(feature = "wasm")]
+#[test]
+fn the_wasm_codec_talks_to_the_simulated_device() {
+    let factory = Arc::new(common::wasm_race_factory());
+    talk_to_the_device(factory, Box::new(common::wasm_race()));
+}
+
 /// The plugin file on disk, the built-in `virtual:race` device, and a codec made on the
 /// ingest thread by a `LuaCodecFactory`: the path the app takes.
 #[test]

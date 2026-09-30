@@ -30,6 +30,16 @@ deny:
     cargo deny --all-features check licenses bans
     -cargo deny --all-features check advisories
 
+# The plugin crate with the WebAssembly tier (wasmtime; a long first build).
+test-wasm:
+    cargo test -p serialist-plugins --features wasm --locked
+
+# Rebuild the WebAssembly plugins (examples/plugins, the adapter's test plugin) and
+# refresh the copies under serialist-plugins/tests/fixtures that the tests load. Needs
+# `rustup target add wasm32-wasip2`.
+wasm-fixtures:
+    SERIALIST_BLESS_WASM=1 cargo test -p serialist-plugins --features wasm --locked --test wasm_plugin the_committed_plugins_match_their_sources
+
 # Everything the CI test job runs.
 ci: fmt-check lint test
 

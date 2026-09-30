@@ -1,0 +1,6 @@
+# The manifest next to plugin.wasm. `name` and `version` must match what the plugin's
+# describe() returns; `api` is the WIT version it was built against (wit/v1).
+name = "airoha-race"
+version = "1.0.0"
+api = "1"
+description = "Airoha RACE: 0x05-framed commands, responses, indications and logs, with the text between frames"

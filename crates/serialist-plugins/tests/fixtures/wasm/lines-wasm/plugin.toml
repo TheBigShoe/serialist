@@ -1,0 +1,4 @@
+name = "lines"
+version = "0.1.0"
+api = "1"
+description = "One frame per line; some lines make it misbehave"
