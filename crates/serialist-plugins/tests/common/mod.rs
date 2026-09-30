@@ -34,6 +34,35 @@ pub fn lua_race() -> LuaCodec {
         .expect("the bundled plugin loads")
 }
 
+/// The committed build of the WebAssembly RACE plugin
+/// (`examples/plugins/airoha-race-wasm`), compiled once per test binary.
+#[cfg(feature = "wasm")]
+pub fn wasm_race_factory() -> serialist_plugins::WasmCodecFactory {
+    use std::sync::OnceLock;
+    static FACTORY: OnceLock<serialist_plugins::WasmCodecFactory> = OnceLock::new();
+    FACTORY
+        .get_or_init(|| {
+            serialist_plugins::WasmCodecFactory::load_dir(
+                fixtures().join("plugins/airoha-race-wasm"),
+            )
+            .expect("the committed RACE plugin loads")
+        })
+        .clone()
+}
+
+/// The WebAssembly RACE plugin, instantiated fresh.
+#[cfg(feature = "wasm")]
+pub fn wasm_race() -> serialist_plugins::WasmCodec {
+    wasm_race_factory()
+        .create_wasm()
+        .expect("the committed RACE plugin instantiates")
+}
+
+/// `tests/fixtures`.
+pub fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
 /// Frames with every arrival time set to `t0`, for comparing differently cut streams.
 pub fn timeless(frames: &[Frame], t0: Instant) -> Vec<Frame> {
     frames
