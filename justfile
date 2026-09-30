@@ -43,6 +43,12 @@ wasm-fixtures:
 # Everything the CI test job runs.
 ci: fmt-check lint test
 
+# Render the real workspace offscreen with Metal in ten states (macOS only) and write
+# PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
+screenshots *names:
+    cargo run -p serialist-ui --example screenshots --locked -- --out target/screenshots {{names}}
+    @ls -lh target/screenshots/*.png
+
 # Release packaging. These run packaging/package.sh (bash; Git Bash on Windows), the same
 # script .github/workflows/release.yml calls. Each builds the release binary first and
 # writes to dist/. None of them cross-compile: run the one for the machine you are on.
