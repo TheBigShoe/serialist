@@ -34,7 +34,7 @@ pub struct WasmLimits {
 
 impl WasmLimits {
     pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
-    /// Generous: the reference RACE plugin decodes a 64 KiB chunk in well under 1 ms.
+    /// Generous: the reference RACE plugin decodes a 64 KiB chunk in about 1 ms (release).
     pub const DEFAULT_TIME_PER_CALL: Duration = Duration::from_millis(50);
     pub const DEFAULT_MAX_HELD_BACK: usize = 1024 * 1024;
     pub const DEFAULT_LOG_LINES_PER_CALL: u32 = 64;
