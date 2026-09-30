@@ -13,6 +13,8 @@ Options:
   --virtual [NAME]    List the simulated devices next to the real ports; with a
                       NAME, also select virtual:<NAME> (repeatable). Built-ins:
                       echo, echo-lines, at, firehose, firehose-ansi
+  --terminal-demo     Open only the milestone 1 terminal element, fed by an
+                      in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help
   -V, --version       Print the version
 
@@ -26,6 +28,8 @@ pub struct Args {
     pub virtual_devices: Vec<String>,
     /// `--virtual` was given at all, with or without a name.
     pub simulator: bool,
+    /// `--terminal-demo`: the terminal element alone, over an in-memory stream.
+    pub terminal_demo: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +67,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Command> 
         match flag.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
+            "--terminal-demo" if inline.is_none() => parsed.terminal_demo = true,
             "--port" => parsed.port = Some(value("--port")?),
             "--baud" => {
                 let text = value("--baud")?;
@@ -103,6 +108,7 @@ mod tests {
             baud: Some(921_600),
             virtual_devices: vec!["echo".into(), "at".into()],
             simulator: true,
+            terminal_demo: false,
         });
         let spaced = run(&[
             "--port",
@@ -149,6 +155,16 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(args.baud, Some(250_000));
+    }
+
+    #[test]
+    fn terminal_demo_flag() {
+        let Command::Run(args) = run(&["--terminal-demo"]).unwrap() else {
+            panic!("expected run");
+        };
+        assert!(args.terminal_demo);
+        assert!(!args.simulator);
+        assert!(run(&["--terminal-demo=yes"]).is_err(), "takes no value");
     }
 
     #[test]
