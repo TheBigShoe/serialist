@@ -12,8 +12,8 @@
 //! view its display defaults, the Devices panel its profiles, the workspace the notice.
 //!
 //! A [`ConfigWatcher`] reports saves; a foreground task drains its channel, reloads the
-//! piece that changed (settings, keymap, themes or saved commands) and installs the
-//! result.
+//! piece that changed (settings, keymap, themes, saved commands or the list of scripts)
+//! and installs the result.
 //!
 //! Saved commands ([`CommandStore`]) live here too, because their keybindings are part
 //! of the key bindings: every install that changes the keymap or the commands rebinds,
@@ -48,6 +48,7 @@ use crate::fonts::{
 use crate::inline::InlineConfig;
 use crate::keymap;
 use crate::prelude::*;
+use crate::script_files::{ScriptEntry, list_scripts};
 use crate::status::Notice;
 use crate::terminal::TerminalPalette;
 use crate::theme_bridge::{self, ZedColors};
@@ -109,6 +110,8 @@ pub enum ConfigPiece {
     Fonts,
     /// Saved-command collections in `commands/` and the project commands file.
     Commands,
+    /// The Lua scripts in `scripts/`.
+    Scripts,
 }
 
 impl fmt::Display for ConfigPiece {
@@ -121,6 +124,7 @@ impl fmt::Display for ConfigPiece {
             ConfigPiece::Bindings => "bindings",
             ConfigPiece::Fonts => "fonts",
             ConfigPiece::Commands => "commands",
+            ConfigPiece::Scripts => "scripts",
         })
     }
 }
@@ -144,6 +148,9 @@ pub struct Config {
     /// The saved commands: the user's and the project's collections and the bundled
     /// examples.
     commands: Arc<CommandStore>,
+    /// The `*.lua` files in the scripts folder, for the Script console and the menu.
+    /// Empty for the bundled defaults, which read nothing from disk.
+    scripts: Arc<Vec<ScriptEntry>>,
     /// Read from `paths` (not just the bundled defaults), so files there may be written:
     /// the compose history, a saved command.
     loaded: bool,
@@ -184,6 +191,7 @@ impl Config {
             settings,
             keymap: Arc::new(Keymap::bundled_default()),
             commands: Arc::new(bundled_commands()),
+            scripts: Arc::new(Vec::new()),
             loaded: false,
             themes,
             system_dark: true,
@@ -209,6 +217,7 @@ impl Config {
         config.reload_keymap();
         config.reload_settings();
         config.reload_commands();
+        config.reload_scripts();
         config
     }
 
@@ -227,6 +236,11 @@ impl Config {
     /// The saved commands.
     pub fn commands(&self) -> &Arc<CommandStore> {
         &self.commands
+    }
+
+    /// The scripts in the scripts folder, sorted by their path under it.
+    pub fn scripts(&self) -> &Arc<Vec<ScriptEntry>> {
+        &self.scripts
     }
 
     /// Whether this configuration was read from its directory, rather than being the
@@ -399,6 +413,14 @@ impl Config {
             .collect();
         self.commands = Arc::new(store);
         self.set_problems(ConfigPiece::Commands, problems);
+    }
+
+    /// List the scripts folder again. Only a configuration read from its directory
+    /// looks there.
+    pub fn reload_scripts(&mut self) {
+        if self.loaded {
+            self.scripts = Arc::new(list_scripts(&self.paths.scripts_dir()));
+        }
     }
 
     /// Read the themes folder again.
@@ -608,6 +630,7 @@ pub fn reload(piece: ConfigPiece, cx: &mut App) {
         ConfigPiece::Keymap | ConfigPiece::Bindings => config.reload_keymap(),
         ConfigPiece::Themes | ConfigPiece::Theme => config.reload_themes(),
         ConfigPiece::Commands => config.reload_commands(),
+        ConfigPiece::Scripts => config.reload_scripts(),
     });
 }
 
@@ -618,6 +641,7 @@ pub fn reload_all(cx: &mut App) {
         config.reload_keymap();
         config.reload_settings();
         config.reload_commands();
+        config.reload_scripts();
     });
 }
 
@@ -665,6 +689,7 @@ fn piece_of(event: ConfigEvent) -> ConfigPiece {
         ConfigEvent::Keymap => ConfigPiece::Keymap,
         ConfigEvent::Themes => ConfigPiece::Themes,
         ConfigEvent::Commands => ConfigPiece::Commands,
+        ConfigEvent::Scripts => ConfigPiece::Scripts,
     }
 }
 

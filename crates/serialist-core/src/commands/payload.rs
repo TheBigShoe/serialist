@@ -125,6 +125,10 @@ pub enum PayloadError {
     /// A codec payload; plugins arrive with milestone 5.
     #[error("codec payloads need a plugin, which is not available yet")]
     CodecUnavailable,
+    /// A `{ "script": … }` payload: sending the command runs the script, so it has no
+    /// bytes. Holds the script's path as written.
+    #[error("this command runs the script {0}; it has no bytes to send")]
+    ScriptPayload(String),
 }
 
 impl Command {
@@ -133,7 +137,8 @@ impl Command {
     /// one, else `session_eol` for a text payload and nothing for hex and codec ones.
     /// See the [module docs](self) for the payload syntax.
     ///
-    /// A codec payload always fails with [`PayloadError::CodecUnavailable`].
+    /// A codec payload always fails with [`PayloadError::CodecUnavailable`], and a
+    /// script payload with [`PayloadError::ScriptPayload`]: the app runs it instead.
     pub fn encode(
         &self,
         params: &ParamValues,
@@ -143,6 +148,9 @@ impl Command {
             Payload::Text(text) => (self.expand_text(text, params)?, session_eol),
             Payload::Hex(hex) => (self.expand_hex(hex, params)?, LineEnding::None),
             Payload::Codec { .. } => return Err(PayloadError::CodecUnavailable),
+            Payload::Script { path } => {
+                return Err(PayloadError::ScriptPayload(path.display().to_string()));
+            }
         };
         bytes.extend_from_slice(self.eol.unwrap_or(default_eol).bytes());
         Ok(bytes)
@@ -174,6 +182,7 @@ impl Command {
                     scan(text, false);
                 }
             }
+            Payload::Script { .. } => {}
         }
         names
     }
@@ -225,7 +234,7 @@ impl Command {
             })
             .collect();
         match self.encode(&sample, LineEnding::None) {
-            Ok(_) | Err(PayloadError::CodecUnavailable) => {}
+            Ok(_) | Err(PayloadError::CodecUnavailable | PayloadError::ScriptPayload(_)) => {}
             Err(err) => found.push(err.to_string()),
         }
         if let Some(expect) = &self.expect {

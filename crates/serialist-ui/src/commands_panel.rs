@@ -937,7 +937,7 @@ pub struct CommandEditor {
     target: Option<CommandRef>,
     /// Kept from the command being edited.
     params: Vec<serialist_core::Param>,
-    /// A codec payload the form cannot edit, kept as it is.
+    /// A codec or script payload the form cannot edit, kept as it is.
     codec: Option<Payload>,
     name: Entity<InputState>,
     collection: Entity<InputState>,
@@ -971,8 +971,8 @@ impl CommandEditor {
         let (payload_text, payload_kind, codec) = match &command.payload {
             Payload::Text(text) => (text.clone(), PayloadKind::Text, None),
             Payload::Hex(hex) => (hex.clone(), PayloadKind::Hex, None),
-            codec @ Payload::Codec { .. } => {
-                (String::new(), PayloadKind::Text, Some(codec.clone()))
+            kept @ (Payload::Codec { .. } | Payload::Script { .. }) => {
+                (String::new(), PayloadKind::Text, Some(kept.clone()))
             }
         };
         let (pattern, timeout) = match &command.expect {
