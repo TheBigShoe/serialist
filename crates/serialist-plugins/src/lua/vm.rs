@@ -99,26 +99,6 @@ impl Budget {
     }
 }
 
-/// Every Rust callback the VM holds is made here or in [`send_hook`], which require it to
-/// be `Send`: the VM moves between threads as one unit (see `LuaCodec`'s `Send` impl), so
-/// no callback may capture anything tied to a thread.
-fn function<A, R, F>(lua: &Lua, f: F) -> mlua::Result<Function>
-where
-    A: mlua::FromLuaMulti,
-    R: IntoLuaMulti,
-    F: Fn(&Lua, A) -> mlua::Result<R> + Send + 'static,
-{
-    lua.create_function(f)
-}
-
-/// See [`function`].
-fn send_hook<F>(f: F) -> F
-where
-    F: Fn(&Lua, &mlua::debug::Debug<'_>) -> mlua::Result<VmState> + Send + 'static,
-{
-    f
-}
-
 /// A loaded plugin: its VM and the functions it returned.
 pub(super) struct Vm {
     pub(super) lua: Lua,
@@ -202,13 +182,13 @@ fn sandbox(name: &str, limits: &LuaLimits, budget: Arc<Budget>) -> mlua::Result<
     let hook_budget = Arc::clone(&budget);
     lua.set_global_hook(
         HookTriggers::new().every_nth_instruction(limits.check_every.max(1)),
-        send_hook(move |_lua, _debug| {
+        move |_lua, _debug| {
             if hook_budget.tick() {
                 Ok(VmState::Continue)
             } else {
                 Err(mlua::Error::runtime(hook_budget.message()))
             }
-        }),
+        },
     )?;
 
     let globals = lua.globals();
@@ -229,7 +209,7 @@ fn sandbox(name: &str, limits: &LuaLimits, budget: Arc<Budget>) -> mlua::Result<
     install_logging(&lua, name)?;
 
     let coroutine: Table = globals.get("coroutine")?;
-    let spent = function(&lua, move |_, ()| Ok(budget.is_spent()))?;
+    let spent = lua.create_function(move |_, ()| Ok(budget.is_spent()))?;
     let array_mt: Table = lua.load(PRELUDE).set_name("=prelude").call((
         globals.get::<Function>("pcall")?,
         globals.get::<Function>("xpcall")?,
@@ -277,14 +257,14 @@ fn hex_table(lua: &Lua) -> mlua::Result<Table> {
     let hex = lua.create_table()?;
     hex.set(
         "encode",
-        function(lua, |_, (data, separator): (LuaValue, Option<String>)| {
+        lua.create_function(|_, (data, separator): (LuaValue, Option<String>)| {
             let bytes = bytes_arg(&data, "hex.encode").map_err(mlua::Error::runtime)?;
             Ok(encode_hex(&bytes, separator.as_deref().unwrap_or(" ")))
         })?,
     )?;
     hex.set(
         "decode",
-        function(lua, |lua, text: LuaString| {
+        lua.create_function(|lua, text: LuaString| {
             let text = text.to_str()?;
             let bytes = decode_hex(&text)
                 .map_err(|err| mlua::Error::runtime(format!("hex.decode: {err}")))?;
@@ -298,14 +278,14 @@ fn bytes_table(lua: &Lua) -> mlua::Result<Table> {
     let bytes = lua.create_table()?;
     bytes.set(
         "from_table",
-        function(lua, |lua, data: LuaValue| {
+        lua.create_function(|lua, data: LuaValue| {
             let bytes = bytes_arg(&data, "bytes.from_table").map_err(mlua::Error::runtime)?;
             lua.create_string(&bytes)
         })?,
     )?;
     bytes.set(
         "to_table",
-        function(lua, |lua, data: LuaString| {
+        lua.create_function(|lua, data: LuaString| {
             lua.create_sequence_from(data.as_bytes().iter().copied())
         })?,
     )?;
@@ -326,7 +306,7 @@ fn install_logging(lua: &Lua, name: &str) -> mlua::Result<()> {
     let plugin = name.to_owned();
     globals.set(
         "print",
-        function(lua, move |_, values: Variadic<LuaValue>| {
+        lua.create_function(move |_, values: Variadic<LuaValue>| {
             tracing::info!(target: "serialist_plugins::lua", plugin = %plugin, "{}", join(&values));
             Ok(())
         })?,
@@ -336,7 +316,7 @@ fn install_logging(lua: &Lua, name: &str) -> mlua::Result<()> {
         let plugin = name.to_owned();
         log.set(
             level,
-            function(lua, move |_, values: Variadic<LuaValue>| {
+            lua.create_function(move |_, values: Variadic<LuaValue>| {
                 let text = join(&values);
                 match level {
                     "debug" => tracing::debug!(target: "serialist_plugins::lua", plugin = %plugin, "{text}"),

@@ -51,7 +51,12 @@
 //!
 //! # Sinks
 //!
-//! A [`ChunkSink`] runs on the ingest thread and hears, in this order:
+//! A [`ChunkSink`] runs on the ingest thread. [`Ingest::spawn`] takes sinks already
+//! built, which must then be `Send` to reach the thread. [`Ingest::spawn_with`] takes a
+//! closure instead, which runs on the ingest thread before the first event and returns
+//! the sinks, so a sink holding something that must stay on one thread (a Lua codec's
+//! VM, say) is made where it runs and never crosses threads. Either way a sink hears,
+//! in this order:
 //!
 //! - `on_connect(description)` once, when the session connects, after the notice line
 //!   is stored;
@@ -120,7 +125,10 @@ pub const IDLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Receives every chunk exactly as the session delivered it, on the ingest thread.
 /// Keep it quick: the ingest thread waits for it.
-pub trait ChunkSink: Send {
+///
+/// Not `Send` itself: a sink made on the ingest thread ([`Ingest::spawn_with`]) may hold
+/// thread-bound state. [`Ingest::spawn`] asks for `Box<dyn ChunkSink + Send>`.
+pub trait ChunkSink {
     fn on_chunk(&mut self, bytes: &[u8], at: Instant);
     /// The session disconnected. No more chunks will arrive from it.
     fn on_disconnect(&mut self);
@@ -220,28 +228,57 @@ impl Drop for CloseMatchers {
 pub struct Ingest;
 
 impl Ingest {
-    /// Start the ingest thread for one session's `events`.
+    /// Start the ingest thread for one session's `events`, with sinks already built.
     pub fn spawn(
         events: Receiver<SessionEvent>,
         store: Store,
-        sinks: Vec<Box<dyn ChunkSink>>,
+        sinks: Vec<Box<dyn ChunkSink + Send>>,
+        waker: Box<dyn Fn() + Send>,
+    ) -> IngestHandle {
+        Self::spawn_with(
+            events,
+            store,
+            Box::new(move || {
+                sinks
+                    .into_iter()
+                    .map(|sink| -> Box<dyn ChunkSink> { sink })
+                    .collect()
+            }),
+            waker,
+        )
+    }
+
+    /// Start the ingest thread for one session's `events`. `build_sinks` runs on the
+    /// ingest thread before the first event is handled, and the sinks it returns live
+    /// and die there. A panic in it ends the thread like a panic in a sink.
+    pub fn spawn_with(
+        events: Receiver<SessionEvent>,
+        store: Store,
+        build_sinks: Box<dyn FnOnce() -> Vec<Box<dyn ChunkSink>> + Send>,
         waker: Box<dyn Fn() + Send>,
     ) -> IngestHandle {
         let reader = store.reader();
         let shared = Arc::new(Shared::default());
         let (commands, command_rx) = unbounded();
-        let worker = Worker {
-            events,
-            commands: command_rx,
-            store,
-            sinks,
-            waker,
-            shared: Arc::clone(&shared),
-            sinks_closed: false,
-        };
+        let worker_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name(INGEST_THREAD_NAME.into())
-            .spawn(move || worker.run())
+            .spawn(move || {
+                // Dropped on the way out, and while unwinding from a panic, including one
+                // in `build_sinks`.
+                let _close_matchers = CloseMatchers(Arc::clone(&worker_shared));
+                let sinks = build_sinks();
+                Worker {
+                    events,
+                    commands: command_rx,
+                    store,
+                    sinks,
+                    waker,
+                    shared: worker_shared,
+                    sinks_closed: false,
+                }
+                .run()
+            })
             .expect("spawn the ingest thread");
         IngestHandle {
             reader,
@@ -411,8 +448,6 @@ enum Flow {
 
 impl Worker {
     fn run(mut self) -> Store {
-        // Dropped on the way out, and while unwinding from a panic.
-        let _close_matchers = CloseMatchers(Arc::clone(&self.shared));
         loop {
             let flow = select! {
                 recv(self.commands) -> command => match command {
@@ -692,6 +727,68 @@ mod tests {
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded.0, b"hello\r\nworld\n");
         assert_eq!(recorded.1, 1, "exactly one on_disconnect");
+    }
+
+    /// Not `Send`: it can only exist on the thread that made it.
+    struct Local {
+        _here: std::rc::Rc<()>,
+        recorded: Arc<Mutex<(Vec<u8>, usize)>>,
+    }
+
+    impl ChunkSink for Local {
+        fn on_chunk(&mut self, bytes: &[u8], _at: Instant) {
+            self.recorded.lock().unwrap().0.extend_from_slice(bytes);
+        }
+
+        fn on_disconnect(&mut self) {
+            self.recorded.lock().unwrap().1 += 1;
+        }
+    }
+
+    #[test]
+    fn spawn_with_builds_sinks_on_the_ingest_thread() {
+        let (tx, rx) = unbounded();
+        let recorded = Arc::new(Mutex::new((Vec::new(), 0)));
+        let built_on = Arc::new(Mutex::new(None));
+        let (sink_recorded, sink_built_on) = (Arc::clone(&recorded), Arc::clone(&built_on));
+        let handle = Ingest::spawn_with(
+            rx,
+            Store::default(),
+            Box::new(move || -> Vec<Box<dyn ChunkSink>> {
+                *sink_built_on.lock().unwrap() = thread::current().name().map(str::to_owned);
+                vec![Box::new(Local {
+                    _here: std::rc::Rc::new(()),
+                    recorded: sink_recorded,
+                })]
+            }),
+            Box::new(|| {}),
+        );
+        tx.send(data(b"ab")).unwrap();
+        tx.send(data(b"c\n")).unwrap();
+        tx.send(SessionEvent::Disconnected { error: None }).unwrap();
+        drop(tx);
+        handle.join().expect("the ingest thread ran cleanly");
+        assert_eq!(
+            built_on.lock().unwrap().as_deref(),
+            Some(INGEST_THREAD_NAME)
+        );
+        assert_eq!(*recorded.lock().unwrap(), (b"abc\n".to_vec(), 1));
+    }
+
+    #[test]
+    fn a_panic_while_building_sinks_is_reported_and_closes_the_matchers() {
+        let (_tx, rx) = unbounded::<SessionEvent>();
+        let handle = Ingest::spawn_with(
+            rx,
+            Store::default(),
+            Box::new(|| panic!("no sinks today")),
+            Box::new(|| {}),
+        );
+        let matchers = handle.matchers();
+        let err = handle.join().expect_err("the build panicked");
+        assert_eq!(err.message, "no sinks today");
+        let expectation = matchers.expect("anything", Duration::from_secs(5)).unwrap();
+        assert_eq!(expectation.wait(), crate::matcher::ExpectResult::Closed);
     }
 
     #[test]
