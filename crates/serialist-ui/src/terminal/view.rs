@@ -34,7 +34,8 @@ use crate::config::Config;
 use crate::fonts::TerminalFont;
 use crate::prelude::*;
 use crate::terminal::element::{
-    CellMetrics, Highlights, Hit, ScreenInputs, ShapeCache, TerminalElement, TerminalInputs,
+    CellMetrics, Highlights, Hit, ResizeScreen, ScreenInputs, ShapeCache, TerminalElement,
+    TerminalInputs,
 };
 use crate::terminal::layout::Span;
 use crate::terminal::palette::TerminalPalette;
@@ -67,7 +68,7 @@ pub const LOG_SEARCH_NOTE: &str = "in the raw log";
 pub struct TerminalScreen {
     /// Called after a frame whose element fits a different number of cells than the
     /// screen has, with the columns and rows that fit.
-    pub resize: Rc<dyn Fn(usize, usize, &mut App)>,
+    pub resize: ResizeScreen,
 }
 
 /// A screen snapshot's size and cursor, as the element draws them.
@@ -80,7 +81,7 @@ pub struct ScreenState {
 }
 
 struct ScreenView {
-    resize: Rc<dyn Fn(usize, usize, &mut App)>,
+    resize: ResizeScreen,
     requested: Rc<Cell<Option<(usize, usize)>>>,
     state: ScreenState,
 }
