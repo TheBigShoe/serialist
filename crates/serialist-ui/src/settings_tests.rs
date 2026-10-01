@@ -6,15 +6,17 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{PortId, SettingsEditor, ThemeMode};
+use serialist_core::{Command, CommandRef, CommandStore, PortId, SettingsEditor, ThemeMode};
 use serialist_sim::{EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::keys;
 use crate::config::{self, Config};
 use crate::prelude::*;
 use crate::session_view::FRAME;
-use crate::settings_io::Origin;
-use crate::settings_view::{DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView};
+use crate::settings_io::{self, Origin};
+use crate::settings_view::{
+    BindingSource, DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView,
+};
 use crate::test_support::{TestDir, draw, open_workspace, run_until, usb_port, wait_connected};
 use crate::workspace::Workspace;
 
@@ -604,6 +606,152 @@ fn rebinding_a_key_writes_the_user_keymap_and_the_new_chord_works(cx: &mut TestA
         workspace.read_with(cx, |w, _| w.tab_count()),
         tabs_before + 1,
         "the old chord is unbound"
+    );
+}
+
+#[gpui_test]
+fn saved_command_bindings_are_listed_and_rebinding_one_edits_the_command(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-command-keys");
+    // The bundled examples are loaded with every store and bind nothing; one command of
+    // the user's has a key.
+    let mut store = CommandStore::load(&paths);
+    let bundled: Vec<CommandRef> = store
+        .commands()
+        .filter(|(reference, _)| {
+            store
+                .collection(&reference.collection)
+                .is_some_and(|collection| collection.is_read_only())
+        })
+        .map(|(reference, _)| reference)
+        .collect();
+    assert!(!bundled.is_empty(), "the bundled examples are in the store");
+    store.create_collection("Bench").unwrap();
+    let reference = store
+        .add_command(
+            "Bench",
+            "Checks",
+            Command::text("Version", "AT+VER?").with_keybinding("ctrl-alt-9"),
+        )
+        .unwrap();
+    store.save_collection("Bench").unwrap();
+    start(cx, &paths);
+
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Keymap);
+    let command_rows = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            v.binding_rows_now(cx)
+                .into_iter()
+                .filter(|row| row.source == BindingSource::Command)
+                .collect::<Vec<_>>()
+        })
+    };
+    let rows = command_rows(cx);
+    assert_eq!(rows.len(), 1, "the user's command, none from the examples");
+    let row = &rows[0];
+    assert_eq!(row.keystrokes, "ctrl-alt-9");
+    assert_eq!(row.action.name, "Bench \u{203a} Version");
+    assert_eq!(row.context.as_deref(), Some("Workspace"));
+    assert_eq!(row.command.as_ref(), Some(&reference));
+    assert!(
+        view.read_with(cx, |v, cx| v.binding_rows_now(cx).len()) > 1,
+        "listed with the keymap's own bindings"
+    );
+
+    // Filterable like the rest: by action text, chord, or the word "command".
+    let query = view.read_with(cx, |v, _| v.keymap_query().clone());
+    let filtered = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, window, cx| {
+            query.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        })
+        .unwrap();
+        view.read_with(cx, |v, cx| v.binding_rows_now(cx))
+    };
+    for text in ["bench version", "CTRL-ALT-9", "checks"] {
+        let rows = filtered(cx, text);
+        assert_eq!(rows.len(), 1, "{text}: {rows:?}");
+        assert_eq!(rows[0].command.as_ref(), Some(&reference), "{text}");
+    }
+    assert!(
+        filtered(cx, "command")
+            .iter()
+            .any(|row| row.command.as_ref() == Some(&reference))
+    );
+    assert!(filtered(cx, "bench nothing").is_empty());
+    filtered(cx, "");
+
+    // Rebind: the command's own file changes, not the keymap's.
+    let keymap_before = std::fs::read_to_string(&paths.keymap).ok();
+    // Filter down to the command's row so it is on screen, click it, then click its
+    // Rebind… button and press the new chord.
+    let index = filtered(cx, "bench version")
+        .iter()
+        .position(|row| row.command.as_ref() == Some(&reference))
+        .expect("the command's row");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-binding", index), cx);
+        window.render_frame(cx);
+        window.click("settings-rebind", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, cx| v.rebind_recorder().read(cx).is_recording()));
+    cx.update_window(window, |_, window, cx| window.press("ctrl-alt-8", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.keymap_error().map(str::to_owned)),
+        None
+    );
+    let saved = CommandStore::load(&paths);
+    assert_eq!(
+        saved.get(&reference).and_then(|c| c.keybinding.as_deref()),
+        Some("ctrl-alt-8"),
+        "written to the command's collection"
+    );
+    assert_eq!(
+        saved.get(&reference).map(|c| c.payload.clone()),
+        Some(Command::text("Version", "AT+VER?").payload),
+        "the rest of the command is as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.keymap).ok(),
+        keymap_before,
+        "keymap.json is not involved"
+    );
+
+    // The watcher brings it into the list: the new chord, the old one gone.
+    run_until(cx, "the command to reload", |cx| {
+        cx.update(|cx| {
+            cx.global::<Config>()
+                .commands()
+                .get(&reference)
+                .and_then(|c| c.keybinding.as_deref().map(str::to_owned))
+                .as_deref()
+                == Some("ctrl-alt-8")
+        })
+    });
+    let rows = command_rows(cx);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].keystrokes, "ctrl-alt-8");
+    assert_eq!(rows[0].source, BindingSource::Command);
+
+    // A command of the read-only examples cannot be given a key.
+    let before = std::fs::read_dir(paths.commands_dir())
+        .map(Iterator::count)
+        .ok();
+    let error = settings_io::rebind_command(&CommandStore::load(&paths), &bundled[0], "ctrl-alt-7")
+        .expect_err("the examples are read-only");
+    assert!(error.contains("read-only"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(paths.commands_dir())
+            .map(Iterator::count)
+            .ok(),
+        before,
+        "nothing was written"
     );
 }
 

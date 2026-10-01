@@ -132,7 +132,8 @@ and dark themes, the UI font), Terminal font (family, size, weight, line height,
 fallbacks, and the `terminal.*` overrides), Display, Session (default baud, line ending,
 echo, restore, and inline mode's Backspace, escape chord and paste pacing), Devices (the
 device profiles: add, edit with the port settings form, remove, drag to reorder), Keymap
-(every binding in effect, yours marked, with Rebind… on a selected row) and Plugins. It is
+(every binding in effect, yours marked, with the saved commands' keys listed as "command" rows,
+with Rebind… on a selected row) and Plugins. It is
 a front end to `settings.json` and `keymap.json`, which stay the source of truth: each
 change writes one key into the file at once (text fields after a 300 ms pause), keeping
 your comments and uncommenting the template's line for the key, and the watcher applies it
