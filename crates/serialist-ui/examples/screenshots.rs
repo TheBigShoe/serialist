@@ -40,13 +40,17 @@ use serialist_ui::export::ExportFormat;
 use serialist_ui::prelude::gpui_test::TestWindowExt;
 use serialist_ui::prelude::*;
 use serialist_ui::session_view::FRAME;
-use serialist_ui::terminal::DisplayMode;
+use serialist_ui::terminal::{DisplayMode, Selection, SelectionPoint};
 use serialist_ui::{AppOptions, SessionView, Workspace};
 
 const WIDE: (f32, f32) = (1440., 900.);
 const NARROW: (f32, f32) = (1024., 640.);
 const DARK: &str = "Serialist Dark";
 const LIGHT: &str = "Serialist Light";
+const EMBER: &str = "Serialist Ember";
+const PHOSPHOR: &str = "Serialist Phosphor";
+const PAPER: &str = "Serialist Paper";
+const CONTRAST: &str = "Serialist Contrast";
 /// The simulated RACE device, which the shots that decode connect to.
 const RACE_PORT: &str = "virtual:race";
 
@@ -192,6 +196,40 @@ const SHOTS: &[Shot] = &[
         connect: Some("virtual:at"),
         drive: settings_screen,
     },
+    // The other bundled themes, each on the ANSI firehose so the log colors show, with a
+    // few lines selected.
+    Shot {
+        file: "16-theme-ember.png",
+        size: WIDE,
+        theme: EMBER,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
+    Shot {
+        file: "17-theme-phosphor.png",
+        size: WIDE,
+        theme: PHOSPHOR,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
+    Shot {
+        file: "18-theme-paper.png",
+        size: WIDE,
+        theme: PAPER,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
+    Shot {
+        file: "19-theme-contrast.png",
+        size: WIDE,
+        theme: CONTRAST,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -230,6 +268,24 @@ fn firehose(stage: &mut Stage) {
     if !view.read_with(&stage.cx, |v, cx| v.is_following_tail(cx)) {
         eprintln!("  note: the terminal is not following the tail");
     }
+}
+
+/// [`firehose`], with a few lines near the tail selected so a theme's selection color
+/// shows over its log colors.
+fn firehose_selected(stage: &mut Stage) {
+    firehose(stage);
+    let terminal = stage
+        .session()
+        .read_with(&stage.cx, |v, _| v.terminal().clone());
+    terminal.update(&mut stage.cx, |t, cx| {
+        let end = t.displayed_span().end.0;
+        let selection = Selection::new(
+            SelectionPoint::new(LineId(end - 9), 10),
+            SelectionPoint::new(LineId(end - 6), 40),
+        );
+        t.set_selection(Some(selection), cx);
+    });
+    stage.cx.run_until_parked();
 }
 
 /// `virtual:race` decoded by the example `airoha-race` plugin (installed into the shot's

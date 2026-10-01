@@ -10,6 +10,7 @@ publishes the version's section as the draft release's notes.
 
 ## [Unreleased]
 
+- Added: four more bundled themes, picked in Settings' Appearance section or by name in `theme`: Serialist Ember (warm charcoal, amber accent), Serialist Phosphor (green CRT), Serialist Paper (warm off-white, teal accent) and Serialist Contrast (pure black, every text color it sets at 7:1 or more, for bright labs and projectors).
 - Fixed: adding, removing or dragging a device profile in Settings rewrote the whole `devices` array in `settings.json` and dropped the comments in it; each now changes that profile only, and a dragged profile takes the comments written with it.
 - Fixed: a tab's monitor or VT mode was forgotten at quit; it is kept in `state.json` (now version 2, and version 1 files still load) and restored with the tab.
 - Fixed: the Settings Keymap list left out the saved commands' keybindings; they are listed as "command" rows (filterable by action, group, chord or "command"), and Rebind… on one sets the command's `keybinding` in its collection instead of writing `keymap.json`.
