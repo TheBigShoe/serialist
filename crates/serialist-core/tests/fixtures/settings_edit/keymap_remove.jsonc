@@ -1,0 +1,15 @@
+// My keys (test fixture).
+[
+  {
+    "context": "Workspace", // main window
+    "bindings": {
+      // clear the screen
+      "cmd-k": "terminal::Clear",
+    },
+  },
+  // everywhere
+  {
+    "bindings": {}
+  },
+  // end of file note
+]
