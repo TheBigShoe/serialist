@@ -305,9 +305,17 @@ mod tests {
         assert!(slot.install(1, sink).is_none());
         ingest.on_chunk(b"hi\x1b[c", now);
         let snapshot = screen.snapshot();
-        assert_eq!(snapshot.screen_text()[0], "hi", "fed from the next chunk only");
+        assert_eq!(
+            snapshot.screen_text()[0],
+            "hi",
+            "fed from the next chunk only"
+        );
         assert_eq!(rings.load(Ordering::SeqCst), 1);
-        assert_eq!(*recorder.0.lock(), [b"\x1b[?6c".to_vec()], "answered at once");
+        assert_eq!(
+            *recorder.0.lock(),
+            [b"\x1b[?6c".to_vec()],
+            "answered at once"
+        );
         assert!(screen.take_events().is_empty());
 
         // Unacknowledged: no second ring. Acknowledged: the next change rings.

@@ -566,7 +566,10 @@ impl TerminalView {
 
     /// The screen as the element draws it this frame, in the text view.
     fn screen_inputs(&self) -> Option<ScreenInputs> {
-        let screen = self.screen.as_ref().filter(|_| self.display == DisplayMode::Text)?;
+        let screen = self
+            .screen
+            .as_ref()
+            .filter(|_| self.display == DisplayMode::Text)?;
         let cursor = screen
             .state
             .cursor
@@ -1219,6 +1222,7 @@ impl TerminalView {
         let log_note = self.searches_log().then(|| {
             div()
                 .id("terminal-search-note")
+                .test_support()
                 .flex_none()
                 .text_xs()
                 .text_color(muted)

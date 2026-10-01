@@ -670,7 +670,9 @@ impl Element for TerminalElement {
         let screen = inputs.screen.as_ref();
         // What fits: a screen is sized to it, and its grid is already wrapped.
         let grid = (
-            (f32::from(text_width) / f32::from(cell_width)).floor().max(1.0) as usize,
+            (f32::from(text_width) / f32::from(cell_width))
+                .floor()
+                .max(1.0) as usize,
             (f32::from(bounds.size.height) / f32::from(row_height))
                 .floor()
                 .max(1.0) as usize,

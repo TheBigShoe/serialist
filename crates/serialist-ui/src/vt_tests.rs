@@ -161,17 +161,10 @@ fn highlighted(snapshot: &VtSnapshot) -> Vec<usize> {
 }
 
 #[gpui_test]
-fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(
-    cx: &mut TestAppContext,
-) {
+fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(cx: &mut TestAppContext) {
     let dir = vt_config("vt-menu");
-    let (window, workspace, view) = open(
-        cx,
-        &quiet_menu_world(),
-        &dir,
-        "virtual:menu",
-        (1280., 800.),
-    );
+    let (window, workspace, view) =
+        open(cx, &quiet_menu_world(), &dir, "virtual:menu", (1280., 800.));
     assert_eq!(view.read_with(cx, |v, _| v.emulation()), Emulation::Vt);
     let status = workspace.read_with(cx, |w, cx| w.status_line(cx)).unwrap();
     assert_eq!(status.emulation, Some("VT"), "the status bar's chip");
@@ -191,7 +184,9 @@ fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(
     let lines = displayed(cx, &view);
     assert!(lines.iter().any(|line| line.text == "     U-Boot console"));
     assert!(
-        !lines.iter().any(|line| line.text.starts_with("Connected to ")),
+        !lines
+            .iter()
+            .any(|line| line.text.starts_with("Connected to ")),
         "the log's notice is not on the screen"
     );
     // The store still has everything, as a smear of escape leftovers.
@@ -210,22 +205,37 @@ fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(
     // The device redrew everything in place; three rows differ (the old and the new
     // highlight and the redraw count), and the range runs from the first to the last.
     let first = after.first_visible();
-    assert_eq!(after.first_visible(), before.first_visible(), "nothing scrolled");
+    assert_eq!(
+        after.first_visible(),
+        before.first_visible(),
+        "nothing scrolled"
+    );
     assert_eq!(
         after.changed_since(&before),
         first.offset(2)..first.offset(8)
     );
     assert_eq!(after.screen_text()[7], "  Redraw 2");
     frame(cx, window);
-    let sample = terminal.read_with(cx, |t, _| {
-        assert_eq!(t.frame_stats().frames(), frames + 1, "one frame drawn");
-        t.frame_stats().last().expect("a frame")
+    // Frames since the key (pressing draws some, a repaint after the wake may draw
+    // another): together they shaped the three changed rows and nothing else, and the
+    // rest of the screen came from the cache.
+    let (samples, shaped, hits) = terminal.read_with(cx, |t, _| {
+        let stats = t.frame_stats();
+        let new = (stats.frames() - frames) as usize;
+        let since: Vec<_> = stats.samples().rev().take(new).copied().collect();
+        let shaped: usize = since.iter().map(|s| s.lines_shaped).sum();
+        let hits: usize = since.iter().map(|s| s.cache_hits).sum();
+        (since, shaped, hits)
     });
-    assert_eq!(
-        sample.lines_shaped, 3,
-        "only the changed rows are shaped again: {sample:?}"
+    assert!(
+        samples.len() < crate::terminal::stats::WINDOW,
+        "{samples:?}"
     );
-    assert!(sample.cache_hits > 0, "{sample:?}");
+    assert_eq!(
+        shaped, 3,
+        "only the changed rows are shaped again: {samples:?}"
+    );
+    assert!(hits > 0, "{samples:?}");
 
     // Enter selects.
     press(cx, window, "enter");
@@ -257,7 +267,12 @@ impl SimDevice for Asker {
     }
 }
 
-fn wait_heard(cx: &mut TestAppContext, heard: &Arc<Mutex<Vec<u8>>>, what: &str, done: impl Fn(&[u8]) -> bool) {
+fn wait_heard(
+    cx: &mut TestAppContext,
+    heard: &Arc<Mutex<Vec<u8>>>,
+    what: &str,
+    done: impl Fn(&[u8]) -> bool,
+) {
     let deadline = Instant::now() + ENGINE_WAIT;
     loop {
         cx.run_until_parked();
@@ -286,9 +301,13 @@ fn a_device_attribute_query_is_answered_from_the_ingest_thread(cx: &mut TestAppC
     let (_window, _workspace, view) = open(cx, &world, &dir, "virtual:asker", (1280., 800.));
     // Primary device attributes, then the cursor after "login: ": row 1, column 8.
     let expected = b"\x1b[?6c\x1b[1;8R";
-    wait_heard(cx, &heard, "the answers", |heard| heard.len() >= expected.len());
+    wait_heard(cx, &heard, "the answers", |heard| {
+        heard.len() >= expected.len()
+    });
     assert_eq!(heard.lock().as_slice(), expected);
-    wait_for_screen(cx, &view, "the prompt", |snap| snap.screen_text()[0] == "login:");
+    wait_for_screen(cx, &view, "the prompt", |snap| {
+        snap.screen_text()[0] == "login:"
+    });
     assert!(
         view.read_with(cx, |v, _| v.vt_handle().unwrap().take_events())
             .is_empty(),
@@ -372,7 +391,11 @@ fn resizing_the_window_resizes_the_screen_and_the_device_hears_it(cx: &mut TestA
     let (window, _workspace, view) = open(cx, &world, &dir, "virtual:sizer", (1280., 800.));
     press(cx, window, keys::TOGGLE_INLINE);
     let (wide, rows) = settle_size(cx, window, &view);
-    assert_ne!((wide, rows), (80, 24), "sized to the element, not the default");
+    assert_ne!(
+        (wide, rows),
+        (80, 24),
+        "sized to the element, not the default"
+    );
 
     press(cx, window, "x");
     wait_heard(cx, &heard, "the first report", |heard| {
@@ -397,13 +420,8 @@ fn resizing_the_window_resizes_the_screen_and_the_device_hears_it(cx: &mut TestA
 fn switching_modes_keeps_the_store_and_the_screen_exports_as_shown(cx: &mut TestAppContext) {
     let dir = TestDir::new("vt-switch");
     std::fs::write(dir.join("settings.json"), "{}").unwrap();
-    let (window, _workspace, view) = open(
-        cx,
-        &quiet_menu_world(),
-        &dir,
-        "virtual:menu",
-        (1280., 800.),
-    );
+    let (window, _workspace, view) =
+        open(cx, &quiet_menu_world(), &dir, "virtual:menu", (1280., 800.));
     assert_eq!(view.read_with(cx, |v, _| v.emulation()), Emulation::Monitor);
     // In monitor mode the menu's first frame is a line of escape leftovers.
     let first_frame = MenuDevice::new().frame().len() as u64;
@@ -442,11 +460,14 @@ fn switching_modes_keeps_the_store_and_the_screen_exports_as_shown(cx: &mut Test
 
     // The screen exports as it is drawn.
     let path = dir.join("screen.txt");
-    view.update(cx, |v, cx| v.export_to(path.clone(), ExportFormat::Screen, cx))
-        .detach();
+    view.update(cx, |v, cx| {
+        v.export_to(path.clone(), ExportFormat::Screen, cx)
+    })
+    .detach();
     run_until(cx, "the screen export", |cx| {
         view.read_with(cx, |v, _| {
-            v.notice().is_some_and(|notice| notice.text.contains("screen.txt"))
+            v.notice()
+                .is_some_and(|notice| notice.text.contains("screen.txt"))
         })
     });
     let exported = std::fs::read_to_string(&path).unwrap();
@@ -460,11 +481,14 @@ fn switching_modes_keeps_the_store_and_the_screen_exports_as_shown(cx: &mut Test
 
     // The text export still reads the log.
     let log_path = dir.join("log.txt");
-    view.update(cx, |v, cx| v.export_to(log_path.clone(), ExportFormat::Text, cx))
-        .detach();
+    view.update(cx, |v, cx| {
+        v.export_to(log_path.clone(), ExportFormat::Text, cx)
+    })
+    .detach();
     run_until(cx, "the text export", |cx| {
         view.read_with(cx, |v, _| {
-            v.notice().is_some_and(|notice| notice.text.contains("log.txt"))
+            v.notice()
+                .is_some_and(|notice| notice.text.contains("log.txt"))
         })
     });
     let log = std::fs::read_to_string(&log_path).unwrap();
@@ -480,7 +504,11 @@ fn switching_modes_keeps_the_store_and_the_screen_exports_as_shown(cx: &mut Test
     assert_eq!(view.read_with(cx, |v, _| v.emulation()), Emulation::Monitor);
     assert!(view.read_with(cx, |v, _| v.vt_snapshot().is_none()));
     let lines = displayed(cx, &view);
-    assert!(lines[0].text.starts_with("Connected to "), "{:?}", lines[0].text);
+    assert!(
+        lines[0].text.starts_with("Connected to "),
+        "{:?}",
+        lines[0].text
+    );
     assert!(
         view.read_with(cx, |v, _| v.snapshot().end()) >= monitor_end,
         "nothing was lost"
@@ -518,7 +546,9 @@ fn cursor_quads(
     view: &Entity<SessionView>,
     color: Hsla,
 ) -> (Vec<Bounds<Pixels>>, Vec<Bounds<Pixels>>) {
-    let bounds = view.read_with(cx, |v, cx| v.terminal().read(cx).scroll_handle().state().bounds);
+    let bounds = view.read_with(cx, |v, cx| {
+        v.terminal().read(cx).scroll_handle().state().bounds
+    });
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         let scale = window.scale_factor();
@@ -536,12 +566,14 @@ fn cursor_quads(
             .map(|quad| unscale(quad.bounds))
             .filter(inside)
             .collect();
-        let outlined = quads
+        // The scene keeps a bordered quad per edge, so an outline can show more than once.
+        let mut outlined: Vec<Bounds<Pixels>> = quads
             .iter()
             .filter(|quad| quad.border_color == color && quad.background.as_solid() != Some(color))
             .map(|quad| unscale(quad.bounds))
             .filter(inside)
             .collect();
+        outlined.dedup();
         (solid, outlined)
     })
     .unwrap()
@@ -551,7 +583,9 @@ fn cursor_quads(
 fn the_cursor_is_painted_where_the_screen_puts_it(cx: &mut TestAppContext) {
     let dir = vt_config("vt-cursor");
     let world = SimWorld::empty();
-    world.add_virtual("prompt", "Prompt", LinkConfig::unpaced(), || Box::new(Prompt));
+    world.add_virtual("prompt", "Prompt", LinkConfig::unpaced(), || {
+        Box::new(Prompt)
+    });
     let (window, _workspace, view) = open(cx, &world, &dir, "virtual:prompt", (1280., 800.));
     press(cx, window, keys::TOGGLE_INLINE);
     let snapshot = wait_for_screen(cx, &view, "the prompt", |snap| {
@@ -614,9 +648,7 @@ impl SimDevice for Modes {
 }
 
 #[gpui_test]
-fn the_screens_modes_reach_the_keys_the_paste_the_tab_and_the_status_dot(
-    cx: &mut TestAppContext,
-) {
+fn the_screens_modes_reach_the_keys_the_paste_the_tab_and_the_status_dot(cx: &mut TestAppContext) {
     let dir = vt_config("vt-modes");
     let heard = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&heard);
@@ -653,6 +685,8 @@ fn the_screens_modes_reach_the_keys_the_paste_the_tab_and_the_status_dot(
     while !view.read_with(cx, |v, _| v.bell_flashing()) {
         assert!(Instant::now() < deadline, "no bell");
         std::thread::sleep(Duration::from_millis(1));
+        // The view answers a ring at most once a frame.
+        cx.executor().advance_clock(FRAME);
         cx.run_until_parked();
     }
     cx.executor().advance_clock(BELL_FLASH + FRAME);
@@ -663,13 +697,8 @@ fn the_screens_modes_reach_the_keys_the_paste_the_tab_and_the_status_dot(
 #[gpui_test]
 fn search_reads_the_log_under_the_screen_and_says_so(cx: &mut TestAppContext) {
     let dir = vt_config("vt-search");
-    let (window, _workspace, view) = open(
-        cx,
-        &quiet_menu_world(),
-        &dir,
-        "virtual:menu",
-        (1280., 800.),
-    );
+    let (window, _workspace, view) =
+        open(cx, &quiet_menu_world(), &dir, "virtual:menu", (1280., 800.));
     wait_for_screen(cx, &view, "the menu", |snap| highlighted(snap) == [2]);
     let terminal = view.read_with(cx, |v, _| v.terminal().clone());
     cx.update_window(window, |_, window, cx| {
@@ -699,4 +728,3 @@ fn search_reads_the_log_under_the_screen_and_says_so(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-
