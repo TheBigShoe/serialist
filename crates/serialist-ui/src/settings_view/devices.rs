@@ -3,8 +3,8 @@
 //!
 //! The form is the port settings form (rate, framing, flow control, line ending) plus a
 //! name, the `match` keys (with a picker that fills them from a port listed now, and the
-//! listed ports' values as hints), a plugin picker over the installed plugins and an
-//! `on_connect` picker over the scripts folder. A profile is written whole when the form
+//! listed ports' values as hints), a plugin picker over the installed plugins, an
+//! `on_connect` picker over the scripts folder and the profile's `emulation`. A profile is written whole when the form
 //! is saved, not key by key: a half-typed `vid` would match the wrong devices meanwhile.
 //! A line setting the profile did not set and the form leaves at the global default is
 //! not written, so the profile keeps following the default.
@@ -14,8 +14,8 @@
 
 use serde_json::{Map, Value, json};
 use serialist_core::{
-    DataBits, DeviceProfile, FlowControl, LineEnding, Parity, PortInfo, PortKind, SerialConfig,
-    Settings, StopBits,
+    DataBits, DeviceProfile, Emulation, FlowControl, LineEnding, Parity, PortInfo, PortKind,
+    SerialConfig, Settings, StopBits,
 };
 
 use super::SettingsView;
@@ -28,6 +28,17 @@ use crate::settings_io::Origin;
 
 /// What the plugin and script pickers call "none".
 const NONE: &str = "None";
+
+/// The emulation picker's items: the global setting, or one of the two.
+const EMULATIONS: [&str; 3] = ["Default", "Monitor", "VT"];
+
+fn emulation_label(emulation: Option<Emulation>) -> &'static str {
+    match emulation {
+        None => EMULATIONS[0],
+        Some(Emulation::Monitor) => EMULATIONS[1],
+        Some(Emulation::Vt) => EMULATIONS[2],
+    }
+}
 
 /// The Devices section's state beside the files.
 #[derive(Default)]
@@ -586,6 +597,7 @@ pub struct ProfileEditor {
     port_form: Entity<PortSettingsForm>,
     plugin: Entity<SelectState<Vec<String>>>,
     on_connect: Entity<SelectState<Vec<String>>>,
+    emulation: Entity<SelectState<Vec<String>>>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -679,6 +691,13 @@ impl ProfileEditor {
             cx,
         );
 
+        let emulation = picker(
+            EMULATIONS.iter().map(|item| (*item).to_owned()).collect(),
+            Some(emulation_label(profile.emulation)),
+            window,
+            cx,
+        );
+
         let subscriptions = vec![
             cx.subscribe_in(
                 &from_port,
@@ -705,6 +724,7 @@ impl ProfileEditor {
             port_form,
             plugin,
             on_connect,
+            emulation,
             error: None,
             _subscriptions: subscriptions,
         }
@@ -894,6 +914,15 @@ impl ProfileEditor {
         if let Some(script) = picked(&self.on_connect) {
             out.insert("on_connect".into(), json!(script));
         }
+        match self.emulation.read(cx).selected_value().map(String::as_str) {
+            Some("Monitor") => {
+                out.insert("emulation".into(), json!("monitor"));
+            }
+            Some("VT") => {
+                out.insert("emulation".into(), json!("vt"));
+            }
+            _ => {}
+        }
         let value = Value::Object(out);
         profile_json(&value)?;
         Ok(value)
@@ -990,6 +1019,13 @@ impl Render for ProfileEditor {
                                 Select::new(&self.on_connect)
                                     .small()
                                     .placeholder("Script")
+                                    .into_any_element(),
+                            )
+                            .child(div().text_xs().text_color(muted).child("EMULATION"))
+                            .child(
+                                Select::new(&self.emulation)
+                                    .small()
+                                    .placeholder("Default")
                                     .into_any_element(),
                             ),
                     ),

@@ -42,7 +42,7 @@ use serialist_core::settings::{
     ConfigPaths, MAX_PASTE_CHUNK_BYTES, MAX_PASTE_CHUNK_DELAY_MS, validate_chord,
 };
 use serialist_core::{
-    BackspaceKey, DisplayView, LineEnding, LineHeight, PortSource, Settings, ThemeMode,
+    BackspaceKey, DisplayView, Emulation, LineEnding, LineHeight, PortSource, Settings, ThemeMode,
     ThemeSelection, TimestampMode,
 };
 
@@ -1661,6 +1661,45 @@ impl SettingsView {
                 cx,
             ),
         ];
+        let emulations = [Emulation::Monitor, Emulation::Vt];
+        let emulation_names = ["monitor", "vt"];
+        let terminal = vec![
+            self.row(
+                "Emulation",
+                "/terminal/emulation",
+                self.segmented(
+                    "settings-emulation",
+                    &["Monitor", "VT"],
+                    emulations
+                        .iter()
+                        .position(|mode| *mode == settings.terminal.emulation),
+                    "/terminal/emulation",
+                    move |this, ix, window, cx| {
+                        let name = emulation_names[ix];
+                        this.write("/terminal/emulation", Some(json!(name)), window, cx);
+                    },
+                    cx,
+                ),
+                Some(
+                    "Monitor logs lines; VT draws a terminal screen (boot menus, consoles). \
+                     A device profile's emulation wins"
+                        .to_owned(),
+                ),
+                cx,
+            ),
+            self.row(
+                "Blink the VT cursor",
+                "/terminal/cursor_blink",
+                self.switch(
+                    "settings-cursor-blink",
+                    "/terminal/cursor_blink",
+                    settings.terminal.cursor_blink,
+                    cx,
+                ),
+                None,
+                cx,
+            ),
+        ];
         let memory = vec![self.row(
             "Scrollback budget (MiB)",
             Field::ScrollbackMib.pointer(),
@@ -1672,6 +1711,7 @@ impl SettingsView {
         )];
         vec![
             self.group("New sessions", rows, cx),
+            self.group("Terminal", terminal, cx),
             self.group("Memory", memory, cx),
         ]
     }
