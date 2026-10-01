@@ -102,6 +102,23 @@ gear on a Devices row (hover the row) sets the same things for the next connect 
 Disconnect in the toolbar closes the port and keeps the scrollback; Connect in its place opens
 it again, with the same settings, into the same scrollback.
 
+### Settings
+
+`cmd-,` (`ctrl-,` on Linux and Windows), the Serialist menu's Settings… or the palette
+opens the Settings screen in a tab beside the sessions: Appearance (theme mode, the light
+and dark themes, the UI font), Terminal font (family, size, weight, line height, ligatures,
+fallbacks, and the `terminal.*` overrides), Display, Session (default baud, line ending,
+echo, restore, and inline mode's Backspace, escape chord and paste pacing), Devices (the
+device profiles: add, edit with the port settings form, remove, drag to reorder), Keymap
+(every binding in effect, yours marked, with Rebind… on a selected row) and Plugins. It is
+a front end to `settings.json` and `keymap.json`, which stay the source of truth: each
+change writes one key into the file at once (text fields after a 300 ms pause), keeping
+your comments and uncommenting the template's line for the key, and the watcher applies it
+like any save. A value nobody set is marked "default"; the arrow beside one you set removes
+it again; one a project's `.serialist/settings.json` sets is read-only there. A value the
+loader would reject is never written and the reason shows under it, and a `settings.json`
+that does not load shows its error and an Open settings.json button instead.
+
 ### The config directory
 
 Settings, key bindings, themes, saved commands, scripts, plugins and history live in one
@@ -111,7 +128,7 @@ The app watches it and applies changes as you save; there is no restart.
 
 | Path | What it holds |
 |---|---|
-| `settings.json` | Settings in JSON with comments and Zed's key names. The Serialist menu's Open Settings writes a commented template of every key if the file is missing. |
+| `settings.json` | Settings in JSON with comments and Zed's key names, edited by hand or from the Settings screen. The Serialist menu's Open settings.json writes a commented template of every key if the file is missing. |
 | `keymap.json` | Key bindings in Zed's keymap format, applied after the defaults. Open Keymap in the same menu writes a commented template. |
 | `themes/` | Zed theme files (schema v0.2.0), one `*.json` each. Serialist Dark and Serialist Light are built in. |
 | `commands/` | Saved-command collections, one `*.json` each. |
@@ -135,6 +152,7 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Where | Action | What it does | macOS | Linux and Windows |
 |---|---|---|---|---|
 | Anywhere | `serialist::Quit` | Quit | `cmd-q` | `ctrl-q` |
+| Workspace | `serialist::OpenSettingsUi` | Open the Settings screen in a tab | `cmd-,` | `ctrl-,` |
 | Workspace | `terminal::Clear` | Clear the terminal | `cmd-k` | `ctrl-shift-k` |
 | Workspace | `serial::Disconnect` | Disconnect the port (asking first while it records or runs a script) | `cmd-shift-w` | `ctrl-alt-w` |
 | Workspace | `tabs::NewTab` | Open an empty tab and focus the Devices panel | `cmd-t` | `ctrl-shift-t` |
