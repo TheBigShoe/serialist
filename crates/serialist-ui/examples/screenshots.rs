@@ -30,10 +30,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{CommandRef, Direction, LineId, LineSource, PortId};
+use serialist_core::{CommandRef, Direction, LineId, LineSource, PortId, StyleFlags};
 use serialist_sim::{
     AtDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator, LinkConfig,
-    SimWorld,
+    MenuDevice, SimWorld,
 };
 use serialist_ui::config::{self, Config};
 use serialist_ui::export::ExportFormat;
@@ -175,6 +175,14 @@ const SHOTS: &[Shot] = &[
         world: SimWorld::new,
         connect: Some("virtual:race"),
         drive: overflow_menu,
+    },
+    Shot {
+        file: "14-vt-menu.png",
+        size: WIDE,
+        theme: DARK,
+        world: menu_world,
+        connect: Some("virtual:menu"),
+        drive: vt_menu,
     },
 ];
 
@@ -340,6 +348,32 @@ fn inline(stage: &mut Stage) {
     });
 }
 
+/// `virtual:menu` in VT mode (its device profile in the shots' settings says so), in
+/// inline mode, with Down pressed once: the boot menu drawn on a terminal screen, the
+/// second item highlighted and the cursor after the status row.
+fn vt_menu(stage: &mut Stage) {
+    let view = stage.session();
+    stage.press("cmd-i");
+    let highlighted = |cx: &HeadlessAppContext, row: usize| {
+        view.read_with(cx, |v, _| {
+            v.vt_snapshot()
+                .and_then(|snapshot| snapshot.visible_line(row).cloned())
+                .is_some_and(|line| {
+                    line.runs
+                        .iter()
+                        .any(|run| run.style.flags.contains(StyleFlags::INVERSE))
+                })
+        })
+    };
+    run_until(&mut stage.cx, "the menu on the screen", |cx| {
+        highlighted(cx, MenuDevice::FIRST_ITEM_ROW - 1)
+    });
+    stage.press("down");
+    run_until(&mut stage.cx, "the second item highlighted", |cx| {
+        highlighted(cx, MenuDevice::FIRST_ITEM_ROW)
+    });
+}
+
 /// The hex view of a short text firehose with the search bar open on line endings.
 fn search_hex(stage: &mut Stage) {
     let view = stage.session();
@@ -433,6 +467,19 @@ fn paused_recording(stage: &mut Stage) {
 }
 
 // --- Simulated worlds ----------------------------------------------------------------
+
+/// The built-in devices, with the boot menu leaving its cursor on (U-Boot hides it) so
+/// the picture shows one.
+fn menu_world() -> SimWorld {
+    let world = SimWorld::new();
+    world.add_virtual(
+        SimWorld::MENU,
+        "Boot menu (virtual)",
+        LinkConfig::default(),
+        || Box::new(MenuDevice::new().with_cursor_shown(true)),
+    );
+    world
+}
 
 /// The built-in devices, with `virtual:firehose` sending ANSI-coloured lines on an
 /// unpaced link and stopping after [`FIREHOSE_LINES`] of them.
@@ -654,14 +701,16 @@ fn has_rx_line(cx: &mut HeadlessAppContext, view: &Entity<SessionView>, text: &s
     })
 }
 
-/// The settings every shot loads: the theme, and a device profile that decodes
-/// `virtual:race` with the `airoha-race` plugin (installed for the shots that open it).
+/// The settings every shot loads: the theme, a device profile that decodes
+/// `virtual:race` with the `airoha-race` plugin (installed for the shots that open it),
+/// and one that opens `virtual:menu` in VT mode.
 fn settings(theme: &str) -> String {
     format!(
         r#"{{
   "theme": "{theme}",
   "devices": [
-    {{ "name": "Airoha RACE board", "match": {{ "path": "virtual:race" }}, "plugin": "airoha-race" }}
+    {{ "name": "Airoha RACE board", "match": {{ "path": "virtual:race" }}, "plugin": "airoha-race" }},
+    {{ "name": "Boot menu", "match": {{ "path": "virtual:menu" }}, "emulation": "vt" }}
   ]
 }}
 "#
