@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Serialist app icon, small-size variant of serialist.svg (Pulse S). Original artwork,
+  licensed like the rest of the project (MIT OR Apache-2.0).
+
+  render.sh uses this file for renders of 24 px and under (the 16 and 24 px PNGs and .ico
+  entries, and the 16 px slice of the .icns); 32 px and up use serialist.svg. At those
+  small sizes the full icon's soft halo covers the whole tile and fills the counters of
+  the S, and the graticule is sub-pixel noise. This variant drops the graticule and the
+  wide halo layers, thickens the beam and its hot core and shrinks the beam spot, so the
+  S keeps clear gaps. The shape, colors and tile are the same. Edit serialist.svg and
+  this file together. Like serialist.svg it needs no filters, masks or patterns.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Serialist</title>
+  <defs>
+    <radialGradient id="tile" gradientUnits="userSpaceOnUse" cx="512" cy="430" r="720">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="0.55" stop-color="#111a2c"/>
+      <stop offset="1" stop-color="#0a0f19"/>
+    </radialGradient>
+    <linearGradient id="trace" gradientUnits="userSpaceOnUse" x1="180" y1="0" x2="844" y2="0">
+      <stop offset="0" stop-color="#4cc9f0" stop-opacity="0"/>
+      <stop offset="0.3" stop-color="#4cc9f0"/>
+      <stop offset="0.75" stop-color="#5df0c6"/>
+    </linearGradient>
+    <linearGradient id="hot" gradientUnits="userSpaceOnUse" x1="180" y1="0" x2="844" y2="0">
+      <stop offset="0.2" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.6" stop-color="#eafff8" stop-opacity="0.85"/>
+    </linearGradient>
+    <radialGradient id="spot" gradientUnits="userSpaceOnUse" cx="844" cy="292" r="104">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.18" stop-color="#d9fff3" stop-opacity="0.9"/>
+      <stop offset="0.45" stop-color="#5df0c6" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#5df0c6" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Blocky like a square wave, with rounded turns (a real edge has a rise time),
+         which is also what keeps it reading as an S rather than a 5. -->
+    <path id="s" d="M180 732H586A90 90 0 0 0 676 642V602A90 90 0 0 0 586 512H438A90 90 0 0 1 348 422V382A90 90 0 0 1 438 292H844"/>
+    <radialGradient id="sheen" gradientUnits="userSpaceOnUse" cx="512" cy="-120" r="760">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#sheen)"/>
+
+
+  <g transform="translate(512 512) scale(1.06) translate(-512 -512)">
+  <!-- The trace: two halo layers, a thick beam, a hot core. -->
+  <g fill="none" stroke="url(#trace)" stroke-linecap="round" stroke-linejoin="round">
+    <use xlink:href="#s" stroke-width="170" stroke-opacity="0.07"/>
+    <use xlink:href="#s" stroke-width="140" stroke-opacity="0.12"/>
+    <use xlink:href="#s" stroke-width="112"/>
+    <use xlink:href="#s" stroke="url(#hot)" stroke-width="40"/>
+  </g>
+
+  <!-- Beam spot, tighter than the full icon's. -->
+  <circle cx="844" cy="292" r="104" fill="url(#spot)"/>
+
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+</svg>

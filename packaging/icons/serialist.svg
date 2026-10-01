@@ -12,8 +12,9 @@
   the file needs no SVG filters, masks or patterns and renders the same everywhere.
 
   The square fills the whole 1024 canvas; render.sh insets it for each platform (macOS
-  wants roughly 10% transparent margin, Windows and Linux less). The old chevron-and-
-  signal mark is classic.svg. How it was chosen: candidates/.
+  wants roughly 10% transparent margin, Windows and Linux less). Renders of 24 px and
+  under come from serialist-small.svg instead, a variant with a tighter glow. The old
+  chevron-and-signal mark is classic.svg. How Pulse S was chosen: candidates/.
 -->
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
   <title>Serialist</title>
