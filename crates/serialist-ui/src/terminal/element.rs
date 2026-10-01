@@ -366,6 +366,9 @@ impl HitMap {
     }
 }
 
+/// Asks for a terminal screen of `columns` by `rows` cells.
+pub type ResizeScreen = Rc<dyn Fn(usize, usize, &mut App)>;
+
 /// A terminal screen on display (VT mode): see the module docs.
 #[derive(Clone)]
 pub struct ScreenInputs {
@@ -376,7 +379,7 @@ pub struct ScreenInputs {
     pub cursor: Option<CursorState>,
     /// Asked, after the frame, for the screen to be `columns` by `rows` when that is what
     /// fits the element and not the screen's size.
-    pub resize: Rc<dyn Fn(usize, usize, &mut App)>,
+    pub resize: ResizeScreen,
     /// The size last asked for, so a size is asked for once.
     pub requested: Rc<Cell<Option<(usize, usize)>>>,
 }
