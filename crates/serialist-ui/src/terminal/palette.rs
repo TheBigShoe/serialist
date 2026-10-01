@@ -710,6 +710,85 @@ mod tests {
         }
     }
 
+    /// Bundled themes whose own text colors already reach a floor against their terminal
+    /// background (AA), so the guard never changes them. (Serialist Dark and Light lean on
+    /// the guard for a few: Dark's bright black, Light's green and its bright colors.)
+    const UNLIFTED: [(&str, f32); 1] = [("Serialist Ember", MINIMUM_CONTRAST)];
+
+    #[test]
+    fn the_themes_drawn_to_a_floor_reach_it_before_the_guard() {
+        for (name, floor) in UNLIFTED {
+            let palette = bundled(name);
+            let dark = relative_luminance(palette.background) < LIGHT_BACKGROUND;
+            // The ANSI colors that are for backgrounds rather than text: black on a dark
+            // theme, the two whites on a light one.
+            let backdrops: &[usize] = if dark { &[0] } else { &[7, 15] };
+            let mut colors = vec![
+                ("foreground", palette.foreground),
+                ("bright foreground", palette.bright_foreground),
+                ("sent lines", palette.tx),
+                ("notices", palette.notice),
+                ("decoded summaries", palette.decoded),
+            ];
+            colors.extend(
+                (0..16)
+                    .filter(|n| !backdrops.contains(n))
+                    .map(|n| (ANSI_KEYS[n], palette.ansi[n])),
+            );
+            for (what, color) in colors {
+                let ratio = contrast_ratio(color, palette.background);
+                assert!(
+                    ratio >= floor,
+                    "{name}: {what} reads at {ratio:.2}, below {floor}"
+                );
+            }
+            // Faint text keeps the faint floor, or the theme's own when that is higher.
+            let faint = if floor > MINIMUM_CONTRAST {
+                floor
+            } else {
+                palette.faint_contrast
+            };
+            let ratio = contrast_ratio(palette.dim_foreground, palette.background);
+            assert!(ratio >= faint, "{name}: dim text reads at {ratio:.2}");
+            if dark {
+                // Black, as a background, keeps the default text on it readable.
+                let ratio = contrast_ratio(palette.foreground, palette.ansi[0]);
+                assert!(ratio >= floor, "{name}: text on black reads at {ratio:.2}");
+            }
+
+            // So the guard draws every one as the theme has it, plain or bold.
+            let text_colors = std::iter::once(Color::Default).chain(
+                (0..16u8)
+                    .filter(|n| !backdrops.contains(&usize::from(*n)))
+                    .map(Color::Ansi),
+            );
+            for fg in text_colors {
+                for flags in [StyleFlags::NONE, StyleFlags::BOLD] {
+                    let bold = flags == StyleFlags::BOLD;
+                    let resolved =
+                        palette.resolve(&style(fg, Color::Default, flags), Direction::Rx);
+                    assert_eq!(
+                        resolved.foreground,
+                        palette.foreground_of(fg, bold, Direction::Rx),
+                        "{name}: the guard lifted {fg:?} ({flags:?})"
+                    );
+                }
+            }
+            for direction in [Direction::Tx, Direction::Notice] {
+                assert_eq!(
+                    palette.resolve(&Style::default(), direction).foreground,
+                    palette.foreground_of(Color::Default, false, direction),
+                    "{name}: {direction:?}"
+                );
+            }
+            assert_eq!(
+                palette.resolve_decoded(&Style::default()).foreground,
+                palette.decoded,
+                "{name}: decoded"
+            );
+        }
+    }
+
     #[test]
     fn dim_colored_text_is_held_to_the_faint_floor_not_the_body_one() {
         let palette = bundled("Serialist Light");
