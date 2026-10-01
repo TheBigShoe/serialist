@@ -158,7 +158,7 @@ The app watches it and applies changes as you save; there is no restart.
 |---|---|
 | `settings.json` | Settings in JSON with comments and Zed's key names, edited by hand or from the Settings screen. The Serialist menu's Open settings.json writes a commented template of every key if the file is missing. |
 | `keymap.json` | Key bindings in Zed's keymap format, applied after the defaults. Open Keymap in the same menu writes a commented template. |
-| `themes/` | Zed theme files (schema v0.2.0), one `*.json` each. Serialist Dark and Serialist Light are built in. |
+| `themes/` | Zed theme files (schema v0.2.0), one `*.json` each. Six are built in: Serialist Dark and Serialist Light (the defaults), Serialist Ember (warm charcoal, amber accent), Serialist Phosphor (green CRT), Serialist Paper (warm off-white, teal accent) and Serialist Contrast (black and white, every text color it sets at 7:1 or more). |
 | `commands/` | Saved-command collections, one `*.json` each. |
 | `scripts/` | Lua scripts, `*.lua` at any depth. The Scripts menu's Open Scripts Folder creates it with two example scripts if it holds none. |
 | `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. None is installed at first; `plugins/examples/` holds copies of the bundled examples, which decode nothing until installed. See [Plugins](#plugins). |
