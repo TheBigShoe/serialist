@@ -17,7 +17,9 @@ use crate::settings_io::{self, Origin};
 use crate::settings_view::{
     BindingSource, DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView,
 };
-use crate::test_support::{TestDir, draw, open_workspace, run_until, usb_port, wait_connected};
+use crate::test_support::{
+    TestDir, draw, has_rx_line, open_workspace, run_until, type_line, usb_port, wait_connected,
+};
 use crate::workspace::Workspace;
 
 /// The chord the rebind test moves `tabs::NewTab` to.
@@ -753,6 +755,93 @@ fn saved_command_bindings_are_listed_and_rebinding_one_edits_the_command(cx: &mu
         before,
         "nothing was written"
     );
+}
+
+/// Which port segments the status line has drawn: the session's own, with its popover,
+/// and the read-only one shown while Settings is in front.
+fn status_port_segments(cx: &mut TestAppContext, window: AnyWindowHandle) -> (bool, bool) {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        (
+            window.try_find("status-port").is_some(),
+            window.try_find("status-port-previous").is_some(),
+        )
+    })
+    .unwrap()
+}
+
+#[gpui_test]
+fn the_status_line_keeps_the_session_while_settings_is_in_front(cx: &mut TestAppContext) {
+    let world = SimWorld::new();
+    let (window, workspace) = open_workspace(cx, &world, Some("virtual:echo"));
+    let session = wait_connected(cx, &workspace);
+    type_line(cx, window, "hello");
+    run_until(cx, "the echo", |cx| has_rx_line(cx, &session, "hello"));
+    draw(cx, window);
+    let in_front = workspace
+        .read_with(cx, |w, cx| w.status_line(cx))
+        .expect("the session's status line");
+    assert_eq!(in_front.state, "Connected");
+    assert!(in_front.title.contains("virtual:echo"), "{in_front:?}");
+    assert_ne!(in_front.tx, "TX 0 B", "something was sent");
+    assert_ne!(in_front.rx, "RX 0 B", "and came back");
+    assert_eq!(status_port_segments(cx, window), (true, false));
+
+    // With Settings in front the status line still says which port and how it stands.
+    open_settings(cx, window, &workspace);
+    draw(cx, window);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.session().is_none(), "the active tab is Settings");
+        assert_eq!(w.status_session(), Some(&session));
+        let line = w.status_line(cx).expect("the previous session's line");
+        assert_eq!(line.state, "Connected");
+        assert!(line.title.contains("virtual:echo"), "{line:?}");
+        assert_eq!((line.rx, line.tx), (in_front.rx, in_front.tx));
+    });
+    assert_eq!(
+        status_port_segments(cx, window),
+        (false, true),
+        "the segment is there to read, without the popover that needs the active tab"
+    );
+
+    // Its state follows the session meanwhile.
+    session.update(cx, |view, cx| view.disconnect(cx));
+    draw(cx, window);
+    let line = workspace
+        .read_with(cx, |w, cx| w.status_line(cx))
+        .expect("still the session's line");
+    assert_eq!(line.state, "Disconnected");
+    assert!(line.title.contains("virtual:echo"), "{line:?}");
+
+    // Back to the session: its own segment again.
+    activate_tab(cx, window, &workspace, 0);
+    draw(cx, window);
+    assert_eq!(status_port_segments(cx, window), (true, false));
+}
+
+#[gpui_test]
+fn the_status_line_names_the_config_directory_on_settings_without_a_session(
+    cx: &mut TestAppContext,
+) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-status");
+    start(cx, &paths);
+    assert_eq!(
+        workspace.read_with(cx, |w, cx| w.status_placeholder(cx)),
+        "No session"
+    );
+
+    open_settings(cx, window, &workspace);
+    draw(cx, window);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.status_line(cx).is_none(), "no session to speak of");
+        assert_eq!(
+            w.status_placeholder(cx),
+            format!("Settings: {}", paths.dir.display())
+        );
+    });
+    assert_eq!(status_port_segments(cx, window), (false, false));
 }
 
 #[gpui_test]

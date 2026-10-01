@@ -110,7 +110,9 @@ front. Connect in the Devices panel opens a new tab (or goes to the port's tab i
 one), `cmd-t` opens an empty tab to pick a port for, `cmd-w` closes a tab (asking first while
 it records or runs a script), `cmd-1` to `cmd-9` and `cmd-shift-]`/`[` switch, and tabs
 reorder by dragging. The tab bar shows once two tabs are open. The status line, the window
-title, the Decoded panel and the Script console follow the tab in front; the others keep
+title, the Decoded panel and the Script console follow the tab in front (with Settings in
+front the status line keeps showing the session you came from, or the config folder when
+there is none); the others keep
 receiving, recording and running their scripts without drawing, and their label counts the
 bytes that arrived meanwhile. When the window closes the tabs are written to `state.json`
 and reopen at the next start (the `restore_session` setting; ports named on the command line

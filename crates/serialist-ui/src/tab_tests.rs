@@ -768,3 +768,54 @@ fn several_ports_at_startup_open_a_tab_each_the_first_in_front(cx: &mut TestAppC
         );
     });
 }
+
+#[gpui_test]
+fn the_status_line_on_settings_follows_the_session_that_was_in_front(cx: &mut TestAppContext) {
+    let world = SimWorld::new();
+    let (window, workspace) = open_tabs(cx, &world, None, &["virtual:at", "virtual:echo"]);
+    wait_tab(cx, &workspace, "virtual:at");
+    wait_tab(cx, &workspace, "virtual:echo");
+    let status_port = |cx: &mut TestAppContext| {
+        workspace
+            .read_with(cx, |w, cx| w.status_line(cx))
+            .map(|status| status.title)
+    };
+
+    // Settings opened from the first tab: that session's segment.
+    press(cx, window, keys::OPEN_SETTINGS_UI);
+    assert_eq!(
+        active_index(cx, &workspace),
+        Some(2),
+        "Settings is in front"
+    );
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:at")));
+
+    // From the second tab: that one's.
+    press(cx, window, keys::TAB_2);
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:echo")));
+    press(cx, window, keys::OPEN_SETTINGS_UI);
+    assert_eq!(active_index(cx, &workspace), Some(2));
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:echo")));
+
+    // The tab it came from is closed meanwhile: another open session stands in.
+    let echo = workspace.read_with(cx, |w, _| w.tab_ids()[1]);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |w, cx| w.close_tab(echo, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(active_index(cx, &workspace), Some(1), "still Settings");
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:at")));
+
+    // With no session left, Settings says so.
+    let at = workspace.read_with(cx, |w, _| w.tab_ids()[0]);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |w, cx| w.close_tab(at, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(status_port(cx), None);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.status_placeholder(cx).starts_with("Settings: "));
+    });
+}
