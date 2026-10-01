@@ -18,6 +18,38 @@ pub enum KeystrokeInputEvent {
     Captured(Keystroke),
 }
 
+/// `keystroke` as keymap files spell it: modifiers in the order the bundled keymaps
+/// use (`ctrl`, then the platform key, `alt`, `shift`, `fn`), then the key, such as
+/// `cmd-alt-t` or `ctrl-shift-]`. GPUI's own `unparse` puts `alt` first.
+pub fn keystroke_text(keystroke: &Keystroke) -> String {
+    let m = &keystroke.modifiers;
+    let platform = if cfg!(target_os = "macos") {
+        "cmd"
+    } else if cfg!(target_os = "windows") {
+        "win"
+    } else {
+        "super"
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    if m.control {
+        parts.push("ctrl");
+    }
+    if m.platform {
+        parts.push(platform);
+    }
+    if m.alt {
+        parts.push("alt");
+    }
+    if m.shift {
+        parts.push("shift");
+    }
+    if m.function {
+        parts.push("fn");
+    }
+    parts.push(&keystroke.key);
+    parts.join("-")
+}
+
 /// Keys GPUI reports for a modifier pressed and released on its own.
 const MODIFIER_KEYS: [&str; 10] = [
     "shift", "control", "ctrl", "alt", "platform", "cmd", "function", "fn", "super", "win",
@@ -42,7 +74,11 @@ impl Focusable for KeystrokeInput {
 
 impl KeystrokeInput {
     /// An input with the element id `id`, showing `keystroke`.
-    pub fn new(id: impl Into<SharedString>, keystroke: Option<Keystroke>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        id: impl Into<SharedString>,
+        keystroke: Option<Keystroke>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             id: id.into(),
             keystroke,
@@ -106,7 +142,7 @@ impl KeystrokeInput {
     }
 
     fn capture(&mut self, keystroke: Keystroke, cx: &mut Context<Self>) {
-        tracing::debug!(keystroke = %keystroke.unparse(), "recorded a keystroke");
+        tracing::debug!(keystroke = %keystroke_text(&keystroke), "recorded a keystroke");
         self.keystroke = Some(keystroke.clone());
         self.stop(cx);
         cx.emit(KeystrokeInputEvent::Captured(keystroke));
@@ -155,5 +191,23 @@ impl Render for KeystrokeInput {
                     this.start(window, cx);
                 }
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keystrokes_read_as_the_bundled_keymaps_write_them() {
+        for chord in ["ctrl-alt-x", "ctrl-shift-]", "alt-f12", "f5", "ctrl-,"] {
+            let keystroke = Keystroke::parse(chord).unwrap();
+            assert_eq!(keystroke_text(&keystroke), chord);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            keystroke_text(&Keystroke::parse("alt-cmd-t").unwrap()),
+            "cmd-alt-t"
+        );
     }
 }

@@ -329,7 +329,11 @@ impl PortSettingsForm {
 
     /// A form for a device profile's line settings: the rate, framing, flow control and
     /// line ending, without the echo, control-line and break rows.
-    pub fn for_profile(settings: PortSettings, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn for_profile(
+        settings: PortSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             profile: true,
             ..Self::new(settings, false, window, cx)
@@ -569,44 +573,46 @@ impl Render for PortSettingsForm {
                 "Line ending",
                 Select::new(&self.line_ending).small(),
             ))
-            .when(!profile, |form| form.child(Self::row(
-                "Local echo",
-                Switch::new("port-local-echo")
-                    .checked(settings.local_echo)
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_local_echo(*on, cx);
-                    })),
-            ))
-            .child(Self::row(
-                "DTR",
-                Switch::new("port-dtr")
-                    .checked(settings.dtr)
-                    .disabled(!live)
-                    .tooltip("Data Terminal Ready")
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_control(ControlLine::Dtr, *on, cx);
-                    })),
-            ))
-            .child(Self::row(
-                "RTS",
-                Switch::new("port-rts")
-                    .checked(settings.rts)
-                    .disabled(!live)
-                    .tooltip("Request To Send")
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_control(ControlLine::Rts, *on, cx);
-                    })),
-            ))
-            .child(
-                h_flex().justify_end().child(
-                    Button::new("port-send-break")
-                        .label("Send break")
-                        .tooltip("Hold the line in the break condition for 250 ms")
-                        .small()
+            .when(!profile, |form| {
+                form.child(Self::row(
+                    "Local echo",
+                    Switch::new("port-local-echo")
+                        .checked(settings.local_echo)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_local_echo(*on, cx);
+                        })),
+                ))
+                .child(Self::row(
+                    "DTR",
+                    Switch::new("port-dtr")
+                        .checked(settings.dtr)
                         .disabled(!live)
-                        .on_click(cx.listener(|this, _, _, cx| this.send_break(cx))),
-                ),
-            ))
+                        .tooltip("Data Terminal Ready")
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_control(ControlLine::Dtr, *on, cx);
+                        })),
+                ))
+                .child(Self::row(
+                    "RTS",
+                    Switch::new("port-rts")
+                        .checked(settings.rts)
+                        .disabled(!live)
+                        .tooltip("Request To Send")
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_control(ControlLine::Rts, *on, cx);
+                        })),
+                ))
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new("port-send-break")
+                            .label("Send break")
+                            .tooltip("Hold the line in the break condition for 250 ms")
+                            .small()
+                            .disabled(!live)
+                            .on_click(cx.listener(|this, _, _, cx| this.send_break(cx))),
+                    ),
+                )
+            })
             .children(self.error.clone().map(|error| {
                 div()
                     .id("port-settings-error")
