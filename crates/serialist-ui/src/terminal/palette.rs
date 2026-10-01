@@ -710,13 +710,18 @@ mod tests {
         }
     }
 
+    /// WCAG AAA for body text, the level Serialist Contrast is drawn to.
+    const AAA_CONTRAST: f32 = 7.0;
+
     /// Bundled themes whose own text colors already reach a floor against their terminal
-    /// background (AA), so the guard never changes them. (Serialist Dark and Light lean on
-    /// the guard for a few: Dark's bright black, Light's green and its bright colors.)
-    const UNLIFTED: [(&str, f32); 3] = [
+    /// background, so the guard never changes them: AAA for Serialist Contrast, AA for the
+    /// others. (Serialist Dark and Light lean on the guard for a few: Dark's bright black,
+    /// Light's green and its bright colors.)
+    const UNLIFTED: [(&str, f32); 4] = [
         ("Serialist Ember", MINIMUM_CONTRAST),
         ("Serialist Phosphor", MINIMUM_CONTRAST),
         ("Serialist Paper", MINIMUM_CONTRAST),
+        ("Serialist Contrast", AAA_CONTRAST),
     ];
 
     #[test]
