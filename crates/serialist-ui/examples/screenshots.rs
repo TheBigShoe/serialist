@@ -48,6 +48,7 @@ const NARROW: (f32, f32) = (1024., 640.);
 const DARK: &str = "Serialist Dark";
 const LIGHT: &str = "Serialist Light";
 const EMBER: &str = "Serialist Ember";
+const PHOSPHOR: &str = "Serialist Phosphor";
 /// The simulated RACE device, which the shots that decode connect to.
 const RACE_PORT: &str = "virtual:race";
 
@@ -199,6 +200,14 @@ const SHOTS: &[Shot] = &[
         file: "16-theme-ember.png",
         size: WIDE,
         theme: EMBER,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
+    Shot {
+        file: "17-theme-phosphor.png",
+        size: WIDE,
+        theme: PHOSPHOR,
         world: ansi_firehose_world,
         connect: Some("virtual:firehose"),
         drive: firehose_selected,
