@@ -9,8 +9,18 @@ use crate::settings::{ConfigPaths, ThemeSelection};
 
 use super::family::{Appearance, Theme, ThemeError, ThemeFamily, ThemeWarning};
 
-const BUNDLED_DARK: &str = include_str!("../../assets/themes/serialist-dark.json");
-const BUNDLED_LIGHT: &str = include_str!("../../assets/themes/serialist-light.json");
+/// The bundled theme files, in the order [`ThemeRegistry::names`] lists them: the two
+/// defaults first.
+const BUNDLED: [(&str, &str); 2] = [
+    (
+        include_str!("../../assets/themes/serialist-dark.json"),
+        "serialist-dark.json",
+    ),
+    (
+        include_str!("../../assets/themes/serialist-light.json"),
+        "serialist-light.json",
+    ),
+];
 
 /// Where a theme came from, for the override warning.
 const BUNDLED_SOURCE: &str = "<bundled>";
@@ -36,17 +46,14 @@ impl ThemeRegistry {
     /// The bundled light theme, and the fallback for a light appearance.
     pub const DEFAULT_LIGHT: &'static str = "Serialist Light";
 
-    /// The two bundled themes and nothing else.
+    /// The bundled themes and nothing else, the two defaults first.
     pub fn bundled() -> Self {
         let mut registry = Self {
             entries: Vec::new(),
             by_name: HashMap::new(),
             warnings: Mutex::new(Vec::new()),
         };
-        for (text, origin) in [
-            (BUNDLED_DARK, "serialist-dark.json"),
-            (BUNDLED_LIGHT, "serialist-light.json"),
-        ] {
+        for (text, origin) in BUNDLED {
             match ThemeFamily::parse(text, origin) {
                 Ok((family, warnings)) => {
                     if !warnings.is_empty() {
@@ -199,7 +206,7 @@ impl ThemeRegistry {
             Appearance::Light => Self::DEFAULT_LIGHT,
         };
         self.get(name)
-            // Both bundled themes are always present, so this only satisfies the types.
+            // Both default themes are always present, so this only satisfies the types.
             .unwrap_or_else(|| &self.entries[0].theme)
     }
 

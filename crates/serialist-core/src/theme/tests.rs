@@ -344,21 +344,29 @@ fn broken_theme_files_are_errors_with_positions() {
 
 // ---- Bundled themes ----
 
+/// Every bundled theme and its appearance, in the order the registry lists them.
+const BUNDLED: [(&str, Appearance); 2] = [
+    ("Serialist Dark", Appearance::Dark),
+    ("Serialist Light", Appearance::Light),
+];
+
 #[test]
 fn the_bundled_themes_define_every_key_the_app_reads() {
     let registry = ThemeRegistry::bundled();
     assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
     assert_eq!(
         registry.names().collect::<Vec<_>>(),
-        ["Serialist Dark", "Serialist Light"]
+        BUNDLED.map(|(name, _)| name)
     );
     for (name, appearance) in [
         (ThemeRegistry::DEFAULT_DARK, Appearance::Dark),
         (ThemeRegistry::DEFAULT_LIGHT, Appearance::Light),
     ] {
-        let theme = registry.get(name).unwrap();
-        assert_eq!(theme.appearance, appearance);
         assert_eq!(registry.default_for(appearance).name, name);
+    }
+    for (name, appearance) in BUNDLED {
+        let theme = registry.get(name).unwrap();
+        assert_eq!(theme.appearance, appearance, "{name}");
         for key in USED_STYLE_KEYS {
             assert!(theme.color(key).is_some(), "{name} lacks {key}");
         }
@@ -380,6 +388,16 @@ fn the_bundled_themes_define_every_key_the_app_reads() {
         assert!(theme.color("players[0].selection").is_some());
         // Every style value is a real color.
         assert!(theme.style.len() >= USED_STYLE_KEYS.len());
+        // The same keys, players and captures as the default, so no bundled theme falls
+        // back where another does not.
+        let reference = registry.default_for(Appearance::Dark);
+        assert!(
+            theme.style.keys().eq(reference.style.keys()),
+            "{name} defines other style keys than {}",
+            reference.name
+        );
+        assert!(theme.syntax.keys().eq(reference.syntax.keys()), "{name}");
+        assert_eq!(theme.players.len(), reference.players.len(), "{name}");
     }
 }
 
@@ -387,21 +405,20 @@ fn the_bundled_themes_define_every_key_the_app_reads() {
 fn the_bundled_terminals_are_dark_and_light_and_readable() {
     let registry = ThemeRegistry::bundled();
     let luma = |color: Rgba| 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-    let dark = registry.default_for(Appearance::Dark);
-    let light = registry.default_for(Appearance::Light);
-    let (dark_bg, dark_fg) = (
-        dark.color("terminal.background").unwrap(),
-        dark.color("terminal.foreground").unwrap(),
-    );
-    let (light_bg, light_fg) = (
-        light.color("terminal.background").unwrap(),
-        light.color("terminal.foreground").unwrap(),
-    );
-    assert!(luma(dark_bg) < 0.2 && luma(dark_fg) > 0.6);
-    assert!(luma(light_bg) > 0.8 && luma(light_fg) < 0.3);
-    // Text stays legible against the window background in both.
-    assert!(luma(dark.color("text").unwrap()) - luma(dark.color("background").unwrap()) > 0.5);
-    assert!(luma(light.color("background").unwrap()) - luma(light.color("text").unwrap()) > 0.5);
+    for theme in registry.themes() {
+        let name = &theme.name;
+        let color = |key: &str| luma(theme.color(key).unwrap());
+        let (bg, fg) = (color("terminal.background"), color("terminal.foreground"));
+        // Text stays legible against the window background too.
+        let (window, text) = (color("background"), color("text"));
+        if theme.is_dark() {
+            assert!(bg < 0.2 && fg > 0.6, "{name}: terminal {bg} {fg}");
+            assert!(text - window > 0.5, "{name}: window {window} {text}");
+        } else {
+            assert!(bg > 0.8 && fg < 0.3, "{name}: terminal {bg} {fg}");
+            assert!(window - text > 0.5, "{name}: window {window} {text}");
+        }
+    }
 }
 
 // ---- Registry ----
@@ -428,16 +445,10 @@ fn user_theme_files_load_and_override_by_name() {
     dir.write("nested/deep.json", FIXTURE);
 
     let registry = ThemeRegistry::load(Some(dir.path()));
-    assert_eq!(
-        registry.names().collect::<Vec<_>>(),
-        [
-            "Serialist Dark",
-            "Serialist Light",
-            "Fixture Night",
-            "Fixture Day"
-        ]
-    );
-    assert_eq!(registry.len(), 4);
+    let mut names: Vec<&str> = BUNDLED.map(|(name, _)| name).to_vec();
+    names.extend(["Fixture Night", "Fixture Day"]);
+    assert_eq!(registry.names().collect::<Vec<_>>(), names);
+    assert_eq!(registry.len(), BUNDLED.len() + 2);
     assert!(!registry.is_empty());
     assert!(registry.get("Fixture Night").is_some());
     assert!(registry.get("Nope").is_none());
@@ -458,7 +469,7 @@ fn user_theme_files_load_and_override_by_name() {
         "{:?}",
         warnings[0]
     );
-    assert_eq!(registry.themes().count(), 4);
+    assert_eq!(registry.themes().count(), BUNDLED.len() + 2);
 }
 
 #[test]
@@ -487,11 +498,11 @@ fn a_later_file_with_the_same_name_wins_and_says_so() {
 fn a_missing_themes_directory_is_fine() {
     let dir = TempDir::new("no-themes");
     let registry = ThemeRegistry::load(Some(&dir.path().join("themes")));
-    assert_eq!(registry.len(), 2);
+    assert_eq!(registry.len(), BUNDLED.len());
     assert!(registry.warnings().is_empty());
     let none = ThemeRegistry::load(None);
-    assert_eq!(none.len(), 2);
-    assert_eq!(ThemeRegistry::default().len(), 2);
+    assert_eq!(none.len(), BUNDLED.len());
+    assert_eq!(ThemeRegistry::default().len(), BUNDLED.len());
     assert!(format!("{none:?}").contains("Serialist Dark"));
 }
 
