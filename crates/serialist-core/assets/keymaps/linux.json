@@ -22,6 +22,7 @@
     "context": "Workspace",
     "bindings": {
       "ctrl-shift-p": "command_palette::Toggle",
+      "ctrl-,": "serialist::OpenSettingsUi",
       "ctrl-shift-k": "terminal::Clear",
       "ctrl-shift-w": "tabs::CloseTab",
       "ctrl-alt-w": "serial::Disconnect",

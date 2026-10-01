@@ -14,6 +14,10 @@
 //!
 //! Baud is a text field that takes any positive integer (Enter or leaving the field
 //! applies it) beside a list of the standard rates.
+//!
+//! The Settings view's device-profile form uses the same form for a profile's line
+//! settings ([`PortSettingsForm::for_profile`]): the rate, framing, flow control and line
+//! ending only, since a profile has no echo or control-line keys and no port to break.
 
 use serialist_core::{
     ControlLine, DataBits, FlowControl, LineEnding, Parity, SerialConfig, StopBits,
@@ -156,6 +160,8 @@ pub struct PortSettingsForm {
     settings: PortSettings,
     /// An open session: the control lines and break act on it now.
     live: bool,
+    /// A device profile's line settings: no echo, control lines or break.
+    profile: bool,
     baud: Entity<InputState>,
     baud_list: Choice,
     data_bits: Choice,
@@ -306,6 +312,7 @@ impl PortSettingsForm {
         Self {
             settings,
             live,
+            profile: false,
             baud,
             baud_list,
             data_bits,
@@ -317,6 +324,19 @@ impl PortSettingsForm {
             status: None,
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// A form for a device profile's line settings: the rate, framing, flow control and
+    /// line ending, without the echo, control-line and break rows.
+    pub fn for_profile(
+        settings: PortSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            profile: true,
+            ..Self::new(settings, false, window, cx)
         }
     }
 
@@ -514,12 +534,15 @@ impl Render for PortSettingsForm {
         let muted = theme.muted_foreground;
         let danger = theme.danger;
         let settings = self.settings.clone();
+        let profile = self.profile;
         v_flex()
             .id("port-settings")
             .track_focus(&self.focus_handle)
             .w(px(330.))
             .gap_2()
-            .child(div().text_xs().text_color(muted).child(if live {
+            .child(div().text_xs().text_color(muted).child(if profile {
+                "LINE SETTINGS (when the device connects)"
+            } else if live {
                 "PORT SETTINGS (applied now)"
             } else {
                 "PORT SETTINGS (for the next connect)"
@@ -550,44 +573,46 @@ impl Render for PortSettingsForm {
                 "Line ending",
                 Select::new(&self.line_ending).small(),
             ))
-            .child(Self::row(
-                "Local echo",
-                Switch::new("port-local-echo")
-                    .checked(settings.local_echo)
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_local_echo(*on, cx);
-                    })),
-            ))
-            .child(Self::row(
-                "DTR",
-                Switch::new("port-dtr")
-                    .checked(settings.dtr)
-                    .disabled(!live)
-                    .tooltip("Data Terminal Ready")
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_control(ControlLine::Dtr, *on, cx);
-                    })),
-            ))
-            .child(Self::row(
-                "RTS",
-                Switch::new("port-rts")
-                    .checked(settings.rts)
-                    .disabled(!live)
-                    .tooltip("Request To Send")
-                    .on_click(cx.listener(|this, on: &bool, _, cx| {
-                        this.change_control(ControlLine::Rts, *on, cx);
-                    })),
-            ))
-            .child(
-                h_flex().justify_end().child(
-                    Button::new("port-send-break")
-                        .label("Send break")
-                        .tooltip("Hold the line in the break condition for 250 ms")
-                        .small()
+            .when(!profile, |form| {
+                form.child(Self::row(
+                    "Local echo",
+                    Switch::new("port-local-echo")
+                        .checked(settings.local_echo)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_local_echo(*on, cx);
+                        })),
+                ))
+                .child(Self::row(
+                    "DTR",
+                    Switch::new("port-dtr")
+                        .checked(settings.dtr)
                         .disabled(!live)
-                        .on_click(cx.listener(|this, _, _, cx| this.send_break(cx))),
-                ),
-            )
+                        .tooltip("Data Terminal Ready")
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_control(ControlLine::Dtr, *on, cx);
+                        })),
+                ))
+                .child(Self::row(
+                    "RTS",
+                    Switch::new("port-rts")
+                        .checked(settings.rts)
+                        .disabled(!live)
+                        .tooltip("Request To Send")
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.change_control(ControlLine::Rts, *on, cx);
+                        })),
+                ))
+                .child(
+                    h_flex().justify_end().child(
+                        Button::new("port-send-break")
+                            .label("Send break")
+                            .tooltip("Hold the line in the break condition for 250 ms")
+                            .small()
+                            .disabled(!live)
+                            .on_click(cx.listener(|this, _, _, cx| this.send_break(cx))),
+                    ),
+                )
+            })
             .children(self.error.clone().map(|error| {
                 div()
                     .id("port-settings-error")

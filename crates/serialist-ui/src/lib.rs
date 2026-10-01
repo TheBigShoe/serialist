@@ -28,6 +28,7 @@ pub mod history;
 pub mod icons;
 pub mod inline;
 pub mod keymap;
+pub mod keystroke_input;
 pub mod palette;
 pub mod param_prompt;
 pub mod plugin_files;
@@ -40,6 +41,8 @@ pub mod session_handle;
 pub mod session_options;
 pub mod session_state;
 pub mod session_view;
+pub mod settings_io;
+pub mod settings_view;
 pub mod status;
 pub mod tabs;
 pub mod terminal;
@@ -65,6 +68,8 @@ mod plugin_tests;
 mod port_tests;
 #[cfg(test)]
 mod script_tests;
+#[cfg(test)]
+mod settings_tests;
 #[cfg(test)]
 mod stream_tests;
 #[cfg(test)]
@@ -101,6 +106,7 @@ pub use session_handle::{
 pub use session_options::{DisplayDefaults, SessionOptions};
 pub use session_state::{SavedMode, SavedTab, SessionState};
 pub use session_view::{ActiveCodec, SessionView, SessionViewEvent};
+pub use settings_view::{Section as SettingsSection, SettingsView};
 pub use status::{
     ConnectionState, Notice, NoticeAction, PauseMark, RecordingStatus, ScriptStatus, StatusLine,
 };
@@ -154,7 +160,7 @@ pub mod prelude {
     // through its private re-export, and `#[schemars(crate = …)]` points the derive here.
     pub use gpui_kit::component::IndexPath;
     pub use gpui_kit::component::highlighter::HighlightThemeStyle;
-    pub use gpui_kit::component::input::{Input, InputEvent, InputState};
+    pub use gpui_kit::component::input::{Input, InputEvent, InputState, NumberInput};
     pub use gpui_kit::component::popover::Popover;
     pub use gpui_kit::component::scroll::{Scrollbar, ScrollbarHandle};
     pub use gpui_kit::component::select::{Select, SelectEvent, SelectState};

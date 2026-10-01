@@ -16,6 +16,7 @@
     "context": "Workspace",
     "bindings": {
       "cmd-shift-p": "command_palette::Toggle",
+      "cmd-,": "serialist::OpenSettingsUi",
       "cmd-k": "terminal::Clear",
       "cmd-w": "tabs::CloseTab",
       "cmd-shift-w": "serial::Disconnect",
