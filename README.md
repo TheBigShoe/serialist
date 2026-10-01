@@ -1,7 +1,16 @@
+<table>
+<tr>
+<td width="148"><img src="packaging/icons/png/serialist-128.png" alt="The Serialist icon: the letter S drawn as an oscilloscope trace" width="128" height="128"></td>
+<td>
+
 # Serialist
 
 A native, GPU-rendered serial terminal built on [GPUI](https://gpui.rs), the UI framework
 behind the Zed editor. macOS first, Linux and Windows from the same code.
+
+</td>
+</tr>
+</table>
 
 - Devices appear the moment they are plugged in.
 - Any baud rate, full framing and flow control settings, per-device profiles.
