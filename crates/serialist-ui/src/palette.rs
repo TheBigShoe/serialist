@@ -112,6 +112,10 @@ pub fn humanize(name: &str) -> String {
         .iter()
         .enumerate()
         .map(|(ix, word)| {
+            // An initialism Rust's naming spells in title case.
+            if word == "Ui" {
+                return "UI".to_owned();
+            }
             let all_caps = word.len() > 1 && word.chars().all(|c| !c.is_lowercase());
             if ix == 0 || all_caps || word.chars().all(|c| c.is_ascii_digit()) {
                 word.clone()
@@ -491,6 +495,10 @@ mod tests {
         assert_eq!(
             humanize("command_palette::Toggle"),
             "Command palette: Toggle"
+        );
+        assert_eq!(
+            humanize("serialist::OpenSettingsUi"),
+            "Serialist: Open settings UI"
         );
     }
 

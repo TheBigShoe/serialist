@@ -11,6 +11,8 @@ actions!(
     serialist,
     [
         Quit,
+        /// Open the Settings screen in a tab, or go to the one open.
+        OpenSettingsUi,
         /// Open settings.json, writing the commented template first if there is none.
         OpenSettings,
         /// Open keymap.json, writing the commented template first if there is none.
@@ -249,6 +251,8 @@ pub mod context {
     pub const COMMAND_PALETTE: &str = "CommandPalette";
     /// The palette's query field, where Up and Down move the selection.
     pub const COMMAND_PALETTE_INPUT: &str = "CommandPalette > Input";
+    /// The Settings screen (see [`settings_view`](crate::settings_view)).
+    pub const SETTINGS_VIEW: &str = crate::settings_view::CONTEXT;
 }
 
 /// The default chords tests press. The bundled keymap in `serialist-core` is where they
@@ -278,6 +282,7 @@ pub(crate) mod keys {
     pub const PASTE: &str = "cmd-v";
     pub const SAVE_AS_COMMAND: &str = "cmd-alt-s";
     pub const COMMAND_PALETTE: &str = "cmd-shift-p";
+    pub const OPEN_SETTINGS_UI: &str = "cmd-,";
 }
 
 // Plain ctrl chords belong to the device once inline mode sends keystrokes to the port
@@ -308,6 +313,7 @@ pub(crate) mod keys {
     pub const PASTE: &str = "ctrl-shift-v";
     pub const SAVE_AS_COMMAND: &str = "ctrl-alt-s";
     pub const COMMAND_PALETTE: &str = "ctrl-shift-p";
+    pub const OPEN_SETTINGS_UI: &str = "ctrl-,";
 }
 
 /// App-level setup: remember gpui-kit's own key bindings (so a keymap reload can put
@@ -366,7 +372,8 @@ pub fn set_menus(cx: &mut App) {
     ]);
     cx.set_menus([
         Menu::new("Serialist").items([
-            MenuItem::action("Open Settings", OpenSettings),
+            MenuItem::action("Settings\u{2026}", OpenSettingsUi),
+            MenuItem::action("Open settings.json", OpenSettings),
             MenuItem::action("Open Keymap", OpenKeymap),
             MenuItem::action("Open Themes Folder", OpenThemesFolder),
             MenuItem::action("Open Plugins Folder", plugins::OpenPluginsFolder),
@@ -500,6 +507,10 @@ mod tests {
         assert_eq!(
             bound(workspace, keys::COMMAND_PALETTE),
             "command_palette::Toggle"
+        );
+        assert_eq!(
+            bound(workspace, keys::OPEN_SETTINGS_UI),
+            "serialist::OpenSettingsUi"
         );
         let palette = Some(context::COMMAND_PALETTE_INPUT);
         assert_eq!(bound(palette, "down"), "command_palette::SelectNext");
