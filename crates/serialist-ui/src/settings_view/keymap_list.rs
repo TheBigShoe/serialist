@@ -257,6 +257,11 @@ impl SettingsView {
         // The recorder leaves the row with the recording; keep the focus in the screen
         // so the window's bindings (the new chord among them) still reach it.
         window.focus(&self.focus_handle, cx);
+        if !super::is_loaded(cx) {
+            self.keymap.error = Some(super::NOT_LOADED.to_owned());
+            cx.notify();
+            return;
+        }
         let user_owned = row.source != BindingSource::Default;
         let paths = self.paths(cx);
         match settings_io::rebind(

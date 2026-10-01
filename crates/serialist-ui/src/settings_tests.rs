@@ -544,3 +544,25 @@ fn a_key_a_project_file_sets_is_read_only_here(cx: &mut TestAppContext) {
     );
     cx.executor().advance_clock(FRAME);
 }
+
+#[gpui_test]
+fn without_a_config_directory_nothing_is_read_or_written(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    // The bundled configuration only: no `config::start`.
+    let view = open_settings(cx, window, &workspace);
+    view.read_with(cx, |v, _| {
+        assert!(v.broken().is_none());
+        assert_eq!(v.origin("/display/wrap"), Origin::Default);
+    });
+    update_view(cx, window, &view, |v, window, cx| {
+        v.set_switch("/display/wrap", true, window, cx);
+    });
+    view.read_with(cx, |v, _| {
+        assert!(
+            v.error("/display/wrap")
+                .is_some_and(|e| e.contains("not read from a directory"))
+        );
+        assert!(!v.settings().display.wrap);
+    });
+}

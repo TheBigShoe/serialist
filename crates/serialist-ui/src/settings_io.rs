@@ -56,6 +56,16 @@ impl SettingsFiles {
         })
     }
 
+    /// The bundled defaults alone, for a configuration not read from a directory: nothing
+    /// is read, and every key is the default.
+    pub fn bundled() -> SettingsFiles {
+        SettingsFiles {
+            settings: Settings::default(),
+            user: None,
+            project: None,
+        }
+    }
+
     /// Where the value at `pointer` (`/buffer_font_size`, `/display/wrap`) comes from.
     /// A key the project file sets wins over the user's, as the loader layers them.
     pub fn origin(&self, pointer: &str) -> Origin {
