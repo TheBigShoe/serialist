@@ -7,7 +7,9 @@
 //! session's store, which parses received bytes once, when they arrive. A change to the
 //! setting therefore applies to sessions opened after it, not to ones already open.
 
-use serialist_core::{DisplayView, LineEnding, PortInfo, Settings, StoreConfig, TimestampMode};
+use serialist_core::{
+    DisplayView, Emulation, LineEnding, PortInfo, Settings, StoreConfig, TimestampMode,
+};
 
 use crate::scrollback::HEX_BYTES_PER_ROW;
 use crate::terminal::DisplayMode;
@@ -33,6 +35,8 @@ pub struct DisplayDefaults {
     pub decoded_inline: bool,
     /// `display.hide_framed_bytes`: leave lines of binary frames out of the text view.
     pub hide_framed_bytes: bool,
+    /// Monitor or VT: the device profile's `emulation`, else `terminal.emulation`.
+    pub emulation: Emulation,
 }
 
 impl Default for DisplayDefaults {
@@ -44,6 +48,7 @@ impl Default for DisplayDefaults {
             hex_bytes_per_row: HEX_BYTES_PER_ROW,
             decoded_inline: true,
             hide_framed_bytes: true,
+            emulation: Emulation::Monitor,
         }
     }
 }
@@ -96,6 +101,7 @@ impl SessionOptions {
                 hex_bytes_per_row: display.hex_bytes_per_row,
                 decoded_inline: display.decoded_inline,
                 hide_framed_bytes: display.hide_framed_bytes,
+                emulation: settings.emulation_for(port),
             },
             codec: settings
                 .profile_for(port)
@@ -140,8 +146,9 @@ mod tests {
                 "display": { "wrap": true, "timestamps": "delta", "view": "hex_ascii",
                              "hex_bytes_per_row": 8, "decoded_inline": false,
                              "hide_framed_bytes": false },
+                "terminal": { "emulation": "vt" },
                 "devices": [ { "match": { "product": "Airoha" }, "eol": "cr",
-                               "plugin": "airoha-race" } ]
+                               "plugin": "airoha-race", "emulation": "monitor" } ]
             }"#,
         )
         .unwrap();
@@ -158,11 +165,13 @@ mod tests {
                 hex_bytes_per_row: 8,
                 decoded_inline: false,
                 hide_framed_bytes: false,
+                emulation: Emulation::Monitor,
             }
         );
         assert_eq!(airoha.codec.as_deref(), Some("airoha-race"));
         let other = SessionOptions::from_settings(&settings, &usb("Something else"));
         assert_eq!(other.line_ending, LineEnding::Lf);
+        assert_eq!(other.display.emulation, Emulation::Vt, "terminal.emulation");
         assert_eq!(other.codec, None, "no profile, no codec");
     }
 

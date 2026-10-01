@@ -85,6 +85,8 @@ pub struct TabLabel {
     /// `+1.2 KiB` received while in the background, if anything was.
     pub unseen: Option<String>,
     pub active: bool,
+    /// Drawn after the title: the title a device in VT mode set (OSC 0 or 2).
+    pub suffix: Option<String>,
 }
 
 impl TabLabel {
@@ -96,7 +98,14 @@ impl TabLabel {
             unseen: (!active && status.unseen_bytes > 0)
                 .then(|| format!("+{}", format_bytes(status.unseen_bytes))),
             active,
+            suffix: None,
         }
+    }
+
+    /// This label with `suffix` after the title, if there is one.
+    pub fn with_suffix(mut self, suffix: Option<String>) -> Self {
+        self.suffix = suffix.filter(|suffix| !suffix.trim().is_empty());
+        self
     }
 }
 
@@ -124,6 +133,10 @@ mod tests {
             false,
         );
         assert_eq!(quiet.unseen, None);
+        assert_eq!(quiet.suffix, None);
+        let titled = quiet.clone().with_suffix(Some("root@board: ~".into()));
+        assert_eq!(titled.suffix.as_deref(), Some("root@board: ~"));
+        assert_eq!(quiet.clone().with_suffix(Some("  ".into())).suffix, None);
         assert_eq!(quiet.state.label(), "paused");
         assert!(quiet.state.is_open());
         assert!(!TabState::Lost.is_open());

@@ -41,6 +41,7 @@ icon_assets!(pub AppIcons, [
     ScrollText,
     SendHorizontal,
     SquareTerminal,
+    Terminal,
     TextWrap,
     Unplug,
     Usb,
@@ -78,6 +79,7 @@ mod tests {
         for icon in [
             IconName::Usb,
             IconName::SquareTerminal,
+            IconName::Terminal,
             IconName::Braces,
             IconName::ScrollText,
             IconName::Plug,

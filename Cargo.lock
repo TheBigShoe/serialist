@@ -7084,6 +7084,7 @@ dependencies = [
  "serialist-plugins",
  "serialist-script",
  "serialist-sim",
+ "serialist-vt",
  "tracing",
 ]
 

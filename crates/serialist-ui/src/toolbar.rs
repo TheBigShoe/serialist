@@ -3,7 +3,7 @@
 //! The toolbar is one 28 px row of groups, with a thin rule between them: the
 //! connection (a state dot, the line settings that open the port settings, Connect or
 //! Disconnect), the mode (Command / Inline), capture (Pause, Record, Clear), the view
-//! (Search, Hex, Timestamps, Wrap), Export, and the codec menu when a codec besides
+//! (Search, Hex, Emulation, Timestamps, Wrap), Export, and the codec menu when a codec besides
 //! `none` is loaded. The connection always shows. When the rest does not fit the width
 //! the toolbar has, controls leave for the overflow menu at the right end, in
 //! [`ToolbarItem::OVERFLOW_ORDER`] (the view toggles first, the mode last), until what
@@ -21,6 +21,8 @@ pub enum ToolbarItem {
     Clear,
     Search,
     Hex,
+    /// Monitor mode or VT mode.
+    Emulation,
     Timestamps,
     Wrap,
     Export,
@@ -34,14 +36,14 @@ impl ToolbarItem {
     pub const GROUPS: [&'static [ToolbarItem]; 5] = [
         &[Mode],
         &[Pause, Record, Clear],
-        &[Search, Hex, Timestamps, Wrap],
+        &[Search, Hex, Emulation, Timestamps, Wrap],
         &[Export],
         &[Codec],
     ];
 
     /// The order controls leave for the overflow menu, first to go first.
-    pub const OVERFLOW_ORDER: [ToolbarItem; 10] = [
-        Wrap, Timestamps, Hex, Codec, Export, Search, Clear, Record, Pause, Mode,
+    pub const OVERFLOW_ORDER: [ToolbarItem; 11] = [
+        Wrap, Timestamps, Hex, Emulation, Codec, Export, Search, Clear, Record, Pause, Mode,
     ];
 
     fn display_index(self) -> usize {
@@ -163,7 +165,7 @@ mod tests {
     fn everything_fits_a_wide_toolbar() {
         let layout = lay_out(1100., &METRICS);
         assert!(layout.overflow.is_empty());
-        assert_eq!(layout.shown.len(), 10);
+        assert_eq!(layout.shown.len(), 11);
         assert!(layout.width <= 1100.);
     }
 
@@ -186,7 +188,7 @@ mod tests {
         assert!(!layout.overflow.is_empty());
         assert_eq!(
             layout.overflow,
-            [Hex, Timestamps, Wrap, Codec],
+            [Hex, Emulation, Timestamps, Wrap, Codec],
             "the view toggles, then the codec, in display order"
         );
         assert!(layout.shows(Mode) && layout.shows(Pause));
@@ -198,7 +200,7 @@ mod tests {
             assert!(fits || nothing_left, "{available}: {layout:?}");
             let mut all = layout.shown.clone();
             all.extend(&layout.overflow);
-            assert_eq!(all.len(), 10, "every control is somewhere");
+            assert_eq!(all.len(), 11, "every control is somewhere");
         }
     }
 }
