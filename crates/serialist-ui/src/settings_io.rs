@@ -4,18 +4,19 @@
 //!
 //! The files stay the source of truth. Every write goes to disk; the configuration's
 //! watcher sees the save and reloads it into the running app like any other edit (see
-//! [`config`](crate::config)). A write that leaves the file unloadable is undone at once,
-//! the file's previous text put back, and the loader's message returned for the view to
-//! show next to the control.
+//! [`config`](crate::config)). Each edit is made in memory first and loaded the way the
+//! app loads the file; one the loader rejects is never saved, and the loader's message is
+//! returned for the view to show next to the control. Should the saved file fail to load
+//! anyway (another program wrote it meanwhile), its previous text is put back.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use serialist_core::keymap::ActionRef;
-use serialist_core::settings::ConfigPaths;
-use serialist_core::{Settings, load_keymap, load_settings};
-
-use self::editor::{KeymapEditor, SettingsEditor};
+use serialist_core::settings::{ConfigPaths, SettingsLayer, load_settings_from_layers};
+use serialist_core::{
+    ActionRef, Keymap, KeymapEditor, Settings, SettingsEditError, SettingsEditor, load_keymap,
+    load_settings,
+};
 
 /// Where a setting's value comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,51 +87,79 @@ fn open_existing(path: &Path) -> Result<Option<SettingsEditor>, String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// How often an edit is tried again when the file changed on disk between reading and
+/// saving it (an editor saved at the same moment).
+const ATTEMPTS: usize = 3;
+
+/// The project layer as the loader takes it, if there is one.
+fn project_layer(paths: &ConfigPaths) -> Result<Option<SettingsLayer>, String> {
+    let Some(path) = &paths.project_settings else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(SettingsLayer::new(path, text))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
 /// Set `pointer` in the user's `settings.json` to `value`, or remove it (`None`, which
-/// puts the default back). The commented template is written first if there is no file.
-/// If the file does not load afterwards, its previous text is put back and the loader's
-/// message returned.
+/// puts the default back, and drops an enclosing object the removal left empty). A file
+/// that does not exist is first written from the commented template, so the key's
+/// commented line is uncommented in place. `Err` is the loader's (or the editor's)
+/// message; the file is then as it was.
 pub fn write_setting(
     paths: &ConfigPaths,
     pointer: &str,
     value: Option<Value>,
 ) -> Result<(), String> {
-    paths
-        .ensure_settings_file()
-        .map_err(|error| format!("{}: {error}", paths.settings.display()))?;
-    let before = std::fs::read_to_string(&paths.settings)
-        .map_err(|error| format!("{}: {error}", paths.settings.display()))?;
-    let written = match value {
-        Some(value) => SettingsEditor::set_in_file(&paths.settings, pointer, value)
-            .map_err(|error| error.to_string()),
-        None => SettingsEditor::open(&paths.settings)
-            .and_then(|mut editor| {
-                editor.remove(pointer)?;
-                editor.save()
-            })
-            .map_err(|error| error.to_string()),
-    };
-    let checked = written.and_then(|()| {
-        load_settings(Some(&paths.settings), paths.project_settings.as_deref())
-            .map(drop)
-            .map_err(|error| error.to_string())
-    });
-    if let Err(message) = checked {
-        tracing::warn!(pointer, %message, "undoing a settings write that does not load");
-        if let Err(error) = std::fs::write(&paths.settings, before) {
-            tracing::error!(%error, "could not put settings.json back");
+    let project = project_layer(paths)?;
+    for attempt in 1..=ATTEMPTS {
+        let mut editor = SettingsEditor::open(&paths.settings).map_err(|error| error.to_string())?;
+        let before = editor.text().to_owned();
+        match &value {
+            Some(value) => editor.set(pointer, value.clone()),
+            None => editor.remove_and_prune(pointer).map(drop),
         }
-        return Err(message);
+        .map_err(|error| error.to_string())?;
+        if !editor.is_dirty() {
+            return Ok(());
+        }
+        // Load the edited text as the app will before it reaches the disk.
+        let mut layers = vec![SettingsLayer::new(&paths.settings, editor.text())];
+        layers.extend(project.clone());
+        load_settings_from_layers(&layers).map_err(|error| error.to_string())?;
+        match editor.save() {
+            Ok(()) => {}
+            Err(SettingsEditError::Changed { .. }) if attempt < ATTEMPTS => {
+                tracing::debug!(pointer, "settings.json changed on disk; editing again");
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        if let Err(error) = load_settings(Some(&paths.settings), paths.project_settings.as_deref()) {
+            tracing::warn!(pointer, %error, "undoing a settings write that does not load");
+            if let Err(error) = std::fs::write(&paths.settings, before) {
+                tracing::error!(%error, "could not put settings.json back");
+            }
+            return Err(error.to_string());
+        }
+        for change in editor.diff_summary() {
+            tracing::info!("settings.json: {change}");
+        }
+        return Ok(());
     }
-    tracing::info!(pointer, "wrote a setting");
-    Ok(())
+    Err(format!(
+        "{}: the file kept changing on disk; try again",
+        paths.settings.display()
+    ))
 }
 
-/// Bind `keystrokes` to `action` in `context` in the user's `keymap.json` and take
-/// `replaces` (the chord the action had there) off it: removed when the user's own file
-/// bound it, else bound to `null` so the bundled binding stops applying. If the keymap
-/// does not load afterwards, its previous text is put back and the loader's message
-/// returned.
+/// Bind `keystrokes` to `action` in `context` in the user's `keymap.json`, and take
+/// `replaces` (the chord the action had there) off it: removed from the file when the
+/// user's own file bound it, so a bundled binding of that chord applies again, else bound
+/// to `null` so the bundled binding stops applying. `Err` is the loader's (or the
+/// editor's) message; the file is then as it was.
 pub fn rebind(
     paths: &ConfigPaths,
     context: Option<&str>,
@@ -138,246 +167,37 @@ pub fn rebind(
     action: &ActionRef,
     replaces: Option<(&str, bool)>,
 ) -> Result<(), String> {
-    paths
-        .ensure_keymap_file()
-        .map_err(|error| format!("{}: {error}", paths.keymap.display()))?;
-    let before = std::fs::read_to_string(&paths.keymap)
-        .map_err(|error| format!("{}: {error}", paths.keymap.display()))?;
-    let written = KeymapEditor::open(&paths.keymap)
-        .and_then(|mut editor| {
-            if let Some((old, user_owned)) = replaces
-                && old != keystrokes
-            {
-                if user_owned {
-                    editor.remove(context, old)?;
-                } else {
-                    editor.unbind(context, old)?;
-                }
+    let action_value = match &action.args {
+        Some(args) => Value::Array(vec![Value::String(action.name.clone()), args.clone()]),
+        None => Value::String(action.name.clone()),
+    };
+    for attempt in 1..=ATTEMPTS {
+        let mut editor = KeymapEditor::open(&paths.keymap).map_err(|error| error.to_string())?;
+        if let Some((old, user_owned)) = replaces
+            && old != keystrokes
+        {
+            if user_owned {
+                editor.remove(context, old).map(drop)
+            } else {
+                editor.unbind(context, old)
             }
-            editor.bind(context, keystrokes, action)?;
-            editor.save()
-        })
-        .map_err(|error| error.to_string());
-    let checked = written.and_then(|()| {
-        load_keymap(Some(&paths.keymap))
-            .map(drop)
-            .map_err(|error| error.to_string())
-    });
-    if let Err(message) = checked {
-        tracing::warn!(keystrokes, %message, "undoing a keymap write that does not load");
-        if let Err(error) = std::fs::write(&paths.keymap, before) {
-            tracing::error!(%error, "could not put keymap.json back");
+            .map_err(|error| error.to_string())?;
         }
-        return Err(message);
+        editor
+            .bind(context, keystrokes, action_value.clone())
+            .map_err(|error| error.to_string())?;
+        Keymap::parse(editor.text(), &paths.keymap).map_err(|error| error.to_string())?;
+        match editor.save() {
+            Ok(()) => {}
+            Err(SettingsEditError::Changed { .. }) if attempt < ATTEMPTS => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        load_keymap(Some(&paths.keymap)).map_err(|error| error.to_string())?;
+        tracing::info!(keystrokes, action = %action.name, ?context, "rebound a key");
+        return Ok(());
     }
-    tracing::info!(keystrokes, action = %action.name, "rebound a key");
-    Ok(())
-}
-
-/// TEMPORARY stand-in for `serialist_core::settings::{SettingsEditor, KeymapEditor}`
-/// with the same signatures, until that branch lands. It does not keep comments.
-mod editor {
-    use std::fmt;
-    use std::path::{Path, PathBuf};
-
-    use serde_json::{Map, Value};
-    use serialist_core::keymap::ActionRef;
-
-    #[derive(Debug)]
-    pub struct EditError(String);
-
-    impl fmt::Display for EditError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(&self.0)
-        }
-    }
-
-    fn parse(path: &Path) -> Result<Value, EditError> {
-        let text = std::fs::read_to_string(path).map_err(|e| EditError(e.to_string()))?;
-        jsonc_parser::parse_to_serde_value::<Value>(&text, &Default::default())
-            .map_err(|e| EditError(e.to_string()))
-    }
-
-    fn tokens(pointer: &str) -> Vec<String> {
-        pointer
-            .split('/')
-            .skip(1)
-            .map(|t| t.replace("~1", "/").replace("~0", "~"))
-            .collect()
-    }
-
-    pub struct SettingsEditor {
-        path: PathBuf,
-        doc: Value,
-    }
-
-    impl SettingsEditor {
-        pub fn open(path: &Path) -> Result<Self, EditError> {
-            let doc = match parse(path)? {
-                Value::Null => Value::Object(Map::new()),
-                doc => doc,
-            };
-            Ok(Self {
-                path: path.to_path_buf(),
-                doc,
-            })
-        }
-
-        pub fn get(&self, pointer: &str) -> Option<Value> {
-            self.doc.pointer(pointer).cloned()
-        }
-
-        pub fn set(&mut self, pointer: &str, value: Value) -> Result<(), EditError> {
-            let tokens = tokens(pointer);
-            let mut node = &mut self.doc;
-            for (ix, token) in tokens.iter().enumerate() {
-                let last = ix + 1 == tokens.len();
-                match node {
-                    Value::Object(map) => {
-                        if last {
-                            map.insert(token.clone(), value);
-                            return Ok(());
-                        }
-                        let child = map
-                            .entry(token.clone())
-                            .or_insert_with(|| Value::Object(Map::new()));
-                        if !child.is_object() && !child.is_array() {
-                            *child = Value::Object(Map::new());
-                        }
-                        node = child;
-                    }
-                    Value::Array(items) => {
-                        let index: usize = token
-                            .parse()
-                            .map_err(|_| EditError(format!("bad index {token}")))?;
-                        if index > items.len() {
-                            return Err(EditError(format!("index {index} out of range")));
-                        }
-                        if index == items.len() {
-                            items.push(Value::Null);
-                        }
-                        if last {
-                            items[index] = value;
-                            return Ok(());
-                        }
-                        node = &mut items[index];
-                    }
-                    _ => return Err(EditError("not a container".into())),
-                }
-            }
-            self.doc = value;
-            Ok(())
-        }
-
-        pub fn remove(&mut self, pointer: &str) -> Result<(), EditError> {
-            let tokens = tokens(pointer);
-            let Some((last, parents)) = tokens.split_last() else {
-                return Ok(());
-            };
-            let parent = format!(
-                "{}",
-                parents
-                    .iter()
-                    .map(|t| format!("/{t}"))
-                    .collect::<String>()
-            );
-            match self.doc.pointer_mut(&parent) {
-                Some(Value::Object(map)) => {
-                    map.remove(last);
-                }
-                Some(Value::Array(items)) => {
-                    if let Ok(index) = last.parse::<usize>()
-                        && index < items.len()
-                    {
-                        items.remove(index);
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-
-        pub fn save(&self) -> Result<(), EditError> {
-            let text = serde_json::to_string_pretty(&self.doc).map_err(|e| EditError(e.to_string()))?;
-            std::fs::write(&self.path, text + "\n").map_err(|e| EditError(e.to_string()))
-        }
-
-        pub fn set_in_file(path: &Path, pointer: &str, value: Value) -> Result<(), EditError> {
-            let mut editor = Self::open(path)?;
-            editor.set(pointer, value)?;
-            editor.save()
-        }
-    }
-
-    pub struct KeymapEditor {
-        path: PathBuf,
-        doc: Vec<Value>,
-    }
-
-    impl KeymapEditor {
-        pub fn open(path: &Path) -> Result<Self, EditError> {
-            let doc = match parse(path)? {
-                Value::Array(items) => items,
-                _ => Vec::new(),
-            };
-            Ok(Self {
-                path: path.to_path_buf(),
-                doc,
-            })
-        }
-
-        fn section(&mut self, context: Option<&str>) -> &mut Map<String, Value> {
-            let position = self.doc.iter().position(|section| {
-                section.get("context").and_then(Value::as_str) == context
-                    && section.get("use_key_equivalents").is_none()
-            });
-            let ix = match position {
-                Some(ix) => ix,
-                None => {
-                    let mut section = Map::new();
-                    if let Some(context) = context {
-                        section.insert("context".into(), Value::String(context.into()));
-                    }
-                    section.insert("bindings".into(), Value::Object(Map::new()));
-                    self.doc.push(Value::Object(section));
-                    self.doc.len() - 1
-                }
-            };
-            let section = self.doc[ix].as_object_mut().expect("a section");
-            section
-                .entry("bindings")
-                .or_insert_with(|| Value::Object(Map::new()))
-                .as_object_mut()
-                .expect("bindings")
-        }
-
-        pub fn bind(
-            &mut self,
-            context: Option<&str>,
-            keystrokes: &str,
-            action: &ActionRef,
-        ) -> Result<(), EditError> {
-            let value = match &action.args {
-                Some(args) => Value::Array(vec![Value::String(action.name.clone()), args.clone()]),
-                None => Value::String(action.name.clone()),
-            };
-            self.section(context).insert(keystrokes.into(), value);
-            Ok(())
-        }
-
-        pub fn unbind(&mut self, context: Option<&str>, keystrokes: &str) -> Result<(), EditError> {
-            self.section(context).insert(keystrokes.into(), Value::Null);
-            Ok(())
-        }
-
-        pub fn remove(&mut self, context: Option<&str>, keystrokes: &str) -> Result<(), EditError> {
-            self.section(context).remove(keystrokes);
-            Ok(())
-        }
-
-        pub fn save(&self) -> Result<(), EditError> {
-            let text = serde_json::to_string_pretty(&self.doc).map_err(|e| EditError(e.to_string()))?;
-            std::fs::write(&self.path, text + "\n").map_err(|e| EditError(e.to_string()))
-        }
-    }
+    Err(format!(
+        "{}: the file kept changing on disk; try again",
+        paths.keymap.display()
+    ))
 }
