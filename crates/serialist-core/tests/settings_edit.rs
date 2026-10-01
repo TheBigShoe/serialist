@@ -192,6 +192,261 @@ fn settings_edit_only_ever_writes_the_line_endings_the_file_had() {
     assert!(!out.contains("\n  "), "no space indentation in a tab file");
 }
 
+// ---- Arrays with comments between their elements ----
+//
+// `devices_commented.jsonc` has three profiles with comments above them, after their
+// commas, a block comment, blank lines and a comment left after the last one. Adding,
+// removing and moving a profile touches that profile only.
+
+/// The comment on each line of `text` that has one, trimmed (one comment per line).
+fn comments_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let at = line.find("/*").or_else(|| line.find("//"))?;
+            Some(line[at..].trim().to_owned())
+        })
+        .collect()
+}
+
+/// The comments of `devices_commented.jsonc` by the profile they are written with, and
+/// the ones about the array as a whole: what an add, a removal or a move of another
+/// profile must never lose.
+const EARBUDS_COMMENTS: [&str; 2] = ["// Airoha earbuds on the bench", "// fast link"];
+const DONGLE_COMMENTS: [&str; 2] = [
+    "/* The dongle: leave this one on 9600 */",
+    "// kept for the lab",
+];
+const FALLBACK_COMMENTS: [&str; 2] = ["// Anything else", "// last resort"];
+const ARRAY_COMMENTS: [&str; 5] = [
+    "// Serialist settings for the bench",
+    "// points",
+    "// Profiles are tried in order; the first match wins.",
+    "// new boards go above the fallback",
+    "// the end of devices",
+];
+
+fn device_names(text: &str) -> Vec<String> {
+    let (_dir, editor) = editor_over(text);
+    editor
+        .get("/devices")
+        .and_then(|devices| devices.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|device| device["name"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+fn assert_all_present(text: &str, comments: &[&str]) {
+    let found = comments_in(text);
+    for comment in comments {
+        assert!(
+            found.iter().any(|c| c == comment),
+            "lost `{comment}` in:\n{text}"
+        );
+    }
+}
+
+#[test]
+fn settings_edit_adding_a_profile_keeps_every_comment() {
+    let input = fixture("devices_commented.jsonc");
+    let out = settings_after("devices_commented.jsonc", |editor| {
+        editor
+            .set(
+                "/devices/-",
+                json!({ "name": "Bench board", "match": { "vid": "0x1234" }, "baud": 57600 }),
+            )
+            .unwrap();
+    });
+    assert_eq!(out, fixture("devices_commented_add.jsonc"));
+    assert_eq!(
+        comments_in(&out),
+        comments_in(&input),
+        "same comments, same order"
+    );
+    assert_eq!(
+        device_names(&out),
+        ["Earbuds", "Dongle", "Fallback", "Bench board"]
+    );
+}
+
+#[test]
+fn settings_edit_removing_a_profile_keeps_the_comments_of_the_others() {
+    let out = settings_after("devices_commented.jsonc", |editor| {
+        assert!(editor.remove("/devices/1").unwrap());
+    });
+    assert_eq!(out, fixture("devices_commented_remove_middle.jsonc"));
+    for kept in [
+        &EARBUDS_COMMENTS[..],
+        &FALLBACK_COMMENTS[..],
+        &ARRAY_COMMENTS[..],
+    ] {
+        assert_all_present(&out, kept);
+    }
+    assert_eq!(device_names(&out), ["Earbuds", "Fallback"]);
+
+    // The comment after a removed profile's comma goes with it; the ones above it stay,
+    // as they do for a removed key.
+    let out = settings_after("devices_commented.jsonc", |editor| {
+        assert!(editor.remove("/devices/0").unwrap());
+    });
+    assert!(!out.contains("// fast link"), "{out}");
+    assert_all_present(&out, &["// Airoha earbuds on the bench"]);
+    for kept in [
+        &DONGLE_COMMENTS[..],
+        &FALLBACK_COMMENTS[..],
+        &ARRAY_COMMENTS[..],
+    ] {
+        assert_all_present(&out, kept);
+    }
+    let out = settings_after("devices_commented.jsonc", |editor| {
+        assert!(editor.remove("/devices/2").unwrap());
+    });
+    assert!(!out.contains("// last resort"), "{out}");
+    for kept in [
+        &EARBUDS_COMMENTS[..],
+        &DONGLE_COMMENTS[..],
+        &ARRAY_COMMENTS[..],
+    ] {
+        assert_all_present(&out, kept);
+    }
+    assert_all_present(&out, &["// Anything else"]);
+}
+
+#[test]
+fn settings_edit_moving_a_profile_takes_its_comments_along() {
+    let input = fixture("devices_commented.jsonc");
+
+    let out = settings_after("devices_commented.jsonc", |editor| {
+        assert!(editor.move_element("/devices/0", 2).unwrap());
+    });
+    assert_eq!(out, fixture("devices_commented_move_to_end.jsonc"));
+    assert_eq!(device_names(&out), ["Dongle", "Fallback", "Earbuds"]);
+
+    let out_front = settings_after("devices_commented.jsonc", |editor| {
+        assert!(editor.move_element("/devices/2", 0).unwrap());
+    });
+    assert_eq!(out_front, fixture("devices_commented_move_to_front.jsonc"));
+    assert_eq!(device_names(&out_front), ["Fallback", "Earbuds", "Dongle"]);
+
+    for moved in [&out, &out_front] {
+        let mut before = comments_in(&input);
+        let mut after = comments_in(moved);
+        before.sort();
+        after.sort();
+        assert_eq!(after, before, "no comment is lost or added");
+    }
+}
+
+#[test]
+fn settings_edit_every_move_of_a_commented_profile_matches_vec_semantics() {
+    let input = fixture("devices_commented.jsonc");
+    let mut expected_comments = comments_in(&input);
+    expected_comments.sort();
+    let names = device_names(&input);
+    for from in 0..3 {
+        for to in 0..3 {
+            let (_dir, mut editor) = editor_over(&input);
+            let moved = editor
+                .move_element(&format!("/devices/{from}"), to)
+                .unwrap();
+            assert_eq!(moved, from != to, "{from} -> {to}");
+            let mut want = names.clone();
+            let name = want.remove(from);
+            want.insert(to, name);
+            assert_eq!(device_names(editor.text()), want, "{from} -> {to}");
+            let mut found = comments_in(editor.text());
+            found.sort();
+            assert_eq!(found, expected_comments, "{from} -> {to}");
+            if from == to {
+                assert_eq!(editor.text(), input);
+            }
+        }
+    }
+}
+
+#[test]
+fn settings_edit_a_moved_profile_keeps_its_comments_around_it() {
+    // Earbuds to the end: its two comments sit with it, the dongle's stay with the dongle.
+    let (_dir, mut editor) = editor_over(&fixture("devices_commented.jsonc"));
+    editor.move_element("/devices/0", 2).unwrap();
+    let lines: Vec<&str> = editor.text().lines().map(str::trim).collect();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no `{needle}` in:\n{}", editor.text()))
+    };
+    assert_eq!(
+        at("// Airoha earbuds on the bench") + 1,
+        at("\"name\": \"Earbuds\"")
+    );
+    assert!(lines[at("\"name\": \"Earbuds\"")].ends_with("// fast link"));
+    assert_eq!(at("// kept for the lab") + 1, at("\"name\": \"Dongle\""));
+    assert!(at("\"name\": \"Dongle\"") < at("// Anything else"));
+    assert!(at("// Anything else") < at("// Airoha earbuds on the bench"));
+}
+
+#[test]
+fn settings_edit_moves_in_an_inline_array_and_keeps_the_file_style() {
+    let (_dir, mut editor) = editor_over(
+        "{ \"devices\": [ { \"baud\": 1 }, { \"baud\": 2 }, { \"baud\": 3 } ] // inline\n}\n",
+    );
+    assert!(editor.move_element("/devices/0", 2).unwrap());
+    assert_eq!(
+        editor.text(),
+        "{ \"devices\": [ { \"baud\": 2 }, { \"baud\": 3 }, { \"baud\": 1 } ] // inline\n}\n"
+    );
+    assert!(editor.move_element("/devices/2", 1).unwrap());
+    assert_eq!(
+        editor.get("/devices"),
+        Some(json!([{ "baud": 2 }, { "baud": 1 }, { "baud": 3 }]))
+    );
+
+    // CRLF and tabs are the file's own.
+    let crlf = fixture("devices_commented.jsonc").replace('\n', "\r\n");
+    let (_dir, mut editor) = editor_over(&crlf);
+    editor.move_element("/devices/1", 0).unwrap();
+    let text = editor.text().replace("\r\n", "");
+    assert!(
+        !text.contains('\n') && !text.contains('\r'),
+        "no bare line ending"
+    );
+    assert_eq!(
+        device_names(editor.text()),
+        ["Dongle", "Earbuds", "Fallback"]
+    );
+}
+
+#[test]
+fn settings_edit_moving_a_profile_refuses_what_is_not_one() {
+    let (_dir, mut editor) = editor_over(&fixture("devices_commented.jsonc"));
+    let before = editor.text().to_owned();
+    for (pointer, to) in [
+        ("/devices/3", 0),
+        ("/devices/0", 3),
+        ("/devices/-", 0),
+        ("/devices/01", 0),
+        ("/devices", 0),
+        ("/display/wrap", 0),
+        ("/not_there/0", 0),
+        ("", 0),
+        ("devices/0", 0),
+    ] {
+        let err = editor.move_element(pointer, to).unwrap_err();
+        assert!(
+            matches!(err, EditError::Pointer { .. }),
+            "{pointer} -> {to}: {err:?}"
+        );
+        assert_eq!(editor.text(), before, "{pointer} -> {to}");
+    }
+    assert!(!editor.is_dirty());
+    assert!(
+        !editor.move_element("/devices/1", 1).unwrap(),
+        "already there"
+    );
+    assert!(!editor.is_dirty());
+}
+
 // ---- Smaller behaviours ----
 
 #[test]

@@ -9,8 +9,11 @@
 //! A line setting the profile did not set and the form leaves at the global default is
 //! not written, so the profile keeps following the default.
 //!
-//! Rows reorder by dragging (the first profile that matches wins), which writes the
-//! list again in its new order.
+//! Rows reorder by dragging (the first profile that matches wins). The list is never
+//! written whole: a new profile is appended (`/devices/-`), a removed one is taken out
+//! by its index and a dragged one is moved, so the comments the user wrote between the
+//! other profiles stay where they are (the editor's rules for what belongs to a profile
+//! are in `serialist_core::settings`).
 
 use serde_json::{Map, Value, json};
 use serialist_core::{
@@ -24,7 +27,7 @@ use crate::config::Config;
 use crate::dialog_footer::DialogButtons;
 use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
 use crate::prelude::*;
-use crate::settings_io::Origin;
+use crate::settings_io::{self, Origin};
 
 /// What the plugin and script pickers call "none".
 const NONE: &str = "None";
@@ -219,15 +222,12 @@ impl SettingsView {
                 return false;
             }
         };
-        let mut devices = self.user_devices();
+        let count = self.user_devices().len();
         match index {
-            Some(ix) if ix < devices.len() => {
-                self.write_profile_at(&format!("/devices/{ix}"), profile, window, cx);
+            Some(ix) if ix < count => {
+                self.write_device(&format!("/devices/{ix}"), Some(profile), window, cx);
             }
-            _ => {
-                devices.push(profile);
-                self.write("/devices", Some(Value::Array(devices)), window, cx);
-            }
+            _ => self.write_device("/devices/-", Some(profile), window, cx),
         }
         match self.errors.get("/devices").cloned() {
             Some(message) => {
@@ -241,15 +241,25 @@ impl SettingsView {
         }
     }
 
-    /// Write one profile in place, reporting a problem under the list.
-    fn write_profile_at(
+    /// Write one profile at `pointer` (`/devices/2` in place, `/devices/-` after the
+    /// others), or remove it (`None`), reporting a problem under the list.
+    fn write_device(
         &mut self,
         pointer: &str,
-        profile: Value,
+        profile: Option<Value>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.write(pointer, Some(profile), window, cx);
+        if self.locked("/devices") {
+            return;
+        }
+        self.write(pointer, profile, window, cx);
+        self.report_under_list(pointer);
+    }
+
+    /// Show the problem the write at `pointer` left, if any, under the list of profiles
+    /// instead, and clear the list's own when the write went through.
+    fn report_under_list(&mut self, pointer: &str) {
         if let Some(message) = self.errors.remove(pointer) {
             self.errors.insert("/devices".to_owned(), message);
         } else {
@@ -257,15 +267,13 @@ impl SettingsView {
         }
     }
 
-    /// Remove profile `index`.
+    /// Remove profile `index`. The file's `devices` key goes with its last profile,
+    /// unless a comment is left in it.
     pub fn remove_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let mut devices = self.user_devices();
-        if index >= devices.len() {
+        if index >= self.user_devices().len() {
             return;
         }
-        devices.remove(index);
-        let value = (!devices.is_empty()).then_some(Value::Array(devices));
-        self.write("/devices", value, window, cx);
+        self.write_device(&format!("/devices/{index}"), None, window, cx);
     }
 
     /// Move profile `from` to `to`, which changes which one a port gets first.
@@ -276,13 +284,16 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut devices = self.user_devices();
-        if from >= devices.len() || from == to {
+        let count = self.user_devices().len();
+        if from >= count || from == to || self.locked("/devices") {
             return;
         }
-        let profile = devices.remove(from);
-        devices.insert(to.min(devices.len()), profile);
-        self.write("/devices", Some(Value::Array(devices)), window, cx);
+        let pointer = format!("/devices/{from}");
+        let to = to.min(count - 1);
+        self.run_edit(&pointer, window, cx, |paths| {
+            settings_io::move_setting_element(paths, &pointer, to)
+        });
+        self.report_under_list(&pointer);
     }
 
     pub(super) fn render_devices(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
