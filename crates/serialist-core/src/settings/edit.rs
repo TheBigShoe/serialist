@@ -42,6 +42,18 @@
 //! This applies to any file, not just the template: a commented-out `// "theme": ...`
 //! line the user left behind is uncommented the same way.
 //!
+//! # Arrays and their comments
+//!
+//! An element of an array (a device profile) is added, removed and moved on its own, so
+//! the comments written between the other elements are never touched. A comment written
+//! with an element is the one on its own lines right above it and the one after its
+//! comma on the same line. [`SettingsEditor::remove`] takes the second with the element
+//! and leaves the first behind, as it does for a key.
+//! [`SettingsEditor::move_element`] carries both along with the element it moves and
+//! leaves the separators and every other element's comments where they are; moving by a
+//! removal and an insertion would leave the comments above the element on whatever was
+//! written after it.
+//!
 //! # What is not preserved
 //!
 //! The comments above a key stay when the key is removed. The keys of an object value
@@ -54,6 +66,7 @@
 //! document with exactly that change. Otherwise the edit is refused with
 //! [`EditError::Rejected`] and the text is unchanged.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
@@ -276,6 +289,17 @@ impl SettingsEditor {
         self.doc.remove(pointer, true)
     }
 
+    /// Moves the array element at `pointer` (`/devices/2`) so that it ends up at index
+    /// `to`, the way `Vec::remove` followed by `Vec::insert` at `to` would. The element
+    /// keeps the comments written with it, and nothing else in the file changes. Returns
+    /// whether anything moved (`false` when it is there already). An index outside the
+    /// array, or a pointer that is not an array element, is an
+    /// [`EditError::Pointer`]. See the [module documentation](self) for what belongs to
+    /// an element.
+    pub fn move_element(&mut self, pointer: &str, to: usize) -> Result<bool, EditError> {
+        self.doc.move_element(pointer, to)
+    }
+
     /// The text as it would be saved.
     pub fn text(&self) -> &str {
         &self.doc.text
@@ -404,6 +428,19 @@ impl Document {
             );
         }
         match edit_remove(&self.text, self.kind, &segments, prune)
+            .map_err(|failure| failure.into_error(&self.path))?
+        {
+            Some(text) => {
+                self.text = text;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn move_element(&mut self, pointer: &str, to: usize) -> Result<bool, EditError> {
+        let segments = parse_pointer(pointer).map_err(|failure| failure.into_error(&self.path))?;
+        match edit_move(&self.text, self.kind, &segments, to)
             .map_err(|failure| failure.into_error(&self.path))?
         {
             Some(text) => {
@@ -1133,6 +1170,112 @@ fn model_remove_empty(root: &mut Value, segments: &[String]) -> Result<(), Fail>
         ));
     }
     model_remove(root, segments)
+}
+
+// ---- Move ----
+
+/// `text` with the array element at `segments` moved to index `to`, checked, or `None`
+/// when it is at `to` already. The elements are reordered by the parser's own sort, which
+/// moves what was written with an element along with it and leaves the separators where
+/// they are.
+pub(super) fn edit_move(
+    text: &str,
+    kind: RootKind,
+    segments: &[String],
+    to: usize,
+) -> Result<Option<String>, Fail> {
+    let pointer = join_pointer(segments);
+    let Some((last, parents)) = segments.split_last() else {
+        return Err(Fail::pointer(&pointer, "name an array element to move"));
+    };
+    let Some(from) = parse_index(last) else {
+        return Err(Fail::pointer(
+            &pointer,
+            format!("`{last}` is not an array index"),
+        ));
+    };
+    let before = parse_value(text, kind)?;
+    let root = parse_root(text)?;
+    let Some(mut container) = root.value().and_then(|node| Container::from_node(&node)) else {
+        return Err(Fail::pointer(&pointer, "the document is empty"));
+    };
+    for (index, segment) in parents.iter().enumerate() {
+        let walked = join_pointer(&segments[..=index]);
+        container = match step(&container, segment, &segments[..index])? {
+            Step::Found(node) => Container::from_node(&node).ok_or_else(|| {
+                Fail::pointer(&walked, format!("`{walked}` is not an object or array"))
+            })?,
+            Step::Missing => {
+                return Err(Fail::pointer(&walked, "the path is not in the document"));
+            }
+        };
+    }
+    let Container::Array(array) = container else {
+        return Err(Fail::pointer(&pointer, "only array elements can be moved"));
+    };
+    let elements = array.elements();
+    let len = elements.len();
+    if from >= len {
+        return Err(Fail::pointer(
+            &pointer,
+            format!("index {from} is out of range: the array has {len} elements"),
+        ));
+    }
+    if to >= len {
+        return Err(Fail::pointer(
+            &pointer,
+            format!("cannot move to index {to}: the array has {len} elements"),
+        ));
+    }
+    if from == to {
+        return Ok(None);
+    }
+
+    // Where each element goes, keyed by its place among the array's children, which is
+    // what the sort sees of it.
+    let mut order: Vec<usize> = (0..len).collect();
+    let moved = order.remove(from);
+    order.insert(to, moved);
+    let rank_of_child: HashMap<usize, usize> = elements
+        .iter()
+        .enumerate()
+        .filter_map(|(position, element)| {
+            let rank = order.iter().position(|&original| original == position)?;
+            Some((element.child_index(), rank))
+        })
+        .collect();
+    array
+        .sort_elements()
+        .by_key(|node| rank_of_child.get(&node.child_index()).copied());
+    let new_text = root.to_string();
+
+    let mut expected = before;
+    model_move(&mut expected, parents, from, to)?;
+    verify(&new_text, kind, &expected)?;
+    Ok(Some(new_text))
+}
+
+/// Moves element `from` of the array at `parents` to index `to` in the model.
+fn model_move(root: &mut Value, parents: &[String], from: usize, to: usize) -> Result<(), Fail> {
+    let mut cursor = root;
+    for segment in parents {
+        cursor = match cursor {
+            Value::Object(map) => map.get_mut(segment),
+            Value::Array(items) => parse_index(segment).and_then(|at| items.get_mut(at)),
+            _ => None,
+        }
+        .ok_or_else(|| Fail::Rejected("the path is not in the document".to_owned()))?;
+    }
+    match cursor {
+        Value::Array(items) if from < items.len() && to < items.len() => {
+            let item = items.remove(from);
+            items.insert(to, item);
+            Ok(())
+        }
+        _ => Err(Fail::Rejected(
+            "the element to move is not in the document".to_owned(),
+        )),
+    }
 }
 
 // ---- Uncommenting template lines ----

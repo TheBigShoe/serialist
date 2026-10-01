@@ -110,7 +110,9 @@ front. Connect in the Devices panel opens a new tab (or goes to the port's tab i
 one), `cmd-t` opens an empty tab to pick a port for, `cmd-w` closes a tab (asking first while
 it records or runs a script), `cmd-1` to `cmd-9` and `cmd-shift-]`/`[` switch, and tabs
 reorder by dragging. The tab bar shows once two tabs are open. The status line, the window
-title, the Decoded panel and the Script console follow the tab in front; the others keep
+title, the Decoded panel and the Script console follow the tab in front (with Settings in
+front the status line keeps showing the session you came from, or the config folder when
+there is none); the others keep
 receiving, recording and running their scripts without drawing, and their label counts the
 bytes that arrived meanwhile. When the window closes the tabs are written to `state.json`
 and reopen at the next start (the `restore_session` setting; ports named on the command line
@@ -132,7 +134,8 @@ and dark themes, the UI font), Terminal font (family, size, weight, line height,
 fallbacks, and the `terminal.*` overrides), Display, Session (default baud, line ending,
 echo, restore, and inline mode's Backspace, escape chord and paste pacing), Devices (the
 device profiles: add, edit with the port settings form, remove, drag to reorder), Keymap
-(every binding in effect, yours marked, with Rebind… on a selected row) and Plugins. It is
+(every binding in effect, yours marked, with the saved commands' keys listed as "command" rows,
+with Rebind… on a selected row) and Plugins. It is
 a front end to `settings.json` and `keymap.json`, which stay the source of truth: each
 change writes one key into the file at once (text fields after a 300 ms pause), keeping
 your comments and uncommenting the template's line for the key, and the watcher applies it
@@ -157,7 +160,7 @@ The app watches it and applies changes as you save; there is no restart.
 | `scripts/` | Lua scripts, `*.lua` at any depth. The Scripts menu's Open Scripts Folder creates it with two example scripts if it holds none. |
 | `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. None is installed at first; `plugins/examples/` holds copies of the bundled examples, which decode nothing until installed. See [Plugins](#plugins). |
 | `history.jsonl` | The compose bar's history, one JSON string per line. |
-| `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode), reopened at the next start. Written by the app. |
+| `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode, monitor or VT), reopened at the next start. Written by the app. |
 
 A project can also check in `.serialist/settings.json` and `.serialist/commands.json`; the
 nearest one found searching up from the working directory is used. Defaults for every

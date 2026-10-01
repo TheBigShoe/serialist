@@ -60,7 +60,8 @@
 //! # Session restore
 //!
 //! When the workspace closes (the window closes, or the app quits) it writes the tabs'
-//! ports and settings to `state.json` in the config directory (see
+//! ports and settings (line settings, codec, input mode, monitor or VT) to `state.json`
+//! in the config directory (see
 //! [`session_state`](crate::session_state)), and the next start reopens them, unless
 //! ports were named on the command line or the `restore_session` setting is off. A
 //! restored port connects if the port source lists it (a simulated port with the
@@ -112,6 +113,7 @@ use crate::decoded_panel::DecodedPanel;
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::dialog_footer::DialogButtons;
 use crate::docks::{CENTER_MIN, DockPanel, DockSide, Docks, RAIL_WIDTH};
+use crate::emulation::Emulation;
 use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
 use crate::inline::Mode;
@@ -208,6 +210,9 @@ struct Reopen {
 struct Restore {
     codec: Option<String>,
     mode: Mode,
+    /// Monitor or VT as the tab showed it, if the file said (one from before it was
+    /// kept leaves the session with the setting's).
+    emulation: Option<Emulation>,
 }
 
 /// A tab: a port, and the session view open on it, if any.
@@ -335,6 +340,9 @@ pub struct Workspace {
     /// In the order the tab bar shows them.
     tabs: Vec<SessionTab>,
     active: Option<TabId>,
+    /// The tab with a session that was in front last before the active one, which the
+    /// status line keeps showing while the Settings tab is in front.
+    last_session: Option<TabId>,
     next_tab: u64,
     /// The tab a close confirmation is open for.
     pending_close: Option<TabId>,
@@ -483,6 +491,7 @@ impl Workspace {
             param_target: None,
             tabs: Vec::new(),
             active: None,
+            last_session: None,
             next_tab: 0,
             pending_close: None,
             docks: Docks::default(),
@@ -575,6 +584,45 @@ impl Workspace {
     /// The active tab's session view.
     pub fn session(&self) -> Option<&Entity<SessionView>> {
         self.active_tab().and_then(|tab| tab.view.as_ref())
+    }
+
+    /// The session the status line is about: the active tab's, or, with the Settings
+    /// tab in front, the one that was in front before it (else any open one, if that tab
+    /// is gone). A tab that has no session shows no segment of its own.
+    pub fn status_session(&self) -> Option<&Entity<SessionView>> {
+        if let Some(session) = self.session() {
+            return Some(session);
+        }
+        if !self.active_tab().is_some_and(|tab| tab.settings.is_some()) {
+            return None;
+        }
+        self.last_session
+            .and_then(|id| self.session_in(id))
+            .or_else(|| self.tabs.iter().find_map(|tab| tab.view.as_ref()))
+    }
+
+    /// What the status line says when there is no session to show: a port being opened
+    /// or not connected, the Settings screen and where its files are, or that there is
+    /// no session.
+    pub fn status_placeholder(&self, cx: &App) -> String {
+        match self.active_tab() {
+            Some(tab) if tab.settings.is_some() => {
+                let dir = cx
+                    .try_global::<Config>()
+                    .map(|config| config.paths().dir.clone())
+                    .unwrap_or_else(|| ConfigPaths::default_for_platform().dir);
+                format!("Settings: {}", dir.display())
+            }
+            Some(tab) if tab.connecting => format!(
+                "Opening {}\u{2026}",
+                tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
+            ),
+            Some(tab) if tab.port.is_some() => format!(
+                "{}: not connected",
+                tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
+            ),
+            _ => "No session".to_owned(),
+        }
     }
 
     /// Every tab's session view, in tab order.
@@ -780,6 +828,7 @@ impl Workspace {
         }
         if let Some(previous) = self.session().cloned() {
             previous.update(cx, |view, cx| view.set_visible(false, cx));
+            self.last_session = self.active;
         }
         if let Some(previous) = self.active.and_then(|previous| self.tab_mut(previous)) {
             previous.shown = None;
@@ -1352,6 +1401,9 @@ impl Workspace {
                     view.want_codec(codec, cx);
                 }
                 view.set_mode(restore.mode, window, cx);
+                if let Some(emulation) = restore.emulation {
+                    view.set_emulation(emulation, cx);
+                }
             }
             if !active {
                 view.set_visible(false, cx);
@@ -1421,6 +1473,7 @@ impl Workspace {
                         serial: view.serial().clone(),
                         codec: view.codec_name().map(str::to_owned),
                         mode: view.mode().into(),
+                        emulation: Some(view.emulation()),
                     }
                 }
                 None => SavedTab {
@@ -1435,6 +1488,7 @@ impl Workspace {
                         .as_ref()
                         .map_or(Mode::Command, |r| r.mode)
                         .into(),
+                    emulation: tab.restore.as_ref().and_then(|r| r.emulation),
                 },
             });
         }
@@ -1494,6 +1548,7 @@ impl Workspace {
                 tab.restore = Some(Restore {
                     codec: saved.codec,
                     mode: saved.mode.into(),
+                    emulation: saved.emulation,
                 });
             }
             restored.push(id);
@@ -2412,18 +2467,12 @@ impl Workspace {
             status_notice("status-config", notice.text, color)
         });
 
-        let Some(session) = self.session().cloned() else {
-            let label = match self.active_tab() {
-                Some(tab) if tab.connecting => format!(
-                    "Opening {}\u{2026}",
-                    tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
-                ),
-                Some(tab) if tab.port.is_some() => format!(
-                    "{}: not connected",
-                    tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
-                ),
-                _ => "No session".to_owned(),
-            };
+        // With the Settings tab in front the segment is the session that was in front
+        // before it, for reading: its controls act on the active tab's session, which
+        // there is none of, so they are left off.
+        let live = self.session().is_some();
+        let Some(session) = self.status_session().cloned() else {
+            let label = self.status_placeholder(cx);
             return line
                 .child(
                     h_flex()
@@ -2461,29 +2510,39 @@ impl Workspace {
 
         // The connection: state, port and settings, one segment that opens the settings.
         let sync = session.downgrade();
-        let connection = Popover::new("status-port-popover")
-            .anchor(Anchor::BottomLeft)
-            .trigger(
-                Button::new("status-port")
-                    .ghost()
-                    .xsmall()
-                    .tooltip(format!("{}: port settings", status.state))
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .items_center()
-                            .child(chrome::state_dot(state_color, disconnected))
-                            .child(div().text_color(foreground).child(SharedString::from(port)))
-                            .child(SharedString::from(settings)),
-                    ),
-            )
-            .content(move |_, _, _| form.clone())
-            .on_open_change(move |open: &bool, window, cx| {
-                if *open {
-                    sync.update(cx, |view, cx| view.sync_port_form(window, cx))
-                        .ok();
-                }
-            });
+        let segment = h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(chrome::state_dot(state_color, disconnected))
+            .child(div().text_color(foreground).child(SharedString::from(port)))
+            .child(SharedString::from(settings));
+        let connection = if live {
+            Popover::new("status-port-popover")
+                .anchor(Anchor::BottomLeft)
+                .trigger(
+                    Button::new("status-port")
+                        .ghost()
+                        .xsmall()
+                        .tooltip(format!("{}: port settings", status.state))
+                        .child(segment),
+                )
+                .content(move |_, _, _| form.clone())
+                .on_open_change(move |open: &bool, window, cx| {
+                    if *open {
+                        sync.update(cx, |view, cx| view.sync_port_form(window, cx))
+                            .ok();
+                    }
+                })
+                .into_any_element()
+        } else {
+            div()
+                .id("status-port-previous")
+                .test_support()
+                .flex_none()
+                .px_2()
+                .child(segment)
+                .into_any_element()
+        };
 
         // The newest notice, cut to fit, all of it in the tooltip, and its button (such
         // as Install for a plugin a device profile names but that is not installed).
@@ -2516,17 +2575,19 @@ impl Workspace {
             } else {
                 theme.muted_foreground
             })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.list_hover))
             .child(status.mode)
-            .tooltip(|window, cx| {
-                Tooltip::new("Switch between command and inline mode")
-                    .action(&ToggleInline, Some(context::WORKSPACE))
-                    .build(window, cx)
-            })
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_inline(&ToggleInline, window, cx);
-            }));
+            .when(live, |chip| {
+                chip.cursor_pointer()
+                    .hover(|style| style.bg(theme.list_hover))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("Switch between command and inline mode")
+                            .action(&ToggleInline, Some(context::WORKSPACE))
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_inline(&ToggleInline, window, cx);
+                    }))
+            });
 
         // RX with its rate, and what the scrollback keeps in the tooltip.
         let mut details = vec![status.retained.clone()];
@@ -2568,28 +2629,32 @@ impl Workspace {
                 .id("status-emulation")
                 .child(Icon::new(IconName::Terminal).size_3())
                 .child(label)
-                .cursor_pointer()
-                .tooltip(|window, cx| {
-                    Tooltip::new("VT mode: the device draws on a terminal screen")
-                        .action(&ToggleEmulation, Some(context::TERMINAL))
-                        .build(window, cx)
+                .when(live, |chip| {
+                    chip.cursor_pointer()
+                        .tooltip(|window, cx| {
+                            Tooltip::new("VT mode: the device draws on a terminal screen")
+                                .action(&ToggleEmulation, Some(context::TERMINAL))
+                                .build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_emulation(&ToggleEmulation, cx);
+                        }))
                 })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_emulation(&ToggleEmulation, cx);
-                }))
         });
         let codec = view.codec_name().map(|codec| {
             chrome::chip(info)
                 .id("status-codec")
                 .child(Icon::new(IconName::Braces).size_3())
                 .child(SharedString::from(codec.to_owned()))
-                .cursor_pointer()
-                .tooltip(|window, cx| {
-                    Tooltip::new("Decoding: show the Decoded panel").build(window, cx)
+                .when(live, |chip| {
+                    chip.cursor_pointer()
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Decoding: show the Decoded panel").build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_panel_open(DockPanel::Decoded, true, cx);
+                        }))
                 })
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_panel_open(DockPanel::Decoded, true, cx);
-                }))
         });
         let paused = status.paused.clone().map(|paused| {
             let short = paused
@@ -2614,11 +2679,15 @@ impl Workspace {
                 .id("status-script")
                 .child(Icon::new(IconName::ScrollText).size_3())
                 .child(SharedString::from(script))
-                .cursor_pointer()
-                .tooltip(|window, cx| Tooltip::new("Show the Script console").build(window, cx))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.set_panel_open(DockPanel::Scripts, true, cx);
-                }))
+                .when(live, |chip| {
+                    chip.cursor_pointer()
+                        .tooltip(|window, cx| {
+                            Tooltip::new("Show the Script console").build(window, cx)
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_panel_open(DockPanel::Scripts, true, cx);
+                        }))
+                })
         });
         line.child(connection)
             .child(
@@ -2642,9 +2711,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The status line's text for the active tab's session, as rendered.
+    /// The status line's text for the session it shows ([`Self::status_session`]), as
+    /// rendered.
     pub fn status_line(&self, cx: &App) -> Option<StatusLine> {
-        self.session().map(|session| session.read(cx).status_line())
+        self.status_session()
+            .map(|session| session.read(cx).status_line())
     }
 
     /// What the status line says about the configuration: a file that did not load, a

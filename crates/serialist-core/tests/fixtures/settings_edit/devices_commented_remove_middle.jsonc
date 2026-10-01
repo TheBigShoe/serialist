@@ -1,0 +1,19 @@
+// Serialist settings for the bench
+{
+  "buffer_font_size": 14, // points
+
+  // Profiles are tried in order; the first match wins.
+  "devices": [
+    // Airoha earbuds on the bench
+    { "name": "Earbuds", "match": { "vid": "0x0e8d" }, "baud": 921600 }, // fast link
+
+    /* The dongle: leave this one on 9600 */
+    // kept for the lab
+
+    // Anything else
+    { "name": "Fallback", "match": {}, "baud": 115200 } // last resort
+    // new boards go above the fallback
+  ],
+  // the end of devices
+  "display": { "wrap": true }
+}

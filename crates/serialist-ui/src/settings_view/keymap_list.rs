@@ -1,17 +1,21 @@
 //! The Keymap section: every binding in effect, by context, from the resolved keymap (the
 //! bundled defaults, then the user's `keymap.json`), marked where the user's file binds
-//! the key and where that overrides a bundled binding. A filter narrows the list.
+//! the key and where that overrides a bundled binding. The saved commands' keybindings
+//! are listed too, marked "command": they are bound in the `Workspace` context, and the
+//! row's action text is the command's collection and name. A filter narrows the list.
 //!
 //! The list is read-only except for one edit: "Rebind…" on the selected row records a
 //! keystroke and writes it to `keymap.json` through the comment-preserving keymap
 //! editor, taking the old chord off the action (unbinding a bundled chord with `null`,
-//! or removing the user's own entry). Anything else is done in the file ("Edit
+//! or removing the user's own entry). On a command's row it sets the command's
+//! `keybinding` instead, in the command's own collection file (as the Commands panel
+//! saves it); the keymap file is not touched. Anything else is done in the file ("Edit
 //! keymap.json"). Single keystrokes only; a sequence is typed into the file.
 
-use serialist_core::{ActionRef, Keymap};
+use serialist_core::{ActionRef, CommandRef, CommandStore, Keymap};
 
 use super::SettingsView;
-use crate::actions;
+use crate::actions::{self, context};
 use crate::chrome;
 use crate::config::Config;
 use crate::keystroke_input::{KeystrokeInput, KeystrokeInputEvent};
@@ -28,6 +32,8 @@ pub enum BindingSource {
     User,
     /// The user's `keymap.json`, replacing a bundled binding of the same chord.
     Overrides,
+    /// A saved command's `keybinding`, in its collection file.
+    Command,
 }
 
 impl BindingSource {
@@ -36,6 +42,7 @@ impl BindingSource {
             BindingSource::Default => "default",
             BindingSource::User => "user",
             BindingSource::Overrides => "overrides default",
+            BindingSource::Command => "command",
         }
     }
 }
@@ -45,20 +52,59 @@ impl BindingSource {
 pub struct BindingRow {
     pub context: Option<String>,
     pub keystrokes: String,
+    /// The action; for a saved command, its collection and name (`Bench › Version`).
     pub action: ActionRef,
     pub source: BindingSource,
+    /// The saved command a [`BindingSource::Command`] row is bound to.
+    pub command: Option<CommandRef>,
+}
+
+/// What names a row: a keymap binding is its context and keystrokes, a command's is the
+/// command, since two bindings can share a chord in the `Workspace` context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowKey {
+    Binding(Option<String>, String),
+    Command(CommandRef),
 }
 
 impl BindingRow {
-    fn key(&self) -> (Option<String>, String) {
-        (self.context.clone(), self.keystrokes.clone())
+    fn key(&self) -> RowKey {
+        match &self.command {
+            Some(command) => RowKey::Command(command.clone()),
+            None => RowKey::Binding(self.context.clone(), self.keystrokes.clone()),
+        }
+    }
+
+    /// The lower-case text a filter word is looked for in.
+    fn haystack(&self) -> String {
+        let context = self.context.as_deref().unwrap_or("global");
+        match &self.command {
+            Some(command) => format!(
+                "{} {} {} {context} command",
+                self.keystrokes, self.action.name, command.group
+            ),
+            None => format!(
+                "{} {} {} {context}",
+                self.keystrokes,
+                self.action.name,
+                humanize(&self.action.name)
+            ),
+        }
+        .to_lowercase()
     }
 }
 
 /// The bindings in effect in `keymap`, whose first `bundled` entries are the bundled
-/// defaults, grouped by context (no context first) and kept in keymap order within one,
-/// narrowed to those matching every word of `query` (keystrokes, action or context).
-pub fn binding_rows(keymap: &Keymap, bundled: usize, query: &str) -> Vec<BindingRow> {
+/// defaults, and those of the saved `commands` (in the `Workspace` context, after the
+/// keymap's own), grouped by context (no context first) and kept in keymap order within
+/// one, narrowed to those matching every word of `query` (keystrokes, action or context;
+/// "command" for a command's).
+pub fn binding_rows(
+    keymap: &Keymap,
+    bundled: usize,
+    commands: &CommandStore,
+    query: &str,
+) -> Vec<BindingRow> {
     use std::collections::HashMap;
     let mut last = HashMap::new();
     for (index, entry) in keymap.entries.iter().enumerate() {
@@ -91,20 +137,29 @@ pub fn binding_rows(keymap: &Keymap, bundled: usize, query: &str) -> Vec<Binding
                 keystrokes: entry.keystrokes.clone(),
                 action,
                 source,
+                command: None,
             })
         })
-        .filter(|row| {
-            let haystack = format!(
-                "{} {} {} {}",
-                row.keystrokes,
-                row.action.name,
-                humanize(&row.action.name),
-                row.context.as_deref().unwrap_or("global")
-            )
-            .to_lowercase();
-            words.iter().all(|word| haystack.contains(word))
-        })
         .collect();
+    rows.extend(
+        commands
+            .all_keybindings()
+            .into_iter()
+            .map(|(keystrokes, reference)| BindingRow {
+                context: Some(context::WORKSPACE.to_owned()),
+                keystrokes,
+                action: ActionRef::new(format!(
+                    "{} \u{203a} {}",
+                    reference.collection, reference.name
+                )),
+                source: BindingSource::Command,
+                command: Some(reference),
+            }),
+    );
+    rows.retain(|row| {
+        let haystack = row.haystack();
+        words.iter().all(|word| haystack.contains(word))
+    });
     // Stable, so each context keeps the keymap's order.
     rows.sort_by(|a, b| a.context.cmp(&b.context));
     rows
@@ -113,8 +168,8 @@ pub fn binding_rows(keymap: &Keymap, bundled: usize, query: &str) -> Vec<Binding
 /// The Keymap section's state.
 pub(super) struct KeymapState {
     query: Entity<InputState>,
-    /// The selected binding, by context and keystrokes.
-    selected: Option<(Option<String>, String)>,
+    /// The selected binding.
+    selected: Option<RowKey>,
     recorder: Entity<KeystrokeInput>,
     /// The binding "Rebind…" is recording a chord for.
     rebinding: Option<BindingRow>,
@@ -186,7 +241,14 @@ impl SettingsView {
     pub fn binding_rows_now(&self, cx: &App) -> Vec<BindingRow> {
         let query = self.keymap.query.read(cx).value().to_string();
         cx.try_global::<Config>()
-            .map(|config| binding_rows(config.keymap(), self.keymap.bundled, &query))
+            .map(|config| {
+                binding_rows(
+                    config.keymap(),
+                    self.keymap.bundled,
+                    config.commands(),
+                    &query,
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -212,15 +274,22 @@ impl SettingsView {
         keystrokes: &str,
         cx: &mut Context<Self>,
     ) {
-        self.keymap.selected = Some((context.map(str::to_owned), keystrokes.to_owned()));
+        self.select_row(
+            RowKey::Binding(context.map(str::to_owned), keystrokes.to_owned()),
+            cx,
+        );
+    }
+
+    fn select_row(&mut self, key: RowKey, cx: &mut Context<Self>) {
+        self.keymap.selected = Some(key);
         self.keymap.stop_recording(cx);
         cx.notify();
     }
 
     fn selected_binding(&self, cx: &App) -> Option<BindingRow> {
         let selected = self.keymap.selected.as_ref()?;
-        let keymap = cx.try_global::<Config>()?.keymap().clone();
-        binding_rows(&keymap, self.keymap.bundled, "")
+        let config = cx.try_global::<Config>()?;
+        binding_rows(config.keymap(), self.keymap.bundled, config.commands(), "")
             .into_iter()
             .find(|row| &row.key() == selected)
     }
@@ -239,7 +308,8 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Bind the selected binding's action to `keystrokes` instead, in `keymap.json`.
+    /// Bind the selected binding's action to `keystrokes` instead, in `keymap.json`; a
+    /// saved command's own `keybinding` is set in its collection instead.
     pub fn rebind_selected(
         &mut self,
         keystrokes: &str,
@@ -262,6 +332,18 @@ impl SettingsView {
             cx.notify();
             return;
         }
+        if let Some(command) = &row.command {
+            let commands = cx.global::<Config>().commands().clone();
+            match settings_io::rebind_command(&commands, command, keystrokes) {
+                Ok(()) => {
+                    self.keymap.error = None;
+                    self.keymap.selected = Some(RowKey::Command(command.clone()));
+                }
+                Err(message) => self.keymap.error = Some(message),
+            }
+            cx.notify();
+            return;
+        }
         let user_owned = row.source != BindingSource::Default;
         let paths = self.paths(cx);
         match settings_io::rebind(
@@ -273,7 +355,8 @@ impl SettingsView {
         ) {
             Ok(()) => {
                 self.keymap.error = None;
-                self.keymap.selected = Some((row.context.clone(), keystrokes.to_owned()));
+                self.keymap.selected =
+                    Some(RowKey::Binding(row.context.clone(), keystrokes.to_owned()));
             }
             Err(message) => self.keymap.error = Some(message),
         }
@@ -312,7 +395,12 @@ impl SettingsView {
                 BindingSource::Default => chrome::quiet_chip(row.source.label(), cx),
                 _ => chrome::chip(info).child(row.source.label()),
             };
-            let action = row.action.name.clone();
+            // A command's row says which command; the group stands where an action's
+            // own name does.
+            let (title, detail) = match &row.command {
+                Some(command) => (row.action.name.clone(), command.group.clone()),
+                None => (humanize(&row.action.name), row.action.name.clone()),
+            };
             list.push(
                 h_flex()
                     .id(("settings-binding", ix))
@@ -337,18 +425,13 @@ impl SettingsView {
                             .flex_1()
                             .min_w_0()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .truncate()
-                                    .child(SharedString::from(humanize(&action))),
-                            )
+                            .child(div().text_sm().truncate().child(SharedString::from(title)))
                             .child(
                                 div()
                                     .text_xs()
                                     .truncate()
                                     .text_color(muted)
-                                    .child(SharedString::from(action.clone())),
+                                    .child(SharedString::from(detail)),
                             ),
                     )
                     .child(source)
@@ -369,7 +452,7 @@ impl SettingsView {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.keymap.selected.as_ref() != Some(&key) {
-                            this.select_binding(key.0.as_deref(), &key.1, cx);
+                            this.select_row(key.clone(), cx);
                         }
                     }))
                     .into_any_element(),
