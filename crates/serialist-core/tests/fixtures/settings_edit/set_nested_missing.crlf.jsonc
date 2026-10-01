@@ -1,0 +1,26 @@
+// Serialist settings (test fixture): tabs, CRLF, comments and trailing commas.
+{
+	// Terminal text
+	"buffer_font_size": 15, // points
+	"buffer_font_weight": 400,
+
+	// Colors follow the system
+	"theme": {
+		"mode": "system",
+		"light": "Serialist Light", // daytime
+		"dark": "Serialist Dark",
+	},
+
+	// Device profiles
+	"devices": [
+		{
+			// the headset
+			"match": { "vid": "0x0e8d" },
+			"baud": 921600,
+		},
+	],
+	"display": {
+		"timestamps": "absolute",
+	},
+	// end of file note
+}
