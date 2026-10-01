@@ -15,8 +15,10 @@
 
 mod de;
 mod defaults;
+mod edit;
 mod font;
 mod inline;
+mod keymap_edit;
 mod load;
 mod paths;
 mod profile;
@@ -28,10 +30,12 @@ mod inline_tests;
 mod tests;
 
 pub use defaults::DEFAULT_SETTINGS_JSONC;
+pub use edit::{EditError, KeyChange, SettingsEditor};
 pub use font::{FontFeatures, FontSpec, LineHeight};
 pub use inline::{
     BackspaceKey, InlineSettings, MAX_PASTE_CHUNK_BYTES, MAX_PASTE_CHUNK_DELAY_MS, validate_chord,
 };
+pub use keymap_edit::KeymapEditor;
 pub use load::{
     SettingsError, SettingsLayer, SettingsWarning, load_settings, load_settings_from_layers,
 };
