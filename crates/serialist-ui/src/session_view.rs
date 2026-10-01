@@ -350,7 +350,6 @@ fn install_screen(
         id,
         handle,
         snapshot,
-        title: None,
     }
 }
 
@@ -1252,8 +1251,8 @@ impl SessionView {
         if !events.is_empty() {
             let palette = self.terminal.read(cx).palette().clone();
             let effects = effects_of(events, &palette);
-            if let Some(title) = effects.title {
-                vt.title = title;
+            if effects.title.is_some() {
+                // The tab reads the title from the snapshot on display.
                 cx.notify();
             }
             if let Some(session) = &self.session {
@@ -1517,9 +1516,10 @@ impl SessionView {
         self.vt.as_ref().map(|vt| &vt.handle)
     }
 
-    /// The title the device set on its screen (VT mode), for the tab.
+    /// The title the device set on its screen (VT mode), as of the snapshot on display,
+    /// for the tab.
     pub fn screen_title(&self) -> Option<&str> {
-        self.vt.as_ref()?.title.as_deref()
+        self.vt.as_ref()?.snapshot.title()
     }
 
     /// Whether the status dot is showing a bell.

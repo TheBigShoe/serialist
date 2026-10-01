@@ -195,10 +195,8 @@ pub struct VtState {
     /// The id it was installed in the slot under.
     pub id: u64,
     pub handle: VtHandle,
-    /// The snapshot on display (held while paused).
+    /// The snapshot on display (held while paused). Its title is the tab's.
     pub snapshot: Arc<serialist_vt::VtSnapshot>,
-    /// The title the device set last, for the tab.
-    pub title: Option<String>,
 }
 
 /// What a batch of screen events asks of the view, besides the answers it writes.

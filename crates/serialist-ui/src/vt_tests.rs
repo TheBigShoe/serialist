@@ -189,8 +189,11 @@ fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(cx: &m
             .any(|line| line.text.starts_with("Connected to ")),
         "the log's notice is not on the screen"
     );
-    // The store still has everything, as a smear of escape leftovers.
-    assert!(view.read_with(cx, |v, _| v.snapshot().raw_range().end) > 0);
+    // The store has everything too, as a smear of escape leftovers. (Its publication
+    // and the screen's are separate, so either may show first.)
+    run_until(cx, "the menu in the store", |cx| {
+        view.read_with(cx, |v, _| v.snapshot().raw_range().end > 0)
+    });
 
     let (columns, _) = settle_size(cx, window, &view);
     assert!(columns >= 40, "the menu fits: {columns} columns");
@@ -246,6 +249,21 @@ fn the_boot_menu_draws_in_vt_mode_and_the_arrows_redraw_only_what_changed(cx: &m
     assert!(
         screen(cx, &view).cursor().is_some_and(|c| !c.visible),
         "the menu hides the cursor"
+    );
+
+    // Selection and copy read the screen's rows.
+    terminal.update(cx, |t, cx| t.select_all(cx));
+    let selected = terminal
+        .read_with(cx, |t, _| t.selection_text())
+        .expect("a selection");
+    assert!(
+        selected.starts_with("  *** Serialist Boot Menu ***\n\n     Boot from eMMC\n"),
+        "{selected:?}"
+    );
+    press(cx, window, keys::COPY);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(selected)
     );
 }
 
