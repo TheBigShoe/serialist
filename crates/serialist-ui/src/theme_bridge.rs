@@ -197,12 +197,134 @@ pub fn apply_kit_theme(config: ThemeConfig, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use serialist_core::theme::ThemeRegistry;
+
     use super::*;
+    use crate::config::hsla;
+    use crate::terminal::palette::MINIMUM_CONTRAST;
 
     #[test]
     fn hex_round_trips_through_gpui_colors() {
         let color = Hsla::from(rgba(0x3b414dff));
         assert_eq!(hex(color).as_ref(), "#3b414dff");
         assert_eq!(hex(Hsla::from(rgba(0x74ade840))).as_ref(), "#74ade840");
+    }
+
+    /// WCAG's level for UI components and large text.
+    const COMPONENT_CONTRAST: f32 = 3.0;
+    /// WCAG AAA for body text.
+    const AAA_CONTRAST: f32 = 7.0;
+
+    /// The surfaces the chrome draws text on.
+    const SURFACES: [&str; 10] = [
+        "background",
+        "surface.background",
+        "elevated_surface.background",
+        "panel.background",
+        "title_bar.background",
+        "status_bar.background",
+        "tab_bar.background",
+        "tab.inactive_background",
+        "tab.active_background",
+        "toolbar.background",
+    ];
+
+    /// Buttons, inputs and selected rows, which body text also sits on.
+    const ELEMENTS: [&str; 4] = [
+        "element.background",
+        "element.hover",
+        "element.active",
+        "element.selected",
+    ];
+
+    /// The floors a bundled theme's chrome is held to, for text (body, muted, links and
+    /// icons), for the status colors (connection state, script results, chips) and for
+    /// the focus ring. Serialist Contrast holds all three to AAA. The others hold text
+    /// to AA and the focus ring to the level for UI components; the status colors are
+    /// text too, except in Serialist Dark and Light, which hold them to the components'
+    /// level.
+    fn floors(name: &str) -> (f32, f32, f32) {
+        match name {
+            "Serialist Contrast" => (AAA_CONTRAST, AAA_CONTRAST, AAA_CONTRAST),
+            "Serialist Dark" | "Serialist Light" => {
+                (MINIMUM_CONTRAST, COMPONENT_CONTRAST, COMPONENT_CONTRAST)
+            }
+            _ => (MINIMUM_CONTRAST, MINIMUM_CONTRAST, COMPONENT_CONTRAST),
+        }
+    }
+
+    fn parse(hex: &SharedString) -> Hsla {
+        let value = u32::from_str_radix(hex.trim_start_matches('#'), 16).expect("a hex color");
+        Hsla::from(rgba(value))
+    }
+
+    /// `top` composited over an opaque `under`.
+    fn over(top: Hsla, under: Hsla) -> Hsla {
+        let (t, u) = (top.to_rgb(), under.to_rgb());
+        let mix = |a: f32, b: f32| a * t.a + b * (1.0 - t.a);
+        Hsla::from(Rgba {
+            r: mix(t.r, u.r),
+            g: mix(t.g, u.g),
+            b: mix(t.b, u.b),
+            a: 1.0,
+        })
+    }
+
+    #[test]
+    fn every_bundled_theme_reads_in_the_chrome() {
+        let registry = ThemeRegistry::bundled();
+        for theme in registry.themes() {
+            let name = theme.name.as_str();
+            let (text_floor, status_floor, ring_floor) = floors(name);
+            let lookup = |key: &str| theme.color(key).map(hsla);
+            let color = |key: &str| lookup(key).unwrap_or_else(|| panic!("{name} lacks {key}"));
+            let check = |what: &str, fg: Hsla, behind: &str, bg: Hsla, floor: f32| {
+                let ratio = contrast_ratio(fg, bg);
+                assert!(
+                    ratio >= floor,
+                    "{name}: {what} on {behind} reads at {ratio:.2}, below {floor}"
+                );
+            };
+            for surface in SURFACES {
+                let bg = color(surface);
+                for key in ["text", "text.muted", "text.accent", "icon"] {
+                    check(key, color(key), surface, bg, text_floor);
+                }
+                for key in ["success", "warning", "error", "info"] {
+                    check(key, color(key), surface, bg, status_floor);
+                }
+                for key in ["border.focused", "panel.focused_border"] {
+                    check(key, color(key), surface, bg, ring_floor);
+                }
+            }
+            for element in ELEMENTS {
+                check("text", color("text"), element, color(element), text_floor);
+            }
+            // Hovered and selected list rows are translucent over the panel.
+            for ghost in ["ghost_element.hover", "ghost_element.selected"] {
+                let bg = over(color(ghost), color("panel.background"));
+                check("text", color("text"), ghost, bg, text_floor);
+            }
+
+            // The primary button's label, which the bridge picks.
+            let config = kit_theme_config(
+                &ZedColors {
+                    name,
+                    dark: theme.is_dark(),
+                    lookup: &lookup,
+                },
+                &UiFont::default(),
+                &TerminalFont::default(),
+            );
+            let primary = parse(config.colors.primary.as_ref().expect("primary"));
+            let label = parse(
+                config
+                    .colors
+                    .primary_foreground
+                    .as_ref()
+                    .expect("primary foreground"),
+            );
+            check("the primary label", label, "primary", primary, text_floor);
+        }
     }
 }
