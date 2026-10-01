@@ -184,6 +184,14 @@ const SHOTS: &[Shot] = &[
         connect: Some("virtual:menu"),
         drive: vt_menu,
     },
+    Shot {
+        file: "15-settings.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: Some("virtual:at"),
+        drive: settings_screen,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -330,6 +338,19 @@ fn overflow_menu(stage: &mut Stage) {
         })
         .expect("the window is open");
     stage.cx.run_until_parked();
+}
+
+/// The Settings screen in its tab beside a session, opened with its key, on the
+/// Appearance section.
+fn settings_screen(stage: &mut Stage) {
+    stage.session();
+    stage.press("cmd-,");
+    let open = stage
+        .workspace
+        .read_with(&stage.cx, |w, _| w.settings_view().is_some());
+    if !open {
+        eprintln!("  note: the settings tab did not open");
+    }
 }
 
 /// Inline mode on `virtual:at`: `ati` and Enter typed key by key, and the reply.
