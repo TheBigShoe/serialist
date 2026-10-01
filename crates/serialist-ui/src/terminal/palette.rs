@@ -565,6 +565,14 @@ mod tests {
         assert_eq!(keyword.decoded, hex(0xc678dd), "the plugin color");
     }
 
+    /// The bundled themes' names, in the registry's order.
+    fn bundled_names() -> Vec<String> {
+        serialist_core::theme::ThemeRegistry::bundled()
+            .names()
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// A bundled theme's palette, as the app builds it.
     fn bundled(name: &str) -> TerminalPalette {
         let theme = serialist_core::theme::ThemeRegistry::bundled()
@@ -637,20 +645,24 @@ mod tests {
             assert_eq!(pick(&dark, n), dark.ansi[n as usize + 8], "dark {n}");
         }
         // Light: lighter means fainter, so bold keeps the normal color wherever the
-        // bright one has less contrast against the page.
+        // bright one has less contrast against the page. In no bundled theme does bold
+        // fade.
         let light = bundled("Serialist Light");
-        for n in 0..8u8 {
-            let (normal, bright) = (light.ansi[n as usize], light.ansi[n as usize + 8]);
-            let chosen = pick(&light, n);
-            let ratio = |color| contrast_ratio(color, light.background);
-            assert!(
-                ratio(chosen) >= ratio(normal).min(ratio(bright)),
-                "light {n}"
-            );
-            assert!(
-                ratio(chosen) >= ratio(normal),
-                "bold never fades, light {n}"
-            );
+        for name in bundled_names() {
+            let palette = bundled(&name);
+            for n in 0..8u8 {
+                let (normal, bright) = (palette.ansi[n as usize], palette.ansi[n as usize + 8]);
+                let chosen = pick(&palette, n);
+                let ratio = |color| contrast_ratio(color, palette.background);
+                assert!(
+                    ratio(chosen) >= ratio(normal).min(ratio(bright)),
+                    "{name} {n}"
+                );
+                assert!(
+                    ratio(chosen) >= ratio(normal),
+                    "bold never fades, {name} {n}"
+                );
+            }
         }
         assert_eq!(
             pick(&light, 2),
@@ -666,8 +678,8 @@ mod tests {
 
     #[test]
     fn every_bundled_theme_combination_is_readable_after_the_guard() {
-        for name in ["Serialist Dark", "Serialist Light"] {
-            let palette = bundled(name);
+        for name in bundled_names() {
+            let palette = bundled(&name);
             assert_eq!(palette.minimum_contrast, MINIMUM_CONTRAST);
             let colors: Vec<Color> = std::iter::once(Color::Default)
                 .chain((0..16).map(Color::Ansi))
