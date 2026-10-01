@@ -345,11 +345,12 @@ fn broken_theme_files_are_errors_with_positions() {
 // ---- Bundled themes ----
 
 /// Every bundled theme and its appearance, in the order the registry lists them.
-const BUNDLED: [(&str, Appearance); 4] = [
+const BUNDLED: [(&str, Appearance); 5] = [
     ("Serialist Dark", Appearance::Dark),
     ("Serialist Light", Appearance::Light),
     ("Serialist Ember", Appearance::Dark),
     ("Serialist Phosphor", Appearance::Dark),
+    ("Serialist Paper", Appearance::Light),
 ];
 
 #[test]
