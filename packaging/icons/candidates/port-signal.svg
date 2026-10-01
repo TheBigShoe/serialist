@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Serialist icon candidate 2: Port and signal. Original artwork, MIT OR Apache-2.0.
+
+  The D of a nine-pin serial connector, upright as it is on the back of a
+  machine, drawn as an anodized mint-to-cyan shell around a recessed insulator
+  face. The prompt and a single pulse sit in the recess where the pins would be,
+  so the port is where the terminal lives, and the current mark (chevron plus
+  square wave) stays recognisable inside an unusual silhouette. Depth comes from
+  a top-lit bevel on the shell, a shadowed upper lip on the recess and a soft
+  drop shadow. Every rounded corner is one core polygon stroked with round
+  joins: the shell with a wide stroke, the face with a narrow one, so they stay
+  concentric. No SVG filters.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Serialist: Port and signal</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2740"/>
+      <stop offset="1" stop-color="#0a0f19"/>
+    </linearGradient>
+    <radialGradient id="sheen" gradientUnits="userSpaceOnUse" cx="512" cy="-120" r="760">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Core of the D: the shell is this stroked 140 wide, the face 28 wide. -->
+    <path id="d" d="M213 332H811L743 676H281Z"/>
+    <linearGradient id="shell" gradientUnits="userSpaceOnUse" x1="200" y1="262" x2="820" y2="746">
+      <stop offset="0" stop-color="#5df0c6"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+    <linearGradient id="bevel" gradientUnits="userSpaceOnUse" x1="0" y1="262" x2="0" y2="746">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#0a0f19" stop-opacity="0.5"/>
+    </linearGradient>
+    <linearGradient id="shade" gradientUnits="userSpaceOnUse" x1="0" y1="262" x2="0" y2="746">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.25"/>
+      <stop offset="0.4" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#0a0f19" stop-opacity="0.3"/>
+    </linearGradient>
+    <linearGradient id="face" gradientUnits="userSpaceOnUse" x1="0" y1="318" x2="0" y2="690">
+      <stop offset="0" stop-color="#03060b"/>
+      <stop offset="1" stop-color="#1a2642"/>
+    </linearGradient>
+    <linearGradient id="lip" gradientUnits="userSpaceOnUse" x1="0" y1="318" x2="0" y2="690">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.7"/>
+      <stop offset="0.35" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="0.8" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="prompt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8bf7d8"/>
+      <stop offset="1" stop-color="#5df0c6"/>
+    </linearGradient>
+    <linearGradient id="wave" gradientUnits="userSpaceOnUse" x1="458" y1="0" x2="714" y2="0">
+      <stop offset="0" stop-color="#eafcff"/>
+      <stop offset="1" stop-color="#4cc9f0"/>
+    </linearGradient>
+    <path id="chev" d="M306 410L398 504L306 598"/>
+    <path id="w" d="M458 598H510V410H650V598H714"/>
+  </defs>
+
+  <rect width="1024" height="1024" rx="230" fill="url(#tile)"/>
+  <rect width="1024" height="1024" rx="230" fill="url(#sheen)"/>
+
+  <!-- Soft drop shadow: the D grown and pushed down in faint steps. -->
+  <g fill="#000000" stroke="#000000" stroke-linejoin="round" fill-opacity="0.07" stroke-opacity="0.07">
+    <use xlink:href="#d" transform="translate(0 40)" stroke-width="200"/>
+    <use xlink:href="#d" transform="translate(0 32)" stroke-width="176"/>
+    <use xlink:href="#d" transform="translate(0 24)" stroke-width="158"/>
+    <use xlink:href="#d" transform="translate(0 16)" stroke-width="146"/>
+  </g>
+
+  <!-- Shell: a top-lit bevel ring, the anodized body, and its lighting. -->
+  <g stroke-linejoin="round">
+    <use xlink:href="#d" fill="url(#bevel)" stroke="url(#bevel)" stroke-width="140"/>
+    <use xlink:href="#d" fill="url(#shell)" stroke="url(#shell)" stroke-width="128"/>
+    <use xlink:href="#d" fill="url(#shade)" stroke="url(#shade)" stroke-width="128"/>
+    <!-- Recessed face, shadowed under its upper lip and lit on its lower one. -->
+    <use xlink:href="#d" fill="url(#face)" stroke="url(#face)" stroke-width="28"/>
+    <use xlink:href="#d" fill="url(#lip)" stroke="url(#lip)" stroke-width="28"/>
+  </g>
+
+  <!-- Prompt and signal, each with a soft halo, centred in the narrowing recess. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" transform="translate(14 0)">
+    <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.025" stroke-width="170"/>
+    <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.04" stroke-width="134"/>
+    <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.07" stroke-width="106"/>
+    <use xlink:href="#chev" stroke="#5df0c6" stroke-opacity="0.12" stroke-width="84"/>
+    <use xlink:href="#w" stroke="#4cc9f0" stroke-opacity="0.025" stroke-width="154"/>
+    <use xlink:href="#w" stroke="#4cc9f0" stroke-opacity="0.04" stroke-width="118"/>
+    <use xlink:href="#w" stroke="#4cc9f0" stroke-opacity="0.07" stroke-width="90"/>
+    <use xlink:href="#w" stroke="#4cc9f0" stroke-opacity="0.12" stroke-width="68"/>
+    <use xlink:href="#chev" stroke="url(#prompt)" stroke-width="72"/>
+    <use xlink:href="#w" stroke="url(#wave)" stroke-width="56"/>
+  </g>
+
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="6"/>
+</svg>

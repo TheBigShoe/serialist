@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Regenerate every icon file from serialist.svg. macOS only: AppKit rasterizes the SVG
-# (render-svg.swift) and iconutil builds the .icns. Needs the Xcode command line tools
-# and python3 (standard library only, for the .ico).
+# Regenerate every icon file from serialist.svg (and serialist-small.svg for the tiniest
+# sizes). macOS only: AppKit rasterizes the SVG (render-svg.swift) and iconutil builds the
+# .icns. Needs the Xcode command line tools and python3 (standard library only, for the .ico).
 #
 # Outputs, all committed so packaging on Linux and Windows needs no SVG renderer:
 #   serialist.icns        macOS app icon (Apple's 10% transparent margin)
 #   serialist.ico         Windows icon, 16 to 256 px
 #   png/serialist-N.png   Linux hicolor sizes (16 to 512 px)
 #
-# Run it after editing serialist.svg (`just icons`) and commit the results.
+# Run it after editing serialist.svg or serialist-small.svg (`just icons`) and commit the
+# results.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -20,12 +21,20 @@ fi
 
 MAC_INSET=0.098 # 824 of 1024 px, the margin macOS icons are drawn with.
 FLAT_INSET=0.03 # Windows and Linux icons sit closer to the edge.
+# At 24 px and under the soft glow and the graticule of serialist.svg fill the counters of
+# the S, so those sizes come from serialist-small.svg: the same icon with a thicker beam
+# and no halo. 32 px and up are fine with the full artwork.
+SMALL_MAX=24
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 swiftc -O render-svg.swift -o "$tmp/render-svg"
-render() { "$tmp/render-svg" serialist.svg "$1" "$2" "$3"; }
+render() {
+    local source=serialist.svg
+    (("$2" <= SMALL_MAX)) && source=serialist-small.svg
+    "$tmp/render-svg" "$source" "$1" "$2" "$3"
+}
 
 # macOS: an iconset of 16 to 512 px, each with an @2x, folded into one .icns.
 iconset="$tmp/serialist.iconset"

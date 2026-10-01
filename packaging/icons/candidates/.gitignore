@@ -1,0 +1,2 @@
+# The 1024 px renders are large; render.sh regenerates them.
+png/*-1024.png
