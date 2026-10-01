@@ -149,6 +149,9 @@ that does not load shows its error and an Open settings.json button instead.
 Settings, key bindings, themes, saved commands, scripts, plugins and history live in one
 directory: `~/.config/serialist` on macOS and Linux (where Zed users expect it),
 `%APPDATA%\Serialist` on Windows. `--config-dir` or `SERIALIST_CONFIG_DIR` overrides it.
+The directory is Serialist's own: it never reads Zed's configuration, and only the settings
+key names and the theme file format match Zed's, so a Zed theme file can be copied into
+`themes/` as it is.
 The app watches it and applies changes as you save; there is no restart.
 
 | Path | What it holds |
