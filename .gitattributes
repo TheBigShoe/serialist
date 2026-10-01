@@ -4,3 +4,6 @@
 *.icns binary
 *.ico binary
 *.wasm binary
+
+# Settings-edit fixtures hold CRLF and tabs on purpose: keep their bytes as written.
+crates/serialist-core/tests/fixtures/settings_edit/*.crlf.* -text
