@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use serialist_core::settings::{ConfigPaths, SettingsLayer, load_settings_from_layers};
 use serialist_core::{
-    ActionRef, Keymap, KeymapEditor, Settings, SettingsEditError, SettingsEditor, load_keymap,
-    load_settings,
+    ActionRef, CommandRef, CommandStore, EditError as CommandEditError, Keymap, KeymapEditor,
+    Settings, SettingsEditError, SettingsEditor, load_keymap, load_settings,
 };
 
 /// Where a setting's value comes from.
@@ -232,4 +232,36 @@ pub fn rebind(
         "{}: the file kept changing on disk; try again",
         paths.keymap.display()
     ))
+}
+
+/// Set the `keybinding` of the saved command `command` to `keystrokes`, in a copy of
+/// `store`, and write the command's collection back to its file the way the Commands
+/// panel saves one: as plain JSON, so comments in that file are not kept. The keymap
+/// file is not involved. `Err` says why not: the command is gone, its collection is the
+/// bundled (read-only) one, or the file could not be written. The watcher's reload
+/// brings the new chord into the app.
+pub fn rebind_command(
+    store: &CommandStore,
+    command: &CommandRef,
+    keystrokes: &str,
+) -> Result<(), String> {
+    let mut store = store.clone();
+    let mut updated = store
+        .get(command)
+        .cloned()
+        .ok_or_else(|| format!("there is no command {command}"))?;
+    updated.keybinding = Some(keystrokes.to_owned());
+    store
+        .update_command(command, updated)
+        .map_err(|error| match error {
+            CommandEditError::ReadOnly(collection) => format!(
+                "{collection} is read-only; give the command a key in a collection of your own"
+            ),
+            other => other.to_string(),
+        })?;
+    store
+        .save_collection(&command.collection)
+        .map_err(|error| error.to_string())?;
+    tracing::info!(%command, keystrokes, "rebound a saved command");
+    Ok(())
 }
