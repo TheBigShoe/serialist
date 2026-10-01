@@ -32,6 +32,8 @@ tracing.workspace = true
 # The `commands::Send` action takes its fields from JSON.
 serde.workspace = true
 serde_json.workspace = true
+# TEMPORARY: the settings-editor shim until serialist-core's SettingsEditor lands.
+jsonc-parser.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

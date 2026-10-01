@@ -48,8 +48,11 @@
 //! script's `serial.current()` is the session of the tab it was started in (its output
 //! goes to that tab's Script console output, and its `commands.send` sends there too).
 //!
-//! The tab bar shows once there are two tabs or more; with one, the status line and
-//! the window title already name the port. Tabs switch with `tabs::ActivateTab1` to `9`
+//! The tab bar shows once there are two tabs or more, or while the Settings tab is open;
+//! with one session tab, the status line and the window title already name the port.
+//!
+//! The Settings screen ([`SettingsView`], `serialist::OpenSettingsUi`) opens in a tab of
+//! its own beside the sessions, one at a time; it closes like any tab. Tabs switch with `tabs::ActivateTab1` to `9`
 //! and `tabs::NextTab`/`PreviousTab`, reorder by dragging, and close with
 //! `tabs::CloseTab` or their × button, which disconnects the port and stops its script
 //! and recording, asking first while either runs.
@@ -97,7 +100,9 @@ use crate::actions::tabs::{
     ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5, ActivateTab6,
     ActivateTab7, ActivateTab8, ActivateTab9, CloseTab, NewTab, NextTab, PreviousTab,
 };
-use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
+use crate::actions::{
+    self, Clear, Disconnect, Export, OpenSettingsUi, Pause, ToggleInline, ToggleRecord, context,
+};
 use crate::chrome;
 use crate::codecs::codec_not_installed;
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
@@ -121,6 +126,7 @@ use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
 use crate::session_options::SessionOptions;
 use crate::session_state::{STATE_VERSION, SavedTab, SessionState, state_path};
 use crate::session_view::{SessionView, SessionViewEvent};
+use crate::settings_view::SettingsView;
 use crate::status::{ConnectionState, Notice, NoticeAction, StatusLine};
 use crate::tabs::{TabId, TabLabel, TabState, TabStatus};
 
@@ -228,6 +234,8 @@ struct SessionTab {
     provisional: Option<Option<TabId>>,
     /// The status last repainted for while in the background.
     shown: Option<TabStatus>,
+    /// The Settings screen, in the one tab that shows it instead of a session.
+    settings: Option<Entity<SettingsView>>,
     _connect_task: Option<Task<()>>,
     _observer: Option<Subscription>,
     _events: Option<Subscription>,
@@ -247,6 +255,7 @@ impl SessionTab {
             error: None,
             provisional: None,
             shown: None,
+            settings: None,
             _connect_task: None,
             _observer: None,
             _events: None,
@@ -255,7 +264,7 @@ impl SessionTab {
 
     /// A new tab with no port picked.
     fn is_blank(&self) -> bool {
-        self.port.is_none() && self.view.is_none() && !self.connecting
+        self.port.is_none() && self.view.is_none() && !self.connecting && self.settings.is_none()
     }
 
     /// Opening, or open.
@@ -664,13 +673,52 @@ impl Workspace {
         self.tab(id).and_then(|tab| tab.port.as_ref())
     }
 
-    /// Whether the tab bar shows: with two tabs or more.
+    /// Whether the tab bar shows: with two tabs or more, or the Settings tab.
     pub fn shows_tab_bar(&self) -> bool {
-        self.tabs.len() > 1
+        self.tabs.len() > 1 || self.settings_view().is_some()
+    }
+
+    /// The Settings screen, while its tab is open.
+    pub fn settings_view(&self) -> Option<&Entity<SettingsView>> {
+        self.tabs.iter().find_map(|tab| tab.settings.as_ref())
+    }
+
+    /// Open the Settings screen in a tab after the others, or go to the one open.
+    pub fn open_settings_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) -> TabId {
+        if let Some(id) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.settings.is_some())
+            .map(|tab| tab.id)
+        {
+            self.activate(id, window, cx);
+            return id;
+        }
+        let source = self.port_source.clone();
+        let view = cx.new(|cx| SettingsView::new(Some(source), window, cx));
+        let id = self.push_tab();
+        if let Some(tab) = self.tab_mut(id) {
+            tab.settings = Some(view);
+        }
+        tracing::info!(tab = %id, "opened the settings screen");
+        self.activate(id, window, cx);
+        id
+    }
+
+    fn open_settings_ui_action(
+        &mut self,
+        _: &OpenSettingsUi,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_ui(window, cx);
     }
 
     /// What a tab is called: its device's name in the Devices panel, else its port id.
     fn tab_title(&self, tab: &SessionTab, cx: &App) -> String {
+        if tab.settings.is_some() {
+            return "Settings".to_owned();
+        }
         let Some(port) = &tab.port else {
             return "New tab".to_owned();
         };
@@ -695,6 +743,9 @@ impl Workspace {
 
     /// `<port> — Serialist` for the active tab's port, else `Serialist`.
     pub fn window_title(&self) -> String {
+        if self.active_tab().is_some_and(|tab| tab.settings.is_some()) {
+            return format!("Settings \u{2014} {APP_TITLE}");
+        }
         match self.active_tab().and_then(|tab| tab.port.as_ref()) {
             Some(port) => format!("{port} \u{2014} {APP_TITLE}"),
             None => APP_TITLE.to_owned(),
@@ -780,6 +831,11 @@ impl Workspace {
     /// Focus where typing goes in the active tab: its session's compose bar (or its
     /// terminal in inline mode), or the Devices panel for a tab with no session.
     fn focus_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = self.active_tab().and_then(|tab| tab.settings.clone()) {
+            let focus = settings.focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
         match self.session().cloned() {
             Some(view) => view.update(cx, |view, cx| view.focus_default(window, cx)),
             None => {
@@ -1995,11 +2051,20 @@ impl Workspace {
             TabState::Lost | TabState::NotConnected | TabState::Empty
         );
         let state = SharedString::from(label.state.label());
-        let dot = div()
-            .id(("tab-dot", id.0 as usize))
-            .flex_none()
-            .child(chrome::state_dot(color, hollow))
-            .tooltip(move |window, cx| Tooltip::new(state.clone()).build(window, cx));
+        let is_settings = self.tab(id).is_some_and(|tab| tab.settings.is_some());
+        let dot = if is_settings {
+            div().id(("tab-dot", id.0 as usize)).flex_none().child(
+                Icon::new(IconName::Settings)
+                    .size_3p5()
+                    .text_color(theme.muted_foreground),
+            )
+        } else {
+            div()
+                .id(("tab-dot", id.0 as usize))
+                .flex_none()
+                .child(chrome::state_dot(color, hollow))
+                .tooltip(move |window, cx| Tooltip::new(state.clone()).build(window, cx))
+        };
         let title = SharedString::from(label.title);
         let muted = theme.muted_foreground;
         let drag_border = theme.drag_border;
@@ -2152,9 +2217,11 @@ impl Workspace {
     }
 
     fn render_center(&self, cx: &mut Context<Self>) -> AnyElement {
-        let body = match self.session() {
-            Some(session) => session.clone().into_any_element(),
-            None => self.render_placeholder(cx),
+        let settings = self.active_tab().and_then(|tab| tab.settings.clone());
+        let body = match (settings, self.session()) {
+            (Some(settings), _) => settings.into_any_element(),
+            (None, Some(session)) => session.clone().into_any_element(),
+            (None, None) => self.render_placeholder(cx),
         };
         v_flex()
             .id("center")
@@ -2672,6 +2739,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::previous_tab_action))
             .on_action(cx.listener(Self::toggle_command_palette))
             .on_action(cx.listener(Self::install_example_plugin_action))
+            .on_action(cx.listener(Self::open_settings_ui_action))
             .on_action(cx.listener(|this, _: &ActivateTab1, window, cx| {
                 this.activate_index(0, window, cx);
             }))
