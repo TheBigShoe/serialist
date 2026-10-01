@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Render the icon candidates for review with the same rasterizer as ../render.sh.
-# macOS only (AppKit). Leaves the shipping icon alone.
+# macOS only (AppKit). Leaves the shipping icon alone. Pulse S won and is now ../serialist.svg;
+# the reference row is the icon it replaced, ../classic.svg.
 #
 #   png/<name>-<size>.png   1024 to 16 px, with the macOS 10% margin (what the Dock shows)
-#   contact-sheet.png       every candidate plus the current icon, dark and light panels
+#   contact-sheet.png       every candidate plus the classic icon, dark and light panels
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -30,15 +31,15 @@ for name in "${names[@]}"; do
     done
 done
 
-# The shipping icon as a reference row; these renders are not kept.
+# The old icon as a reference row; these renders are not kept.
 for size in 256 64 32 16; do
-    "$tmp/render-svg" ../serialist.svg "$tmp/current-$size.png" "$size" "$MAC_INSET"
+    "$tmp/render-svg" ../classic.svg "$tmp/current-$size.png" "$size" "$MAC_INSET"
 done
 
 rows=()
 for i in "${!names[@]}"; do
     rows+=("png/${names[$i]}=${labels[$i]}")
 done
-"$tmp/contact-sheet" contact-sheet.png "${rows[@]}" "$tmp/current=Current (reference)"
+"$tmp/contact-sheet" contact-sheet.png "${rows[@]}" "$tmp/current=Classic (reference)"
 
 ls -l contact-sheet.png png

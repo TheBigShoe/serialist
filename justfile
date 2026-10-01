@@ -70,6 +70,6 @@ release-linux:
 release-windows:
     bash packaging/package.sh windows
 
-# Regenerate the .icns, .ico and PNG icons from packaging/icons/serialist.svg (macOS only).
+# Regenerate the .icns, .ico and PNG icons from packaging/icons/serialist.svg and serialist-small.svg (macOS only).
 icons:
     packaging/icons/render.sh

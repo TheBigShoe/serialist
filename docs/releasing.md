@@ -123,10 +123,20 @@ Windows code signing is not set up. When it is, `cargo wix sign` or `signtool` o
 
 ## Changing the icon
 
-`packaging/icons/serialist.svg` is the source. Edit it and run `just icons` (macOS only: it
-renders with AppKit and builds the `.icns` with `iconutil`). That rewrites
-`serialist.icns`, `serialist.ico` and `png/serialist-*.png`, which are committed so that
-packaging on Linux and Windows needs no SVG renderer. Commit the regenerated files.
+`packaging/icons/serialist.svg` is the source (the "Pulse S" mark). Edit it and run
+`just icons` (macOS only: it renders with AppKit and builds the `.icns` with `iconutil`).
+That rewrites `serialist.icns`, `serialist.ico` and `png/serialist-*.png`, which are
+committed so that packaging on Linux and Windows needs no SVG renderer. Commit the
+regenerated files.
+
+Renders of 24 px and under (the 16 and 24 px PNGs and `.ico` entries, and the 16 px
+`.icns` slice) come from `serialist-small.svg`, the same icon with a tighter glow and a
+thicker beam, because the full artwork's halo fills the counters of the S at that size.
+Keep the two files in step when you change the shape or the colors. Both must stay free of
+SVG filters, masks and patterns: the same `serialist.svg` is installed as the Linux
+scalable icon, and desktop icon renderers do not all support them. `classic.svg` is the
+previous mark, kept for history, and `candidates/` holds the other designs that were
+considered; neither is used by the build.
 
 On Windows, `crates/serialist/build.rs` embeds `serialist.ico` in `serialist.exe` as icon
 resource 1 (the id GPUI's Windows backend loads), by writing a `.res` file and passing it to
