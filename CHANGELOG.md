@@ -10,6 +10,10 @@ publishes the version's section as the draft release's notes.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.0] - 2026-10-01
+
 Nothing has been released yet. What exists so far, one line per milestone of `docs/plan.md`:
 
 - Milestone 0, toolchain and shell: the workspace, CI and license policy, the session engine with reader and writer threads, real serial transport with hotplug port discovery, a simulated-device world (`--virtual`), and a GPUI shell that shows a device's output.
