@@ -582,6 +582,25 @@ impl Focusable for SettingsView {
     }
 }
 
+/// Why nothing is written while the configuration is the bundled defaults alone.
+const NOT_LOADED: &str =
+    "The configuration was not read from a directory, so there is no file to write";
+
+/// Whether the configuration was read from its directory, so its files may be written.
+fn is_loaded(cx: &App) -> bool {
+    cx.try_global::<Config>().is_some_and(Config::is_loaded)
+}
+
+/// The files the installed configuration was read from, or the bundled defaults alone
+/// when it was not read from a directory (nothing is read or written then).
+fn read_files(cx: &App) -> Result<SettingsFiles, String> {
+    if is_loaded(cx) {
+        SettingsFiles::read(&paths_of(cx))
+    } else {
+        Ok(SettingsFiles::bundled())
+    }
+}
+
 fn paths_of(cx: &App) -> ConfigPaths {
     cx.try_global::<Config>()
         .map(|config| config.paths().clone())
@@ -596,8 +615,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let read = SettingsFiles::read(&paths_of(cx));
-        let (files, broken) = match read {
+        let (files, broken) = match read_files(cx) {
             Ok(files) => (Some(files), None),
             Err(message) => (None, Some(message)),
         };
@@ -783,7 +801,7 @@ impl SettingsView {
     /// Read the files again and show what they say, leaving alone a field that is being
     /// typed in.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match SettingsFiles::read(&self.paths(cx)) {
+        match read_files(cx) {
             Ok(files) => {
                 self.files = Some(files);
                 self.broken = None;
@@ -877,6 +895,12 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         if self.locked(pointer) {
+            return;
+        }
+        if !is_loaded(cx) {
+            self.errors
+                .insert(pointer.to_owned(), NOT_LOADED.to_owned());
+            cx.notify();
             return;
         }
         match settings_io::write_setting(&self.paths(cx), pointer, value) {
