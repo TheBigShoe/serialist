@@ -212,6 +212,8 @@ mod tests {
 
     /// WCAG's level for UI components and large text.
     const COMPONENT_CONTRAST: f32 = 3.0;
+    /// WCAG AAA for body text.
+    const AAA_CONTRAST: f32 = 7.0;
 
     /// The surfaces the chrome draws text on.
     const SURFACES: [&str; 10] = [
@@ -237,11 +239,13 @@ mod tests {
 
     /// The floors a bundled theme's chrome is held to, for text (body, muted, links and
     /// icons), for the status colors (connection state, script results, chips) and for
-    /// the focus ring: text to AA and the focus ring to the level for UI components. The
-    /// status colors are text too, except in Serialist Dark and Light, which hold them to
-    /// the components' level.
+    /// the focus ring. Serialist Contrast holds all three to AAA. The others hold text
+    /// to AA and the focus ring to the level for UI components; the status colors are
+    /// text too, except in Serialist Dark and Light, which hold them to the components'
+    /// level.
     fn floors(name: &str) -> (f32, f32, f32) {
         match name {
+            "Serialist Contrast" => (AAA_CONTRAST, AAA_CONTRAST, AAA_CONTRAST),
             "Serialist Dark" | "Serialist Light" => {
                 (MINIMUM_CONTRAST, COMPONENT_CONTRAST, COMPONENT_CONTRAST)
             }
