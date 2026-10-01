@@ -352,28 +352,42 @@ impl SettingsView {
                     .children(script)
                     .when(!locked, |row| {
                         row.child(
-                            chrome::icon_button(("settings-profile-edit", index), IconName::Pencil, cx)
-                                .xsmall()
-                                .tooltip("Edit")
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                            chrome::icon_button(
+                                ("settings-profile-edit", index),
+                                IconName::Pencil,
+                                cx,
+                            )
+                            .xsmall()
+                            .tooltip("Edit")
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     this.open_profile_editor(Some(index), window, cx);
-                                })),
+                                },
+                            )),
                         )
                         .child(
-                            chrome::icon_button(("settings-profile-remove", index), IconName::Trash, cx)
-                                .xsmall()
-                                .tooltip("Remove")
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                            chrome::icon_button(
+                                ("settings-profile-remove", index),
+                                IconName::Trash,
+                                cx,
+                            )
+                            .xsmall()
+                            .tooltip("Remove")
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     this.remove_profile(index, window, cx);
-                                })),
+                                },
+                            )),
                         )
                         .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                         .drag_over::<DraggedProfile>(move |style, _, _, _| {
                             style.border_t_2().border_color(drag_border)
                         })
-                        .on_drop(cx.listener(move |this, dragged: &DraggedProfile, window, cx| {
-                            this.move_profile(dragged.index, index, window, cx);
-                        }))
+                        .on_drop(cx.listener(
+                            move |this, dragged: &DraggedProfile, window, cx| {
+                                this.move_profile(dragged.index, index, window, cx);
+                            },
+                        ))
                     })
                     .into_any_element(),
             );
@@ -609,8 +623,11 @@ impl ProfileEditor {
                     .map(|value| format!("e.g. {value}"))
                     .unwrap_or_default();
                 let value = key.of_profile(profile).unwrap_or_default();
-                let input =
-                    cx.new(|cx| InputState::new(window, cx).placeholder(hint).default_value(value));
+                let input = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .placeholder(hint)
+                        .default_value(value)
+                });
                 (key, input)
             })
             .collect();
@@ -728,20 +745,16 @@ impl ProfileEditor {
     }
 
     /// Set a field, as typing in it does.
-    pub fn set_text(
-        input: &Entity<InputState>,
-        text: &str,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    pub fn set_text(input: &Entity<InputState>, text: &str, window: &mut Window, cx: &mut App) {
         input.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
     }
 
     /// Pick the plugin (`None` for none).
     pub fn set_plugin(&mut self, name: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         let value = name.unwrap_or(NONE).to_owned();
-        self.plugin
-            .update(cx, |select, cx| select.set_selected_value(&value, window, cx));
+        self.plugin.update(cx, |select, cx| {
+            select.set_selected_value(&value, window, cx)
+        });
     }
 
     /// Fill the match fields from the listed port `name` (as the picker writes it): its
@@ -806,7 +819,9 @@ impl ProfileEditor {
         let baud_text = line.baud_text(cx);
         let settings = line.settings();
         if baud_text.trim() != settings.serial.baud.to_string() {
-            return Err(format!("Baud: {baud_text:?} is not applied; press Enter in the field"));
+            return Err(format!(
+                "Baud: {baud_text:?} is not applied; press Enter in the field"
+            ));
         }
         let serial = &settings.serial;
         let (default_baud, default_eol) = self.defaults;

@@ -71,8 +71,12 @@ impl SettingsView {
             .map(|config| config.paths().plugins_dir().display().to_string())
             .unwrap_or_default();
         let theme = cx.theme();
-        let (muted, danger, border, info) =
-            (theme.muted_foreground, theme.danger, theme.border, theme.info);
+        let (muted, danger, border, info) = (
+            theme.muted_foreground,
+            theme.danger,
+            theme.border,
+            theme.info,
+        );
 
         let mut list: Vec<AnyElement> = rows
             .iter()

@@ -334,9 +334,7 @@ impl Field {
                 let list = family_list(text);
                 Ok((!list.is_empty()).then(|| json!(list)))
             }
-            Field::TerminalFallbacks => {
-                Ok((!text.is_empty()).then(|| json!(family_list(text))))
-            }
+            Field::TerminalFallbacks => Ok((!text.is_empty()).then(|| json!(family_list(text)))),
             Field::TimestampFormat => {
                 if text.is_empty() {
                     return Ok(None);
@@ -357,8 +355,9 @@ impl Field {
                 .map(|baud| Some(json!(baud)))
                 .map_err(|error| format!("Baud: {error}")),
             Field::EscapeChord => chord(text).map(|chord| Some(Value::String(chord))),
-            Field::PasteChunkBytes => whole(text, 1, MAX_PASTE_CHUNK_BYTES as u64, "Chunk size")
-                .map(|v| Some(json!(v))),
+            Field::PasteChunkBytes => {
+                whole(text, 1, MAX_PASTE_CHUNK_BYTES as u64, "Chunk size").map(|v| Some(json!(v)))
+            }
             Field::PasteChunkDelay => {
                 whole(text, 0, MAX_PASTE_CHUNK_DELAY_MS, "Delay").map(|v| Some(json!(v)))
             }
@@ -396,9 +395,9 @@ fn font_size(text: &str) -> Result<Value, String> {
 }
 
 fn line_height_number(text: &str) -> Result<Value, String> {
-    let value: f64 = text.parse().map_err(|_| {
-        format!("{text:?} is not a line height: comfortable, standard or a number")
-    })?;
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("{text:?} is not a line height: comfortable, standard or a number"))?;
     if !(1.0..=4.0).contains(&value) {
         return Err(format!("A line height must be from 1 to 4, got {text}"));
     }
@@ -686,7 +685,11 @@ impl SettingsView {
             window,
             |this, _, event: &KeystrokeInputEvent, window, cx| match event {
                 KeystrokeInputEvent::Captured(keystroke) => {
-                    this.set_escape_chord(&keystroke.unparse(), window, cx);
+                    this.set_escape_chord(
+                        &crate::keystroke_input::keystroke_text(keystroke),
+                        window,
+                        cx,
+                    );
                 }
             },
         ));
@@ -810,8 +813,7 @@ impl SettingsView {
                 continue;
             }
             // Typing that says the same thing in other words ("18.0" for 18) stays.
-            if focused && field.parse(&current).ok() == Some(field.parse(&shown).ok().flatten())
-            {
+            if focused && field.parse(&current).ok() == Some(field.parse(&shown).ok().flatten()) {
                 continue;
             }
             input.update(cx, |input, cx| input.set_value(shown, window, cx));
@@ -1113,8 +1115,23 @@ impl SettingsView {
         hint: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.row_marked(label, pointer, control, hint, true, cx)
+    }
+
+    /// [`Self::row`], with the origin marker left out (`marked` false) on a row whose
+    /// key another row already marks, so a reset button's id stays unique.
+    fn row_marked(
+        &self,
+        label: &str,
+        pointer: &'static str,
+        control: impl IntoElement,
+        hint: Option<String>,
+        marked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let origin = self.origin(pointer);
-        let error = self.errors.get(pointer).cloned();
+        // The row that marks the key also says what went wrong with it.
+        let error = self.errors.get(pointer).filter(|_| marked).cloned();
         let theme = cx.theme();
         let (muted, danger) = (theme.muted_foreground, theme.danger);
         let marker: AnyElement = match &origin {
@@ -1153,10 +1170,9 @@ impl SettingsView {
         let note = error
             .map(|error| (error, danger))
             .or_else(|| match &origin {
-                Origin::Project(path) => Some((
-                    format!("Read-only here: set in {}", path.display()),
-                    muted,
-                )),
+                Origin::Project(path) if marked => {
+                    Some((format!("Read-only here: set in {}", path.display()), muted))
+                }
                 _ => hint.map(|hint| (hint, muted)),
             });
         v_flex()
@@ -1180,7 +1196,7 @@ impl SettingsView {
                             .w(MARKER_WIDTH)
                             .flex_none()
                             .justify_end()
-                            .child(marker),
+                            .when(marked, |this| this.child(marker)),
                     ),
             )
             .children(note.map(|(text, color)| {
@@ -1321,18 +1337,20 @@ impl SettingsView {
                 static_hint,
                 cx,
             ),
-            self.row(
+            self.row_marked(
                 "Light theme",
                 "/theme",
                 self.select(Pick::LightTheme, "Theme", "/theme"),
                 None,
+                false,
                 cx,
             ),
-            self.row(
+            self.row_marked(
                 "Dark theme",
                 "/theme",
                 self.select(Pick::DarkTheme, "Theme", "/theme"),
                 Some("Zed theme files in the themes folder are listed too".to_owned()),
+                false,
                 cx,
             ),
         ];
@@ -1427,7 +1445,12 @@ impl SettingsView {
             self.row(
                 "Ligatures",
                 "/buffer_font_features/calt",
-                self.switch("settings-ligatures", "/buffer_font_features/calt", ligatures, cx),
+                self.switch(
+                    "settings-ligatures",
+                    "/buffer_font_features/calt",
+                    ligatures,
+                    cx,
+                ),
                 Some("Writes buffer_font_features.calt".to_owned()),
                 cx,
             ),
@@ -1464,7 +1487,11 @@ impl SettingsView {
             self.row(
                 "Weight",
                 "/terminal/font_weight",
-                self.select(Pick::TerminalWeight, SAME_AS_BUFFER, "/terminal/font_weight"),
+                self.select(
+                    Pick::TerminalWeight,
+                    SAME_AS_BUFFER,
+                    "/terminal/font_weight",
+                ),
                 None,
                 cx,
             ),
@@ -1524,7 +1551,12 @@ impl SettingsView {
                     stamps.iter().position(|mode| *mode == display.timestamps),
                     "/display/timestamps",
                     move |this, ix, window, cx| {
-                        this.write("/display/timestamps", Some(json!(stamp_names[ix])), window, cx);
+                        this.write(
+                            "/display/timestamps",
+                            Some(json!(stamp_names[ix])),
+                            window,
+                            cx,
+                        );
                     },
                     cx,
                 ),
@@ -1639,7 +1671,9 @@ impl SettingsView {
                 self.segmented(
                     "settings-line-ending",
                     &["None", "CR", "LF", "CRLF"],
-                    endings.iter().position(|ending| *ending == settings.line_ending),
+                    endings
+                        .iter()
+                        .position(|ending| *ending == settings.line_ending),
                     "/line_ending",
                     move |this, ix, window, cx| {
                         this.write("/line_ending", Some(json!(ending_names[ix])), window, cx);
@@ -1652,7 +1686,12 @@ impl SettingsView {
             self.row(
                 "Local echo",
                 "/local_echo",
-                self.switch("settings-local-echo", "/local_echo", settings.local_echo, cx),
+                self.switch(
+                    "settings-local-echo",
+                    "/local_echo",
+                    settings.local_echo,
+                    cx,
+                ),
                 None,
                 cx,
             ),

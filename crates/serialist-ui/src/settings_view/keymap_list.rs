@@ -64,10 +64,7 @@ pub fn binding_rows(keymap: &Keymap, bundled: usize, query: &str) -> Vec<Binding
     for (index, entry) in keymap.entries.iter().enumerate() {
         last.insert((entry.context.as_deref(), entry.keystrokes.as_str()), index);
     }
-    let words: Vec<String> = query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect();
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut rows: Vec<BindingRow> = keymap
         .entries
         .iter()
@@ -133,22 +130,24 @@ impl KeymapState {
         subscriptions: &mut Vec<Subscription>,
     ) -> Self {
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Filter bindings"));
-        subscriptions.push(cx.subscribe_in(
-            &query,
-            window,
-            |_, _, event: &InputEvent, _, cx| {
+        subscriptions.push(
+            cx.subscribe_in(&query, window, |_, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
                 }
-            },
-        ));
+            }),
+        );
         let recorder = cx.new(|cx| KeystrokeInput::new("settings-rebind-keystroke", None, cx));
         subscriptions.push(cx.subscribe_in(
             &recorder,
             window,
             |this, _, event: &KeystrokeInputEvent, window, cx| match event {
                 KeystrokeInputEvent::Captured(keystroke) => {
-                    this.rebind_selected(&keystroke.unparse(), window, cx);
+                    this.rebind_selected(
+                        &crate::keystroke_input::keystroke_text(keystroke),
+                        window,
+                        cx,
+                    );
                 }
             },
         ));
@@ -170,12 +169,16 @@ impl KeymapState {
 
 /// Keystrokes as keycaps, each stroke of a sequence its own.
 fn keycaps(keystrokes: &str) -> Div {
-    h_flex().gap_1().children(keystrokes.split_whitespace().map(|stroke| {
-        match Keystroke::parse(stroke) {
-            Ok(keystroke) => Kbd::new(keystroke).into_any_element(),
-            Err(_) => div().child(SharedString::from(stroke.to_owned())).into_any_element(),
-        }
-    }))
+    h_flex()
+        .gap_1()
+        .children(keystrokes.split_whitespace().map(|stroke| {
+            match Keystroke::parse(stroke) {
+                Ok(keystroke) => Kbd::new(keystroke).into_any_element(),
+                Err(_) => div()
+                    .child(SharedString::from(stroke.to_owned()))
+                    .into_any_element(),
+            }
+        }))
 }
 
 impl SettingsView {
@@ -229,17 +232,20 @@ impl SettingsView {
         };
         self.keymap.error = None;
         self.keymap.rebinding = Some(row);
-        self.keymap
-            .recorder
-            .update(cx, |recorder, cx| {
-                recorder.set_keystroke(None, cx);
-                recorder.start(window, cx);
-            });
+        self.keymap.recorder.update(cx, |recorder, cx| {
+            recorder.set_keystroke(None, cx);
+            recorder.start(window, cx);
+        });
         cx.notify();
     }
 
     /// Bind the selected binding's action to `keystrokes` instead, in `keymap.json`.
-    pub fn rebind_selected(&mut self, keystrokes: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn rebind_selected(
+        &mut self,
+        keystrokes: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(row) = self
             .keymap
             .rebinding
@@ -248,7 +254,9 @@ impl SettingsView {
         else {
             return;
         };
-        let _ = window;
+        // The recorder leaves the row with the recording; keep the focus in the screen
+        // so the window's bindings (the new chord among them) still reach it.
+        window.focus(&self.focus_handle, cx);
         let user_owned = row.source != BindingSource::Default;
         let paths = self.paths(cx);
         match settings_io::rebind(
@@ -313,7 +321,12 @@ impl SettingsView {
                     .cursor_pointer()
                     .when(is_selected, |this| this.bg(active))
                     .when(!is_selected, |this| this.hover(|this| this.bg(hover)))
-                    .child(div().w(px(150.)).flex_none().child(keycaps(&row.keystrokes)))
+                    .child(
+                        div()
+                            .w(px(150.))
+                            .flex_none()
+                            .child(keycaps(&row.keystrokes)),
+                    )
                     .child(
                         h_flex()
                             .flex_1()
@@ -372,10 +385,11 @@ impl SettingsView {
             .gap_2()
             .items_center()
             .child(
-                div()
-                    .flex_1()
-                    .max_w(px(320.))
-                    .child(Input::new(&self.keymap.query).id("settings-keymap-filter").small()),
+                div().flex_1().max_w(px(320.)).child(
+                    Input::new(&self.keymap.query)
+                        .id("settings-keymap-filter")
+                        .small(),
+                ),
             )
             .child(
                 Button::new("settings-edit-keymap")

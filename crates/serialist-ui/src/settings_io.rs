@@ -115,7 +115,8 @@ pub fn write_setting(
 ) -> Result<(), String> {
     let project = project_layer(paths)?;
     for attempt in 1..=ATTEMPTS {
-        let mut editor = SettingsEditor::open(&paths.settings).map_err(|error| error.to_string())?;
+        let mut editor =
+            SettingsEditor::open(&paths.settings).map_err(|error| error.to_string())?;
         let before = editor.text().to_owned();
         match &value {
             Some(value) => editor.set(pointer, value.clone()),
@@ -137,7 +138,8 @@ pub fn write_setting(
             }
             Err(error) => return Err(error.to_string()),
         }
-        if let Err(error) = load_settings(Some(&paths.settings), paths.project_settings.as_deref()) {
+        if let Err(error) = load_settings(Some(&paths.settings), paths.project_settings.as_deref())
+        {
             tracing::warn!(pointer, %error, "undoing a settings write that does not load");
             if let Err(error) = std::fs::write(&paths.settings, before) {
                 tracing::error!(%error, "could not put settings.json back");
