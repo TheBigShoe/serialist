@@ -203,8 +203,7 @@ use crate::status::{
 use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
 use crate::terminal::{
-    Clock, DisplayMode, ScreenState, TerminalScreen, TerminalView, TimestampMode,
-    TimestampModeExt,
+    Clock, DisplayMode, ScreenState, TerminalScreen, TerminalView, TimestampMode, TimestampModeExt,
 };
 use crate::toolbar::{self, ToolbarItem, ToolbarLayout, ToolbarMetrics};
 
@@ -1543,11 +1542,7 @@ impl SessionView {
         self.emulation = emulation;
         match emulation {
             Emulation::Vt => {
-                let size = self
-                    .terminal
-                    .read(cx)
-                    .grid_size()
-                    .unwrap_or(DEFAULT_SCREEN);
+                let size = self.terminal.read(cx).grid_size().unwrap_or(DEFAULT_SCREEN);
                 self.next_vt += 1;
                 let epoch = self.snapshot().epoch();
                 self.vt = Some(install_screen(
@@ -1564,7 +1559,8 @@ impl SessionView {
                     && let Some(sink) = self.vt_slot.take(vt.id)
                 {
                     // A screen with its scrollback is a lot to free on the main thread.
-                    cx.background_spawn(async move { drop((sink, vt)) }).detach();
+                    cx.background_spawn(async move { drop((sink, vt)) })
+                        .detach();
                 }
                 self.bell = None;
                 self.terminal

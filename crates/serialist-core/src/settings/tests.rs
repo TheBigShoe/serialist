@@ -1056,7 +1056,10 @@ fn ensure_keymap_file_writes_a_commented_template_once() {
 fn emulation_comes_from_the_terminal_setting_then_the_profile() {
     let defaults = Settings::default();
     assert_eq!(defaults.terminal.emulation, Emulation::Monitor);
-    assert!(!defaults.terminal.cursor_blink, "a steady cursor by default");
+    assert!(
+        !defaults.terminal.cursor_blink,
+        "a steady cursor by default"
+    );
     assert_eq!(defaults.emulation_for(&airoha_port()), Emulation::Monitor);
 
     let settings = user_settings(
