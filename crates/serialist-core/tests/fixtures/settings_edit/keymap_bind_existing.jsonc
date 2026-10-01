@@ -1,0 +1,16 @@
+// My keys (test fixture).
+[
+  {
+    "context": "Workspace", // main window
+    "bindings": {
+      // clear the screen
+      "cmd-k": "terminal::ClearAll",
+      "cmd-w": null,
+    },
+  },
+  // everywhere
+  {
+    "bindings": { "cmd-q": "serialist::Quit" }
+  },
+  // end of file note
+]
