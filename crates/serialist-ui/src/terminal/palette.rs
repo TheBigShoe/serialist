@@ -713,7 +713,10 @@ mod tests {
     /// Bundled themes whose own text colors already reach a floor against their terminal
     /// background (AA), so the guard never changes them. (Serialist Dark and Light lean on
     /// the guard for a few: Dark's bright black, Light's green and its bright colors.)
-    const UNLIFTED: [(&str, f32); 1] = [("Serialist Ember", MINIMUM_CONTRAST)];
+    const UNLIFTED: [(&str, f32); 2] = [
+        ("Serialist Ember", MINIMUM_CONTRAST),
+        ("Serialist Phosphor", MINIMUM_CONTRAST),
+    ];
 
     #[test]
     fn the_themes_drawn_to_a_floor_reach_it_before_the_guard() {
