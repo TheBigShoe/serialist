@@ -20,6 +20,9 @@
 //! changes something redraws at once, and a timer redraws every
 //! [`redraw interval`](MenuDevice::with_redraw_interval) regardless, with the redraw
 //! count on the status row, the way a bootloader refreshes its countdown.
+//!
+//! [`with_cursor_shown`](MenuDevice::with_cursor_shown) leaves the cursor on, parked at the
+//! end of the status row after each frame, for a picture of a screen with a cursor.
 
 use std::time::{Duration, Instant};
 
@@ -44,6 +47,7 @@ pub struct MenuDevice {
     interval: Option<Duration>,
     next: Option<Instant>,
     keys: Keys,
+    show_cursor: bool,
 }
 
 impl MenuDevice {
@@ -74,7 +78,14 @@ impl MenuDevice {
             interval: Some(Self::DEFAULT_REDRAW_INTERVAL),
             next: None,
             keys: Keys::Idle,
+            show_cursor: false,
         }
+    }
+
+    /// Leave the cursor visible instead of hiding it on connect (U-Boot hides it).
+    pub fn with_cursor_shown(mut self, shown: bool) -> Self {
+        self.show_cursor = shown;
+        self
     }
 
     /// How often the timer redraws; `None` redraws only on connect and on keys.
@@ -179,7 +190,11 @@ impl SimDevice for MenuDevice {
 
     fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
         // Hide the cursor and clear the screen once, as U-Boot's bootmenu does.
-        out.send(b"\x1b[?25l\x1b[2J");
+        if self.show_cursor {
+            out.send(b"\x1b[2J");
+        } else {
+            out.send(b"\x1b[?25l\x1b[2J");
+        }
         self.redraw(out);
     }
 
@@ -259,6 +274,16 @@ mod tests {
         // Other keys and sequences are ignored.
         dev.on_receive(b"x\x1b[C\x1b[2~", &mut out);
         assert_eq!(dev.selected(), 0);
+    }
+
+    #[test]
+    fn the_cursor_can_be_left_on() {
+        let mut dev = quiet().with_cursor_shown(true);
+        let mut out = CaptureOutput::new();
+        dev.on_connect(&mut out);
+        let sent = text(&out.take());
+        assert!(sent.starts_with("\x1b[2J\x1b[H"), "{sent:?}");
+        assert!(!sent.contains("\x1b[?25l"));
     }
 
     #[test]

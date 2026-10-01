@@ -4,14 +4,27 @@
 //! The view never copies lines. It holds `Arc`s to the sources and draws whatever they
 //! say is retained; pause is a frozen end id, hex view is a second source, selection is
 //! a pair of line ids and columns, and search results are line ids and byte ranges.
+//!
+//! # A terminal screen
+//!
+//! In VT mode the text source is a terminal screen's snapshot (see
+//! [`emulation`](crate::emulation)) and the view is told so with [`TerminalView::set_screen`]
+//! and, per snapshot, [`TerminalView::update_screen`]. The element then draws the screen's
+//! rows and its cursor and keeps it sized to the element (see
+//! [`element`](super::element)). Selection and copy work on the screen's rows as on any
+//! lines. Search does not: the screen is redrawn in place, so it searches the log the
+//! session keeps underneath ([`TerminalView::set_log`]), says so in the search bar, and
+//! marks nothing on the screen, whose line ids mean screen rows, not log lines.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serialist_core::store::DEFAULT_TIMESTAMP_FORMAT;
 use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
+use serialist_vt::CursorState;
 
 use crate::actions::{
     self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
@@ -21,7 +34,8 @@ use crate::config::Config;
 use crate::fonts::TerminalFont;
 use crate::prelude::*;
 use crate::terminal::element::{
-    CellMetrics, Highlights, Hit, ShapeCache, TerminalElement, TerminalInputs,
+    CellMetrics, Highlights, Hit, ResizeScreen, ScreenInputs, ShapeCache, TerminalElement,
+    TerminalInputs,
 };
 use crate::terminal::layout::Span;
 use crate::terminal::palette::TerminalPalette;
@@ -42,6 +56,35 @@ pub enum DisplayMode {
 
 /// Marks kept at most: the newest command responses.
 pub const MAX_MARKS: usize = 256;
+
+/// How long a blinking cursor stays on, and then off.
+pub const CURSOR_BLINK: Duration = Duration::from_millis(530);
+
+/// What the search bar says while it searches the log under a terminal screen.
+pub const LOG_SEARCH_NOTE: &str = "in the raw log";
+
+/// A terminal screen to show (VT mode): how the element asks for it to be resized.
+#[derive(Clone)]
+pub struct TerminalScreen {
+    /// Called after a frame whose element fits a different number of cells than the
+    /// screen has, with the columns and rows that fit.
+    pub resize: ResizeScreen,
+}
+
+/// A screen snapshot's size and cursor, as the element draws them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenState {
+    pub columns: usize,
+    pub rows: usize,
+    /// `None` while the device hides the cursor.
+    pub cursor: Option<CursorState>,
+}
+
+struct ScreenView {
+    resize: ResizeScreen,
+    requested: Rc<Cell<Option<(usize, usize)>>>,
+    state: ScreenState,
+}
 
 /// Where each source stood when the view was paused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +148,15 @@ pub struct TerminalView {
     search: SearchBar,
     /// Inline mode: the key context is `TerminalInline` and keys go to the port.
     inline: bool,
+    /// The terminal screen the text source is, in VT mode.
+    screen: Option<ScreenView>,
+    /// What search runs over while a screen is shown: the session's log.
+    log: Option<Arc<dyn LineSource>>,
+    /// `terminal.cursor_blink`.
+    cursor_blink: bool,
+    /// A blinking cursor is in its on phase.
+    blink_on: bool,
+    _blink: Option<Task<()>>,
 
     /// Highlighted text lines, such as a saved command's matched response. Sorted by
     /// line, then start; drawn like search matches whether or not search is open.
@@ -143,10 +195,15 @@ impl TerminalView {
             || DEFAULT_TIMESTAMP_FORMAT.to_owned(),
             |config| config.timestamp_format().to_owned(),
         );
+        let cursor_blink = cx
+            .try_global::<Config>()
+            .is_some_and(|config| config.settings().terminal.cursor_blink);
         let config_changes = cx.observe_global::<Config>(|this, cx| {
             let config = cx.global::<Config>();
             let (font, palette) = (config.terminal_font().clone(), config.palette().clone());
             let format = config.timestamp_format().to_owned();
+            let blink = config.settings().terminal.cursor_blink;
+            this.set_cursor_blink(blink, cx);
             this.set_font(font, cx);
             // A reload about something else keeps the shaped lines.
             if *this.palette != palette {
@@ -190,6 +247,11 @@ impl TerminalView {
                 stale: false,
             },
             inline: false,
+            screen: None,
+            log: None,
+            cursor_blink,
+            blink_on: true,
+            _blink: None,
 
             marks: Arc::default(),
             focus_handle: cx.focus_handle(),
@@ -410,6 +472,118 @@ impl TerminalView {
         self.cache.borrow().metrics()
     }
 
+    /// The columns and rows of text that fit, as of the last frame drawn.
+    pub fn grid_size(&self) -> Option<(usize, usize)> {
+        self.cache.borrow().grid()
+    }
+
+    // --- A terminal screen ------------------------------------------------------------
+
+    /// Show the text source as a terminal screen (VT mode), or as lines again (`None`).
+    /// Call [`Self::update_screen`] with each snapshot's size and cursor.
+    pub fn set_screen(&mut self, screen: Option<TerminalScreen>, cx: &mut Context<Self>) {
+        self.screen = screen.map(|screen| ScreenView {
+            resize: screen.resize,
+            requested: Rc::default(),
+            state: ScreenState::default(),
+        });
+        if self.screen.is_none() {
+            self.log = None;
+        }
+        self.sync_blink(cx);
+        cx.notify();
+    }
+
+    /// The size and cursor of the screen snapshot now in the text source.
+    pub fn update_screen(&mut self, state: ScreenState, cx: &mut Context<Self>) {
+        let Some(screen) = &mut self.screen else {
+            return;
+        };
+        if screen.state != state {
+            screen.state = state;
+            self.sync_blink(cx);
+            cx.notify();
+        }
+    }
+
+    /// The screen's size and cursor, while the text source is a terminal screen.
+    pub fn screen_state(&self) -> Option<ScreenState> {
+        self.screen.as_ref().map(|screen| screen.state)
+    }
+
+    /// Whether a terminal screen is on display: set, and the text (not hex) view.
+    pub fn shows_screen(&self) -> bool {
+        self.screen.is_some() && self.display == DisplayMode::Text
+    }
+
+    /// The log search runs over while a terminal screen is shown (the session's store,
+    /// whose searcher is the text searcher); `None` searches the text source itself.
+    pub fn set_log(&mut self, log: Option<Arc<dyn LineSource>>) {
+        self.log = log;
+    }
+
+    /// Whether search runs over the log rather than what is on display.
+    pub fn searches_log(&self) -> bool {
+        self.log.is_some() && self.display == DisplayMode::Text
+    }
+
+    /// `terminal.cursor_blink`: blink a cursor the device asks to blink.
+    pub fn set_cursor_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        if self.cursor_blink != blink {
+            self.cursor_blink = blink;
+            self.sync_blink(cx);
+            cx.notify();
+        }
+    }
+
+    /// Run the blink timer while a blinking cursor is shown and blinking is on.
+    fn sync_blink(&mut self, cx: &mut Context<Self>) {
+        let wanted = self.cursor_blink
+            && self
+                .screen
+                .as_ref()
+                .and_then(|screen| screen.state.cursor)
+                .is_some_and(|cursor| cursor.blinking);
+        if !wanted {
+            self._blink = None;
+            self.blink_on = true;
+            return;
+        }
+        if self._blink.is_none() {
+            self._blink = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(CURSOR_BLINK).await;
+                    let alive = this.update(cx, |view, cx| {
+                        view.blink_on = !view.blink_on;
+                        cx.notify();
+                    });
+                    if alive.is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+    }
+
+    /// The screen as the element draws it this frame, in the text view.
+    fn screen_inputs(&self) -> Option<ScreenInputs> {
+        let screen = self
+            .screen
+            .as_ref()
+            .filter(|_| self.display == DisplayMode::Text)?;
+        let cursor = screen
+            .state
+            .cursor
+            .filter(|cursor| cursor.visible && (self.blink_on || !cursor.blinking));
+        Some(ScreenInputs {
+            columns: screen.state.columns,
+            rows: screen.state.rows,
+            cursor,
+            resize: screen.resize.clone(),
+            requested: screen.requested.clone(),
+        })
+    }
+
     // --- Inline mode and marks ---------------------------------------------------------
 
     pub fn is_inline(&self) -> bool {
@@ -462,8 +636,12 @@ impl TerminalView {
     }
 
     /// Search matches and marks together, for the element. The active search match
-    /// stays active.
+    /// stays active. Nothing is marked on a terminal screen: matches and marks name log
+    /// lines, and the screen's ids are its rows.
     fn highlights(&self) -> Highlights {
+        if self.searches_log() {
+            return Highlights::default();
+        }
         let search = self.search.open.then_some(&self.search.results);
         // Mark line ids are text line ids.
         let marks =
@@ -559,9 +737,11 @@ impl TerminalView {
             hex: self.hex_source.as_ref().map(|hex| hex.end()),
         });
         // Matches found past the frozen end are not on display any more.
-        let span = self.displayed_span();
-        self.search.results.retain_lines(span.range());
-        self.search.covered = self.search.covered.min(span.end);
+        if !self.searches_log() {
+            let span = self.displayed_span();
+            self.search.results.retain_lines(span.range());
+            self.search.covered = self.search.covered.min(span.end);
+        }
         cx.notify();
         true
     }
@@ -595,6 +775,15 @@ impl TerminalView {
     pub fn lines_since_pause(&self) -> Option<u64> {
         let frozen = self.frozen?;
         Some(self.text_source.end().0.saturating_sub(frozen.text.0))
+    }
+
+    /// The lines search runs over: those on display, or the whole log under a terminal
+    /// screen.
+    fn search_span(&self) -> Span {
+        match (&self.log, self.display) {
+            (Some(log), DisplayMode::Text) => Span::new(log.first_line(), log.end()),
+            _ => self.displayed_span(),
+        }
     }
 
     /// The lines on display: retained, cut at the frozen end while paused. An export
@@ -802,10 +991,10 @@ impl TerminalView {
             search.stale = true;
             return;
         }
-        let span = self.displayed_span();
+        let span = self.search_span();
         self.search.results.retain_lines(span.range());
         let covered = self.search.covered.min(span.end);
-        if covered >= span.end && self.frozen.is_some() {
+        if covered >= span.end && self.frozen.is_some() && !self.searches_log() {
             // Paused, and everything on display was searched.
             return;
         }
@@ -824,7 +1013,7 @@ impl TerminalView {
     /// Run the current query on the background executor.
     fn start_search(&mut self, kind: SearchKind, cx: &mut Context<Self>) {
         let query = self.search.results.query.clone();
-        let span = self.displayed_span();
+        let span = self.search_span();
         let Some(searcher) = self.searcher().cloned() else {
             cx.notify();
             return;
@@ -909,6 +1098,10 @@ impl TerminalView {
     }
 
     fn reveal_active(&self) {
+        if self.searches_log() {
+            // The match is a log line; the screen has no such row to scroll to.
+            return;
+        }
         if let Some(found) = self.search.results.active_match() {
             self.scroll.reveal(found.line);
         }
@@ -1026,6 +1219,23 @@ impl TerminalView {
         } else {
             theme.muted_foreground
         };
+        let muted = theme.muted_foreground;
+        let log_note = self.searches_log().then(|| {
+            div()
+                .id("terminal-search-note")
+                .test_support()
+                .flex_none()
+                .text_xs()
+                .text_color(muted)
+                .child(LOG_SEARCH_NOTE)
+                .tooltip(|window, cx| {
+                    Tooltip::new(
+                        "VT mode: search reads the log of everything received, not the \
+                         screen, and marks nothing on it",
+                    )
+                    .build(window, cx)
+                })
+        });
         h_flex()
             .key_context(context::TERMINAL_SEARCH)
             .on_action(cx.listener(Self::dismiss_search_action))
@@ -1044,6 +1254,7 @@ impl TerminalView {
                         .small(),
                 ),
             )
+            .children(log_note)
             .child(
                 div()
                     .id("terminal-search-count")
@@ -1121,6 +1332,7 @@ impl Render for TerminalView {
             selection: self.selection,
             highlights,
             focus: self.focus_handle.clone(),
+            screen: self.screen_inputs(),
         });
         let following = self.scroll.is_following();
         let search_bar = search_open.then(|| self.render_search_bar(cx));

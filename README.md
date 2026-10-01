@@ -26,9 +26,9 @@ Milestones 0 to 5 of `docs/plan.md` have landed: the session engine and GPUI she
 terminal element over a page-store scrollback, Zed-format settings, themes and keymaps that
 apply live, inline interactive and saved-command modes, Lua scripting with a headless
 `--script` mode, and protocol plugins in Lua and WebAssembly. Milestone 6 has
-started: CI on macOS, Linux and Windows, release packaging, and tabs for several sessions
-(with a port settings popover and session restore) are in; full terminal emulation is
-pending (the terminal is monitor mode, an ANSI parser over the received text). The plan's "Status as built" section lists where the build
+started: CI on macOS, Linux and Windows, release packaging, tabs for several sessions
+(with a port settings popover and session restore) and full terminal emulation (VT mode,
+for U-Boot menus and Linux consoles, next to the monitor log) are in. The plan's "Status as built" section lists where the build
 differs from the plan, and `CHANGELOG.md` says what each milestone shipped.
 
 ## Quick start
@@ -44,8 +44,8 @@ cargo run --release -p serialist -- --virtual at
 `--virtual at` lists Serialist's simulated devices next to your real ports and opens the
 simulated AT modem, so everything works with no hardware attached (it answers `AT` with
 `OK`). The built-in simulated devices are `echo`, `echo-lines`, `at`, `firehose`,
-`firehose-ansi` and `race`. To open a real port, pick it in the Devices panel, or start
-with `--port <PATH> --baud <N>`.
+`firehose-ansi`, `race` and `menu` (a U-Boot style boot menu, for VT mode). To open a real
+port, pick it in the Devices panel, or start with `--port <PATH> --baud <N>`.
 
 | Flag | What it does |
 |---|---|
@@ -71,15 +71,37 @@ folds to its rail, and below 900 px the left one does; a panel opened from the r
 
 The session toolbar is one row of icons, each with its shortcut in its tooltip: the port and
 its settings, Connect or Disconnect, Command / Inline, Pause, Record and Clear, Search, Hex,
-Timestamps and Wrap, an Export menu (text, raw bytes, decoded frames), and, once a codec
+VT mode, Timestamps and Wrap, an Export menu (text, the VT screen, raw bytes, decoded
+frames), and, once a codec
 plugin is installed, the codec menu (which also turns summaries and hidden frames on and
 off, installs the bundled examples and opens the plugins folder). Whatever does not fit the width
 goes to the `…` menu at its right end. The status bar shows the port and its settings (click
 for the settings), the newest notice, then the mode (click to switch), RX and TX with their
-rates, and chips for the codec, a pause, a recording and a running script.
+rates, and chips for the codec, VT mode, a pause, a recording and a running script.
 
 `cmd-shift-p` (`ctrl-shift-p` on Linux and Windows) opens the command palette: every action,
 saved command and script, filtered as you type, with its key binding; Enter runs it.
+
+### VT mode
+
+By default a session is in monitor mode: a log of every line received, with colors and
+other escapes applied line by line. VT mode shows a terminal screen instead, which the
+device draws on with cursor addressing, so a U-Boot `bootmenu`, a Linux console, `top` or
+an editor look as they would in a terminal. `alt-v` in the terminal (or the toolbar's
+`>_` button) switches a session; `terminal.emulation` (`"monitor"` or `"vt"`) sets the
+default, and a device profile's `"emulation"` sets it per device. Try it with
+`serialist --virtual menu`: the `>_` button, then `cmd-i` (inline mode) and the arrow keys.
+
+In VT mode the screen is sized to the terminal pane (a device that asks with `CSI 18 t`
+learns the new size), the cursor is drawn where the device puts it, the arrows follow
+the device's cursor key mode, pastes are bracketed when it asks, its window title shows
+on the tab and its bell flashes the status dot. Queries such as device attributes and
+the cursor position are answered at once. The log keeps recording underneath: search
+reads it (the search bar says so), raw and text export and recording are the same as in
+monitor mode, and Export adds the screen's rows as text. Switching to VT mode starts a
+blank screen that the next bytes draw on; what arrived before is not replayed into it.
+Pause holds the screen as it was; Clear hides the log's lines and leaves the screen, which
+is the device's, alone.
 
 ### Tabs
 
@@ -164,6 +186,7 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Terminal | `terminal::ToggleWrap` | Toggle line wrapping | `alt-z` | `alt-z` |
 | Terminal | `terminal::CycleTimestamps` | Cycle the timestamp gutter (off, absolute, relative, delta) | `alt-t` | `alt-t` |
 | Terminal | `terminal::ToggleHexView` | Toggle the hex view | `alt-h` | `alt-h` |
+| Terminal | `terminal::ToggleEmulation` | Switch between monitor mode and VT mode | `alt-v` | `alt-v` |
 | Terminal | `terminal::ToggleFrameStats` | Toggle the frame-time overlay | `cmd-alt-i` | `ctrl-alt-i` |
 | Terminal | `terminal::PageUp` | Page up | `pageup` | `pageup` |
 | Terminal | `terminal::PageDown` | Page down | `pagedown` | `pagedown` |

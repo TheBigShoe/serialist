@@ -9,7 +9,7 @@
 //! # Encoding
 //!
 //! [`encode_key`] turns a GPUI [`Keystroke`] into the bytes an xterm-style terminal
-//! sends for it (normal cursor mode; no terminal modes are tracked):
+//! sends for it (normal cursor mode; in monitor mode no terminal modes are tracked):
 //!
 //! | Key | Bytes |
 //! | --- | --- |
@@ -31,6 +31,12 @@
 //! parameter (`ESC [ 1 ; 5 A` is ctrl-Up). Alt sends ESC before whatever the key sends
 //! without it. Keys with the platform modifier (cmd, super) send nothing: they are the
 //! app's shortcuts.
+//!
+//! In VT mode the screen tracks the device's modes, and the encoder is told the cursor
+//! key mode ([`KeyEncoder::with_cursor_keys`]): an unmodified arrow, Home or End then
+//! sends what [`serialist_vt::vt_key_bytes`] gives, `ESC O A` in application cursor
+//! mode (DECCKM). A paste into a screen in bracketed paste mode is wrapped in
+//! `ESC [ 200 ~` and `ESC [ 201 ~` ([`bracketed`]).
 //!
 //! # Leaving
 //!
@@ -178,6 +184,9 @@ pub struct KeyEncoder {
     pub enter: Vec<u8>,
     /// What Backspace sends.
     pub backspace: u8,
+    /// In VT mode, the screen's cursor key mode: `true` in application mode (DECCKM).
+    /// `None` in monitor mode, where the cursor keys always send the normal form.
+    pub cursor_keys: Option<bool>,
 }
 
 impl Default for KeyEncoder {
@@ -186,6 +195,7 @@ impl Default for KeyEncoder {
         Self {
             enter: b"\r".to_vec(),
             backspace: 0x7f,
+            cursor_keys: None,
         }
     }
 }
@@ -207,7 +217,19 @@ impl KeyEncoder {
             [] => b"\r".to_vec(),
             bytes => bytes.to_vec(),
         };
-        Self { enter, backspace }
+        Self {
+            enter,
+            backspace,
+            cursor_keys: None,
+        }
+    }
+
+    /// Encode unmodified cursor keys (arrows, Home, End) for a VT screen whose cursor key
+    /// mode is `application` (see [`serialist_vt::vt_key_bytes`]); `None` for monitor
+    /// mode.
+    pub fn with_cursor_keys(mut self, application: Option<bool>) -> Self {
+        self.cursor_keys = application;
+        self
     }
 
     /// What `keystroke` sends, or `None` if it sends nothing.
@@ -232,6 +254,14 @@ impl KeyEncoder {
         // xterm's modifier parameter: 1 + shift + 4 * ctrl (alt is the ESC prefix).
         let parameter = 1 + u8::from(modifiers.shift) + 4 * u8::from(modifiers.control);
         let control = |bytes: Vec<u8>| Some((bytes, Echo::Nothing));
+        // A VT screen's cursor key mode decides the unmodified cursor keys.
+        if let Some(application) = self.cursor_keys
+            && parameter == 1
+            && !modifiers.alt
+            && let Some(bytes) = serialist_vt::vt_key_bytes(&keystroke.key, application)
+        {
+            return control(bytes.to_vec());
+        }
         match keystroke.key.as_str() {
             "enter" => Some((self.enter.clone(), Echo::Enter)),
             "tab" if modifiers.shift => control(b"\x1b[Z".to_vec()),
@@ -356,6 +386,13 @@ pub fn is_chord(chord: &Keystroke, pressed: &Keystroke) -> bool {
         && a.alt == b.alt
         && a.shift == b.shift
         && a.platform == b.platform
+}
+
+/// `bytes` as a bracketed paste: between `ESC [ 200 ~` and `ESC [ 201 ~`, which a
+/// terminal in bracketed paste mode (`CSI ? 2004 h`) sends so the program can tell a
+/// paste from typing.
+pub fn bracketed(bytes: &[u8]) -> Vec<u8> {
+    [b"\x1b[200~".as_slice(), bytes, b"\x1b[201~"].concat()
 }
 
 // --- The escape chord --------------------------------------------------------------
@@ -566,6 +603,33 @@ mod tests {
         for (source, expected) in table {
             assert_eq!(bytes(source).as_deref(), Some(*expected), "{source}");
         }
+    }
+
+    #[test]
+    fn a_vt_screen_in_application_cursor_mode_changes_only_the_plain_cursor_keys() {
+        let application = KeyEncoder::default().with_cursor_keys(Some(true));
+        let normal = KeyEncoder::default().with_cursor_keys(Some(false));
+        let sent = |encoder: &KeyEncoder, source: &str| encoder.encode(&key(source)).unwrap().bytes;
+        let table: &[(&str, &[u8], &[u8])] = &[
+            ("up", b"\x1bOA", b"\x1b[A"),
+            ("down", b"\x1bOB", b"\x1b[B"),
+            ("right", b"\x1bOC", b"\x1b[C"),
+            ("left", b"\x1bOD", b"\x1b[D"),
+            ("home", b"\x1bOH", b"\x1b[H"),
+            ("end", b"\x1bOF", b"\x1b[F"),
+            // Modified keys take the CSI form in both modes; other keys do not change.
+            ("shift-up", b"\x1b[1;2A", b"\x1b[1;2A"),
+            ("ctrl-left", b"\x1b[1;5D", b"\x1b[1;5D"),
+            ("alt-up", b"\x1b\x1b[A", b"\x1b\x1b[A"),
+            ("pageup", b"\x1b[5~", b"\x1b[5~"),
+            ("f1", b"\x1bOP", b"\x1bOP"),
+            ("a", b"a", b"a"),
+        ];
+        for (source, in_application, in_normal) in table {
+            assert_eq!(sent(&application, source), *in_application, "{source}");
+            assert_eq!(sent(&normal, source), *in_normal, "{source}");
+        }
+        assert_eq!(bracketed(b"ls\r"), b"\x1b[200~ls\r\x1b[201~");
     }
 
     #[test]

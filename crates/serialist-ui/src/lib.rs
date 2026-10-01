@@ -20,6 +20,7 @@ pub mod decoded_panel;
 pub mod devices_panel;
 pub mod dialog_footer;
 pub mod docks;
+pub mod emulation;
 pub mod export;
 pub mod fonts;
 pub mod framed;
@@ -70,6 +71,8 @@ mod stream_tests;
 mod tab_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod vt_tests;
 
 pub use capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
 pub use codecs::{CodecSelection, CodecSet, CodecSlotSink, PluginCodec, PluginProblem};

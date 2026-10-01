@@ -25,7 +25,7 @@ pub mod view;
 mod tests;
 
 pub use demo::open_terminal_demo;
-pub use element::{CellMetrics, Highlights, TerminalElement, TerminalInputs};
+pub use element::{CellMetrics, Highlights, ScreenInputs, TerminalElement, TerminalInputs};
 pub use layout::{ScrollPosition, Span};
 pub use palette::TerminalPalette;
 pub use scroll::TerminalScrollHandle;
@@ -33,4 +33,4 @@ pub use search::SearchResults;
 pub use selection::{Selection, SelectionMode, SelectionPoint};
 pub use stats::{FrameSample, FrameStats, FrameSummary};
 pub use timestamps::{Clock, TimestampMode, TimestampModeExt};
-pub use view::{DisplayMode, TerminalView};
+pub use view::{DisplayMode, ScreenState, TerminalScreen, TerminalView};

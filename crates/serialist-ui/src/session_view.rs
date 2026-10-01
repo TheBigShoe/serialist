@@ -127,6 +127,27 @@
 //! `expect` is a frame predicate waits for a matching frame: a task polls the frame store
 //! each frame from the id it had before the write, until a frame matches or the timeout,
 //! and reports as a line match does.
+//!
+//! # VT mode
+//!
+//! A session is in monitor mode or VT mode ([`Emulation`]; see
+//! [`emulation`](crate::emulation) for the plumbing). In VT mode the ingest thread also
+//! feeds a terminal screen, and the view hands the terminal the screen's snapshot as its
+//! text source instead of the store's lines, with the screen's size and cursor
+//! ([`TerminalView::update_screen`]), a hook through which the element resizes the
+//! screen to fit, and the store's text as the log search runs over. Per ring the view
+//! acknowledges the screen with the stores, takes its snapshot, and acts on its events:
+//! a title goes on the tab, a bell flashes the status dot, answers the ingest thread did
+//! not write and color queries (answered from the palette) are written to the session.
+//! Unmodified cursor keys follow the screen's cursor key mode, and a paste is bracketed
+//! when the screen asks for it. The store goes on recording everything, so raw and text
+//! export, search and recording are the same in both modes; export adds the screen's rows
+//! ([`ExportFormat::Screen`]). Pause holds the screen snapshot on display; Clear hides the
+//! log's lines and leaves the screen, which is the device's, alone.
+//!
+//! Switching to VT mode starts a fresh screen, fed from the next chunk: what arrived
+//! before is not replayed into it. Switching back shows the store's lines again, which
+//! kept growing all along.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -144,6 +165,7 @@ use serialist_core::{
     SessionEvent, SessionStats, Snapshot, Store, StyledLine, TextOptions, Timestamps,
 };
 use serialist_script::{ScriptOutcome, ScriptSource};
+use serialist_vt::{DEFAULT_SCROLLBACK, VtScreen, VtSnapshot};
 
 use crate::actions::{self, context};
 use crate::capture::{Recorder, RecorderStats, RecordingSink, RecordingSlot};
@@ -155,12 +177,13 @@ use crate::codecs::{
 use crate::compose::{ComposeBar, ComposeEvent};
 use crate::config::Config;
 use crate::dialog_footer::DialogButtons;
+use crate::emulation::{Emulation, VtSlot, VtState, effects_of};
 use crate::export::{ExportFormat, ExportJob, FramesFormat, SharedSource};
 use crate::framed::{FilteredText, FramedFilter};
 use crate::history::PersistentHistory;
 use crate::inline::{
-    Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, is_chord,
-    paste_bytes, paste_echo,
+    Echo, EncodedKey, EscapeChord, InlineConfig, KeyEncoder, Mode, PasteProgress, bracketed,
+    is_chord, paste_bytes, paste_echo,
 };
 use crate::plugin_files;
 use crate::port_settings::{PortSettings, PortSettingsEvent, PortSettingsForm};
@@ -179,7 +202,9 @@ use crate::status::{
 };
 use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
-use crate::terminal::{Clock, DisplayMode, TerminalView, TimestampMode, TimestampModeExt};
+use crate::terminal::{
+    Clock, DisplayMode, ScreenState, TerminalScreen, TerminalView, TimestampMode, TimestampModeExt,
+};
 use crate::toolbar::{self, ToolbarItem, ToolbarLayout, ToolbarMetrics};
 
 /// The shortest time between two snapshots: about a frame at 120 Hz.
@@ -300,6 +325,34 @@ pub enum SessionViewEvent {
 /// How long Send break holds the line.
 pub const BREAK_DURATION: Duration = Duration::from_millis(250);
 
+/// How long the status dot shows a bell (VT mode).
+pub const BELL_FLASH: Duration = Duration::from_millis(250);
+
+/// A screen's size before the terminal has drawn a frame to measure.
+const DEFAULT_SCREEN: (usize, usize) = (80, 24);
+
+/// A new VT screen of `columns` by `rows`, stamped in `epoch` (the store's, so the two
+/// agree on times), fed by `slot` under `id` from the next chunk on. With `answer`, the
+/// ingest thread answers the device's queries through the slot's writer.
+fn install_screen(
+    slot: &VtSlot,
+    id: u64,
+    (columns, rows): (usize, usize),
+    epoch: serialist_core::Epoch,
+    answer: bool,
+) -> VtState {
+    let screen = VtScreen::new(columns, rows, DEFAULT_SCROLLBACK).with_epoch(epoch);
+    let sink = slot.sink(screen, answer);
+    let handle = sink.handle();
+    let snapshot = handle.snapshot();
+    slot.install(id, sink);
+    VtState {
+        id,
+        handle,
+        snapshot,
+    }
+}
+
 /// How long a reconfigure may take to be confirmed before the form says so.
 const PORT_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -397,15 +450,18 @@ struct IngestStart {
 }
 
 /// Start an ingest thread taking `events` into `store`, through the view's recording
-/// and script-link sinks, then `extra_sinks`, then a codec slot decoding with
-/// `selection` into a new frame store (from the store's current end, so frames name
-/// its stream offsets), and a task answering its doorbell.
+/// and script-link sinks, then `extra_sinks`, then the VT slot's sink (which feeds a
+/// terminal screen in VT mode), then a codec slot decoding with `selection` into a new
+/// frame store (from the store's current end, so frames name its stream offsets), and a
+/// task answering its doorbell.
+#[allow(clippy::too_many_arguments)]
 fn start_ingest(
     events: Receiver<SessionEvent>,
     store: Store,
     recording: &RecordingSlot,
     script_link: &ScriptLinkParts,
     selection: &Arc<CodecSelection>,
+    vt: &VtSlot,
     extra_sinks: Vec<Box<dyn ChunkSink + Send>>,
     cx: &mut Context<SessionView>,
 ) -> IngestStart {
@@ -421,6 +477,8 @@ fn start_ingest(
     let frames = frame_store.reader();
     let slot_selection = selection.clone();
     let frame_doorbell = doorbell.clone();
+    let vt_slot = vt.clone();
+    let vt_doorbell = doorbell.clone();
     let offset = store.stats().raw_len;
     let ingest = Ingest::spawn_with(
         events,
@@ -430,6 +488,10 @@ fn start_ingest(
                 .into_iter()
                 .map(|sink| -> Box<dyn ChunkSink> { sink })
                 .collect();
+            // The screen's wakes ring the same doorbell.
+            sinks.push(Box::new(vt_slot.ingest_sink(move || {
+                let _ = vt_doorbell.try_send(());
+            })));
             sinks.push(Box::new(
                 CodecSlotSink::new(
                     slot_selection,
@@ -624,6 +686,16 @@ pub struct SessionView {
     /// DTR and RTS as last set from here; opening a port asserts both.
     dtr: bool,
     rts: bool,
+    /// Monitor or VT mode.
+    emulation: Emulation,
+    /// Where the ingest thread finds the screen to feed; shared with its VT slot sink.
+    vt_slot: VtSlot,
+    /// VT mode's screen, while it is on.
+    vt: Option<VtState>,
+    /// The id the last screen was installed under.
+    next_vt: u64,
+    /// The status dot shows a bell until this task ends.
+    bell: Option<Task<()>>,
     /// The port settings popover's form.
     port_form: Entity<PortSettingsForm>,
     /// A change sent to the port, waiting for the writer thread's verdict.
@@ -715,16 +787,31 @@ impl SessionView {
         let recording = RecordingSlot::default();
         let script_link = ScriptLinkParts::default();
         let selection = Arc::new(CodecSelection::default());
+        let vt_slot = VtSlot::default();
+        vt_slot.set_writer(session.control());
+        let store = Store::new(options.store.clone());
+        // A session that starts in VT mode feeds its screen from the first chunk, so the
+        // screen is in the slot before the ingest thread starts.
+        let initial_screen = (options.display.emulation == Emulation::Vt).then(|| {
+            install_screen(
+                &vt_slot,
+                1,
+                DEFAULT_SCREEN,
+                store.epoch(),
+                vt_slot.has_writer(),
+            )
+        });
         let IngestStart {
             ingest,
             frames,
             wake,
         } = start_ingest(
             session.events(),
-            Store::new(options.store.clone()),
+            store,
             &recording,
             &script_link,
             &selection,
+            &vt_slot,
             extra_sinks,
             cx,
         );
@@ -854,6 +941,11 @@ impl SessionView {
             pending_disconnect: false,
             dtr: true,
             rts: true,
+            emulation: Emulation::Monitor,
+            vt_slot,
+            vt: None,
+            next_vt: 1,
+            bell: None,
             port_form,
             port_change: None,
             _port_watch: None,
@@ -871,6 +963,11 @@ impl SessionView {
         // The device profile's codec, from the first chunk on, if its plugin is installed.
         if let Some(name) = initial_codec {
             view.want_codec(&name, cx);
+        }
+        if let Some(screen) = initial_screen {
+            view.emulation = Emulation::Vt;
+            view.vt = Some(screen);
+            view.show_screen(cx);
         }
         view
     }
@@ -1022,6 +1119,7 @@ impl SessionView {
             script: script.as_ref(),
             codec,
             rates: self.rates.rates(),
+            emulation: self.emulation,
         })
     }
 
@@ -1121,13 +1219,68 @@ impl SessionView {
         };
         ingest.acknowledge();
         self.frames.acknowledge();
+        if let Some(vt) = &self.vt {
+            vt.handle.acknowledge();
+        }
         let frames = self.frames.snapshot();
         let snapshot = ingest.snapshot();
         let decoded = self.take_frames(frames);
-        let shown = self.show(snapshot, decoded, cx);
+        let screen = self.take_screen(cx);
+        let shown = self.show(snapshot, decoded, screen, cx);
         if self.poll_session(cx) || shown || decoded {
             cx.notify();
         }
+    }
+
+    /// VT mode: take the screen's newest snapshot (unless paused, which holds the one on
+    /// display) and act on its events. Returns whether the snapshot changed.
+    fn take_screen(&mut self, cx: &mut Context<Self>) -> bool {
+        let paused = self.pause.is_some();
+        let Some(vt) = &mut self.vt else {
+            return false;
+        };
+        let events = vt.handle.take_events();
+        let mut changed = false;
+        if !paused {
+            let latest = vt.handle.snapshot();
+            if latest.generation() != vt.snapshot.generation() {
+                vt.snapshot = latest;
+                changed = true;
+            }
+        }
+        if !events.is_empty() {
+            let palette = self.terminal.read(cx).palette().clone();
+            let effects = effects_of(events, &palette);
+            if effects.title.is_some() {
+                // The tab reads the title from the snapshot on display.
+                cx.notify();
+            }
+            if let Some(session) = &self.session {
+                for bytes in effects.writes {
+                    if session.write(bytes).is_err() {
+                        tracing::debug!(port = %self.port, "an answer to the device was not sent");
+                    }
+                }
+            }
+            if effects.bell {
+                self.ring_bell(cx);
+            }
+        }
+        changed
+    }
+
+    /// Flash the status dot once for the device's bell.
+    fn ring_bell(&mut self, cx: &mut Context<Self>) {
+        // A bell during a flash starts it over.
+        self.bell = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BELL_FLASH).await;
+            this.update(cx, |view, cx| {
+                view.bell = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Take a newer frame snapshot, and put the summaries of the new frames into the
@@ -1227,14 +1380,24 @@ impl SessionView {
     }
 
     /// Hand `snapshot` to the terminal if it holds anything new, or, while framed bytes
-    /// are hidden, if the frames (`decoded`) changed what is hidden. Returns whether it
-    /// did.
-    fn show(&mut self, snapshot: Snapshot, decoded: bool, cx: &mut Context<Self>) -> bool {
+    /// are hidden, if the frames (`decoded`) changed what is hidden, or if the screen
+    /// (`screen`, VT mode) changed. Returns whether it did.
+    fn show(
+        &mut self,
+        snapshot: Snapshot,
+        decoded: bool,
+        screen: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
         // A snapshot of what the view already has: a wake that found nothing new. (Not
         // the stats, which cannot see a line being typed change without changing size.)
         let same = self.snapshot().is_same_publication(&snapshot);
         if same && !(decoded && self.filter.is_some()) {
-            return false;
+            if screen {
+                // Only the screen moved (a resize, a synchronized update let go).
+                self.push_sources(cx, |_, cx| cx.notify());
+            }
+            return screen;
         }
         let after = snapshot.stats();
         // The lines that were still open (the one arriving, the ones being typed) may
@@ -1270,9 +1433,17 @@ impl SessionView {
         };
     }
 
-    /// What the terminal shows as text: the scrollback, with framed bytes left out while
-    /// they are hidden.
+    /// What the terminal shows as text: the screen in VT mode, else the log.
     pub fn text_source(&self) -> Arc<dyn LineSource> {
+        match &self.vt {
+            Some(vt) => vt.snapshot.clone(),
+            None => self.log_source(),
+        }
+    }
+
+    /// The store's lines as the terminal shows them in monitor mode: the scrollback, with
+    /// framed bytes left out while they are hidden. What search reads in both modes.
+    pub fn log_source(&self) -> Arc<dyn LineSource> {
         match &self.filtered {
             Some(filtered) => Arc::new(filtered.clone()),
             None => self.scrollback.text_source(),
@@ -1286,7 +1457,8 @@ impl SessionView {
         }
     }
 
-    /// Give the terminal the current scrollback's sources, then run `then` on it.
+    /// Give the terminal the current scrollback's sources (and the screen's, in VT mode),
+    /// then run `then` on it.
     fn push_sources(
         &self,
         cx: &mut Context<Self>,
@@ -1294,7 +1466,13 @@ impl SessionView {
     ) {
         let scrollback = self.scrollback.clone();
         let (text, searcher) = (self.text_source(), self.text_searcher());
+        let log = self.vt.is_some().then(|| self.log_source());
+        let screen = self.screen_state();
         self.terminal.update(cx, |terminal, cx| {
+            terminal.set_log(log);
+            if let Some(screen) = screen {
+                terminal.update_screen(screen, cx);
+            }
             terminal.update_sources(
                 text,
                 Some(searcher),
@@ -1307,15 +1485,137 @@ impl SessionView {
     }
 
     /// Give the terminal a text source whose ids mean something else (framed bytes
-    /// hidden or shown again): its scroll and selection start over, and the marks are
-    /// given again in the new ids.
+    /// hidden or shown again, VT mode on or off): its scroll and selection start over,
+    /// and the marks are given again in the new ids.
     fn replace_text_source(&mut self, cx: &mut Context<Self>) {
         let (text, searcher) = (self.text_source(), self.text_searcher());
+        let log = self.vt.is_some().then(|| self.log_source());
         self.terminal.update(cx, |terminal, cx| {
-            terminal.set_source(text, cx);
+            // The log first: a search that reruns on the new source reads it.
+            terminal.set_log(log);
             terminal.set_searcher(Some(searcher), cx);
+            terminal.set_source(text, cx);
         });
         self.sync_marks(cx);
+    }
+
+    // --- VT mode -----------------------------------------------------------------------
+
+    /// Monitor or VT mode.
+    pub fn emulation(&self) -> Emulation {
+        self.emulation
+    }
+
+    /// The screen snapshot on display, in VT mode.
+    pub fn vt_snapshot(&self) -> Option<&Arc<VtSnapshot>> {
+        self.vt.as_ref().map(|vt| &vt.snapshot)
+    }
+
+    /// The screen's handle, in VT mode.
+    pub fn vt_handle(&self) -> Option<&serialist_vt::VtHandle> {
+        self.vt.as_ref().map(|vt| &vt.handle)
+    }
+
+    /// The title the device set on its screen (VT mode), as of the snapshot on display,
+    /// for the tab.
+    pub fn screen_title(&self) -> Option<&str> {
+        self.vt.as_ref()?.snapshot.title()
+    }
+
+    /// Whether the status dot is showing a bell.
+    pub fn bell_flashing(&self) -> bool {
+        self.bell.is_some()
+    }
+
+    /// The toggle: the toolbar's terminal button and `terminal::ToggleEmulation`.
+    pub fn toggle_emulation(&mut self, cx: &mut Context<Self>) {
+        self.set_emulation(self.emulation.toggled(), cx);
+    }
+
+    /// Show the store's lines (monitor) or a terminal screen (VT). A new screen starts
+    /// blank, sized to the terminal, and is fed from the next chunk: what arrived before
+    /// is not replayed. The store keeps everything either way.
+    pub fn set_emulation(&mut self, emulation: Emulation, cx: &mut Context<Self>) {
+        if self.emulation == emulation {
+            return;
+        }
+        self.emulation = emulation;
+        match emulation {
+            Emulation::Vt => {
+                let size = self.terminal.read(cx).grid_size().unwrap_or(DEFAULT_SCREEN);
+                self.next_vt += 1;
+                let epoch = self.snapshot().epoch();
+                self.vt = Some(install_screen(
+                    &self.vt_slot,
+                    self.next_vt,
+                    size,
+                    epoch,
+                    self.vt_slot.has_writer(),
+                ));
+                self.show_screen(cx);
+            }
+            Emulation::Monitor => {
+                if let Some(vt) = self.vt.take()
+                    && let Some(sink) = self.vt_slot.take(vt.id)
+                {
+                    // A screen with its scrollback is a lot to free on the main thread.
+                    cx.background_spawn(async move { drop((sink, vt)) })
+                        .detach();
+                }
+                self.bell = None;
+                self.terminal
+                    .update(cx, |terminal, cx| terminal.set_screen(None, cx));
+                self.replace_text_source(cx);
+            }
+        }
+        tracing::debug!(port = %self.port, emulation = emulation.label(), "emulation");
+        cx.notify();
+    }
+
+    /// The size and cursor of the screen snapshot on display, in VT mode.
+    fn screen_state(&self) -> Option<ScreenState> {
+        let snapshot = &self.vt.as_ref()?.snapshot;
+        Some(ScreenState {
+            columns: snapshot.columns(),
+            rows: snapshot.viewport_rows(),
+            cursor: snapshot.cursor().filter(|cursor| cursor.visible),
+        })
+    }
+
+    /// Put the screen on the terminal: its snapshot as the text source, the log to
+    /// search, and the hook the element resizes it through.
+    fn show_screen(&mut self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        let screen = TerminalScreen {
+            resize: std::rc::Rc::new(move |columns, rows, cx: &mut App| {
+                view.update(cx, |view, cx| view.resize_screen(columns, rows, cx))
+                    .ok();
+            }),
+        };
+        let state = self.screen_state();
+        self.terminal.update(cx, |terminal, cx| {
+            terminal.set_screen(Some(screen), cx);
+            if let Some(state) = state {
+                terminal.update_screen(state, cx);
+            }
+        });
+        self.replace_text_source(cx);
+    }
+
+    /// The element fits `columns` by `rows` cells: resize the screen to that (the device
+    /// learns it when it asks, `CSI 18 t`) and show the result.
+    pub fn resize_screen(&mut self, columns: usize, rows: usize, cx: &mut Context<Self>) {
+        let paused = self.pause.is_some();
+        let Some(vt) = &mut self.vt else {
+            return;
+        };
+        vt.handle.resize(columns, rows);
+        tracing::debug!(port = %self.port, columns, rows, "screen resized");
+        if !paused {
+            vt.snapshot = vt.handle.snapshot();
+            self.push_sources(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
     }
 
     /// Hand the terminal the marked replies and the selected frame's lines, in the ids of
@@ -1951,6 +2251,8 @@ impl SessionView {
             DisplayMode::Hex => Some(LineId(
                 frame.raw.start / self.hex_bytes_per_row.max(1) as u64,
             )),
+            // A screen's rows are not the store's lines: nothing to scroll to.
+            DisplayMode::Text if self.vt.is_some() => None,
             DisplayMode::Text => {
                 let store = lines
                     .first()
@@ -2287,8 +2589,15 @@ impl SessionView {
         self.set_mode(self.mode.toggled(), window, cx);
     }
 
+    /// The encoder for this session's keys: its line ending and Backspace byte, and in
+    /// VT mode the screen's cursor key mode as of now.
     fn key_encoder(&self, cx: &App) -> KeyEncoder {
+        let cursor_keys = self
+            .vt
+            .as_ref()
+            .map(|vt| vt.handle.snapshot().modes().app_cursor_keys);
         KeyEncoder::new(self.line_ending(cx), inline_settings(cx).backspace)
+            .with_cursor_keys(cursor_keys)
     }
 
     /// The keystroke interceptor, which runs before the keymap. In inline mode, with the
@@ -2376,9 +2685,17 @@ impl SessionView {
     /// stops it.
     pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         let settings = inline_settings(cx);
-        let bytes = paste_bytes(text, &self.key_encoder(cx).enter);
+        let mut bytes = paste_bytes(text, &self.key_encoder(cx).enter);
         if bytes.is_empty() {
             return;
+        }
+        // A screen in bracketed paste mode (VT mode) gets the paste marked as one.
+        if self
+            .vt
+            .as_ref()
+            .is_some_and(|vt| vt.handle.snapshot().modes().bracketed_paste)
+        {
+            bytes = bracketed(&bytes);
         }
         if self.live().is_none() {
             self.notice = Some(Notice::error("Not connected; nothing pasted"));
@@ -2526,6 +2843,9 @@ impl SessionView {
             }
         }
         let (new, old) = (options.display, old.display);
+        if new.emulation != old.emulation {
+            self.set_emulation(new.emulation, cx);
+        }
         if new.decoded_inline != old.decoded_inline {
             self.set_decoded_inline(new.decoded_inline, cx);
         }
@@ -2578,6 +2898,7 @@ impl SessionView {
             self.stats = session.stats();
             cx.background_spawn(async move { session.close() }).detach();
         }
+        self.vt_slot.set_writer(None);
         self.port_form
             .update(cx, |form, cx| form.set_live(false, cx));
     }
@@ -2687,6 +3008,8 @@ impl SessionView {
             .unwrap_or_else(|| Store::new(self.options.store.clone()));
         // A closed bell stays closed: scripts get a new one.
         self.script_link = ScriptLinkParts::default();
+        // The screen (VT mode) carries on, answering the device through the new session.
+        self.vt_slot.set_writer(session.control());
         let IngestStart {
             ingest,
             frames,
@@ -2697,6 +3020,7 @@ impl SessionView {
             &self.recording,
             &self.script_link,
             &self.selection,
+            &self.vt_slot,
             Vec::new(),
             cx,
         );
@@ -3039,10 +3363,14 @@ impl SessionView {
         cx.notify();
     }
 
-    /// Follow the live tail again.
+    /// Follow the live tail again. In VT mode the screen shows as it is now.
     pub fn resume(&mut self, cx: &mut Context<Self>) {
         if self.pause.take().is_none() {
             return;
+        }
+        if let Some(vt) = &mut self.vt {
+            vt.snapshot = vt.handle.snapshot();
+            self.push_sources(cx, |_, _| {});
         }
         self.terminal.update(cx, |terminal, cx| terminal.resume(cx));
         cx.notify();
@@ -3092,11 +3420,20 @@ impl SessionView {
     }
 
     /// Ask where to export, then export. The file's extension picks the format;
-    /// `preferred` is the suggestion and the fallback for unknown extensions.
+    /// `preferred` is the suggestion and the fallback for unknown extensions. The screen
+    /// stays the screen under any text extension.
     pub fn export(&mut self, preferred: ExportFormat, cx: &mut Context<Self>) {
-        let suggested = format!("{}.{}", self.file_stem(), preferred.extension());
+        let stem = self.file_stem();
+        let suggested = match preferred {
+            ExportFormat::Screen => format!("{stem}-screen.txt"),
+            _ => format!("{stem}.{}", preferred.extension()),
+        };
         self.prompt_for_path(suggested, cx, move |view, path, cx| {
-            let format = ExportFormat::from_path(&path).unwrap_or(preferred);
+            let format = match (preferred, ExportFormat::from_path(&path)) {
+                (ExportFormat::Screen, None | Some(ExportFormat::Text)) => ExportFormat::Screen,
+                (_, Some(format)) => format,
+                (_, None) => preferred,
+            };
             view.export_to(path, format, cx).detach();
         });
     }
@@ -3107,12 +3444,29 @@ impl SessionView {
     /// the gutter is (absolute stamps in `display.timestamp_format`, which is read when
     /// the job is taken). Raw is the stream bytes under the same choice, whole lines at a
     /// time; with no selection it ignores Clear, which hides lines, not bytes.
+    ///
+    /// In VT mode the text view's selection is of screen rows: a text export of it writes
+    /// those rows, and with none the export reads the store's lines (the log), cut at the
+    /// pause. Raw bytes cannot be told apart by screen row, so a raw export there ignores
+    /// the selection. [`ExportFormat::Screen`] writes the screen's rows as shown.
     pub fn export_job(&self, format: ExportFormat, cx: &App) -> ExportJob {
         let terminal = self.terminal.read(cx);
         let snapshot = self.snapshot().clone();
+        if format == ExportFormat::Screen {
+            let rows = self.vt.as_ref().map_or_else(Vec::new, |vt| {
+                vt.snapshot
+                    .screen_text()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            });
+            return ExportJob::Screen { rows };
+        }
+        let screen = self.vt.is_some() && terminal.display_mode() == DisplayMode::Text;
         let span = terminal.displayed_span();
         let selected = terminal
             .selection()
+            .filter(|_| !(screen && format == ExportFormat::Raw))
             .and_then(|selection| selection.clipped(span))
             .map(|range| {
                 // A selection ending at the start of a line does not take that line.
@@ -3131,6 +3485,35 @@ impl SessionView {
         if let Some(config) = cx.try_global::<Config>() {
             options = options.with_timestamp_format(config.timestamp_format());
         }
+        if screen && format == ExportFormat::Text {
+            if let Some(lines) = selected {
+                return ExportJob::Lines {
+                    source: SharedSource(self.text_source()),
+                    lines,
+                    options,
+                };
+            }
+            // The log, as far as a pause saw it.
+            let log = self.log_source();
+            let end = match (self.pause, &self.filtered) {
+                (None, _) => log.end(),
+                (Some(mark), None) => LineId(mark.lines).min(log.end()),
+                (Some(mark), Some(filtered)) => filtered.view_at_or_after(LineId(mark.lines)),
+            };
+            let lines = log.first_line()..end.max(log.first_line());
+            return match &self.filtered {
+                Some(_) => ExportJob::Lines {
+                    source: SharedSource(log),
+                    lines,
+                    options,
+                },
+                None => ExportJob::Text {
+                    snapshot,
+                    lines,
+                    options,
+                },
+            };
+        }
         match (format, terminal.display_mode()) {
             // Decoded frames: all of them, whatever the view shows.
             (ExportFormat::Csv | ExportFormat::Json, _) => ExportJob::Frames {
@@ -3146,7 +3529,7 @@ impl SessionView {
             // With framed bytes hidden the terminal's line ids are the filter's.
             (ExportFormat::Text, DisplayMode::Text) if self.filtered.is_some() => {
                 ExportJob::Lines {
-                    source: SharedSource(self.text_source()),
+                    source: SharedSource(self.log_source()),
                     lines,
                     options,
                 }
@@ -3161,6 +3544,7 @@ impl SessionView {
                 rows: lines,
                 options,
             },
+            (ExportFormat::Screen, _) => unreachable!("taken above"),
             (ExportFormat::Raw, _) => {
                 let range = match (selected, self.pause) {
                     (Some(lines), _) => raw_under(terminal.source().as_ref(), lines),
@@ -3183,6 +3567,13 @@ impl SessionView {
         if format.is_decoded() && self.codec.is_none() && self.frame_snapshot.is_empty() {
             self.notice = Some(Notice::error(
                 "No codec decodes this session, so there are no frames to export",
+            ));
+            cx.notify();
+            return Task::ready(());
+        }
+        if format == ExportFormat::Screen && self.vt.is_none() {
+            self.notice = Some(Notice::error(
+                "Only VT mode has a screen to export; the text export has the lines",
             ));
             cx.notify();
             return Task::ready(());
@@ -3412,6 +3803,7 @@ impl SessionView {
             has_hex: terminal.has_hex_source(),
             timestamps: terminal.timestamps(),
             wrap: terminal.wrap(),
+            vt: self.emulation == Emulation::Vt,
             decoding: self.codec.is_some(),
             decoded_inline: self.decoded_inline,
             hide_framed: self.hide_framed,
@@ -3673,6 +4065,20 @@ impl SessionView {
                         .update(cx, |terminal, cx| terminal.toggle_hex(cx));
                 }))
                 .into_any_element(),
+            ToolbarItem::Emulation => {
+                chrome::toggle_button("emulation", IconName::Terminal, state.vt, cx)
+                    .tooltip_with_action(
+                        if state.vt {
+                            "VT mode: the device draws on a terminal screen (click for the log)"
+                        } else {
+                            "Monitor mode: a log of lines (click for a terminal screen)"
+                        },
+                        &actions::ToggleEmulation,
+                        terminal,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_emulation(cx)))
+                    .into_any_element()
+            }
             ToolbarItem::Timestamps => chrome::toggle_button(
                 "timestamps",
                 IconName::Clock,
@@ -3700,10 +4106,10 @@ impl SessionView {
                 }))
                 .into_any_element(),
             ToolbarItem::Export => {
-                let (decoding, view) = (state.decoding, view.clone());
+                let (decoding, screen, view) = (state.decoding, state.vt, view.clone());
                 chrome::icon_button("export", IconName::Download, cx)
                     .tooltip_with_action("Export", &actions::Export, workspace)
-                    .dropdown_menu(move |menu, _, _| export_items(menu, decoding, &view))
+                    .dropdown_menu(move |menu, _, _| export_items(menu, decoding, screen, &view))
                     .into_any_element()
             }
             ToolbarItem::Codec => {
@@ -3787,6 +4193,8 @@ struct ToolState {
     has_hex: bool,
     timestamps: TimestampMode,
     wrap: bool,
+    /// VT mode.
+    vt: bool,
     decoding: bool,
     decoded_inline: bool,
     hide_framed: bool,
@@ -3819,8 +4227,14 @@ fn on_view(
     }
 }
 
-/// The Export menu: the displayed text, the raw bytes, the decoded frames.
-fn export_items(menu: PopupMenu, decoding: bool, view: &WeakEntity<SessionView>) -> PopupMenu {
+/// The Export menu: the displayed text, the screen (VT mode), the raw bytes, the
+/// decoded frames.
+fn export_items(
+    menu: PopupMenu,
+    decoding: bool,
+    screen: bool,
+    view: &WeakEntity<SessionView>,
+) -> PopupMenu {
     menu.min_w(px(200.))
         .item(
             PopupMenuItem::new("Text\u{2026}")
@@ -3830,6 +4244,15 @@ fn export_items(menu: PopupMenu, decoding: bool, view: &WeakEntity<SessionView>)
                     view.export(ExportFormat::Text, cx)
                 })),
         )
+        .when(screen, |menu| {
+            menu.item(
+                PopupMenuItem::new("Screen\u{2026}")
+                    .icon(IconName::Terminal)
+                    .on_click(on_view(view, |view, _, cx| {
+                        view.export(ExportFormat::Screen, cx)
+                    })),
+            )
+        })
         .item(
             PopupMenuItem::new("Raw bytes\u{2026}")
                 .icon(IconName::Binary)
@@ -3989,6 +4412,12 @@ fn overflow_menu(
                             .update(cx, |terminal, cx| terminal.toggle_hex(cx))
                     })),
             ),
+            ToolbarItem::Emulation => menu.item(
+                PopupMenuItem::new("VT mode")
+                    .checked(state.vt)
+                    .action(Box::new(actions::ToggleEmulation))
+                    .on_click(on_view(view, |view, _, cx| view.toggle_emulation(cx))),
+            ),
             ToolbarItem::Timestamps => menu.item(
                 PopupMenuItem::new(format!("Timestamps: {}", state.timestamps.label()))
                     .checked(state.timestamps != TimestampMode::Off)
@@ -4006,9 +4435,9 @@ fn overflow_menu(
                     })),
             ),
             ToolbarItem::Export => {
-                let (decoding, view) = (state.decoding, view.clone());
+                let (decoding, screen, view) = (state.decoding, state.vt, view.clone());
                 menu.submenu("Export", window, cx, move |menu, _, _| {
-                    export_items(menu, decoding, &view)
+                    export_items(menu, decoding, screen, &view)
                 })
             }
             ToolbarItem::Codec => {
@@ -4033,6 +4462,9 @@ impl Render for SessionView {
             .on_key_up(cx.listener(Self::key_up))
             .on_action(cx.listener(Self::paste_action))
             .on_action(cx.listener(Self::toggle_inline_action))
+            .on_action(cx.listener(|this, _: &actions::ToggleEmulation, _, cx| {
+                this.toggle_emulation(cx);
+            }))
             .size_full()
             .bg(theme.background)
             .child(toolbar)

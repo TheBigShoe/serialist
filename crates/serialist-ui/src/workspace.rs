@@ -97,7 +97,9 @@ use crate::actions::tabs::{
     ActivateTab1, ActivateTab2, ActivateTab3, ActivateTab4, ActivateTab5, ActivateTab6,
     ActivateTab7, ActivateTab8, ActivateTab9, CloseTab, NewTab, NextTab, PreviousTab,
 };
-use crate::actions::{self, Clear, Disconnect, Export, Pause, ToggleInline, ToggleRecord, context};
+use crate::actions::{
+    self, Clear, Disconnect, Export, Pause, ToggleEmulation, ToggleInline, ToggleRecord, context,
+};
 use crate::chrome;
 use crate::codecs::codec_not_installed;
 use crate::commands_panel::{CommandsPanel, CommandsPanelEvent};
@@ -688,6 +690,11 @@ impl Workspace {
                     self.tab_title(tab, cx),
                     tab.status(cx),
                     self.active == Some(tab.id),
+                )
+                .with_suffix(
+                    tab.view
+                        .as_ref()
+                        .and_then(|view| view.read(cx).screen_title().map(str::to_owned)),
                 )
             })
             .collect()
@@ -1736,6 +1743,13 @@ impl Workspace {
         }
     }
 
+    /// As [`Self::toggle_inline`], for monitor and VT mode.
+    fn toggle_emulation(&mut self, _: &ToggleEmulation, cx: &mut Context<Self>) {
+        if let Some(session) = self.session().cloned() {
+            session.update(cx, |view, cx| view.toggle_emulation(cx));
+        }
+    }
+
     // --- The command palette -------------------------------------------------------------
 
     /// The command palette, while it is open.
@@ -2015,6 +2029,14 @@ impl Workspace {
                     .gap_1()
                     .pr_1()
                     .items_center()
+                    .children(label.suffix.map(|suffix| {
+                        div()
+                            .max_w(px(160.))
+                            .truncate()
+                            .text_size(chrome::LABEL_SIZE)
+                            .text_color(muted)
+                            .child(SharedString::from(suffix))
+                    }))
                     .children(label.unseen.map(|unseen| {
                         div()
                             .text_size(chrome::LABEL_SIZE)
@@ -2353,6 +2375,8 @@ impl Workspace {
         let status = view.status_line();
         let inline = view.mode() == Mode::Inline;
         let state_color = match view.state() {
+            // The device rang the bell (VT mode): the dot flashes once.
+            _ if view.bell_flashing() => theme.warning,
             ConnectionState::Connected => theme.success,
             ConnectionState::Disconnected { error: None } => theme.muted_foreground,
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
@@ -2473,6 +2497,21 @@ impl Workspace {
                     .map(|rate| div().text_color(info).child(SharedString::from(rate))),
             );
 
+        let emulation = status.emulation.map(|label| {
+            chrome::chip(info)
+                .id("status-emulation")
+                .child(Icon::new(IconName::Terminal).size_3())
+                .child(label)
+                .cursor_pointer()
+                .tooltip(|window, cx| {
+                    Tooltip::new("VT mode: the device draws on a terminal screen")
+                        .action(&ToggleEmulation, Some(context::TERMINAL))
+                        .build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_emulation(&ToggleEmulation, cx);
+                }))
+        });
         let codec = view.codec_name().map(|codec| {
             chrome::chip(info)
                 .id("status-codec")
@@ -2530,6 +2569,7 @@ impl Workspace {
             .children(recording)
             .children(paused)
             .children(codec)
+            .children(emulation)
             .child(mode)
             .child(rx)
             .child(tx)
@@ -2661,6 +2701,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::toggle_record))
             .on_action(cx.listener(Self::toggle_inline))
+            .on_action(cx.listener(|this, action: &ToggleEmulation, _, cx| {
+                this.toggle_emulation(action, cx);
+            }))
             .on_action(cx.listener(Self::send_command_action))
             .on_action(cx.listener(Self::run_script_action))
             .on_action(cx.listener(Self::run_inline_action))

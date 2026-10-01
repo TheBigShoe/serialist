@@ -164,6 +164,7 @@ mod tests {
                 "virtual:firehose",
                 "virtual:firehose-ansi",
                 "virtual:race",
+                "virtual:menu",
             ]
         );
         assert_eq!(options.select_port, Some(PortId::new("virtual:echo")));
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn bare_virtual_lists_the_built_ins_without_selecting() {
         let options = options(&["--virtual"]).unwrap();
-        assert_eq!(listed(&options).len(), 7);
+        assert_eq!(listed(&options).len(), 8);
         assert_eq!(options.select_port, None);
         assert!(
             options.open_ports.is_empty(),
@@ -238,7 +239,7 @@ mod tests {
             .expect("an error");
         assert_eq!(
             error.to_string(),
-            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi, race"
+            "unknown virtual device \"toaster\"; known devices: at, echo, echo-lines, firehose, firehose-ansi, menu, race"
         );
         assert!(options(&["--port", "virtual:toaster"]).is_err());
     }

@@ -14,8 +14,7 @@
 //! - Built-in devices: [`EchoDevice`], [`AtDevice`], [`FirehoseDevice`] (configurable rate
 //!   and content, verified end to end by [`FirehoseVerifier`]), [`RaceDevice`] (Airoha RACE
 //!   binary frames mixed with text, for the codec plugins), [`MenuDevice`] (a U-Boot style
-//!   boot menu redrawn in place with cursor addressing, for the VT screen; added to a
-//!   world with [`SimWorld::add_menu`]).
+//!   boot menu redrawn in place with cursor addressing, for the VT screen).
 //! - [`Clock`]: where a link gets its time. [`SystemClock`] is real time; a
 //!   [`ManualClock`] moves only when a test moves it, so timing assertions are exact.
 //!   [`VirtualLink::connect_with_clock`] and [`SimWorld::with_clock`] take one.
