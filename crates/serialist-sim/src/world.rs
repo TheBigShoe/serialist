@@ -27,10 +27,10 @@ use crate::{
 /// | `virtual:firehose`       | [`FirehoseDevice`], text, as fast as the baud |
 /// | `virtual:firehose-ansi`  | [`FirehoseDevice`], ANSI, as fast as the baud |
 /// | `virtual:race`           | [`RaceDevice::new`]                           |
+/// | `virtual:menu`           | [`MenuDevice::new`], a U-Boot style boot menu |
 ///
-/// [`SimWorld::add_menu`] adds `virtual:menu`, a [`MenuDevice`] (a U-Boot style boot menu
-/// for the VT screen). It is not a built-in yet: the app lists the built-ins in developer
-/// mode, and a full-screen menu only makes sense there once the UI has a VT mode.
+/// The boot menu draws with cursor addressing, so it reads as a menu in the app's VT
+/// mode (`terminal.emulation`) and as a smear of redraws in monitor mode.
 ///
 /// Links run in real time. A test that wants exact timing builds the world with
 /// [`SimWorld::with_clock`] (or [`SimWorld::empty_with_clock`]) and a
@@ -50,7 +50,6 @@ impl SimWorld {
     pub const FIREHOSE: &'static str = "firehose";
     pub const FIREHOSE_ANSI: &'static str = "firehose-ansi";
     pub const RACE: &'static str = "race";
-    /// The name [`SimWorld::add_menu`] registers.
     pub const MENU: &'static str = "menu";
 
     /// A world with the built-in devices plugged in.
@@ -115,11 +114,13 @@ impl SimWorld {
         world.add_virtual(Self::RACE, "Airoha RACE (virtual)", link, || {
             Box::new(RaceDevice::new())
         });
+        world.add_menu();
         world
     }
 
     /// Register `virtual:menu`, a [`MenuDevice`] with its default redraw interval, on a
-    /// default (paced) link, and plug it in.
+    /// default (paced) link, and plug it in. [`SimWorld::new`] has it already; this is
+    /// for a world built [`empty`](SimWorld::empty).
     pub fn add_menu(&self) -> PortId {
         self.add_virtual(
             Self::MENU,

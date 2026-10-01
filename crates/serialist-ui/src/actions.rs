@@ -32,6 +32,9 @@ actions!(
         ToggleInline,
         /// In inline mode, send the clipboard to the port in paced chunks.
         Paste,
+        /// Switch the session between monitor mode (a log of lines) and VT mode (a
+        /// terminal screen the device draws on).
+        ToggleEmulation,
     ]
 );
 actions!(

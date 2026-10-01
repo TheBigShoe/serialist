@@ -10,7 +10,7 @@ use crate::config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
 use crate::port::{PortInfo, PortKind};
 
 use super::de::{Raw, opt_baud_rate, optional_scalar, scalar};
-use super::types::LineEnding;
+use super::types::{Emulation, LineEnding};
 
 /// A USB vendor or product id.
 ///
@@ -217,6 +217,10 @@ pub struct DeviceProfile {
     /// A script to run when the device connects.
     #[serde(default)]
     pub on_connect: Option<PathBuf>,
+    /// How this device's sessions start: `monitor` or `vt`. Without it:
+    /// `terminal.emulation`.
+    #[serde(default)]
+    pub emulation: Option<Emulation>,
 }
 
 impl DeviceProfile {

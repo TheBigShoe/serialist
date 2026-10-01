@@ -29,6 +29,13 @@
 //!   `raw` (hex, or `null` once the store has evicted the bytes).
 //!
 //! Times are stamped as the Decoded panel stamps them ([`FrameTime`]).
+//!
+//! # The screen
+//!
+//! In VT mode the text exports still read the store (the log of everything received);
+//! [`ExportFormat::Screen`] writes the terminal screen instead: its rows as they are drawn
+//! now, top to bottom, one line each, trailing blanks dropped. The rows are taken with the
+//! job, so a device redrawing meanwhile changes nothing.
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -58,6 +65,8 @@ pub enum ExportFormat {
     Csv,
     /// The decoded frames as a JSON array.
     Json,
+    /// The terminal screen's rows as text (VT mode).
+    Screen,
 }
 
 impl ExportFormat {
@@ -77,7 +86,7 @@ impl ExportFormat {
 
     pub fn extension(self) -> &'static str {
         match self {
-            ExportFormat::Text => "txt",
+            ExportFormat::Text | ExportFormat::Screen => "txt",
             ExportFormat::Raw => "bin",
             ExportFormat::Csv => "csv",
             ExportFormat::Json => "json",
@@ -125,6 +134,8 @@ pub enum ExportJob {
         lines: Range<LineId>,
         options: TextOptions,
     },
+    /// A terminal screen's rows, as taken.
+    Screen { rows: Vec<String> },
     /// Every retained decoded frame, with its bytes from `raw`.
     Frames {
         frames: FrameSnapshot,
@@ -188,6 +199,16 @@ impl ExportJob {
                 })
                 .map(|_| format!("Exported {count} frames to {name}"))
             }
+            ExportJob::Screen { rows } => write_atomically(path, |out| {
+                let mut bytes = 0;
+                for row in rows {
+                    out.write_all(row.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    bytes += row.len() as u64 + 1;
+                }
+                Ok(bytes)
+            })
+            .map(|_| format!("Exported {} screen rows to {name}", rows.len())),
             ExportJob::Raw { snapshot, range } => {
                 let evicted = evicted_bytes(snapshot, range);
                 export_raw(path, snapshot, range.clone()).map(|bytes| {

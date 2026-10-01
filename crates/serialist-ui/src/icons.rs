@@ -49,6 +49,7 @@ icon_assets!(pub AppIcons, [
     Settings,
     SlidersHorizontal,
     SquareTerminal,
+    Terminal,
     TextWrap,
     Trash,
     Type,
@@ -88,6 +89,7 @@ mod tests {
         for icon in [
             IconName::Usb,
             IconName::SquareTerminal,
+            IconName::Terminal,
             IconName::Braces,
             IconName::ScrollText,
             IconName::Plug,

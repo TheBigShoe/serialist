@@ -57,7 +57,7 @@ pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use settings::EditError as SettingsEditError;
 pub use settings::{
-    BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView,
+    BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView, Emulation,
     FontFeatures, FontSpec, InlineSettings, KeyChange, KeymapEditor, LineEnding, LineHeight,
     Platform, Settings, SettingsEditor, SettingsError, SettingsWarning, TerminalSettings,
     ThemeMode, ThemeSelection, TimestampMode, UsbId, load_settings,
