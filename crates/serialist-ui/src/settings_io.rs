@@ -123,16 +123,36 @@ pub fn write_setting(
     pointer: &str,
     value: Option<Value>,
 ) -> Result<(), String> {
+    edit_settings(paths, pointer, |editor| match &value {
+        Some(value) => editor.set(pointer, value.clone()),
+        None => editor.remove_and_prune(pointer).map(drop),
+    })
+}
+
+/// Move the element of an array in the user's `settings.json` that `pointer`
+/// (`/devices/2`) names, so that it ends up at index `to`, taking the comments written
+/// with it along and leaving the rest of the file as it was. Checked and written the way
+/// [`write_setting`] does, with the same messages for a file that does not load.
+pub fn move_setting_element(paths: &ConfigPaths, pointer: &str, to: usize) -> Result<(), String> {
+    edit_settings(paths, pointer, |editor| {
+        editor.move_element(pointer, to).map(drop)
+    })
+}
+
+/// Apply `edit` to the user's `settings.json` in memory, load the result as the app will,
+/// then save it, undoing the save if the file does not load after all. `pointer` names
+/// the key for the log.
+fn edit_settings(
+    paths: &ConfigPaths,
+    pointer: &str,
+    edit: impl Fn(&mut SettingsEditor) -> Result<(), SettingsEditError>,
+) -> Result<(), String> {
     let project = project_layer(paths)?;
     for attempt in 1..=ATTEMPTS {
         let mut editor =
             SettingsEditor::open(&paths.settings).map_err(|error| error.to_string())?;
         let before = editor.text().to_owned();
-        match &value {
-            Some(value) => editor.set(pointer, value.clone()),
-            None => editor.remove_and_prune(pointer).map(drop),
-        }
-        .map_err(|error| error.to_string())?;
+        edit(&mut editor).map_err(|error| error.to_string())?;
         if !editor.is_dirty() {
             return Ok(());
         }

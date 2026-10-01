@@ -399,6 +399,140 @@ fn a_profile_added_in_the_form_is_written_and_used_on_the_next_connect(cx: &mut 
     assert_eq!(file_value(&paths.settings, "/devices"), None);
 }
 
+/// A `settings.json` whose profiles have comments between them: above a profile, after
+/// its comma, a block comment, blank lines.
+const COMMENTED_PROFILES: &str = r#"// my bench
+{
+  "buffer_font_size": 14,
+
+  "devices": [
+    // Airoha earbuds
+    { "name": "Earbuds", "match": { "vid": "0x0e8d" }, "baud": 921600 }, // fast link
+
+    /* the dongle */
+    { "name": "Dongle", "match": { "vid": "0x1a86" }, "baud": 9600 },
+
+    // anything else
+    { "name": "Fallback", "match": {}, "baud": 115200 } // last resort
+  ],
+  // after the list
+  "terminal": { "font_size": 13 }
+}
+"#;
+
+/// The comment on each line of `text` that has one, trimmed.
+fn comments_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let at = line.find("/*").or_else(|| line.find("//"))?;
+            Some(line[at..].trim().to_owned())
+        })
+        .collect()
+}
+
+fn profile_names(path: &Path) -> Vec<String> {
+    file_value(path, "/devices")
+        .and_then(|devices| devices.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[gpui_test]
+fn adding_removing_and_moving_profiles_keeps_the_comments_between_them(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let dir = TestDir::new("settings-profile-comments");
+    let paths = ConfigPaths::new(dir.path());
+    std::fs::write(&paths.settings, COMMENTED_PROFILES).expect("write settings.json");
+    start(cx, &paths);
+    let original = comments_in(COMMENTED_PROFILES);
+    let read_comments = || comments_in(&std::fs::read_to_string(&paths.settings).unwrap());
+
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Devices);
+
+    // Add one through the form: it goes after the others, every comment stays.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.open_profile_editor(None, window, cx);
+    });
+    let editor: Entity<ProfileEditor> = view
+        .read_with(cx, |v, _| v.profile_editor().cloned())
+        .expect("the profile form");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            ProfileEditor::set_text(editor.name_input(), "Bench board", window, cx);
+            ProfileEditor::set_text(editor.match_input(MatchKey::Product), "CH340", window, cx);
+            let form = editor.port_form().clone();
+            form.update(cx, |form, cx| form.enter_baud("57600", window, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let saved = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.save_profile(window, cx))
+        })
+        .unwrap();
+    assert!(
+        saved,
+        "{:?}",
+        editor.read_with(cx, |e, _| e.error().map(str::to_owned))
+    );
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Earbuds", "Dongle", "Fallback", "Bench board"]
+    );
+    assert_eq!(read_comments(), original, "an add keeps every comment");
+
+    // Drag the first profile to the end: its comments go with it.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.move_profile(0, 3, window, cx);
+    });
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Dongle", "Fallback", "Bench board", "Earbuds"]
+    );
+    let text = std::fs::read_to_string(&paths.settings).unwrap();
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let at = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
+    assert_eq!(at("// Airoha earbuds") + 1, at("\"name\": \"Earbuds\""));
+    assert!(lines[at("\"name\": \"Earbuds\"")].ends_with("// fast link"));
+    let (mut moved, mut before) = (read_comments(), original.clone());
+    moved.sort();
+    before.sort();
+    assert_eq!(moved, before, "a move keeps every comment");
+
+    // Remove the fallback: the comment after its comma goes with it; the rest stays.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.remove_profile(1, window, cx);
+    });
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Dongle", "Bench board", "Earbuds"]
+    );
+    let kept = read_comments();
+    for comment in [
+        "// my bench",
+        "// Airoha earbuds",
+        "// fast link",
+        "/* the dongle */",
+        "// after the list",
+    ] {
+        assert!(
+            kept.iter().any(|c| c == comment),
+            "lost {comment}: {kept:?}"
+        );
+    }
+    assert!(!kept.iter().any(|c| c == "// last resort"));
+
+    // The watcher loads what the form wrote.
+    run_until(cx, "the profiles to load", |cx| {
+        cx.update(|cx| cx.global::<Config>().settings().devices.len() == 3)
+    });
+}
+
 #[gpui_test]
 fn rebinding_a_key_writes_the_user_keymap_and_the_new_chord_works(cx: &mut TestAppContext) {
     let world = SimWorld::empty();
