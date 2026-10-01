@@ -60,7 +60,8 @@
 //! # Session restore
 //!
 //! When the workspace closes (the window closes, or the app quits) it writes the tabs'
-//! ports and settings to `state.json` in the config directory (see
+//! ports and settings (line settings, codec, input mode, monitor or VT) to `state.json`
+//! in the config directory (see
 //! [`session_state`](crate::session_state)), and the next start reopens them, unless
 //! ports were named on the command line or the `restore_session` setting is off. A
 //! restored port connects if the port source lists it (a simulated port with the
@@ -112,6 +113,7 @@ use crate::decoded_panel::DecodedPanel;
 use crate::devices_panel::{DevicesPanel, DevicesPanelEvent};
 use crate::dialog_footer::DialogButtons;
 use crate::docks::{CENTER_MIN, DockPanel, DockSide, Docks, RAIL_WIDTH};
+use crate::emulation::Emulation;
 use crate::export::ExportFormat;
 use crate::history::PersistentHistory;
 use crate::inline::Mode;
@@ -208,6 +210,9 @@ struct Reopen {
 struct Restore {
     codec: Option<String>,
     mode: Mode,
+    /// Monitor or VT as the tab showed it, if the file said (one from before it was
+    /// kept leaves the session with the setting's).
+    emulation: Option<Emulation>,
 }
 
 /// A tab: a port, and the session view open on it, if any.
@@ -1352,6 +1357,9 @@ impl Workspace {
                     view.want_codec(codec, cx);
                 }
                 view.set_mode(restore.mode, window, cx);
+                if let Some(emulation) = restore.emulation {
+                    view.set_emulation(emulation, cx);
+                }
             }
             if !active {
                 view.set_visible(false, cx);
@@ -1421,6 +1429,7 @@ impl Workspace {
                         serial: view.serial().clone(),
                         codec: view.codec_name().map(str::to_owned),
                         mode: view.mode().into(),
+                        emulation: Some(view.emulation()),
                     }
                 }
                 None => SavedTab {
@@ -1435,6 +1444,7 @@ impl Workspace {
                         .as_ref()
                         .map_or(Mode::Command, |r| r.mode)
                         .into(),
+                    emulation: tab.restore.as_ref().and_then(|r| r.emulation),
                 },
             });
         }
@@ -1494,6 +1504,7 @@ impl Workspace {
                 tab.restore = Some(Restore {
                     codec: saved.codec,
                     mode: saved.mode.into(),
+                    emulation: saved.emulation,
                 });
             }
             restored.push(id);
