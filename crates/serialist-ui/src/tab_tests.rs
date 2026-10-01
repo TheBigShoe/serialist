@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    Direction, LineId, LineSource, PortId, PortInfo, PortKind, SerialConfig, UsbInfo,
+    Direction, Emulation, LineId, LineSource, PortId, PortInfo, PortKind, SerialConfig, UsbInfo,
 };
 use serialist_sim::{
     AtDevice, EchoDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, LinkConfig, SimWorld,
@@ -599,6 +599,9 @@ fn the_open_tabs_come_back_at_the_next_start(cx: &mut TestAppContext) {
     press(cx, window, keys::TAB_1);
     press(cx, window, keys::TOGGLE_INLINE);
     race.update(cx, |v, cx| assert!(v.set_codec(Some("airoha-race"), cx)));
+    // The RACE device and the adapter show a terminal screen; the modem stays a monitor.
+    race.update(cx, |v, cx| v.set_emulation(Emulation::Vt, cx));
+    adapter.update(cx, |v, cx| v.set_emulation(Emulation::Vt, cx));
     press(cx, window, keys::NEXT_TAB);
     assert_eq!(active_index(cx, &workspace), Some(1));
     assert_eq!(adapter.read_with(cx, |v, _| v.serial().baud), 57_600);
@@ -616,6 +619,16 @@ fn the_open_tabs_come_back_at_the_next_start(cx: &mut TestAppContext) {
     assert_eq!(state.tabs[0].mode, SavedMode::Inline);
     assert_eq!(state.tabs[1].codec.as_deref(), Some("airoha-race"));
     assert_eq!(state.tabs[2].serial.baud, 57_600);
+    assert_eq!(state.version, 2);
+    let emulations: Vec<_> = state.tabs.iter().map(|tab| tab.emulation).collect();
+    assert_eq!(
+        emulations,
+        [
+            Some(Emulation::Monitor),
+            Some(Emulation::Vt),
+            Some(Emulation::Vt)
+        ]
+    );
 
     // The adapter is unplugged before the next start: its tab comes back, waiting.
     world.unplug(&PortId::new(FAKE_ADAPTER));
@@ -632,8 +645,15 @@ fn the_open_tabs_come_back_at_the_next_start(cx: &mut TestAppContext) {
             state.tabs[2].serial.baud, 57_600,
             "kept for when it connects"
         );
+        assert_eq!(
+            state.tabs[2].emulation,
+            Some(Emulation::Vt),
+            "and so is VT mode"
+        );
     });
     assert_eq!(at.read_with(cx, |v, _| v.mode()), Mode::Inline);
+    assert_eq!(at.read_with(cx, |v, _| v.emulation()), Emulation::Monitor);
+    assert_eq!(race.read_with(cx, |v, _| v.emulation()), Emulation::Vt);
     assert_eq!(
         race.read_with(cx, |v, _| v.codec_name().map(str::to_owned)),
         Some("airoha-race".to_owned())
@@ -650,7 +670,39 @@ fn the_open_tabs_come_back_at_the_next_start(cx: &mut TestAppContext) {
     .unwrap();
     let adapter = wait_tab(cx, &workspace, FAKE_ADAPTER);
     assert_eq!(adapter.read_with(cx, |v, _| v.serial().baud), 57_600);
+    assert_eq!(adapter.read_with(cx, |v, _| v.emulation()), Emulation::Vt);
     let _ = window;
+}
+
+#[gpui_test]
+fn a_version_1_state_file_reopens_its_tabs_with_the_emulation_the_settings_name(
+    cx: &mut TestAppContext,
+) {
+    let dir = TestDir::new("tab-restore-v1");
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{ "terminal": { "emulation": "vt" } }"#,
+    )
+    .unwrap();
+    // As 0.1.0 wrote it: no `emulation` on the tab.
+    std::fs::write(
+        dir.join("state.json"),
+        r#"{ "version": 1, "active": 0, "tabs": [
+            { "port": "virtual:at",
+              "serial": { "baud": 115200, "data_bits": "eight", "parity": "none",
+                          "stop_bits": "one", "flow_control": "none" },
+              "codec": null, "mode": "command" } ] }"#,
+    )
+    .unwrap();
+    let world = SimWorld::new();
+    let (_window, workspace) = open_tabs(cx, &world, Some(&dir), &[]);
+    let at = wait_tab(cx, &workspace, "virtual:at");
+    assert_eq!(at.read_with(cx, |v, _| v.emulation()), Emulation::Vt);
+    workspace.read_with(cx, |w, cx| {
+        let state = w.session_state(cx);
+        assert_eq!(state.version, 2, "written as version 2 from now on");
+        assert_eq!(state.tabs[0].emulation, Some(Emulation::Vt));
+    });
 }
 
 #[gpui_test]
@@ -665,6 +717,7 @@ fn restore_session_off_starts_with_no_tabs(cx: &mut TestAppContext) {
             serial: SerialConfig::default(),
             codec: None,
             mode: SavedMode::Command,
+            emulation: None,
         }],
         ..SessionState::default()
     };
@@ -713,5 +766,56 @@ fn several_ports_at_startup_open_a_tab_each_the_first_in_front(cx: &mut TestAppC
             3,
             "every open port has its dot"
         );
+    });
+}
+
+#[gpui_test]
+fn the_status_line_on_settings_follows_the_session_that_was_in_front(cx: &mut TestAppContext) {
+    let world = SimWorld::new();
+    let (window, workspace) = open_tabs(cx, &world, None, &["virtual:at", "virtual:echo"]);
+    wait_tab(cx, &workspace, "virtual:at");
+    wait_tab(cx, &workspace, "virtual:echo");
+    let status_port = |cx: &mut TestAppContext| {
+        workspace
+            .read_with(cx, |w, cx| w.status_line(cx))
+            .map(|status| status.title)
+    };
+
+    // Settings opened from the first tab: that session's segment.
+    press(cx, window, keys::OPEN_SETTINGS_UI);
+    assert_eq!(
+        active_index(cx, &workspace),
+        Some(2),
+        "Settings is in front"
+    );
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:at")));
+
+    // From the second tab: that one's.
+    press(cx, window, keys::TAB_2);
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:echo")));
+    press(cx, window, keys::OPEN_SETTINGS_UI);
+    assert_eq!(active_index(cx, &workspace), Some(2));
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:echo")));
+
+    // The tab it came from is closed meanwhile: another open session stands in.
+    let echo = workspace.read_with(cx, |w, _| w.tab_ids()[1]);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |w, cx| w.close_tab(echo, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(active_index(cx, &workspace), Some(1), "still Settings");
+    assert!(status_port(cx).is_some_and(|title| title.contains("virtual:at")));
+
+    // With no session left, Settings says so.
+    let at = workspace.read_with(cx, |w, _| w.tab_ids()[0]);
+    cx.update_window(window, |_, window, cx| {
+        workspace.update(cx, |w, cx| w.close_tab(at, window, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(status_port(cx), None);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.status_placeholder(cx).starts_with("Settings: "));
     });
 }

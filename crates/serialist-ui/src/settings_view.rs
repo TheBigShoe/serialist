@@ -897,13 +897,28 @@ impl SettingsView {
         if self.locked(pointer) {
             return;
         }
+        self.run_edit(pointer, window, cx, |paths| {
+            settings_io::write_setting(paths, pointer, value)
+        });
+    }
+
+    /// Run a write to `settings.json` and show how it went under the row for `pointer`:
+    /// the message of one the loader rejects, or nothing. The screen then reads the
+    /// files again.
+    fn run_edit(
+        &mut self,
+        pointer: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        edit: impl FnOnce(&ConfigPaths) -> Result<(), String>,
+    ) {
         if !is_loaded(cx) {
             self.errors
                 .insert(pointer.to_owned(), NOT_LOADED.to_owned());
             cx.notify();
             return;
         }
-        match settings_io::write_setting(&self.paths(cx), pointer, value) {
+        match edit(&self.paths(cx)) {
             Ok(()) => {
                 self.errors.remove(pointer);
             }

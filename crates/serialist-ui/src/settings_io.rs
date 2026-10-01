@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use serialist_core::settings::{ConfigPaths, SettingsLayer, load_settings_from_layers};
 use serialist_core::{
-    ActionRef, Keymap, KeymapEditor, Settings, SettingsEditError, SettingsEditor, load_keymap,
-    load_settings,
+    ActionRef, CommandRef, CommandStore, EditError as CommandEditError, Keymap, KeymapEditor,
+    Settings, SettingsEditError, SettingsEditor, load_keymap, load_settings,
 };
 
 /// Where a setting's value comes from.
@@ -123,16 +123,36 @@ pub fn write_setting(
     pointer: &str,
     value: Option<Value>,
 ) -> Result<(), String> {
+    edit_settings(paths, pointer, |editor| match &value {
+        Some(value) => editor.set(pointer, value.clone()),
+        None => editor.remove_and_prune(pointer).map(drop),
+    })
+}
+
+/// Move the element of an array in the user's `settings.json` that `pointer`
+/// (`/devices/2`) names, so that it ends up at index `to`, taking the comments written
+/// with it along and leaving the rest of the file as it was. Checked and written the way
+/// [`write_setting`] does, with the same messages for a file that does not load.
+pub fn move_setting_element(paths: &ConfigPaths, pointer: &str, to: usize) -> Result<(), String> {
+    edit_settings(paths, pointer, |editor| {
+        editor.move_element(pointer, to).map(drop)
+    })
+}
+
+/// Apply `edit` to the user's `settings.json` in memory, load the result as the app will,
+/// then save it, undoing the save if the file does not load after all. `pointer` names
+/// the key for the log.
+fn edit_settings(
+    paths: &ConfigPaths,
+    pointer: &str,
+    edit: impl Fn(&mut SettingsEditor) -> Result<(), SettingsEditError>,
+) -> Result<(), String> {
     let project = project_layer(paths)?;
     for attempt in 1..=ATTEMPTS {
         let mut editor =
             SettingsEditor::open(&paths.settings).map_err(|error| error.to_string())?;
         let before = editor.text().to_owned();
-        match &value {
-            Some(value) => editor.set(pointer, value.clone()),
-            None => editor.remove_and_prune(pointer).map(drop),
-        }
-        .map_err(|error| error.to_string())?;
+        edit(&mut editor).map_err(|error| error.to_string())?;
         if !editor.is_dirty() {
             return Ok(());
         }
@@ -212,4 +232,36 @@ pub fn rebind(
         "{}: the file kept changing on disk; try again",
         paths.keymap.display()
     ))
+}
+
+/// Set the `keybinding` of the saved command `command` to `keystrokes`, in a copy of
+/// `store`, and write the command's collection back to its file the way the Commands
+/// panel saves one: as plain JSON, so comments in that file are not kept. The keymap
+/// file is not involved. `Err` says why not: the command is gone, its collection is the
+/// bundled (read-only) one, or the file could not be written. The watcher's reload
+/// brings the new chord into the app.
+pub fn rebind_command(
+    store: &CommandStore,
+    command: &CommandRef,
+    keystrokes: &str,
+) -> Result<(), String> {
+    let mut store = store.clone();
+    let mut updated = store
+        .get(command)
+        .cloned()
+        .ok_or_else(|| format!("there is no command {command}"))?;
+    updated.keybinding = Some(keystrokes.to_owned());
+    store
+        .update_command(command, updated)
+        .map_err(|error| match error {
+            CommandEditError::ReadOnly(collection) => format!(
+                "{collection} is read-only; give the command a key in a collection of your own"
+            ),
+            other => other.to_string(),
+        })?;
+    store
+        .save_collection(&command.collection)
+        .map_err(|error| error.to_string())?;
+    tracing::info!(%command, keystrokes, "rebound a saved command");
+    Ok(())
 }

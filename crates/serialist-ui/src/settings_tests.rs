@@ -6,16 +6,20 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{PortId, SettingsEditor, ThemeMode};
+use serialist_core::{Command, CommandRef, CommandStore, PortId, SettingsEditor, ThemeMode};
 use serialist_sim::{EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::keys;
 use crate::config::{self, Config};
 use crate::prelude::*;
 use crate::session_view::FRAME;
-use crate::settings_io::Origin;
-use crate::settings_view::{DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView};
-use crate::test_support::{TestDir, draw, open_workspace, run_until, usb_port, wait_connected};
+use crate::settings_io::{self, Origin};
+use crate::settings_view::{
+    BindingSource, DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView,
+};
+use crate::test_support::{
+    TestDir, draw, has_rx_line, open_workspace, run_until, type_line, usb_port, wait_connected,
+};
 use crate::workspace::Workspace;
 
 /// The chord the rebind test moves `tabs::NewTab` to.
@@ -399,6 +403,140 @@ fn a_profile_added_in_the_form_is_written_and_used_on_the_next_connect(cx: &mut 
     assert_eq!(file_value(&paths.settings, "/devices"), None);
 }
 
+/// A `settings.json` whose profiles have comments between them: above a profile, after
+/// its comma, a block comment, blank lines.
+const COMMENTED_PROFILES: &str = r#"// my bench
+{
+  "buffer_font_size": 14,
+
+  "devices": [
+    // Airoha earbuds
+    { "name": "Earbuds", "match": { "vid": "0x0e8d" }, "baud": 921600 }, // fast link
+
+    /* the dongle */
+    { "name": "Dongle", "match": { "vid": "0x1a86" }, "baud": 9600 },
+
+    // anything else
+    { "name": "Fallback", "match": {}, "baud": 115200 } // last resort
+  ],
+  // after the list
+  "terminal": { "font_size": 13 }
+}
+"#;
+
+/// The comment on each line of `text` that has one, trimmed.
+fn comments_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let at = line.find("/*").or_else(|| line.find("//"))?;
+            Some(line[at..].trim().to_owned())
+        })
+        .collect()
+}
+
+fn profile_names(path: &Path) -> Vec<String> {
+    file_value(path, "/devices")
+        .and_then(|devices| devices.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+#[gpui_test]
+fn adding_removing_and_moving_profiles_keeps_the_comments_between_them(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let dir = TestDir::new("settings-profile-comments");
+    let paths = ConfigPaths::new(dir.path());
+    std::fs::write(&paths.settings, COMMENTED_PROFILES).expect("write settings.json");
+    start(cx, &paths);
+    let original = comments_in(COMMENTED_PROFILES);
+    let read_comments = || comments_in(&std::fs::read_to_string(&paths.settings).unwrap());
+
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Devices);
+
+    // Add one through the form: it goes after the others, every comment stays.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.open_profile_editor(None, window, cx);
+    });
+    let editor: Entity<ProfileEditor> = view
+        .read_with(cx, |v, _| v.profile_editor().cloned())
+        .expect("the profile form");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            ProfileEditor::set_text(editor.name_input(), "Bench board", window, cx);
+            ProfileEditor::set_text(editor.match_input(MatchKey::Product), "CH340", window, cx);
+            let form = editor.port_form().clone();
+            form.update(cx, |form, cx| form.enter_baud("57600", window, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let saved = cx
+        .update_window(window, |_, window, cx| {
+            view.update(cx, |v, cx| v.save_profile(window, cx))
+        })
+        .unwrap();
+    assert!(
+        saved,
+        "{:?}",
+        editor.read_with(cx, |e, _| e.error().map(str::to_owned))
+    );
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Earbuds", "Dongle", "Fallback", "Bench board"]
+    );
+    assert_eq!(read_comments(), original, "an add keeps every comment");
+
+    // Drag the first profile to the end: its comments go with it.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.move_profile(0, 3, window, cx);
+    });
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Dongle", "Fallback", "Bench board", "Earbuds"]
+    );
+    let text = std::fs::read_to_string(&paths.settings).unwrap();
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let at = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
+    assert_eq!(at("// Airoha earbuds") + 1, at("\"name\": \"Earbuds\""));
+    assert!(lines[at("\"name\": \"Earbuds\"")].ends_with("// fast link"));
+    let (mut moved, mut before) = (read_comments(), original.clone());
+    moved.sort();
+    before.sort();
+    assert_eq!(moved, before, "a move keeps every comment");
+
+    // Remove the fallback: the comment after its comma goes with it; the rest stays.
+    update_view(cx, window, &view, |v, window, cx| {
+        v.remove_profile(1, window, cx);
+    });
+    assert_eq!(
+        profile_names(&paths.settings),
+        ["Dongle", "Bench board", "Earbuds"]
+    );
+    let kept = read_comments();
+    for comment in [
+        "// my bench",
+        "// Airoha earbuds",
+        "// fast link",
+        "/* the dongle */",
+        "// after the list",
+    ] {
+        assert!(
+            kept.iter().any(|c| c == comment),
+            "lost {comment}: {kept:?}"
+        );
+    }
+    assert!(!kept.iter().any(|c| c == "// last resort"));
+
+    // The watcher loads what the form wrote.
+    run_until(cx, "the profiles to load", |cx| {
+        cx.update(|cx| cx.global::<Config>().settings().devices.len() == 3)
+    });
+}
+
 #[gpui_test]
 fn rebinding_a_key_writes_the_user_keymap_and_the_new_chord_works(cx: &mut TestAppContext) {
     let world = SimWorld::empty();
@@ -471,6 +609,239 @@ fn rebinding_a_key_writes_the_user_keymap_and_the_new_chord_works(cx: &mut TestA
         tabs_before + 1,
         "the old chord is unbound"
     );
+}
+
+#[gpui_test]
+fn saved_command_bindings_are_listed_and_rebinding_one_edits_the_command(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-command-keys");
+    // The bundled examples are loaded with every store and bind nothing; one command of
+    // the user's has a key.
+    let mut store = CommandStore::load(&paths);
+    let bundled: Vec<CommandRef> = store
+        .commands()
+        .filter(|(reference, _)| {
+            store
+                .collection(&reference.collection)
+                .is_some_and(|collection| collection.is_read_only())
+        })
+        .map(|(reference, _)| reference)
+        .collect();
+    assert!(!bundled.is_empty(), "the bundled examples are in the store");
+    store.create_collection("Bench").unwrap();
+    let reference = store
+        .add_command(
+            "Bench",
+            "Checks",
+            Command::text("Version", "AT+VER?").with_keybinding("ctrl-alt-9"),
+        )
+        .unwrap();
+    store.save_collection("Bench").unwrap();
+    start(cx, &paths);
+
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Keymap);
+    let command_rows = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            v.binding_rows_now(cx)
+                .into_iter()
+                .filter(|row| row.source == BindingSource::Command)
+                .collect::<Vec<_>>()
+        })
+    };
+    let rows = command_rows(cx);
+    assert_eq!(rows.len(), 1, "the user's command, none from the examples");
+    let row = &rows[0];
+    assert_eq!(row.keystrokes, "ctrl-alt-9");
+    assert_eq!(row.action.name, "Bench \u{203a} Version");
+    assert_eq!(row.context.as_deref(), Some("Workspace"));
+    assert_eq!(row.command.as_ref(), Some(&reference));
+    assert!(
+        view.read_with(cx, |v, cx| v.binding_rows_now(cx).len()) > 1,
+        "listed with the keymap's own bindings"
+    );
+
+    // Filterable like the rest: by action text, chord, or the word "command".
+    let query = view.read_with(cx, |v, _| v.keymap_query().clone());
+    let filtered = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, window, cx| {
+            query.update(cx, |input, cx| input.set_value(text.to_owned(), window, cx));
+        })
+        .unwrap();
+        view.read_with(cx, |v, cx| v.binding_rows_now(cx))
+    };
+    for text in ["bench version", "CTRL-ALT-9", "checks"] {
+        let rows = filtered(cx, text);
+        assert_eq!(rows.len(), 1, "{text}: {rows:?}");
+        assert_eq!(rows[0].command.as_ref(), Some(&reference), "{text}");
+    }
+    assert!(
+        filtered(cx, "command")
+            .iter()
+            .any(|row| row.command.as_ref() == Some(&reference))
+    );
+    assert!(filtered(cx, "bench nothing").is_empty());
+    filtered(cx, "");
+
+    // Rebind: the command's own file changes, not the keymap's.
+    let keymap_before = std::fs::read_to_string(&paths.keymap).ok();
+    // Filter down to the command's row so it is on screen, click it, then click its
+    // Rebind… button and press the new chord.
+    let index = filtered(cx, "bench version")
+        .iter()
+        .position(|row| row.command.as_ref() == Some(&reference))
+        .expect("the command's row");
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-binding", index), cx);
+        window.render_frame(cx);
+        window.click("settings-rebind", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(view.read_with(cx, |v, cx| v.rebind_recorder().read(cx).is_recording()));
+    cx.update_window(window, |_, window, cx| window.press("ctrl-alt-8", cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |v, _| v.keymap_error().map(str::to_owned)),
+        None
+    );
+    let saved = CommandStore::load(&paths);
+    assert_eq!(
+        saved.get(&reference).and_then(|c| c.keybinding.as_deref()),
+        Some("ctrl-alt-8"),
+        "written to the command's collection"
+    );
+    assert_eq!(
+        saved.get(&reference).map(|c| c.payload.clone()),
+        Some(Command::text("Version", "AT+VER?").payload),
+        "the rest of the command is as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.keymap).ok(),
+        keymap_before,
+        "keymap.json is not involved"
+    );
+
+    // The watcher brings it into the list: the new chord, the old one gone.
+    run_until(cx, "the command to reload", |cx| {
+        cx.update(|cx| {
+            cx.global::<Config>()
+                .commands()
+                .get(&reference)
+                .and_then(|c| c.keybinding.as_deref().map(str::to_owned))
+                .as_deref()
+                == Some("ctrl-alt-8")
+        })
+    });
+    let rows = command_rows(cx);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].keystrokes, "ctrl-alt-8");
+    assert_eq!(rows[0].source, BindingSource::Command);
+
+    // A command of the read-only examples cannot be given a key.
+    let before = std::fs::read_dir(paths.commands_dir())
+        .map(Iterator::count)
+        .ok();
+    let error = settings_io::rebind_command(&CommandStore::load(&paths), &bundled[0], "ctrl-alt-7")
+        .expect_err("the examples are read-only");
+    assert!(error.contains("read-only"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(paths.commands_dir())
+            .map(Iterator::count)
+            .ok(),
+        before,
+        "nothing was written"
+    );
+}
+
+/// Which port segments the status line has drawn: the session's own, with its popover,
+/// and the read-only one shown while Settings is in front.
+fn status_port_segments(cx: &mut TestAppContext, window: AnyWindowHandle) -> (bool, bool) {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        (
+            window.try_find("status-port").is_some(),
+            window.try_find("status-port-previous").is_some(),
+        )
+    })
+    .unwrap()
+}
+
+#[gpui_test]
+fn the_status_line_keeps_the_session_while_settings_is_in_front(cx: &mut TestAppContext) {
+    let world = SimWorld::new();
+    let (window, workspace) = open_workspace(cx, &world, Some("virtual:echo"));
+    let session = wait_connected(cx, &workspace);
+    type_line(cx, window, "hello");
+    run_until(cx, "the echo", |cx| has_rx_line(cx, &session, "hello"));
+    draw(cx, window);
+    let in_front = workspace
+        .read_with(cx, |w, cx| w.status_line(cx))
+        .expect("the session's status line");
+    assert_eq!(in_front.state, "Connected");
+    assert!(in_front.title.contains("virtual:echo"), "{in_front:?}");
+    assert_ne!(in_front.tx, "TX 0 B", "something was sent");
+    assert_ne!(in_front.rx, "RX 0 B", "and came back");
+    assert_eq!(status_port_segments(cx, window), (true, false));
+
+    // With Settings in front the status line still says which port and how it stands.
+    open_settings(cx, window, &workspace);
+    draw(cx, window);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.session().is_none(), "the active tab is Settings");
+        assert_eq!(w.status_session(), Some(&session));
+        let line = w.status_line(cx).expect("the previous session's line");
+        assert_eq!(line.state, "Connected");
+        assert!(line.title.contains("virtual:echo"), "{line:?}");
+        assert_eq!((line.rx, line.tx), (in_front.rx, in_front.tx));
+    });
+    assert_eq!(
+        status_port_segments(cx, window),
+        (false, true),
+        "the segment is there to read, without the popover that needs the active tab"
+    );
+
+    // Its state follows the session meanwhile.
+    session.update(cx, |view, cx| view.disconnect(cx));
+    draw(cx, window);
+    let line = workspace
+        .read_with(cx, |w, cx| w.status_line(cx))
+        .expect("still the session's line");
+    assert_eq!(line.state, "Disconnected");
+    assert!(line.title.contains("virtual:echo"), "{line:?}");
+
+    // Back to the session: its own segment again.
+    activate_tab(cx, window, &workspace, 0);
+    draw(cx, window);
+    assert_eq!(status_port_segments(cx, window), (true, false));
+}
+
+#[gpui_test]
+fn the_status_line_names_the_config_directory_on_settings_without_a_session(
+    cx: &mut TestAppContext,
+) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-status");
+    start(cx, &paths);
+    assert_eq!(
+        workspace.read_with(cx, |w, cx| w.status_placeholder(cx)),
+        "No session"
+    );
+
+    open_settings(cx, window, &workspace);
+    draw(cx, window);
+    workspace.read_with(cx, |w, cx| {
+        assert!(w.status_line(cx).is_none(), "no session to speak of");
+        assert_eq!(
+            w.status_placeholder(cx),
+            format!("Settings: {}", paths.dir.display())
+        );
+    });
+    assert_eq!(status_port_segments(cx, window), (false, false));
 }
 
 #[gpui_test]
