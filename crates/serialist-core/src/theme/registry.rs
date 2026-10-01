@@ -11,7 +11,7 @@ use super::family::{Appearance, Theme, ThemeError, ThemeFamily, ThemeWarning};
 
 /// The bundled theme files, in the order [`ThemeRegistry::names`] lists them: the two
 /// defaults first.
-const BUNDLED: [(&str, &str); 2] = [
+const BUNDLED: [(&str, &str); 3] = [
     (
         include_str!("../../assets/themes/serialist-dark.json"),
         "serialist-dark.json",
@@ -19,6 +19,10 @@ const BUNDLED: [(&str, &str); 2] = [
     (
         include_str!("../../assets/themes/serialist-light.json"),
         "serialist-light.json",
+    ),
+    (
+        include_str!("../../assets/themes/serialist-ember.json"),
+        "serialist-ember.json",
     ),
 ];
 
