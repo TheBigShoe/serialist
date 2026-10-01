@@ -184,7 +184,8 @@ fn world_lists_and_opens_the_builtins() {
             "virtual:at",
             "virtual:firehose",
             "virtual:firehose-ansi",
-            "virtual:race"
+            "virtual:race",
+            "virtual:menu"
         ]
     );
     assert!(ports.iter().all(|p| p.kind == PortKind::Virtual));
@@ -196,12 +197,17 @@ fn world_lists_and_opens_the_builtins() {
 }
 
 #[test]
-fn the_boot_menu_is_added_on_request_and_draws_on_connect() {
-    let world = SimWorld::new();
+fn the_boot_menu_is_a_built_in_and_draws_on_connect() {
     let id = virtual_port_id(SimWorld::MENU);
-    assert!(!world.source().contains(&id), "not a built-in");
+    let empty = SimWorld::empty();
+    assert!(!empty.source().contains(&id));
+    assert_eq!(empty.add_menu(), id, "an empty world adds it on request");
+    assert!(empty.source().contains(&id));
+    let world = SimWorld::new();
+    assert!(world.source().contains(&id), "a built-in");
+    // Adding it again changes nothing.
     assert_eq!(world.add_menu(), id);
-    assert!(world.source().contains(&id));
+    assert_eq!(world.source().snapshot().len(), 7);
     let mut t = world.factory().open(&id, &SerialConfig::default()).unwrap();
     let first = MenuDevice::new().frame();
     let expected = [&b"\x1b[?25l\x1b[2J"[..], &first].concat();

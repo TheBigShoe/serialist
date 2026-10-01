@@ -76,6 +76,38 @@ pub enum DisplayView {
     HexAscii,
 }
 
+/// How a session shows what the device sends: the `terminal.emulation` setting and a
+/// device profile's `emulation`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Emulation {
+    /// A log of lines, with colors and other escapes applied line by line: what a serial
+    /// monitor shows. Searchable and exportable as it arrived.
+    #[default]
+    Monitor,
+    /// A terminal screen the device draws on with cursor addressing (U-Boot menus, Linux
+    /// consoles, editors). The log is still kept underneath.
+    Vt,
+}
+
+impl Emulation {
+    /// The other one, as the toggle switches.
+    pub fn toggled(self) -> Self {
+        match self {
+            Emulation::Monitor => Emulation::Vt,
+            Emulation::Vt => Emulation::Monitor,
+        }
+    }
+
+    /// What the UI calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Emulation::Monitor => "Monitor",
+            Emulation::Vt => "VT",
+        }
+    }
+}
+
 /// The `display` object: defaults for each session's view, which the status line can
 /// override per session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +140,8 @@ pub struct DisplaySettings {
     pub hide_framed_bytes: bool,
 }
 
-/// The `terminal` object. A key that is set replaces the matching `buffer_font_*` value
-/// for the terminal only.
+/// The `terminal` object. A font key that is set replaces the matching `buffer_font_*`
+/// value for the terminal only; `emulation` and `cursor_blink` are the terminal's own.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TerminalSettings {
     #[serde(default)]
@@ -124,6 +156,14 @@ pub struct TerminalSettings {
     pub font_fallbacks: Option<Vec<String>>,
     #[serde(default)]
     pub line_height: Option<LineHeight>,
+    /// How new sessions show what they receive: `monitor` (default) or `vt`. A device
+    /// profile's `emulation` wins for its ports.
+    #[serde(default)]
+    pub emulation: Emulation,
+    /// Blink the VT cursor when the device asks for a blinking one. Default false: a
+    /// steady cursor.
+    #[serde(default)]
+    pub cursor_blink: bool,
 }
 
 /// Whether a `theme` object follows the system appearance or pins one.
@@ -359,6 +399,14 @@ impl Settings {
         self.profile_for(port)
             .and_then(|profile| profile.eol)
             .unwrap_or(self.line_ending)
+    }
+
+    /// How a session on `port` starts: the profile's `emulation`, else
+    /// `terminal.emulation`.
+    pub fn emulation_for(&self, port: &PortInfo) -> Emulation {
+        self.profile_for(port)
+            .and_then(|profile| profile.emulation)
+            .unwrap_or(self.terminal.emulation)
     }
 
     /// The name the Devices panel shows for `port`: the matching profile's `name`, if

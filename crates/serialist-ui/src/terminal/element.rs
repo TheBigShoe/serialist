@@ -17,6 +17,19 @@
 //! registers mouse handlers for selection and scrolling.
 //!
 //! Nothing in either phase depends on the number of lines retained.
+//!
+//! # A terminal screen
+//!
+//! In VT mode the source is a terminal screen's snapshot and the element gets
+//! [`ScreenInputs`]. The grid is already wrapped, so nothing wraps; the viewport is cut to
+//! whole rows, so following the tail keeps the screen's top row at the element's top (the
+//! scrollback above it scrolls into view like any other lines); the cursor is drawn from
+//! the snapshot's [`CursorState`]; and each frame the element works out how many cells
+//! fit (columns from the text area's width, rows from its height, over the cell
+//! metrics) and, when that differs from the screen's size, asks for a resize through
+//! [`ScreenInputs::resize`]. The request runs after the frame (`App::defer`, since
+//! nothing can be notified mid-draw), once per size, so a window being dragged costs at
+//! most one resize a frame.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -26,7 +39,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::cell::Cell;
+
 use serialist_core::{Direction, LineId, LineSource, SearchMatch, Style, StyledLine};
+use serialist_vt::{CursorShape, CursorState};
 
 use crate::config::Config;
 use crate::prelude::*;
@@ -51,6 +67,9 @@ pub const LINE_HEIGHT: f32 = crate::fonts::STANDARD_LINE_HEIGHT;
 const SHAPED_LINES: usize = 2048;
 /// Wrap counts kept for lines scrolled past but not necessarily on screen.
 const WRAP_COUNTS: usize = 64 * 1024;
+
+/// The thickness of an underline or bar cursor.
+pub const CURSOR_THICKNESS: Pixels = px(2.);
 
 /// The grid every line is drawn on.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,6 +149,8 @@ pub struct ShapeCache {
     lines: Lru<LineId, ShapedEntry>,
     wraps: Lru<LineId, u32>,
     wrap_columns: usize,
+    /// Columns and rows of text that fit the element, as of the last frame.
+    grid: Option<(usize, usize)>,
 }
 
 impl Default for ShapeCache {
@@ -141,6 +162,7 @@ impl Default for ShapeCache {
             lines: Lru::new(SHAPED_LINES),
             wraps: Lru::new(WRAP_COUNTS),
             wrap_columns: 0,
+            grid: None,
         }
     }
 }
@@ -185,6 +207,12 @@ impl ShapeCache {
     /// The grid of the last frame, once one was drawn.
     pub fn metrics(&self) -> Option<CellMetrics> {
         self.metrics
+    }
+
+    /// The columns and rows of text that fit the element, as of the last frame: what a
+    /// terminal screen is sized to.
+    pub fn grid(&self) -> Option<(usize, usize)> {
+        self.grid
     }
 }
 
@@ -338,6 +366,24 @@ impl HitMap {
     }
 }
 
+/// Asks for a terminal screen of `columns` by `rows` cells.
+pub type ResizeScreen = Rc<dyn Fn(usize, usize, &mut App)>;
+
+/// A terminal screen on display (VT mode): see the module docs.
+#[derive(Clone)]
+pub struct ScreenInputs {
+    /// The screen's size in cells, as its snapshot says.
+    pub columns: usize,
+    pub rows: usize,
+    /// The cursor to draw: `None` while the device hides it, or a blink has it off.
+    pub cursor: Option<CursorState>,
+    /// Asked, after the frame, for the screen to be `columns` by `rows` when that is what
+    /// fits the element and not the screen's size.
+    pub resize: ResizeScreen,
+    /// The size last asked for, so a size is asked for once.
+    pub requested: Rc<Cell<Option<(usize, usize)>>>,
+}
+
 /// What the view hands the element each frame.
 pub struct TerminalInputs {
     pub view: Entity<TerminalView>,
@@ -360,6 +406,8 @@ pub struct TerminalInputs {
     pub selection: Option<Selection>,
     pub highlights: Highlights,
     pub focus: FocusHandle,
+    /// Set when the source is a terminal screen (VT mode).
+    pub screen: Option<ScreenInputs>,
 }
 
 pub struct TerminalElement {
@@ -386,6 +434,10 @@ pub struct TerminalLayout {
     rects: Vec<(Bounds<Pixels>, Hsla)>,
     rows: Vec<PaintRow>,
     gutter: Vec<PaintRow>,
+    /// The cursor, painted over the text, and the character under a block cursor again
+    /// in the background color, over the block.
+    cursor: Vec<PaintQuad>,
+    cursor_glyph: Option<PaintRow>,
     hit_map: Rc<HitMap>,
 }
 
@@ -618,7 +670,27 @@ impl Element for TerminalElement {
         let text_left = bounds.left() + PADDING_LEFT + gutter_width;
         let text_right = (bounds.right() - PADDING_RIGHT).max(text_left + cell_width);
         let text_width = text_right - text_left;
-        let columns = if inputs.wrap {
+        let screen = inputs.screen.as_ref();
+        // What fits: a screen is sized to it, and its grid is already wrapped.
+        let grid = (
+            (f32::from(text_width) / f32::from(cell_width))
+                .floor()
+                .max(1.0) as usize,
+            (f32::from(bounds.size.height) / f32::from(row_height))
+                .floor()
+                .max(1.0) as usize,
+        );
+        cache.grid = Some(grid);
+        if let Some(screen) = screen
+            && grid != (screen.columns, screen.rows)
+            && screen.requested.get() != Some(grid)
+        {
+            screen.requested.set(Some(grid));
+            let resize = screen.resize.clone();
+            cx.defer(move |cx| resize(grid.0, grid.1, cx));
+        }
+        let wrap = inputs.wrap && screen.is_none();
+        let columns = if wrap {
             (f32::from(text_width) / f32::from(cell_width))
                 .floor()
                 .max(1.0) as usize
@@ -634,8 +706,14 @@ impl Element for TerminalElement {
             .frozen_end
             .map_or(live_end, |frozen| frozen.min(live_end));
         let span = Span::new(first, end);
+        // A screen's rows are whole: the grid's top row sits on the element's top edge
+        // when following, and the part row left over at the bottom stays blank.
+        let height = match screen {
+            Some(_) => grid.1 as f32 * f32::from(row_height),
+            None => f32::from(bounds.size.height),
+        };
         let viewport = Viewport {
-            height: f32::from(bounds.size.height),
+            height,
             row_height: f32::from(row_height),
         };
 
@@ -652,7 +730,7 @@ impl Element for TerminalElement {
 
         let visible = {
             let cache = &mut *cache;
-            if inputs.wrap {
+            if wrap {
                 let mut rows = WrapCounter {
                     wraps: &mut cache.wraps,
                     frame: &mut frame,
@@ -711,7 +789,7 @@ impl Element for TerminalElement {
         }
         drop(cache);
 
-        let horizontal = if inputs.wrap {
+        let horizontal = if wrap {
             inputs.scroll.reset_horizontal();
             0.0
         } else {
@@ -845,6 +923,62 @@ impl Element for TerminalElement {
             }
         }
 
+        // The cursor, on its row if that row is on screen.
+        let mut cursor = Vec::new();
+        let mut cursor_glyph = None;
+        if let Some(state) = screen.and_then(|screen| screen.cursor)
+            && let Some(row) = visible.iter().find(|row| row.line == state.line)
+        {
+            let origin = point(x_of(state.column), bounds.top() + px(row.y));
+            let cell = Bounds::new(origin, size(cell_width, row_height));
+            let color = palette.cursor;
+            let focused = inputs.focus.is_focused(window);
+            match state.shape {
+                // Without the keyboard, the cursor is an outline whatever its shape.
+                _ if !focused => cursor.push(outline(cell, color, BorderStyle::Solid)),
+                CursorShape::HollowBlock => {
+                    cursor.push(outline(cell, color, BorderStyle::Solid));
+                }
+                CursorShape::Underline => cursor.push(fill(
+                    Bounds::new(
+                        point(origin.x, origin.y + row_height - CURSOR_THICKNESS),
+                        size(cell_width, CURSOR_THICKNESS),
+                    ),
+                    color,
+                )),
+                CursorShape::Beam => cursor.push(fill(
+                    Bounds::new(origin, size(CURSOR_THICKNESS, row_height)),
+                    color,
+                )),
+                CursorShape::Block => {
+                    cursor.push(fill(cell, color));
+                    let under = frame
+                        .lines
+                        .get(&state.line)
+                        .and_then(|line| line.text.chars().nth(state.column))
+                        .filter(|c| !c.is_whitespace());
+                    if let Some(c) = under {
+                        let text = c.to_string();
+                        let run = TextRun {
+                            len: text.len(),
+                            font: inputs.font.clone(),
+                            color: palette.background,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shaped = window.text_system().shape_line(
+                            text.into(),
+                            inputs.font_size,
+                            &[run],
+                            Some(cell_width),
+                        );
+                        cursor_glyph = Some(PaintRow { origin, shaped });
+                    }
+                }
+            }
+        }
+
         sample.lines_fetched = frame.fetched;
         sample.prepaint = started.elapsed();
         inputs.stats.borrow_mut().record(sample);
@@ -860,6 +994,8 @@ impl Element for TerminalElement {
             rects,
             rows,
             gutter,
+            cursor,
+            cursor_glyph,
             hit_map: Rc::new(HitMap {
                 bounds,
                 column_origin,
@@ -903,6 +1039,24 @@ impl Element for TerminalElement {
                             )
                             .ok();
                     }
+                    // The cursor covers its cell's glyph, and a block cursor then shows
+                    // the glyph again in the background color.
+                    for quad in layout.cursor.drain(..) {
+                        window.paint_quad(quad);
+                    }
+                    if let Some(glyph) = &layout.cursor_glyph {
+                        glyph
+                            .shaped
+                            .paint(
+                                glyph.origin,
+                                layout.row_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    }
                 },
             );
             for row in &layout.gutter {
@@ -935,7 +1089,7 @@ impl TerminalElement {
         window: &mut Window,
     ) {
         let row_height = layout.row_height;
-        let wrap = self.inputs.wrap;
+        let wrap = self.inputs.wrap && self.inputs.screen.is_none();
 
         window.on_mouse_event({
             let view = self.inputs.view.clone();

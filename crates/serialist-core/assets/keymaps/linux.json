@@ -99,6 +99,7 @@
       "alt-z": "terminal::ToggleWrap",
       "alt-t": "terminal::CycleTimestamps",
       "alt-h": "terminal::ToggleHexView",
+      "alt-v": "terminal::ToggleEmulation",
       "ctrl-alt-i": "terminal::ToggleFrameStats",
       "pageup": "terminal::PageUp",
       "pagedown": "terminal::PageDown",

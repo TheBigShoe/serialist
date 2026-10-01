@@ -18,6 +18,8 @@ serialist-core.workspace = true
 serialist-plugins.workspace = true
 serialist-script.workspace = true
 serialist-sim.workspace = true
+# VT mode: the terminal screen a session's ingest thread feeds (see `emulation`).
+serialist-vt.workspace = true
 # gpui-kit re-exports GPUI and its platform crate, and GPUI's macros resolve through it,
 # so GPUI is not listed separately. Code reaches all of it through `prelude`.
 gpui-kit.workspace = true

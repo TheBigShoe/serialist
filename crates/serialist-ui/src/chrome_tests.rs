@@ -88,6 +88,7 @@ fn item_id(item: ToolbarItem) -> &'static str {
         ToolbarItem::Clear => "clear",
         ToolbarItem::Search => "search",
         ToolbarItem::Hex => "hex-view",
+        ToolbarItem::Emulation => "emulation",
         ToolbarItem::Timestamps => "timestamps",
         ToolbarItem::Wrap => "wrap",
         ToolbarItem::Export => "export",
@@ -138,9 +139,13 @@ fn the_toolbar_moves_what_does_not_fit_into_its_overflow_menu(cx: &mut TestAppCo
     view.update(cx, |v, cx| assert!(v.set_codec(Some("airoha-race"), cx)));
     draw(cx, window);
     let wide = layout(cx, &view);
+    // With both docks open and the codec menu, the last of the view toggles (the ones
+    // that go first) may not fit at 1440.
     assert!(
-        wide.overflow.is_empty(),
-        "everything fits at 1440: {wide:?}"
+        wide.overflow
+            .iter()
+            .all(|item| matches!(item, ToolbarItem::Timestamps | ToolbarItem::Wrap)),
+        "at 1440 at most the last view toggles overflow: {wide:?}"
     );
     assert!(
         wide.shows(ToolbarItem::Codec),
@@ -165,7 +170,11 @@ fn the_toolbar_moves_what_does_not_fit_into_its_overflow_menu(cx: &mut TestAppCo
     }
     let mut every: Vec<ToolbarItem> = narrow.shown.clone();
     every.extend(&narrow.overflow);
-    assert_eq!(every.len(), wide.shown.len(), "nothing is lost");
+    assert_eq!(
+        every.len(),
+        wide.shown.len() + wide.overflow.len(),
+        "nothing is lost"
+    );
     assert_toolbar_fits(cx, window, &narrow);
 
     // Narrower still, with both docks on their rails: still inside.
