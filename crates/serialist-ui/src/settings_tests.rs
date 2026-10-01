@@ -221,6 +221,18 @@ fn ligatures_theme_and_default_write_and_remove_their_keys(cx: &mut TestAppConte
         })
     });
 
+    // VT mode by default, from the Display section's emulation control.
+    show(cx, window, Section::Display);
+    cx.update_window(window, |_, window, cx| {
+        window.click("settings-emulation-1", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        file_value(&paths.settings, "/terminal/emulation"),
+        Some(json!("vt"))
+    );
+
     show(cx, window, Section::Appearance);
     update_view(cx, window, &view, |v, window, cx| {
         v.set_theme_mode(ThemeMode::Dark, window, cx);
