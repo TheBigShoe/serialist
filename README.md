@@ -157,7 +157,7 @@ The app watches it and applies changes as you save; there is no restart.
 | `scripts/` | Lua scripts, `*.lua` at any depth. The Scripts menu's Open Scripts Folder creates it with two example scripts if it holds none. |
 | `plugins/` | Codec plugins, one folder each: `plugin.lua`, or `plugin.wasm` with `plugin.toml`. None is installed at first; `plugins/examples/` holds copies of the bundled examples, which decode nothing until installed. See [Plugins](#plugins). |
 | `history.jsonl` | The compose bar's history, one JSON string per line. |
-| `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode), reopened at the next start. Written by the app. |
+| `state.json` | The tabs open when the window last closed (ports, line settings, codec, input mode, monitor or VT), reopened at the next start. Written by the app. |
 
 A project can also check in `.serialist/settings.json` and `.serialist/commands.json`; the
 nearest one found searching up from the working directory is used. Defaults for every
