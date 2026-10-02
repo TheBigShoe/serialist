@@ -25,10 +25,13 @@ fn append(c: &mut Criterion) {
     let mut group = c.benchmark_group("append");
     group.throughput(Throughput::Bytes(APPEND_BYTES as u64));
     group.sample_size(20);
-    for (name, content) in [
-        ("plain", FirehoseContent::Text),
-        ("ansi", FirehoseContent::Ansi),
-        ("long_lines", FirehoseContent::LongLines),
+    // The last case is what a session hands ingest at 12 Mbaud: every kind of line mixed,
+    // in the 1 200-byte packets the virtual link releases once a millisecond.
+    for (name, content, chunk_len) in [
+        ("plain", FirehoseContent::Text, CHUNK),
+        ("ansi", FirehoseContent::Ansi, CHUNK),
+        ("long_lines", FirehoseContent::LongLines, CHUNK),
+        ("mixed_1200", FirehoseContent::Mixed, 1200),
     ] {
         let data = firehose(content);
         group.bench_function(name, |b| {
@@ -36,7 +39,7 @@ fn append(c: &mut Criterion) {
                 || Store::new(StoreConfig::default()),
                 |mut store| {
                     let now = Instant::now();
-                    for chunk in data.chunks(CHUNK) {
+                    for chunk in data.chunks(chunk_len) {
                         store.append(chunk, now);
                     }
                     store
