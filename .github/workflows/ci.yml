@@ -130,3 +130,179 @@ jobs:
         with:
           command: check advisories
           arguments: --all-features
+
+  # Fuzzing with cargo-fuzz (libFuzzer) on nightly. fuzz/ is its own workspace outside
+  # the root one, with its own Cargo.lock (fuzz/Cargo.toml says why), so the jobs above
+  # never build it. The seeds, and every crash reproducer committed with them in
+  # fuzz/seeds/<target>/, replay first on the pinned stable toolchain; then each target
+  # runs for FUZZ_SECONDS from those seeds. `--no-cfg-fuzzing`: nusb 0.2's `cfg(fuzzing)`
+  # code does not compile. `just fuzz-check` and `just fuzz <target>` do the same locally.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FUZZ_SECONDS: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # The pinned stable toolchain (rust-toolchain.toml) for the checks and the seed
+      # replay, and nightly for cargo-fuzz's instrumented build.
+      - name: Install toolchains
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # serialport's libudev feature, through serialist-core. No GPUI here.
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # cargo-fuzz has no --locked; this fails if fuzz/Cargo.lock is out of date.
+      - name: Check fuzz/Cargo.lock
+        run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Format, clippy and seed replay (stable)
+        run: |
+          cargo fmt --manifest-path fuzz/Cargo.toml --check
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Build fuzz targets (nightly)
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing
+
+      # Every target runs even when an earlier one crashes; the step fails at the end. A
+      # target with a libFuzzer dictionary in fuzz/dicts/<target>.dict gets it.
+      - name: Fuzz each target for ${{ env.FUZZ_SECONDS }} s
+        run: |
+          targets=$(cargo +nightly fuzz list --fuzz-dir fuzz)
+          if [ -z "$targets" ]; then
+            echo "No fuzz targets."
+            exit 0
+          fi
+          failed=""
+          for target in $targets; do
+            echo "::group::$target"
+            mkdir -p "fuzz/corpus/$target"
+            args=(-max_total_time="$FUZZ_SECONDS" -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10)
+            if [ -f "fuzz/dicts/$target.dict" ]; then
+              args+=(-dict="fuzz/dicts/$target.dict")
+            fi
+            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing "$target" \
+              "fuzz/corpus/$target" "fuzz/seeds/$target" -- "${args[@]}" \
+              || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::Fuzz targets failed:$failed. The reproducers are in the fuzz-artifacts artifact."
+            exit 1
+          fi
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Line coverage with cargo-llvm-cov, failing below two floors: 87% for the workspace and
+  # 90% for serialist-core (the plan's proposal). Measured on macOS at 8f77082: 90.5% and
+  # 94.2%; Linux runs different platform code, hence the margin. Only Linux: the floors
+  # guard the trend, and one instrumented GPUI build is enough. The lcov report is kept as
+  # an artifact for local viewers and review tools. `just coverage` runs the same steps.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Every crate but serialist-core, for the core floor.
+      NOT_CORE: crates/serialist-(sim|script|plugins|plugin-sdk|ui|vt)/|crates/serialist/|examples/
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The same packages as the test job: the UI crate's tests run here too.
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfontconfig-dev \
+            libudev-dev \
+            libvulkan1 \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # The store gate's timing budget is for uninstrumented builds and has failed under
+      # coverage on a loaded machine (11.8 s against 10 s). The test job runs it in full.
+      - name: Tests under coverage
+        run: cargo llvm-cov --workspace --locked --no-report --no-fail-fast -- --skip one_million_lines_gate
+
+      - name: Coverage floor, workspace (lines)
+        run: cargo llvm-cov report --summary-only --fail-under-lines 87
+
+      - name: Coverage floor, serialist-core (lines)
+        run: cargo llvm-cov report --summary-only --fail-under-lines 90 --ignore-filename-regex "$NOT_CORE"
+
+      - name: lcov report
+        if: ${{ !cancelled() }}
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The criterion benches (store append, parse, line lookup, search; the virtual link and
+  # firehose), every [[bench]] target in the workspace, in --quick mode: this proves they
+  # build and run on every push, not how fast they are, because hosted runners are too
+  # noisy for absolute numbers. The timing gates that hold the budgets (the store gate,
+  # the terminal frame cost, the VT firehose) stay in `cargo test`. `just bench` runs the
+  # same command.
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # serialport's libudev feature, through serialist-core. No GPUI here.
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev
+
+      - name: Benches (quick)
+        run: cargo bench --workspace --locked --bench '*' -- --quick
