@@ -904,9 +904,14 @@ fn scroll_frames(
     out
 }
 
-/// The per-frame budget: 8 ms optimized. Unoptimized builds of this crate get 40 ms.
+/// The per-frame budget: 8 ms optimized. Unoptimized builds of this crate get 40 ms. A
+/// coverage build gets none (`Duration::MAX`): `cargo llvm-cov` instruments the code, which
+/// then costs several times what any budget allows. The lines fetched and shaped per frame
+/// are counted, not timed, and are still checked there.
 fn frame_budget() -> Duration {
-    if cfg!(debug_assertions) {
+    if cfg!(coverage) {
+        Duration::MAX
+    } else if cfg!(debug_assertions) {
         Duration::from_millis(40)
     } else {
         Duration::from_millis(8)
