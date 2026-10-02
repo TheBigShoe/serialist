@@ -477,6 +477,80 @@ fn the_frame_budget_is_a_limit_like_the_others() {
     assert!(message.contains("more than 1000 bytes"), "{message}");
 }
 
+/// Why a plugin failed to load.
+fn load_error(name: &str, code: &str, limits: LuaLimits) -> String {
+    match LuaCodec::from_source(name, code, limits) {
+        Err(CodecError::Internal(message)) => message,
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+/// A description can share tables too: one kind listed 100 000 times, or many kinds
+/// sharing one long list of fields. What the host copies out of it is capped, so such a
+/// plugin fails to load at once instead of the app building it all.
+#[test]
+fn a_shared_description_cannot_be_bigger_than_the_budget() {
+    let shapes = [
+        r#"local kind = { kind = "k", description = "the same kind again" }
+           local kinds = {}
+           for i = 1, 100000 do kinds[i] = kind end
+           return { name = "big", kinds = kinds }"#,
+        r#"local fields = {}
+           for i = 1, 10000 do fields[i] = { name = "f" .. i, type = "uint" } end
+           local kinds = {}
+           for i = 1, 1000 do kinds[i] = { kind = "k" .. i, fields = fields } end
+           return { name = "big", kinds = kinds }"#,
+    ];
+    for describe in shapes {
+        let code = format!(
+            "return {{ describe = function() {describe} end, decode = print, encode = print }}"
+        );
+        let started = Instant::now();
+        let message = load_error("big.lua", &code, limits());
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+        assert!(
+            message.contains("describe() is larger than the limit of 1048576 bytes"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn the_describe_budget_is_a_limit_like_the_others() {
+    assert_eq!(LuaLimits::default().max_describe_bytes, 1024 * 1024);
+    // Plugins as they are written load well within it.
+    assert!(LuaCodec::from_source("lines.lua", LINES, LuaLimits::default()).is_ok());
+    assert!(bundled_race_lua(LuaLimits::default()).is_ok());
+    // Each kind, command and field costs 32 bytes, and each string its length: the name
+    // (5) and description (3), the kind (32 + 1) with its field (32 + 1 + 4 for `uint`),
+    // and the command (32 + 2).
+    let plugin = r#"
+      return {
+        describe = function()
+          return {
+            name = "sized", description = "abc",
+            kinds = { { kind = "k", fields = { { name = "n", type = "uint" } } } },
+            commands = { { name = "go" } },
+          }
+        end,
+        decode = print, encode = print,
+      }"#;
+    let size = 5 + 3 + 33 + 37 + 34;
+    let within = |max_describe_bytes| LuaLimits {
+        max_describe_bytes,
+        ..limits()
+    };
+    assert!(LuaCodec::from_source("sized.lua", plugin, within(size)).is_ok());
+    let message = load_error("sized.lua", plugin, within(size - 1));
+    assert_eq!(
+        message,
+        format!(
+            "sized.lua: describe() is larger than the limit of {} bytes",
+            size - 1
+        )
+    );
+}
+
 #[test]
 fn field_names_that_differ_only_in_invalid_utf8_come_out_in_byte_order() {
     // Both names read as U+FFFD once converted: the bytes decide the order, not the

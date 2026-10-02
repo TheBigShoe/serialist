@@ -95,7 +95,9 @@
 //! field name or a frame counts for 32 bytes, and text for its length (the exact charges
 //! are in the `Budget` docs in `convert.rs`). A frame past that, and every frame after
 //! it in the call, is a [`PLUGIN_ERROR_KIND`] frame over its bytes. The next call starts
-//! over with a full budget.
+//! over with a full budget. What `describe` returns is counted the same way against
+//! [`max_describe_bytes`](LuaLimits::max_describe_bytes) (1 MiB), and a plugin whose
+//! description is larger fails to load.
 //!
 //! # Threads
 //!
@@ -143,6 +145,9 @@ pub struct LuaLimits {
     /// of the call, are [`PLUGIN_ERROR_KIND`] frames. The VM's memory cap bounds what a
     /// plugin builds, not what it returns.
     pub max_frame_bytes: usize,
+    /// Most bytes what `describe` returns may take on the host, counted like frames; a
+    /// plugin whose description is larger fails to load.
+    pub max_describe_bytes: usize,
 }
 
 impl LuaLimits {
@@ -153,6 +158,8 @@ impl LuaLimits {
     pub const DEFAULT_CHECK_EVERY: u32 = 10_000;
     pub const DEFAULT_MAX_HELD_BACK: usize = 1024 * 1024;
     pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+    /// A description is normally a few hundred bytes.
+    pub const DEFAULT_MAX_DESCRIBE_BYTES: usize = 1024 * 1024;
 }
 
 impl Default for LuaLimits {
@@ -163,6 +170,7 @@ impl Default for LuaLimits {
             check_every: Self::DEFAULT_CHECK_EVERY,
             max_held_back: Self::DEFAULT_MAX_HELD_BACK,
             max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
+            max_describe_bytes: Self::DEFAULT_MAX_DESCRIBE_BYTES,
         }
     }
 }
@@ -207,7 +215,7 @@ impl Loaded {
         let fail = |message: String| CodecError::Internal(format!("{name}: {message}"));
         let vm = Vm::load(&name, &code, limits).map_err(fail)?;
         let described = vm.call::<LuaValue>(&vm.describe, ()).map_err(fail)?;
-        let info = convert::info_from_lua(described).map_err(fail)?;
+        let info = convert::info_from_lua(described, limits.max_describe_bytes).map_err(fail)?;
         let state = vm
             .lua
             .create_table()
@@ -399,7 +407,7 @@ impl LuaCodec {
                 ));
             }
         };
-        let mut budget = convert::Budget::new(self.limits.max_frame_bytes);
+        let mut budget = convert::Budget::frames(self.limits.max_frame_bytes);
         let mut prev_stop = base;
         for (i, item) in frames.sequence_values::<LuaValue>().enumerate() {
             let item = item.map_err(|err| vm::describe_error(&err))?;
