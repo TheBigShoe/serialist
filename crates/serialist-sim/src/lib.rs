@@ -15,6 +15,10 @@
 //!   and content, verified end to end by [`FirehoseVerifier`]), [`RaceDevice`] (Airoha RACE
 //!   binary frames mixed with text, for the codec plugins), [`MenuDevice`] (a U-Boot style
 //!   boot menu redrawn in place with cursor addressing, for the VT screen).
+//! - [`CaptureRecorder`] and [`record_device`]: record a device the way the app's Record
+//!   toggle does, into a [`Capture`] (raw bytes plus the timing sidecar) that the replay
+//!   transport plays back. The recording runs on a [`ManualClock`], so it is
+//!   byte-for-byte reproducible.
 //! - [`Clock`]: where a link gets its time. [`SystemClock`] is real time; a
 //!   [`ManualClock`] moves only when a test moves it, so timing assertions are exact.
 //!   [`VirtualLink::connect_with_clock`] and [`SimWorld::with_clock`] take one.
@@ -23,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use serialist_core::{ControlLine, SerialConfig};
 
+mod capture;
 mod clock;
 mod crc;
 mod devices;
@@ -34,6 +39,7 @@ mod race;
 mod source;
 mod world;
 
+pub use capture::{Capture, CaptureRecorder, record_device};
 pub use clock::{Clock, ManualClock, SystemClock, Wakeup};
 pub use crc::crc32;
 pub use devices::{AtDevice, CaptureOutput, EchoDevice};

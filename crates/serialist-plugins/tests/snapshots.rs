@@ -9,15 +9,13 @@
 
 mod common;
 
-use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use serialist_core::{Frame, Value, codec::encode_hex};
 use serialist_plugins::corpus;
 use serialist_plugins::race::AirohaRace;
 
-use common::{decode_chunks, lua_race, timeless};
+use common::{decode_chunks, lua_race, render, timeless};
 
 const SEED: u64 = 0x5E71_A115_2026_0930;
 const SEGMENTS: usize = 160;
@@ -40,45 +38,6 @@ fn the_capture_is_the_generated_corpus() {
         fixture() == generated,
         "the capture no longer matches the generator; see this file's docs to rewrite it"
     );
-}
-
-fn value(value: &Value) -> String {
-    match value {
-        Value::Str(s) if s.len() > 72 => {
-            let cut = s.floor_char_boundary(72);
-            format!("{:?} ..+{}", &s[..cut], s.len() - cut)
-        }
-        Value::Str(s) => format!("{s:?}"),
-        Value::Bytes(b) if b.len() > 24 => {
-            format!("[{} ..+{}]", encode_hex(&b[..24], " "), b.len() - 24)
-        }
-        Value::Bytes(b) => format!("[{}]", encode_hex(b, " ")),
-        other => other.to_string(),
-    }
-}
-
-fn render(frames: &[Frame]) -> String {
-    let mut out = String::new();
-    for f in frames {
-        let fields: Vec<String> = f
-            .fields
-            .iter()
-            .map(|(name, v)| format!("{name}={}", value(v)))
-            .collect();
-        let _ = writeln!(
-            out,
-            "{:>6}..{:<6} {:<10} {:<7} {}",
-            f.raw.start,
-            f.raw.end,
-            f.kind,
-            f.severity,
-            fields.join(" ")
-        );
-        if f.kind != "text" {
-            let _ = writeln!(out, "{:>15} {}", "|", f.summary);
-        }
-    }
-    out
 }
 
 #[test]

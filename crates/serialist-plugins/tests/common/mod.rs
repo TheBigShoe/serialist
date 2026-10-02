@@ -1,12 +1,14 @@
 //! Helpers shared by the plugin integration tests.
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serialist_core::{Codec, Frame};
+use serialist_core::codec::encode_hex;
+use serialist_core::{Codec, Frame, Value};
 use serialist_plugins::{LuaCodec, LuaLimits, bundled_race_lua};
 
 /// Feed `chunks` to `codec` as one stream starting at offset 0. Chunk `i` arrives at
@@ -73,6 +75,46 @@ pub fn timeless(frames: &[Frame], t0: Instant) -> Vec<Frame> {
             f
         })
         .collect()
+}
+
+fn value(value: &Value) -> String {
+    match value {
+        Value::Str(s) if s.len() > 72 => {
+            let cut = s.floor_char_boundary(72);
+            format!("{:?} ..+{}", &s[..cut], s.len() - cut)
+        }
+        Value::Str(s) => format!("{s:?}"),
+        Value::Bytes(b) if b.len() > 24 => {
+            format!("[{} ..+{}]", encode_hex(&b[..24], " "), b.len() - 24)
+        }
+        Value::Bytes(b) => format!("[{}]", encode_hex(b, " ")),
+        other => other.to_string(),
+    }
+}
+
+/// The frames as text, one block per frame: what the snapshot tests pin.
+pub fn render(frames: &[Frame]) -> String {
+    let mut out = String::new();
+    for f in frames {
+        let fields: Vec<String> = f
+            .fields
+            .iter()
+            .map(|(name, v)| format!("{name}={}", value(v)))
+            .collect();
+        let _ = writeln!(
+            out,
+            "{:>6}..{:<6} {:<10} {:<7} {}",
+            f.raw.start,
+            f.raw.end,
+            f.kind,
+            f.severity,
+            fields.join(" ")
+        );
+        if f.kind != "text" {
+            let _ = writeln!(out, "{:>15} {}", "|", f.summary);
+        }
+    }
+    out
 }
 
 /// A directory under the system temp dir, removed on drop.
