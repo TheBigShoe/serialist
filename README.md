@@ -13,6 +13,7 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 </table>
 
 - Devices appear the moment they are plugged in.
+- Raw TCP streams and recorded captures open in tabs like serial ports, and a recording replays at its original pace.
 - Any baud rate, full framing and flow control settings, per-device profiles.
 - Two modes: inline interactive, and saved commands you can send with a click or a key.
 - Lua scripting and protocol plugins you install (an Airoha RACE example ships with the app).
@@ -40,7 +41,7 @@ These pictures are the real workspace, drawn offscreen against Serialist's simul
 
 ## Status
 
-Milestones 0 to 5 of `docs/plan.md` have landed: the session engine and GPUI shell, the
+Milestones 0 to 5 of `docs/plan.md` have landed: the session engine (serial, raw TCP and capture-replay transports) and GPUI shell, the
 terminal element over a page-store scrollback, Zed-format settings, themes and keymaps that
 apply live, inline interactive and saved-command modes, Lua scripting with a headless
 `--script` mode, and protocol plugins in Lua and WebAssembly. Milestone 6 has
@@ -63,11 +64,12 @@ cargo run --release -p serialist -- --virtual at
 simulated AT modem, so everything works with no hardware attached (it answers `AT` with
 `OK`). The built-in simulated devices are `echo`, `echo-lines`, `at`, `firehose`,
 `firehose-ansi`, `race` and `menu` (a U-Boot style boot menu, for VT mode). To open a real
-port, pick it in the Devices panel, or start with `--port <PATH> --baud <N>`.
+port, pick it in the Devices panel, or start with `--port <PATH> --baud <N>`. A TCP stream or
+a recorded capture opens from the Serial menu or with `--port` too; see [Ports](#ports).
 
 | Flag | What it does |
 |---|---|
-| `--port <PATH>` | Open this port at startup in a tab of its own (`virtual:<NAME>` for a simulated one). Repeatable |
+| `--port <ID>` | Open this port at startup in a tab of its own: a path (`/dev/cu.usbserial-1420`, `COM3`), `virtual:<NAME>` for a simulated device, `tcp:<HOST>:<PORT>` for a raw TCP stream or `replay:<FILE>` for a recorded capture (see [Ports](#ports)). Repeatable |
 | `--baud <N>` | Baud rate for `--port` and the Connect field, any positive integer (default 115200) |
 | `--virtual [NAME]` | List the simulated devices next to the real ports; with a NAME, also open `virtual:<NAME>` at startup in a tab of its own. Repeatable |
 | `--config-dir <DIR>` | Read and keep the configuration in DIR instead of the user config directory (also `SERIALIST_CONFIG_DIR`) |
@@ -134,15 +136,98 @@ there is none); the others keep
 receiving, recording and running their scripts without drawing, and their label counts the
 bytes that arrived meanwhile. When the window closes the tabs are written to `state.json`
 and reopen at the next start (the `restore_session` setting; ports named on the command line
-open instead).
+open instead; [Ports](#ports) says what happens to TCP and replay tabs).
 
 The button at the left of a session's toolbar (`115200 8N1`), and the port in the status
 bar, open its port settings: baud
 (any integer, or one from the list), data bits, parity, stop bits, flow control, line ending,
-local echo, live DTR and RTS switches and Send break, applied to the open port at once. The
+local echo, live DTR and RTS switches and Send break, applied to the open port at once (on a TCP tab
+the button reads `TCP` and keeps only the line ending and local echo, and on a replay it
+shows the speed; see [Ports](#ports)). The
 gear on a Devices row (hover the row) sets the same things for the next connect to that port.
 Disconnect in the toolbar closes the port and keeps the scrollback; Connect in its place opens
 it again, with the same settings, into the same scrollback.
+
+### Ports
+
+Everything that opens is a port id: what follows `--port`, what a tab's entry in `state.json`
+holds, and what a device profile's `match.path` is a prefix of. There are four forms. A
+`tcp:` or `replay:` port is never discovered, so it does not appear in the Devices panel.
+
+| Id | Opens |
+|---|---|
+| `/dev/cu.usbserial-1420`, `COM3` | An OS serial port. |
+| `virtual:<name>` | A simulated device (the Devices panel's Simulated group, or `--virtual`). |
+| `tcp:<host>:<port>` | A raw TCP byte stream, for serial-to-network bridges such as ser2net in raw mode, ESP-Link or a terminal server's raw port. `host` is a name, an IPv4 address or a bracketed IPv6 address (`tcp:[::1]:4000`) and `port` is 1 to 65535. Raw only: no Telnet negotiation and no RFC 2217. |
+| `replay:<file>[?speed=…&end=…]` | A recorded capture played into the session as if a device were sending it. `speed` is `1x`, `4x`, `0.5x` and so on, or `max` (as fast as the session reads); `end` is `disconnect` (the default: the session ends after the last byte) or `hold` (it stays open). |
+
+Two actions open them from the window, in the Serial menu (beside Disconnect) and in the
+command palette. Neither has a default key.
+
+- **Connect to TCP…** (`serial::ConnectTcp`, "Serial: Connect TCP" in the palette) asks for
+  `host:port` in a small dialog. A pasted `tcp:host:port` works, and an entry that does not
+  parse says why under the field and keeps the dialog open.
+- **Open Capture…** (`serial::OpenCapture`, "Serial: Open capture") picks a file with the
+  platform's open dialog.
+
+`--port` takes the same ids, and so does `--script` (see [`docs/scripting.md`](docs/scripting.md#headless-runs-with---script)).
+Quote a replay id in a shell, since `?` is a glob character: `--port 'replay:boot.bin?speed=4x'`.
+A device profile applies to these ports as to any other, with `match.path` a prefix of the id:
+`{ "match": { "path": "tcp:10.0.0.5:4000" }, "plugin": "airoha-race" }` gives that endpoint a
+codec, and `"path": "replay:"` matches every replay.
+
+What the tab shows:
+
+- A TCP tab is titled `host:port` and a replay tab with the capture's file name; the window
+  title follows.
+- The status line shows the transport's own description, `tcp:bridge.local:4000 (192.168.1.50:4000)`
+  or `replay:boot.bin (4x)`, and no line settings, which a stream does not have. A replay with
+  no timing file is the exception: its baud rate paces it, so the settings stay
+  (`replay:dump.bin (4x, no timing)`, then `115200 8N1`).
+- The toolbar's settings button reads `TCP`, and its popover keeps the line ending and local
+  echo only: no baud, framing, flow control, DTR, RTS or Send break, because a socket has none
+  (a bridge's own serial side is set on the bridge). On a replay the button shows the speed and
+  opens a menu (0.25x, 0.5x, 1x, 2x, 4x, 10x, 100x, max); choosing one plays the capture again
+  from its first byte at that speed, in the same tab, after the scrollback already there.
+- A peer that closes a TCP connection ends the session as "Connection lost", and Connect opens a
+  new one. A replay that plays its last byte under `end = disconnect` ends quietly as
+  "Disconnected", and Connect plays it again. Whatever is typed or sent to a replay is discarded,
+  so inline mode and the compose bar do no harm there.
+
+The `replay` setting gives the speed and the end of a replay whose id does not say:
+
+```jsonc
+"replay": { "speed": "1x", "end": "disconnect" }
+```
+
+`speed` is `"1x"`, `"4x"`, `"0.5x"`, `"max"` or a bare number, and `end` is `"disconnect"` or
+`"hold"`. An id's own `?speed=` and `?end=` win, and a change reaches the next replay that
+opens, not one already playing. The Settings screen has no control for it; edit `settings.json`.
+
+Restored tabs: with `restore_session` on, a `tcp:` tab connects again at the next start, as a
+serial tab does when its device is plugged in (if the endpoint does not answer, the tab says why
+and waits with a Connect button). A `replay:` tab waits with a Connect button instead, because
+playing a file the moment the app opens would be a surprise.
+
+### Recording and replay
+
+Record (the toolbar, `cmd-shift-r`, `ctrl-shift-r` on Linux and Windows) asks for a file name
+and appends every chunk the port delivers to it, byte for byte, as it always has. It also
+writes `<file>.timing` beside it (`boot.bin` gets `boot.bin.timing`): a small text file with one
+line per chunk saying when it arrived and where its bytes sit in the raw file, plus a line each
+for the link coming up and going down. A replay reads it to play the capture at its original
+pace and in its original chunks. The format is written out in the module docs of
+`serialist_core::capture` (`crates/serialist-core/src/capture.rs`). The two files are flushed
+together, a recording starts only if both can be created, and stopping says
+`Recorded 12 KiB to boot.bin (timing in boot.bin.timing)`. Only Record writes a sidecar;
+Export's raw bytes are the raw file alone. A replay looks for `<name>.timing` in the capture's
+folder, so keep the pair together.
+
+The sidecar is optional. A capture without one, such as a recording made before sidecars existed
+or a dump from another tool, still replays: at the baud rate the tab opens with (`default_baud`,
+a device profile that matches the id, or `--baud`) times the speed, or as fast as the session
+reads at `max`. A `.timing` file that does not parse makes the open fail with a message naming
+the port, rather than play at the wrong pace.
 
 ### Settings
 
