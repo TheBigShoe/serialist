@@ -225,6 +225,14 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(args.baud, Some(250_000));
+        // The top of the standard list, with or without digit separators.
+        for fast in ["12000000", "12_000_000"] {
+            let Command::Run(args) = run(&["--port", "/dev/ttyUSB0", "--baud", fast]).unwrap()
+            else {
+                panic!("expected run");
+            };
+            assert_eq!(args.baud, Some(12_000_000));
+        }
     }
 
     #[test]

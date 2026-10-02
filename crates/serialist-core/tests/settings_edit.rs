@@ -870,6 +870,27 @@ fn settings_edit_round_trip_changes_only_the_edited_value() {
 }
 
 #[test]
+fn settings_edit_12_mbaud_round_trips_through_the_file() {
+    // The top of the standard list (an FT232H at full speed), as the default rate and in
+    // a device profile: written as a plain integer and read back unchanged.
+    let dir = TempDir::new("12-mbaud");
+    let path = dir.write("settings.json", "{}\n");
+    SettingsEditor::set_in_file(&path, "/default_baud", 12_000_000).unwrap();
+    let profile = json!({ "name": "FT232H", "match": { "vid": "0x0403" }, "baud": 12_000_000 });
+    SettingsEditor::set_in_file(&path, "/devices/-", profile).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"default_baud\": 12000000"), "{text}");
+    assert!(text.contains("\"baud\": 12000000"), "{text}");
+    let settings = load_settings(Some(&path), None).unwrap();
+    assert_eq!(settings.default_baud, 12_000_000);
+    assert_eq!(settings.devices[0].baud, Some(12_000_000));
+    assert_eq!(
+        SettingsEditor::open(&path).unwrap().get("/devices/0/baud"),
+        Some(json!(12_000_000))
+    );
+}
+
+#[test]
 fn settings_edit_keeps_the_sample_comments_through_edits() {
     let dir = TempDir::new("sample-comments");
     let path = dir.write("settings.json", SAMPLE);

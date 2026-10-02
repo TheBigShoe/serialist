@@ -202,6 +202,17 @@ mod tests {
                     mode: SavedMode::Inline,
                     emulation: Some(Emulation::Vt),
                 },
+                SavedTab {
+                    // The top of the standard list, an FT232H at full speed.
+                    port: PortId::new("/dev/cu.usbserial-FT232H"),
+                    serial: SerialConfig {
+                        baud: 12_000_000,
+                        ..SerialConfig::default()
+                    },
+                    codec: None,
+                    mode: SavedMode::Command,
+                    emulation: Some(Emulation::Monitor),
+                },
             ],
             docks: Some(SavedDocks {
                 left_width: 312.,
@@ -219,6 +230,7 @@ mod tests {
         assert!(text.contains(r#""emulation": "vt""#), "{text}");
         assert!(text.contains(r#""emulation": "monitor""#), "{text}");
         assert!(text.contains(r#""left_width": 312.0"#), "{text}");
+        assert!(text.contains(r#""baud": 12000000"#), "{text}");
         assert!(!dir.join("state.json.tmp").exists());
     }
 

@@ -566,6 +566,13 @@ mod tests {
         assert_eq!(request.port, Some(PortId::new("virtual:at")));
         assert_eq!(request.serial.baud, 9600);
 
+        // The top of the standard list, an FT232H at full speed.
+        let options: Table = lua
+            .load(r#"return { port = "/dev/cu.usbserial-FT232H", baud = 12000000 }"#)
+            .eval()
+            .unwrap();
+        assert_eq!(open_request(&options).unwrap().serial.baud, 12_000_000);
+
         let options: Table = lua
             .load(r#"return { match = { product = "Airoha", vid = "0x0e8d", pid = 3 } }"#)
             .eval()
