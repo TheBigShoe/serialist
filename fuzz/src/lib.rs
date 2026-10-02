@@ -20,6 +20,7 @@
 
 pub mod ansi_monitor;
 pub mod codec;
+pub mod race_lua;
 pub mod race_rust;
 pub mod text_lines;
 
