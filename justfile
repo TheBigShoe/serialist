@@ -46,7 +46,11 @@ ci: fmt-check lint test
 # Fuzzing. fuzz/ is a cargo-fuzz crate outside the workspace, with its own Cargo.lock (see
 # fuzz/Cargo.toml for why): cargo-fuzz builds it with nightly, so `cargo test --workspace`
 # and `just ci` never see it. These mirror the `fuzz` job in .github/workflows/ci.yml.
-# `--no-cfg-fuzzing`: nusb 0.2 has `cfg(fuzzing)` code that does not compile.
+# `--no-cfg-fuzzing`: nusb 0.2 has `cfg(fuzzing)` code that does not compile. New inputs
+# go to fuzz/corpus/<target> (not committed) and crashes to fuzz/artifacts/<target>; copy
+# a crash into fuzz/seeds/<target>/ once fixed so `just fuzz-check` replays it from then
+# on. fuzz/dicts/<target>.dict, when it exists, is passed as the libFuzzer dictionary.
+# Running a target needs `cargo install cargo-fuzz --locked`, and `just fuzz` nightly too.
 fuzz_flags := "--fuzz-dir fuzz --no-cfg-fuzzing"
 fuzz_limits := "-rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10"
 
@@ -56,23 +60,39 @@ fuzz-check:
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
     cargo test --manifest-path fuzz/Cargo.toml --locked
 
-# Fuzz one target for `secs` seconds; `just fuzz-list` names them. New inputs go to
-# fuzz/corpus/<target> (not committed), crashes to fuzz/artifacts/<target>. Copy a crash
-# into fuzz/seeds/<target>/ once fixed so `just fuzz-check` replays it from then on.
-# Needs `rustup toolchain install nightly` and `cargo install cargo-fuzz --locked`.
-fuzz target secs="60":
-    mkdir -p fuzz/corpus/{{target}}
-    cargo +nightly fuzz run {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}}
+# Fuzz one target for `secs` seconds with nightly and AddressSanitizer, as CI does.
+fuzz target secs="60": (_fuzz-run "+nightly" "address" target secs)
 
-# The same run without nightly: the pinned stable toolchain with coverage guidance but no
-# AddressSanitizer. Good for a quick local look; CI fuzzes with nightly and ASan.
-fuzz-stable target secs="60":
+# Fuzz one target on the pinned stable toolchain: coverage-guided, but no AddressSanitizer.
+fuzz-stable target secs="60": (_fuzz-run "" "none" target secs)
+
+[private]
+_fuzz-run toolchain sanitizer target secs:
     mkdir -p fuzz/corpus/{{target}}
-    cargo fuzz run --sanitizer none {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}}
+    cargo {{toolchain}} fuzz run --sanitizer {{sanitizer}} {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}} $(test -f fuzz/dicts/{{target}}.dict && echo -dict=fuzz/dicts/{{target}}.dict)
 
 # List the fuzz targets.
 fuzz-list:
     cargo fuzz list --fuzz-dir fuzz
+
+# Everything but serialist-core, for its coverage floor.
+not_core := "crates/serialist-(sim|script|plugins|plugin-sdk|ui|vt)/|crates/serialist/|examples/"
+
+# The store gate is skipped: its timing budget is for uninstrumented builds. Needs `cargo
+# install cargo-llvm-cov --locked` and `rustup component add llvm-tools-preview`. For a
+# browsable report afterwards: `cargo llvm-cov report --html --open`.
+# Line coverage held to the CI floors: 87% of the workspace, 90% of serialist-core.
+coverage:
+    cargo llvm-cov --workspace --locked --no-report -- --skip one_million_lines_gate
+    cargo llvm-cov report --summary-only --fail-under-lines 87
+    cargo llvm-cov report --summary-only --fail-under-lines 90 --ignore-filename-regex '{{not_core}}'
+
+# `--bench '*'` picks the [[bench]] targets only: a library's libtest harness rejects
+# criterion's flags. `--quick` proves they build and run; for real numbers pass other
+# criterion arguments, such as a filter: `just bench parse`.
+# Every criterion bench, as the CI bench job runs them.
+bench *args="--quick":
+    cargo bench --workspace --locked --bench '*' -- {{args}}
 
 # Render the real workspace offscreen with Metal in nineteen states (macOS only) and write
 # PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
