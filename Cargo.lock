@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "airoha-race-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serialist-plugin-sdk",
 ]
@@ -4197,7 +4197,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "lines-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serialist-plugin-sdk",
 ]
@@ -6974,7 +6974,7 @@ dependencies = [
 
 [[package]]
 name = "serialist"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serialist-core",
@@ -6987,7 +6987,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -7013,7 +7013,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-plugin-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dlmalloc",
  "wit-bindgen 0.62.0",
@@ -7021,7 +7021,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-plugins"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -7042,7 +7042,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-script"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "mlua",
@@ -7056,7 +7056,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "crossbeam-channel",
@@ -7070,7 +7070,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "chrono",
@@ -7091,7 +7091,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-vt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "criterion",
