@@ -39,7 +39,9 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [features]
-# The WebAssembly codec tier (wasmtime): `cargo +nightly fuzz build --features wasm`.
+# The WebAssembly codec tier (wasmtime), which the race_wasm target needs:
+# `cargo +nightly fuzz build --features wasm`. CI passes it on every build and run, and
+# `just fuzz` for that target.
 wasm = ["serialist-plugins/wasm"]
 
 [dependencies]
@@ -80,3 +82,14 @@ path = "fuzz_targets/text_lines.rs"
 test = false
 doc = false
 bench = false
+
+# Needs the `wasm` feature (wasmtime): `cargo fuzz run --features wasm race_wasm`. Without
+# it cargo skips the target, so a plain `cargo build` or `cargo test` never compiles
+# wasmtime.
+[[bin]]
+name = "race_wasm"
+path = "fuzz_targets/race_wasm.rs"
+test = false
+doc = false
+bench = false
+required-features = ["wasm"]
