@@ -277,17 +277,22 @@ jobs:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
-  # Line coverage with cargo-llvm-cov, failing below two floors: 87% for the workspace and
-  # 90% for serialist-core (the plan's proposal). Measured on macOS at 8f77082: 90.5% and
-  # 94.2%; Linux runs different platform code, hence the margin. Only Linux: the floors
-  # guard the trend, and one instrumented GPUI build is enough. The lcov report is kept as
-  # an artifact for local viewers and review tools. `just coverage` runs the same steps.
+  # Line coverage with cargo-llvm-cov, held to a floor for each crate and for the workspace
+  # (.github/scripts/coverage_floors.py: the floors, and the measurements they came from).
+  # The tests run once, all of them: where one holds a wall-clock threshold it knows when
+  # it is under coverage (`--cfg coverage`) and skips that threshold, not its memory and
+  # correctness checks. Only Linux: the floors guard the trend, and one instrumented GPUI
+  # build is enough. The lcov file and the JSON summary are kept as an artifact for local
+  # viewers and review tools. `just coverage` runs the same steps.
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # Every crate but serialist-core, for the core floor.
-      NOT_CORE: crates/serialist-(sim|script|plugins|plugin-sdk|ui|vt)/|crates/serialist/|examples/
+      # Code no hardware-free native test can run, left out of every report below: the
+      # binary's entry point (it installs the global log subscriber, exits the process and
+      # starts the GPUI event loop). Not for code that is merely untested. One regex; the
+      # justfile has the same string as `coverage_ignore`, so change both together.
+      COVERAGE_IGNORE: crates/serialist/src/main\.rs
     steps:
       - uses: actions/checkout@v7
 
@@ -317,26 +322,34 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      # The store gate's timing budget is for uninstrumented builds and has failed under
-      # coverage on a loaded machine (11.8 s against 10 s). The test job runs it in full.
+      # Nothing is skipped by name: the store gate, the VT firehose, the terminal frame cost
+      # and the other wall-clock tests check their time and rate thresholds only where
+      # wall-clock timing holds, which a coverage build never does (they test `cfg!(coverage)`;
+      # cargo-llvm-cov sets it). Their memory and correctness checks run as usual.
       - name: Tests under coverage
-        run: cargo llvm-cov --workspace --locked --no-report --no-fail-fast -- --skip one_million_lines_gate
+        run: cargo llvm-cov --workspace --locked --no-report --no-fail-fast
 
-      - name: Coverage floor, workspace (lines)
-        run: cargo llvm-cov report --summary-only --fail-under-lines 87
-
-      - name: Coverage floor, serialist-core (lines)
-        run: cargo llvm-cov report --summary-only --fail-under-lines 90 --ignore-filename-regex "$NOT_CORE"
+      # One run of the tests, two reports from it. Both leave out COVERAGE_IGNORE.
+      - name: Coverage summary (JSON)
+        if: ${{ !cancelled() }}
+        run: cargo llvm-cov report --json --summary-only --output-path coverage-summary.json --ignore-filename-regex "$COVERAGE_IGNORE"
 
       - name: lcov report
         if: ${{ !cancelled() }}
-        run: cargo llvm-cov report --lcov --output-path lcov.info
+        run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"
+
+      # Fails when the workspace or a crate is under its floor; the table is in the log and
+      # the job summary.
+      - name: Coverage floors (lines)
+        run: python3 .github/scripts/coverage_floors.py coverage-summary.json
 
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
-          name: coverage-lcov
-          path: lcov.info
+          name: coverage
+          path: |
+            lcov.info
+            coverage-summary.json
           if-no-files-found: ignore
           retention-days: 14
 
