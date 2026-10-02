@@ -35,9 +35,12 @@
 //! appear in a Windows file name at all and is rare elsewhere.
 //!
 //! Neither kind of id is discovered by a [`PortSource`](crate::port::PortSource), so they
-//! do not appear in the Devices panel. They open from `--port`, `serial.open{ port = … }`
-//! in a script, a restored tab, and the UI's own "Connect to TCP…" and "Open capture…"
-//! actions, all through the same [`RoutingTransportFactory`](crate::RoutingTransportFactory).
+//! do not appear in the Devices panel. They open from `--port` (with or without
+//! `--script`), `serial.open{ port = … }` in a headless `--script` run, a restored tab, and
+//! the UI's own "Connect to TCP…" and "Open capture…" actions, all through the same
+//! [`RoutingTransportFactory`](crate::RoutingTransportFactory). (Scripts in the app reach a
+//! TCP or replay tab through `serial.current()`; the app gives scripts no `serial.open` for
+//! any kind of port.)
 //! A device profile still applies to them: its `match.path` is a prefix of the id, so
 //! `{ "match": { "path": "tcp:10.0.0.5:4000" }, "plugin": "airoha-race" }` gives that
 //! endpoint a codec, and `"path": "replay:"` matches every replay.
