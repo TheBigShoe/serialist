@@ -75,6 +75,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "race_lua"
+path = "fuzz_targets/race_lua.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "text_lines"
 path = "fuzz_targets/text_lines.rs"
 test = false
