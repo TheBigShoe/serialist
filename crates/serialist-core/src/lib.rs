@@ -20,6 +20,7 @@ pub mod ingest;
 pub mod keymap;
 pub mod matcher;
 pub mod port;
+pub mod replay;
 pub mod serial;
 pub mod session;
 pub mod settings;
@@ -66,6 +67,7 @@ pub use ingest::{
 pub use keymap::{ActionRef, KeyBinding, Keymap, KeymapError, load_keymap};
 pub use matcher::{ExpectResult, Expectation, MatcherHandle};
 pub use port::{PortEvent, PortId, PortInfo, PortKind, PortSource, UsbInfo};
+pub use replay::{REPLAY_NOT_BUILT, ReplayOptions, ReplayTransportFactory};
 pub use serial::SerialportFactory;
 pub use session::{Session, SessionClosed, SessionConfig, SessionEvent, SessionStats};
 pub use settings::EditError as SettingsEditError;
