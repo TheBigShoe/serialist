@@ -80,3 +80,10 @@ path = "fuzz_targets/text_lines.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lua_values"
+path = "fuzz_targets/lua_values.rs"
+test = false
+doc = false
+bench = false
