@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use crate::address::{ReplayEnd, ReplaySpeed};
 use crate::config::SerialConfig;
 use crate::port::PortInfo;
+use crate::replay::ReplayOptions;
 
 use super::de::{baud_rate, font_size, font_weight, opt_font_size, opt_font_weight, row_bytes};
 use super::defaults as d;
@@ -166,6 +168,41 @@ pub struct TerminalSettings {
     pub cursor_blink: bool,
 }
 
+/// The `replay` object: how captures play back when their `replay:` id does not say.
+///
+/// A `replay:<file>?speed=…&end=…` id's own options win over these; a replay already open
+/// keeps the options it opened with, so a change reaches only the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReplaySettings {
+    /// `"1x"` plays at the recorded pace, `"4x"` four times faster, `"max"` as fast as
+    /// the session reads; a bare number is a factor too. A capture without a `.timing`
+    /// file plays at the port's baud rate times this. Default `"1x"`.
+    #[serde(default = "d::replay_speed")]
+    pub speed: ReplaySpeed,
+    /// What happens after the last byte: `"disconnect"` ends the session, `"hold"` keeps
+    /// it open. Default `"disconnect"`.
+    #[serde(default = "d::replay_end")]
+    pub end: ReplayEnd,
+}
+
+impl Default for ReplaySettings {
+    /// The bundled defaults.
+    fn default() -> Self {
+        d::replay()
+    }
+}
+
+impl ReplaySettings {
+    /// What the replay factory takes as its defaults
+    /// ([`ReplayTransportFactory::set_defaults`](crate::ReplayTransportFactory::set_defaults)).
+    pub fn options(&self) -> ReplayOptions {
+        ReplayOptions {
+            speed: self.speed,
+            end: self.end,
+        }
+    }
+}
+
 /// Whether a `theme` object follows the system appearance or pins one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -319,6 +356,9 @@ pub struct Settings {
     /// Reopen the tabs open at the last quit (kept in `state.json`). Default true.
     #[serde(default = "d::restore_session")]
     pub restore_session: bool,
+    /// How `replay:` ports play a capture when the id has no `?speed=` or `?end=`.
+    #[serde(default = "d::replay")]
+    pub replay: ReplaySettings,
 
     /// Inline interactive mode: the Backspace byte, the escape chord and paste pacing.
     #[serde(default = "d::inline")]

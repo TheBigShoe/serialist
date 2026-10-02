@@ -44,8 +44,8 @@ pub use paths::{
 };
 pub use profile::{DeviceMatch, DeviceProfile, UsbId};
 pub use types::{
-    DisplaySettings, DisplayView, Emulation, LineEnding, Settings, TerminalSettings, ThemeMode,
-    ThemeSelection, TimestampMode,
+    DisplaySettings, DisplayView, Emulation, LineEnding, ReplaySettings, Settings,
+    TerminalSettings, ThemeMode, ThemeSelection, TimestampMode,
 };
 
 /// The nearest `.serialist/settings.json` in `cwd` or an ancestor.

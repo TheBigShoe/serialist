@@ -68,6 +68,7 @@ fn open(
         select_port: None,
         open_ports: ports.iter().map(|port| PortId::new(*port)).collect(),
         store: None,
+        replay: None,
     };
     open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))
 }

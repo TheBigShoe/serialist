@@ -75,6 +75,7 @@ fn open(cx: &mut TestAppContext, dir: &TestDir, watch: bool) -> Opened {
         select_port: None,
         open_ports: vec![PortId::new("virtual:race")],
         store: None,
+        replay: None,
     };
     let paths = ConfigPaths::new(dir.path());
     let (window, workspace) = open_test_window(cx, move |window, cx| {

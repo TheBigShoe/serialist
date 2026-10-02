@@ -662,6 +662,7 @@ impl Stage {
             select_port: shot.connect.map(PortId::new),
             open_ports: shot.connect.map(PortId::new).into_iter().collect(),
             store: None,
+            replay: None,
         };
         let (width, height) = shot.size;
         let (window, workspace) = cx
