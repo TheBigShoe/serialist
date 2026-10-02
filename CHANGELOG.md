@@ -10,6 +10,7 @@ publishes the version's section as the draft release's notes.
 
 ## [Unreleased]
 
+- Fixed: a `buffer_font_size`, `ui_font_size`, terminal `font_size` or line height too large or small for a 32-bit float (such as `1e300`) loaded as infinity or zero; it is now rejected with its position, like other bad values. Found by the new `config_jsonc` fuzz target.
 - Added: the Fadetouched theme family by Arishawke (MIT, https://github.com/Arishawke/fadetouched-theme) is bundled: Fadetouched and Fadetouched Blur, dark teal-green (Serialist does not blur windows, so Fadetouched Blur differs from Fadetouched only in its translucent surface colors over an opaque window), picked in Settings' Appearance section or by name in `theme`. Its copyright and license text are in the new `THIRD_PARTY_LICENSES.md`, which the macOS, Linux and Windows packages now include.
 - Added: four more bundled themes, picked in Settings' Appearance section or by name in `theme`: Serialist Ember (warm charcoal, amber accent), Serialist Phosphor (green CRT), Serialist Paper (warm off-white, teal accent) and Serialist Contrast (pure black, every text color it sets at 7:1 or more, for bright labs and projectors).
 - Fixed: adding, removing or dragging a device profile in Settings rewrote the whole `devices` array in `settings.json` and dropped the comments in it; each now changes that profile only, and a dragged profile takes the comments written with it.
