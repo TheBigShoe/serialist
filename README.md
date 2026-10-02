@@ -30,7 +30,7 @@ The Airoha RACE example plugin, installed, decoding a simulated board: the log i
 <td width="50%" valign="top"><img src="docs/screenshots/vt-mode-boot-menu.png" alt="VT mode showing a simulated U-Boot style boot menu with three entries, the second highlighted, and the toolbar's VT button lit" width="100%"><br><sub><b>VT mode</b> draws what a device paints with cursor addressing, here a U-Boot style boot menu (the <code>menu</code> simulated device).</sub></td>
 </tr>
 <tr>
-<td width="50%" valign="top"><img src="docs/screenshots/theme-phosphor-ansi.png" alt="The Serialist Phosphor theme, a green-on-black CRT look, showing an ANSI-coloured log with a few lines selected" width="100%"><br><sub><b>Serialist Phosphor</b>, one of six bundled themes, on a log full of ANSI colours.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/theme-phosphor-ansi.png" alt="The Serialist Phosphor theme, a green-on-black CRT look, showing an ANSI-coloured log with a few lines selected" width="100%"><br><sub><b>Serialist Phosphor</b>, one of the bundled themes, on a log full of ANSI colours.</sub></td>
 <td width="50%" valign="top"><img src="docs/screenshots/theme-paper-ansi.png" alt="The Serialist Paper theme, warm off-white with a teal accent, showing the same ANSI-coloured log" width="100%"><br><sub><b>Serialist Paper</b>, a light theme. Zed theme files load unchanged.</sub></td>
 </tr>
 </table>
