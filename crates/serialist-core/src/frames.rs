@@ -40,8 +40,16 @@
 //! # Bounds
 //!
 //! The store keeps the newest [`FrameStoreConfig::capacity`] frames (default
-//! [`DEFAULT_FRAME_CAPACITY`], 100 000), like the scrollback's ring: older frames are
-//! evicted, a block at a time once every frame in it is past the window. [`FrameId`]s
+//! [`DEFAULT_FRAME_CAPACITY`], 100 000) within a byte budget
+//! ([`FrameStoreConfig::budget`], default [`DEFAULT_FRAME_BUDGET`], 64 MiB), like the
+//! scrollback store: older frames are evicted a block at a time, once every frame in the
+//! block is past the count window or while the blocks together exceed the budget. A
+//! frame's size is what it holds (its summary, its field names and values, a block's
+//! slot), so a codec that emits large frames keeps fewer of them, and the store's memory
+//! stays near the budget whatever a plugin returns. A block closes early once it holds
+//! [`BLOCK_BYTES`] of frames, so eviction by bytes moves in steps of about that size;
+//! the newest block is never evicted, so one frame larger than the budget is kept until
+//! the next frame arrives. [`FrameStats::memory`] reports the bytes held. [`FrameId`]s
 //! increase by one per frame and are never reused, so an id below
 //! [`FrameSnapshot::first`] names an evicted frame.
 //!
@@ -70,15 +78,27 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use parking_lot::Mutex;
+use smol_str::SmolStr;
 
-use crate::codec::{Codec, CodecFactory, Frame, Severity};
+use crate::codec::{Codec, CodecFactory, Frame, Severity, Value};
 use crate::ingest::ChunkSink;
 
 /// Frames a store keeps by default.
 pub const DEFAULT_FRAME_CAPACITY: usize = 100_000;
 
+/// Bytes of frames a store keeps by default: 64 MiB, room for the default capacity of
+/// ordinary frames (a few hundred bytes each) and a bound for any other kind.
+pub const DEFAULT_FRAME_BUDGET: usize = 64 << 20;
+
 /// Frames per block: the unit of allocation and eviction.
 const BLOCK: u64 = 512;
+
+/// Bytes of frames at which a block closes before it has [`BLOCK`] of them, so that the
+/// budget evicts in steps of about this size. Also the least budget a store accepts.
+pub const BLOCK_BYTES: usize = 1 << 20;
+
+/// What a block's slots cost before any frame is in them.
+const BLOCK_OVERHEAD: usize = BLOCK as usize * std::mem::size_of::<OnceLock<Frame>>();
 
 /// Identity of a frame in one store. Increases by one per frame and is never reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -96,12 +116,17 @@ impl FrameId {
 pub struct FrameStoreConfig {
     /// Frames kept before the oldest are evicted. At least one.
     pub capacity: usize,
+    /// Bytes of frames kept before the oldest are evicted, counting what each frame
+    /// holds and the slots of the blocks they sit in. Values below [`BLOCK_BYTES`] are
+    /// raised to it.
+    pub budget: usize,
 }
 
 impl Default for FrameStoreConfig {
     fn default() -> Self {
         Self {
             capacity: DEFAULT_FRAME_CAPACITY,
+            budget: DEFAULT_FRAME_BUDGET,
         }
     }
 }
@@ -114,6 +139,9 @@ pub struct FrameStats {
     /// One past the newest frame; also how many were ever stored.
     pub end: FrameId,
     pub capacity: usize,
+    /// Bytes the retained blocks hold: their slots and what their frames own.
+    pub memory: usize,
+    pub budget: usize,
 }
 
 impl FrameStats {
@@ -123,27 +151,56 @@ impl FrameStats {
     }
 }
 
-/// Write-once slots for `BLOCK` consecutive frames.
+/// Write-once slots for up to `BLOCK` consecutive frames, the first with id `first`.
 struct Block {
+    first: u64,
     slots: Box<[OnceLock<Frame>]>,
 }
 
 impl Block {
-    fn new() -> Arc<Self> {
+    fn new(first: u64) -> Arc<Self> {
         Arc::new(Self {
+            first,
             slots: (0..BLOCK).map(|_| OnceLock::new()).collect(),
         })
     }
+}
+
+/// Bytes a frame owns beyond its slot: its summary, its field names and values.
+fn frame_heap_bytes(frame: &Frame) -> usize {
+    fn name(s: &SmolStr) -> usize {
+        if s.is_heap_allocated() { s.len() } else { 0 }
+    }
+    fn value(v: &Value) -> usize {
+        match v {
+            Value::Str(s) => s.capacity(),
+            Value::Bytes(b) => b.capacity(),
+            Value::List(items) => {
+                items.capacity() * std::mem::size_of::<Value>()
+                    + items.iter().map(value).sum::<usize>()
+            }
+            Value::Bool(_) | Value::Int(_) | Value::UInt(_) | Value::Float(_) => 0,
+        }
+    }
+    name(&frame.kind)
+        + frame.summary.capacity()
+        + frame.fields.capacity() * std::mem::size_of::<(SmolStr, Value)>()
+        + frame
+            .fields
+            .iter()
+            .map(|(n, v)| name(n) + value(v))
+            .sum::<usize>()
 }
 
 /// An immutable view shared by snapshots.
 struct Published {
     first: u64,
     end: u64,
-    /// Index (id / BLOCK) of `blocks[0]`.
-    first_block: u64,
+    /// In id order; a block's `first` says which ids it holds.
     blocks: Arc<[Arc<Block>]>,
     capacity: usize,
+    memory: usize,
+    budget: usize,
 }
 
 impl Published {
@@ -152,7 +209,23 @@ impl Published {
             first: FrameId(self.first),
             end: FrameId(self.end),
             capacity: self.capacity,
+            memory: self.memory,
+            budget: self.budget,
         }
+    }
+
+    /// The frame `id`, if it is retained.
+    fn get(&self, id: u64) -> Option<&Frame> {
+        if id < self.first || id >= self.end {
+            return None;
+        }
+        // The last block that starts at or before `id`.
+        let i = self
+            .blocks
+            .partition_point(|b| b.first <= id)
+            .checked_sub(1)?;
+        let block = &self.blocks[i];
+        block.slots.get((id - block.first) as usize)?.get()
     }
 }
 
@@ -164,9 +237,15 @@ struct Shared {
 /// The writer side: owned by the thread that decodes. See the module docs.
 pub struct FrameStore {
     capacity: usize,
+    budget: usize,
     shared: Arc<Shared>,
     blocks: VecDeque<Arc<Block>>,
-    first_block: u64,
+    /// Bytes each block holds, in step with `blocks`.
+    block_bytes: VecDeque<usize>,
+    /// Frames in the newest block.
+    block_len: usize,
+    /// Bytes all blocks hold.
+    memory: usize,
     first: u64,
     end: u64,
     /// The published block directory, rebuilt only when a block comes or goes.
@@ -184,6 +263,8 @@ impl fmt::Debug for FrameStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FrameStore")
             .field("capacity", &self.capacity)
+            .field("budget", &self.budget)
+            .field("memory", &self.memory)
             .field("first", &self.first)
             .field("end", &self.end)
             .finish_non_exhaustive()
@@ -193,21 +274,26 @@ impl fmt::Debug for FrameStore {
 impl FrameStore {
     pub fn new(config: FrameStoreConfig) -> Self {
         let capacity = config.capacity.max(1);
+        let budget = config.budget.max(BLOCK_BYTES);
         let dir: Arc<[Arc<Block>]> = Arc::new([]);
         Self {
             capacity,
+            budget,
             shared: Arc::new(Shared {
                 current: Mutex::new(Arc::new(Published {
                     first: 0,
                     end: 0,
-                    first_block: 0,
                     blocks: Arc::clone(&dir),
                     capacity,
+                    memory: 0,
+                    budget,
                 })),
                 dirty: AtomicBool::new(false),
             }),
             blocks: VecDeque::new(),
-            first_block: 0,
+            block_bytes: VecDeque::new(),
+            block_len: 0,
+            memory: 0,
             first: 0,
             end: 0,
             dir,
@@ -215,9 +301,17 @@ impl FrameStore {
         }
     }
 
-    /// A store keeping at most `capacity` frames.
+    /// A store keeping at most `capacity` frames within the default budget.
     pub fn with_capacity(capacity: usize) -> Self {
-        Self::new(FrameStoreConfig { capacity })
+        Self::new(FrameStoreConfig {
+            capacity,
+            ..FrameStoreConfig::default()
+        })
+    }
+
+    /// Bytes the blocks hold now, published or not.
+    pub fn memory(&self) -> usize {
+        self.memory
     }
 
     pub fn reader(&self) -> FrameStoreReader {
@@ -257,22 +351,58 @@ impl FrameStore {
 
     fn append(&mut self, frame: Frame) -> FrameId {
         let id = self.end;
-        let slot = (id % BLOCK) as usize;
-        if slot == 0 {
-            self.blocks.push_back(Block::new());
+        let bytes = frame_heap_bytes(&frame);
+        // A new block when there is none, the newest is full, or the frame would take
+        // it past BLOCK_BYTES (a block always takes its first frame, whatever its size).
+        let open = self.block_len > 0
+            && self.block_len < BLOCK as usize
+            && self
+                .block_bytes
+                .back()
+                .is_some_and(|b| b + bytes <= BLOCK_BYTES);
+        if !open {
+            self.blocks.push_back(Block::new(id));
+            self.block_bytes.push_back(BLOCK_OVERHEAD);
+            self.block_len = 0;
+            self.memory += BLOCK_OVERHEAD;
             self.dir_dirty = true;
         }
         let block = self.blocks.back().expect("a block for the new frame");
         // A fresh slot: `end` only moves forward, so no slot is set twice.
-        let _ = block.slots[slot].set(frame);
+        let _ = block.slots[self.block_len].set(frame);
+        self.block_len += 1;
+        *self.block_bytes.back_mut().expect("the new frame's block") += bytes;
+        self.memory += bytes;
         self.end += 1;
-        self.first = self.end.saturating_sub(self.capacity as u64);
-        while (self.first_block + 1) * BLOCK <= self.first {
-            self.blocks.pop_front();
-            self.first_block += 1;
-            self.dir_dirty = true;
+        self.first = self
+            .first
+            .max(self.end.saturating_sub(self.capacity as u64));
+        // Over budget: the oldest blocks go, all but the newest.
+        while self.memory > self.budget && self.blocks.len() > 1 {
+            self.evict_oldest_block();
+        }
+        // Blocks whose every frame is past the count window go too.
+        while self.blocks.len() > 1 && self.blocks[1].first <= self.first {
+            self.evict_oldest_block();
         }
         FrameId(id)
+    }
+
+    /// Drop the oldest block, moving `first` past it. Never the last block.
+    fn evict_oldest_block(&mut self) {
+        debug_assert!(self.blocks.len() > 1);
+        self.blocks.pop_front();
+        let bytes = self
+            .block_bytes
+            .pop_front()
+            .expect("the evicted block's bytes");
+        self.memory -= bytes;
+        let next = self
+            .blocks
+            .front()
+            .expect("the block after the evicted one");
+        self.first = self.first.max(next.first);
+        self.dir_dirty = true;
     }
 
     fn publish(&mut self) {
@@ -283,9 +413,10 @@ impl FrameStore {
         let published = Arc::new(Published {
             first: self.first,
             end: self.end,
-            first_block: self.first_block,
             blocks: Arc::clone(&self.dir),
             capacity: self.capacity,
+            memory: self.memory,
+            budget: self.budget,
         });
         *self.shared.current.lock() = published;
     }
@@ -371,12 +502,7 @@ impl FrameSnapshot {
 
     /// The frame `id`, if it is retained.
     pub fn get(&self, id: FrameId) -> Option<&Frame> {
-        let p = &*self.p;
-        if id.0 < p.first || id.0 >= p.end {
-            return None;
-        }
-        let block = p.blocks.get((id.0 / BLOCK - p.first_block) as usize)?;
-        block.slots[(id.0 % BLOCK) as usize].get()
+        self.p.get(id.0)
     }
 
     /// The retained frames in `range`, in order, with their ids.
@@ -655,6 +781,144 @@ mod tests {
         // An old snapshot still reads what it saw.
         assert_eq!(held.get(FrameId(0)).unwrap().raw, 0..1);
         assert_eq!(held.count(), 600);
+    }
+
+    /// A frame of `n` carrying `bytes` of payload.
+    fn heavy(n: u64, bytes: usize) -> Frame {
+        frame(n).with_field("payload", Value::Bytes(vec![0xAA; bytes]))
+    }
+
+    /// Every retained id reads back as the frame pushed under it.
+    fn check_readable(snap: &FrameSnapshot) {
+        for (id, frame) in snap.frames() {
+            assert_eq!(frame.field("n").and_then(|v| v.as_u64()), Some(id.0));
+        }
+        assert_eq!(snap.frames().count(), snap.count());
+        assert!(snap.get(FrameId(snap.first().0.wrapping_sub(1))).is_none());
+        assert!(snap.get(snap.end()).is_none());
+    }
+
+    #[test]
+    fn the_budget_evicts_the_oldest_frames_by_bytes() {
+        let budget = 4 * BLOCK_BYTES;
+        let mut store = FrameStore::new(FrameStoreConfig {
+            capacity: 100_000,
+            budget,
+        });
+        let reader = store.reader();
+        // 2000 frames of 10 KiB: 20 MiB, five times the budget.
+        let held = {
+            store.extend((0..100).map(|n| heavy(n, 10 << 10)));
+            reader.snapshot()
+        };
+        store.extend((100..2000).map(|n| heavy(n, 10 << 10)));
+        let snap = reader.snapshot();
+        let stats = snap.stats();
+        assert_eq!(stats.budget, budget);
+        assert!(
+            stats.memory <= budget,
+            "{} bytes held against a budget of {budget}",
+            stats.memory
+        );
+        assert_eq!(stats.memory, store.memory());
+        // Near the budget, not far under it: at most one block's worth of slack.
+        assert!(stats.memory > budget - BLOCK_BYTES - BLOCK_OVERHEAD);
+        assert_eq!(snap.end(), FrameId(2000));
+        assert!(snap.first() > FrameId(1500), "{:?}", snap.first());
+        assert!(snap.count() < 400);
+        check_readable(&snap);
+        // An old snapshot still reads what it saw, evicted or not.
+        assert_eq!(held.count(), 100);
+        check_readable(&held);
+        assert!(store.blocks.len() <= 5, "{} blocks", store.blocks.len());
+    }
+
+    #[test]
+    fn a_block_closes_early_under_heavy_frames_and_lookups_still_work() {
+        let mut store = FrameStore::default();
+        let reader = store.reader();
+        // 300 KiB frames: three to a block, not 512. Then small ones fill blocks again.
+        store.extend((0..10).map(|n| heavy(n, 300 << 10)));
+        assert_eq!(store.blocks.len(), 4, "three heavy frames per block");
+        store.extend((10..1000).map(frame));
+        assert!(store.blocks.len() <= 4 + 2, "{} blocks", store.blocks.len());
+        let snap = reader.snapshot();
+        assert_eq!((snap.first(), snap.end()), (FrameId(0), FrameId(1000)));
+        check_readable(&snap);
+        assert_eq!(snap.get(FrameId(9)).unwrap().raw, 9..10);
+        assert_eq!(snap.get(FrameId(10)).unwrap().raw, 10..11);
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_budget_is_kept_until_the_next_arrives() {
+        let mut store = FrameStore::new(FrameStoreConfig {
+            capacity: 100_000,
+            budget: 0, // raised to BLOCK_BYTES
+        });
+        let reader = store.reader();
+        store.extend((0..3).map(frame));
+        store.push(heavy(3, 3 * BLOCK_BYTES));
+        let snap = reader.snapshot();
+        assert_eq!((snap.first(), snap.end()), (FrameId(3), FrameId(4)));
+        assert!(snap.stats().memory > 3 * BLOCK_BYTES);
+        check_readable(&snap);
+        store.push(frame(4));
+        let snap = reader.snapshot();
+        assert_eq!((snap.first(), snap.end()), (FrameId(4), FrameId(5)));
+        assert!(snap.stats().memory <= BLOCK_BYTES);
+        check_readable(&snap);
+    }
+
+    #[test]
+    fn random_frame_sizes_keep_memory_within_the_budget_and_ids_consistent() {
+        // A small xorshift so the test needs no dependency and replays the same way.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..6 {
+            let capacity = [1, 7, 100, 1000, 100_000, 600][round];
+            let budget = [
+                0,
+                BLOCK_BYTES,
+                3 * BLOCK_BYTES,
+                8 * BLOCK_BYTES,
+                BLOCK_BYTES,
+                2 * BLOCK_BYTES,
+            ][round];
+            let mut store = FrameStore::new(FrameStoreConfig { capacity, budget });
+            let reader = store.reader();
+            let mut largest = 0;
+            let mut last_end = 0;
+            for n in 0..3000u64 {
+                let bytes = match next() % 10 {
+                    0 => (next() % (2 << 20)) as usize, // up to 2 MiB
+                    1..=3 => (next() % (64 << 10)) as usize,
+                    _ => (next() % 256) as usize,
+                };
+                largest = largest.max(bytes);
+                store.push(heavy(n, bytes));
+                if next() % 50 == 0 {
+                    let snap = reader.snapshot();
+                    let stats = snap.stats();
+                    assert_eq!(stats.end, FrameId(n + 1));
+                    assert!(stats.end.0 >= last_end);
+                    last_end = stats.end.0;
+                    assert!(snap.count() <= capacity, "{} > {capacity}", snap.count());
+                    let slack = BLOCK_BYTES + BLOCK_OVERHEAD + largest;
+                    assert!(
+                        stats.memory <= stats.budget + slack,
+                        "round {round}: {} bytes held, budget {}, slack {slack}",
+                        stats.memory,
+                        stats.budget
+                    );
+                    check_readable(&snap);
+                }
+            }
+        }
     }
 
     #[test]

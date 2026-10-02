@@ -10,6 +10,7 @@ publishes the version's section as the draft release's notes.
 
 ## [Unreleased]
 
+- Fixed: the Decoded panel's frame store kept its newest 100 000 frames whatever their size, so a plugin returning large frames (a payload field of a few hundred kilobytes, say) could hold gigabytes before the oldest was dropped. The store now has a byte budget too (`FrameStoreConfig::budget`, 64 MiB by default), counting what each frame holds, and evicts the oldest frames while it is over, the way the scrollback store does; `FrameStats::memory` reports the bytes held. Blocks of frames close early at 1 MiB, so eviction moves in steps of about that size, and a single frame larger than the budget stays until the next frame arrives.
 - Fixed: in VT mode, a device sending combining marks without end grew one screen cell without bound, since a mark takes no cell of its own and Alacritty keeps every one; `CSI 65535 b` (repeat the last character that many times) made eleven bytes add 65535 of them, and every snapshot of the row copied them all. A cell now keeps at most 30 zero-width characters (`serialist_vt::MAX_ZERO_WIDTH`, the Unicode Stream-Safe Text Format's limit, which no conforming text exceeds) and drops the rest. Found by the `vt_screen` fuzz target's nightly run.
 
 ## [0.2.0] - 2026-10-02
