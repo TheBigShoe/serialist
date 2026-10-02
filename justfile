@@ -55,7 +55,12 @@ ci: fmt-check lint test
 # `fuzz` and `fuzz-stable` add for that target only. cargo-fuzz rebuilds when the features
 # change, so the next target after it builds without wasmtime again.
 fuzz_flags := "--fuzz-dir fuzz --no-cfg-fuzzing"
-fuzz_limits := "-rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10"
+# libFuzzer's bounds, the same as CI's. The RSS limit is process-wide: it counts
+# AddressSanitizer's quarantine and the allocator's high-water mark, which a 600 s
+# vt_screen run takes past 1 GiB with no leak (its inputs run alone at a few MB, and a
+# 1024-column screen costs tens of MB in Alacritty's row cache). The malloc limit is the
+# sharp check: one allocation over 256 MiB fails the run.
+fuzz_limits := "-rss_limit_mb=2048 -malloc_limit_mb=256 -timeout=10"
 
 # Format check, clippy and the seed replay for fuzz/, on the pinned stable toolchain. The
 # tests run twice: as a plain build sees the crate, and with the `wasm` feature, which adds

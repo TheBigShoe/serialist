@@ -109,7 +109,7 @@ jobs:
           for target in $targets; do
             echo "::group::$target"
             mkdir -p "fuzz/corpus/$target"
-            args=(-max_total_time="$FUZZ_SECONDS" -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10)
+            args=(-max_total_time="$FUZZ_SECONDS" -rss_limit_mb=2048 -malloc_limit_mb=256 -timeout=10)
             if [ -f "fuzz/dicts/$target.dict" ]; then
               args+=(-dict="fuzz/dicts/$target.dict")
             fi
@@ -143,7 +143,7 @@ jobs:
             echo "::group::$target"
             mkdir -p "fuzz/corpus/$target"
             cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET" "$target" \
-              "fuzz/corpus/$target" -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10 \
+              "fuzz/corpus/$target" -- -rss_limit_mb=2048 -malloc_limit_mb=256 -timeout=10 \
               || echo "::warning::Could not minimize the corpus of $target; saving it as it is."
             echo "::endgroup::"
           done
