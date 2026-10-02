@@ -162,7 +162,8 @@ use serialist_core::{
     ControlLine, Direction, ExpectResult, Expectation, FrameId, FrameSnapshot, FrameStore,
     FrameStoreReader, Ingest, IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId,
     LineSource, LinkState, ParamValues, Payload, PortId, SearchMatch, Searcher, SerialConfig,
-    SessionEvent, SessionStats, Snapshot, Store, StyledLine, TextOptions, Timestamps,
+    SessionEvent, SessionStats, Snapshot, Store, StyledLine, TIMING_SUFFIX, TextOptions,
+    Timestamps,
 };
 use serialist_script::{ScriptOutcome, ScriptSource};
 use serialist_vt::{DEFAULT_SCROLLBACK, VtScreen, VtSnapshot};
@@ -3629,10 +3630,17 @@ impl SessionView {
         });
         let slot = self.recording.clone();
         let name = file_name(&path);
+        // A link that is already up gets its `connect` record from the recorder; one
+        // that comes up later is noted by the recording sink.
+        let description = match &self.connection.state {
+            LinkState::Connected { .. } => self.connection.description.clone(),
+            _ => None,
+        };
         cx.spawn(async move |this, cx| {
             let opened = cx
                 .background_spawn(async move {
-                    let recorder = Recorder::create(&path).map_err(|error| error.to_string())?;
+                    let recorder = Recorder::create(&path, description.as_deref())
+                        .map_err(|error| error.to_string())?;
                     let stats = recorder.stats();
                     if let Some(displaced) = slot.install(id, recorder) {
                         let _ = displaced.finish();
@@ -3698,9 +3706,10 @@ impl SessionView {
                 .background_spawn(async move { slot.take(id).map(Recorder::finish) })
                 .await;
             let notice = match finished {
-                Some(Ok(bytes)) => {
-                    Notice::info(format!("Recorded {} to {name}", format_bytes(bytes)))
-                }
+                Some(Ok(bytes)) => Notice::info(format!(
+                    "Recorded {} to {name} (timing in {name}{TIMING_SUFFIX})",
+                    format_bytes(bytes)
+                )),
                 Some(Err(error)) => Notice::error(format!("Recording to {name} failed: {error}")),
                 None => return,
             };
