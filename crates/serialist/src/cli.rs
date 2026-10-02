@@ -9,8 +9,11 @@ pub const USAGE: &str = "\
 Usage: serialist [OPTIONS]
 
 Options:
-  --port <PATH>       Open this port at startup in a tab of its own (virtual:<NAME>
-                      for a simulated one). Repeatable
+  --port <ID>         Open this port at startup in a tab of its own: an OS path
+                      (/dev/cu.usbserial-1420, COM3), virtual:<NAME> for a
+                      simulated device, tcp:<HOST>:<PORT> for a raw TCP stream,
+                      or replay:<FILE>[?speed=4x|max&end=hold] to play a
+                      recorded capture. Repeatable
   --baud <N>          Baud rate for --port and the Connect field, any positive
                       integer (default 115200)
   --virtual [NAME]    List the simulated devices next to the real ports; with a
@@ -217,6 +220,76 @@ mod tests {
         );
         assert_eq!(args.ports, ["/dev/ttyUSB0", "virtual:echo"]);
         assert_eq!(args.virtual_devices, ["at", "race"]);
+    }
+
+    #[test]
+    fn tcp_and_replay_ids_open_in_the_order_given_with_their_query_intact() {
+        let expected = ["tcp:10.0.0.5:4000", "replay:/c/x.bin?speed=max"];
+        for flags in [
+            // The id is the next argument, so its `=` and `?` are not flag syntax.
+            &[
+                "--port",
+                "tcp:10.0.0.5:4000",
+                "--port",
+                "replay:/c/x.bin?speed=max",
+            ][..],
+            // Joined: only the first `=` splits the flag from its value.
+            &[
+                "--port=tcp:10.0.0.5:4000",
+                "--port=replay:/c/x.bin?speed=max",
+            ][..],
+        ] {
+            let Command::Run(args) = run(flags).unwrap() else {
+                panic!("expected run");
+            };
+            assert_eq!(args.open, expected, "{flags:?}");
+            assert_eq!(args.ports, expected, "{flags:?}");
+            assert!(
+                !args.simulator,
+                "{flags:?}: neither id starts the simulator"
+            );
+        }
+
+        let Command::Run(args) = run(&[
+            "--port",
+            "replay:/c/x.bin?speed=4x&end=hold",
+            "--virtual",
+            "at",
+            "--port",
+            "tcp:[::1]:4000",
+        ])
+        .unwrap() else {
+            panic!("expected run");
+        };
+        assert_eq!(
+            args.open,
+            [
+                "replay:/c/x.bin?speed=4x&end=hold",
+                "virtual:at",
+                "tcp:[::1]:4000"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_help_names_every_kind_of_port_id() {
+        // The `--port` entry, up to the next option.
+        let entry = USAGE
+            .split("\n  --")
+            .find(|entry| entry.starts_with("port <ID>"))
+            .expect("a --port entry");
+        for form in [
+            "an OS path",
+            "virtual:<NAME>",
+            "tcp:<HOST>:<PORT>",
+            "replay:<FILE>[?speed=4x|max&end=hold]",
+        ] {
+            assert!(entry.contains(form), "--port help lacks {form}: {entry}");
+        }
+        assert!(
+            entry.lines().all(|line| line.len() <= 80),
+            "the entry wraps at 80: {entry}"
+        );
     }
 
     #[test]
