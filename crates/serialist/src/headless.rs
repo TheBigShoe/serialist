@@ -223,6 +223,8 @@ mod tests {
         assert_eq!(out, "virtual:at @ 9600 8N1\n", "the profile's baud");
         let (_, out) = run_script(&dir, &["--port", "virtual:at", "--baud", "57600"], code);
         assert_eq!(out, "virtual:at @ 57600 8N1\n", "--baud wins");
+        let (_, out) = run_script(&dir, &["--port", "virtual:at", "--baud", "12000000"], code);
+        assert_eq!(out, "virtual:at @ 12000000 8N1\n", "the top of the list");
     }
 
     #[test]
