@@ -13,6 +13,8 @@
   What it installs, per machine:
     C:\Program Files\Serialist\bin\serialist.exe
     C:\Program Files\Serialist\LICENSE-MIT.txt and LICENSE-APACHE.txt
+    C:\Program Files\Serialist\THIRD_PARTY_LICENSES.txt (THIRD_PARTY_LICENSES.md, renamed
+    like the two above so that it opens in Notepad)
     a Start menu shortcut
     optionally (Customize page, off by default): the bin folder on the system PATH, so
     scripted runs (serialist with the script flag) work from any terminal.
@@ -73,6 +75,14 @@
                             Source='$(env.SERIALIST_ROOT)\LICENSE-APACHE'
                             KeyPath='yes'/>
                     </Component>
+                    <Component Id='ThirdPartyLicenses' Guid='*'>
+                        <File
+                            Id='ThirdPartyLicensesFile'
+                            Name='THIRD_PARTY_LICENSES.txt'
+                            DiskId='1'
+                            Source='$(env.SERIALIST_ROOT)\THIRD_PARTY_LICENSES.md'
+                            KeyPath='yes'/>
+                    </Component>
 
                     <Directory Id='Bin' Name='bin'>
                         <Component Id='Path' Guid='EDB2349B-73DF-4778-967C-07874C730A98' KeyPath='yes'>
@@ -131,6 +141,7 @@
 
             <ComponentRef Id='LicenseMit'/>
             <ComponentRef Id='LicenseApache'/>
+            <ComponentRef Id='ThirdPartyLicenses'/>
             <ComponentRef Id='binary0'/>
             <ComponentRef Id='StartMenuShortcut'/>
 

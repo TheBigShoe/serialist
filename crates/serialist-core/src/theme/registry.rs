@@ -10,8 +10,10 @@ use crate::settings::{ConfigPaths, ThemeSelection};
 use super::family::{Appearance, Theme, ThemeError, ThemeFamily, ThemeWarning};
 
 /// The bundled theme files, in the order [`ThemeRegistry::names`] lists them: the two
-/// defaults first.
-const BUNDLED: [(&str, &str); 6] = [
+/// defaults first. `fadetouched.json` is Arishawke's Fadetouched family (MIT; see
+/// `THIRD_PARTY_LICENSES.md`), kept byte for byte as upstream publishes it, and holds two
+/// themes: Fadetouched and Fadetouched Blur.
+const BUNDLED: [(&str, &str); 7] = [
     (
         include_str!("../../assets/themes/serialist-dark.json"),
         "serialist-dark.json",
@@ -36,7 +38,18 @@ const BUNDLED: [(&str, &str); 6] = [
         include_str!("../../assets/themes/serialist-contrast.json"),
         "serialist-contrast.json",
     ),
+    (
+        include_str!("../../assets/themes/fadetouched.json"),
+        "fadetouched.json",
+    ),
 ];
+
+/// The bundled files made by someone other than Serialist, shipped verbatim under their
+/// own license (see `THIRD_PARTY_LICENSES.md`). Every other file of [`BUNDLED`] is
+/// Serialist-made. [`ThemeRegistry::is_third_party`] reports it, and the tests hold
+/// third-party themes to a looser contract than Serialist-made ones, because a file that
+/// ships verbatim cannot be edited to fit.
+const THIRD_PARTY: &[&str] = &["fadetouched.json"];
 
 /// Where a theme came from, for the override warning.
 const BUNDLED_SOURCE: &str = "<bundled>";
@@ -44,6 +57,8 @@ const BUNDLED_SOURCE: &str = "<bundled>";
 struct Entry {
     theme: Theme,
     source: String,
+    /// A bundled theme from [`THIRD_PARTY`]. A user file that replaces it is a user theme.
+    third_party: bool,
 }
 
 /// All loaded themes, looked up by name.
@@ -75,7 +90,10 @@ impl ThemeRegistry {
                     if !warnings.is_empty() {
                         tracing::warn!(?warnings, "bundled theme {origin} has warnings");
                     }
-                    registry.add_family(family, BUNDLED_SOURCE);
+                    let third_party = THIRD_PARTY.contains(&origin);
+                    for theme in family.themes {
+                        registry.insert_theme(theme, BUNDLED_SOURCE, third_party);
+                    }
                 }
                 Err(err) => panic!("the bundled theme {origin} is invalid: {err}"),
             }
@@ -163,6 +181,10 @@ impl ThemeRegistry {
 
     /// Adds one theme, replacing an earlier one of the same name.
     pub fn add_theme(&mut self, theme: Theme, source: &str) {
+        self.insert_theme(theme, source, false);
+    }
+
+    fn insert_theme(&mut self, theme: Theme, source: &str, third_party: bool) {
         match self.by_name.get(&theme.name).copied() {
             Some(index) => {
                 let previous = &self.entries[index].source;
@@ -177,6 +199,7 @@ impl ThemeRegistry {
                 self.entries[index] = Entry {
                     theme,
                     source: source.to_string(),
+                    third_party,
                 };
             }
             None => {
@@ -184,6 +207,7 @@ impl ThemeRegistry {
                 self.entries.push(Entry {
                     theme,
                     source: source.to_string(),
+                    third_party,
                 });
             }
         }
@@ -194,6 +218,15 @@ impl ThemeRegistry {
         self.by_name
             .get(name)
             .map(|index| &self.entries[*index].theme)
+    }
+
+    /// Whether `name` is a bundled theme made by someone other than Serialist (the
+    /// Fadetouched themes), as it shipped. A user file that replaces a bundled theme makes
+    /// it a user theme, and a name that is not loaded is not third-party.
+    pub fn is_third_party(&self, name: &str) -> bool {
+        self.by_name
+            .get(name)
+            .is_some_and(|index| self.entries[*index].third_party)
     }
 
     /// Theme names, bundled first and then in the order they were loaded.

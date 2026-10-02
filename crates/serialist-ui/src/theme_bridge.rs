@@ -197,7 +197,7 @@ pub fn apply_kit_theme(config: ThemeConfig, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use serialist_core::theme::ThemeRegistry;
+    use serialist_core::theme::{ThemeRegistry, USED_STYLE_KEYS, USED_SYNTAX_KEYS};
 
     use super::*;
     use crate::config::hsla;
@@ -270,21 +270,74 @@ mod tests {
         })
     }
 
+    /// Contrast misses of the bundled third-party themes against the floors of [`floors`]:
+    /// (theme, foreground key, surface key, ratio measured). Third-party themes ship
+    /// verbatim, so this table is the only place a miss is allowed. A listed pairing passes
+    /// while it reads at its recorded ratio less 0.01 or better. Any other pairing below
+    /// its floor fails, and so does a listed one that drops below the recorded ratio. A
+    /// listed pairing that now meets its floor fails too, so the table cannot go stale.
+    const KNOWN_MISSES: &[(&str, &str, &str, f32)] = &[
+        // Fadetouched draws errors in #c87a75, on the #1f2d29 of menus and popovers.
+        ("Fadetouched", "error", "elevated_surface.background", 4.43),
+        (
+            "Fadetouched Blur",
+            "error",
+            "elevated_surface.background",
+            4.43,
+        ),
+    ];
+
+    /// Keys of the theme keys list that a bundled third-party theme may leave out, with
+    /// the keys the runtime reads instead (the theme must define at least one of them).
+    const RUNTIME_FALLBACKS: &[(&str, &[&str])] = &[
+        // Zed colors a focused panel border with it. The bridge never reads it: the focus
+        // ring (gpui-kit ring and drag_border) is border.focused.
+        ("panel.focused_border", &["border.focused"]),
+    ];
+
     #[test]
     fn every_bundled_theme_reads_in_the_chrome() {
         let registry = ThemeRegistry::bundled();
+        let mut hit = vec![false; KNOWN_MISSES.len()];
         for theme in registry.themes() {
             let name = theme.name.as_str();
+            let third_party = registry.is_third_party(name);
             let (text_floor, status_floor, ring_floor) = floors(name);
             let lookup = |key: &str| theme.color(key).map(hsla);
             let color = |key: &str| lookup(key).unwrap_or_else(|| panic!("{name} lacks {key}"));
-            let check = |what: &str, fg: Hsla, behind: &str, bg: Hsla, floor: f32| {
+            let mut check = |what: &str, fg: Hsla, behind: &str, bg: Hsla, floor: f32| {
                 let ratio = contrast_ratio(fg, bg);
+                if ratio >= floor {
+                    return;
+                }
+                let known = KNOWN_MISSES.iter().position(|(owner, key, surface, _)| {
+                    third_party && *owner == name && *key == what && *surface == behind
+                });
+                let Some(index) = known else {
+                    panic!("{name}: {what} on {behind} reads at {ratio:.2}, below {floor}");
+                };
+                let recorded = KNOWN_MISSES[index].3;
                 assert!(
-                    ratio >= floor,
-                    "{name}: {what} on {behind} reads at {ratio:.2}, below {floor}"
+                    ratio >= recorded - 0.01,
+                    "{name}: {what} on {behind} reads at {ratio:.2}, below the {recorded:.2} \
+                     recorded in KNOWN_MISSES"
                 );
+                hit[index] = true;
             };
+
+            // The focus ring. A Serialist theme defines both keys and holds each to the
+            // floor. A third-party theme may leave panel.focused_border out, so its ring is
+            // the first of the two it defines (border.focused is the one the bridge reads).
+            let ring_keys = ["border.focused", "panel.focused_border"];
+            let rings: Vec<(&str, Hsla)> = if third_party {
+                let first = ring_keys
+                    .into_iter()
+                    .find_map(|key| lookup(key).map(|ring| (key, ring)));
+                vec![first.unwrap_or_else(|| panic!("{name} has no focus ring"))]
+            } else {
+                ring_keys.into_iter().map(|key| (key, color(key))).collect()
+            };
+
             for surface in SURFACES {
                 let bg = color(surface);
                 for key in ["text", "text.muted", "text.accent", "icon"] {
@@ -293,8 +346,8 @@ mod tests {
                 for key in ["success", "warning", "error", "info"] {
                     check(key, color(key), surface, bg, status_floor);
                 }
-                for key in ["border.focused", "panel.focused_border"] {
-                    check(key, color(key), surface, bg, ring_floor);
+                for (key, ring) in &rings {
+                    check(key, *ring, surface, bg, ring_floor);
                 }
             }
             for element in ELEMENTS {
@@ -326,5 +379,70 @@ mod tests {
             );
             check("the primary label", label, "primary", primary, text_floor);
         }
+        for (index, (name, what, behind, _)) in KNOWN_MISSES.iter().enumerate() {
+            assert!(
+                registry.is_third_party(name),
+                "KNOWN_MISSES lists {name}, which is not a bundled third-party theme"
+            );
+            assert!(
+                hit[index],
+                "{name}: {what} on {behind} meets its floor now; remove it from KNOWN_MISSES"
+            );
+        }
+    }
+
+    /// A third-party theme cannot be edited to define every key, so each key of the theme
+    /// keys list it leaves out must be one the runtime has a fallback for. The lists live
+    /// here, with the bridge, rather than in serialist-core.
+    #[test]
+    fn third_party_themes_resolve_every_key_the_app_reads_at_run_time() {
+        let registry = ThemeRegistry::bundled();
+        let mut checked = 0;
+        for theme in registry.themes() {
+            let name = theme.name.as_str();
+            if !registry.is_third_party(name) {
+                continue;
+            }
+            checked += 1;
+            for key in USED_STYLE_KEYS {
+                if theme.color(key).is_some() {
+                    continue;
+                }
+                let Some((_, instead)) = RUNTIME_FALLBACKS.iter().find(|(left, _)| left == key)
+                else {
+                    panic!("{name} lacks {key}, which has no entry in RUNTIME_FALLBACKS");
+                };
+                assert!(
+                    instead.iter().any(|key| theme.color(key).is_some()),
+                    "{name} lacks {key} and every key the runtime reads instead: {instead:?}"
+                );
+            }
+            for capture in USED_SYNTAX_KEYS {
+                assert!(
+                    theme.syntax_color(capture).is_some(),
+                    "{name} lacks syntax.{capture}"
+                );
+            }
+
+            // The runtime ring is border.focused, whatever panel.focused_border is.
+            let lookup = |key: &str| theme.color(key).map(hsla);
+            let config = kit_theme_config(
+                &ZedColors {
+                    name,
+                    dark: theme.is_dark(),
+                    lookup: &lookup,
+                },
+                &UiFont::default(),
+                &TerminalFont::default(),
+            );
+            let expected = hex(lookup("border.focused").expect("border.focused"));
+            assert_eq!(config.colors.ring.as_ref(), Some(&expected), "{name}");
+            assert_eq!(
+                config.colors.drag_border.as_ref(),
+                Some(&expected),
+                "{name}"
+            );
+        }
+        assert_eq!(checked, 2, "the Fadetouched themes");
     }
 }
