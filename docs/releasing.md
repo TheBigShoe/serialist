@@ -34,7 +34,9 @@ install prefix (`bin/`, `share/`) and has an `install.sh` that copies it to `~/.
 1. **Start from a green `main`.** CI (`.github/workflows/ci.yml`) must pass on the commit
    you are releasing.
 2. **Bump the version.** Set `version` under `[workspace.package]` in the root `Cargo.toml`
-   (every crate inherits it), then run `cargo check --workspace` so `Cargo.lock` follows.
+   (every crate inherits it), then run `cargo check --workspace` so `Cargo.lock` follows,
+   and `cargo fetch --manifest-path fuzz/Cargo.toml` so the fuzz crate's own `Cargo.lock`
+   follows too (it records the path crates' versions, and CI checks it with `--locked`).
    Pre-release versions such as `0.2.0-rc.1` work: the release is marked as a pre-release,
    and the macOS and Windows metadata use the plain `0.2.0`.
 3. **Update `CHANGELOG.md`.** Rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a
