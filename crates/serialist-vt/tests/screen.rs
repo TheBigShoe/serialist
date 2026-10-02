@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serialist_core::{LineId, LineSource};
 use serialist_vt::{VtEvent, VtScreen};
 
-use common::{screen_text, scrollback_text, t0};
+use common::{in_pieces, one_shot, screen_text, scrollback_text, t0};
 
 fn numbered(from: usize, to: usize) -> Vec<u8> {
     (from..to)
@@ -315,4 +315,63 @@ fn the_event_queue_is_bounded() {
     let mut screen = VtScreen::new(20, 3, 100);
     screen.feed(&b"\x1b[5n".repeat(serialist_vt::MAX_EVENTS + 10));
     assert_eq!(screen.take_events().len(), serialist_vt::MAX_EVENTS);
+}
+
+/// vte 0.15.0 skips the bytes after a character that the next chunk completes when they
+/// hold another whole character and then an invalid or cut-off one: its buffer of up to
+/// four bytes yields the first character but consumes everything valid in it. The screen
+/// holds back a cut-off character instead, so vte never sees one split across calls.
+#[test]
+fn a_character_cut_by_a_chunk_boundary_does_not_eat_the_text_after_it() {
+    let cut_off_next: [&[u8]; 3] = [b"caf\xc3", b"\xa9 \xe2\x82", b"\xac end"];
+    let invalid_next: [&[u8]; 2] = [b"caf\xc3", b"\xa9 \xff end"];
+    for (chunks, expected) in [
+        (&cut_off_next[..], "caf\u{e9} \u{20ac} end"),
+        (&invalid_next[..], "caf\u{e9} \u{fffd} end"),
+    ] {
+        let mut screen = VtScreen::new(20, 3, 100);
+        for chunk in chunks {
+            screen.feed_at(chunk, t0());
+        }
+        assert_eq!(screen_text(&screen.snapshot())[0], expected);
+        assert_eq!(
+            screen.bytes_fed(),
+            chunks.iter().map(|c| c.len()).sum::<usize>() as u64
+        );
+    }
+}
+
+#[test]
+fn text_is_the_same_cut_anywhere_twice_including_inside_characters() {
+    let mut bytes = "ab\u{e9} \u{20ac}\u{1F600} \u{65e5}x \u{ff}\u{fe}\r\nfin"
+        .as_bytes()
+        .to_vec();
+    bytes.extend_from_slice(b"\xff\x9b\xc3 \xe2\x82!");
+    bytes.extend_from_slice("\u{1F600}\u{e9}".as_bytes());
+    let whole = one_shot(10, 3, &bytes);
+    for first in 1..bytes.len() {
+        for second in first..bytes.len() {
+            assert_eq!(
+                in_pieces(10, 3, &bytes, &[first, second]),
+                whole,
+                "cut at {first} and {second}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_character_cut_off_at_the_end_waits_for_the_rest_and_a_reset_forgets_it() {
+    let mut screen = VtScreen::new(10, 2, 100);
+    screen.feed_at(b"a\xe2\x82", t0());
+    assert_eq!(screen_text(&screen.snapshot())[0], "a");
+    screen.feed_at(b"\xacb", t0());
+    assert_eq!(screen_text(&screen.snapshot())[0], "a\u{20ac}b");
+
+    screen.feed_at(b"\r\n\xf0\x9f", t0());
+    screen.reset();
+    screen.feed_at(b"\x98\x80z", t0());
+    // The reset dropped the cut-off emoji, so its tail is two stray C1 controls, which
+    // draw nothing (had the screen kept the bytes, it would show the emoji).
+    assert_eq!(screen_text(&screen.snapshot())[0], "z");
 }

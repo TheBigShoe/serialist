@@ -24,6 +24,16 @@
 //!
 //! The alternate screen has no history (Alacritty gives it none), so nothing scrolls off
 //! it; the scrollback shown above it is the primary screen's.
+//!
+//! # Characters cut by a chunk boundary
+//!
+//! vte 0.15.0 buffers a UTF-8 character cut off at the end of a chunk and finishes it
+//! with the next, but when that next chunk holds more characters and then an invalid or
+//! another cut-off one, it skips the bytes between (`advance_partial_utf8` returns the
+//! length of everything valid in its four-byte buffer, not of the first character). So
+//! [`VtScreen::feed_at`] holds a cut-off character back and parses it with the next chunk,
+//! the way `serialist_core::AnsiParser` does: vte then never sees a character split across
+//! two calls, and the screen does not depend on where the chunks end.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +48,7 @@ use alacritty_terminal::vte::ansi::{
     Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
     cursor_icon::CursorIcon,
 };
+use serialist_core::ansi::incomplete_utf8_suffix;
 use serialist_core::{Epoch, LineId, StyledLine};
 
 use crate::convert::{Stamp, build_line, same_content};
@@ -59,6 +70,9 @@ pub const MAX_ROWS: usize = 1024;
 
 /// Scrollback rows kept by [`VtScreen::default`].
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+/// The largest buffer kept for joining a held-back character to the next chunk.
+const KEEP_JOINED: usize = 64 * 1024;
 
 struct Size {
     columns: usize,
@@ -104,6 +118,12 @@ pub struct VtScreen {
     offset: u64,
     /// When the last chunk arrived; the time given to rows it changed.
     last_at: Instant,
+    /// A UTF-8 character cut off at the end of the last chunk, held back until the next
+    /// one (see the module docs). Counted in `offset`, not yet parsed.
+    held: [u8; 3],
+    held_len: usize,
+    /// Reused to join held bytes to the next chunk.
+    joined: Vec<u8>,
 }
 
 impl Default for VtScreen {
@@ -151,6 +171,9 @@ impl VtScreen {
             epoch,
             offset: 0,
             last_at: epoch.instant,
+            held: [0; 3],
+            held_len: 0,
+            joined: Vec::new(),
         }
     }
 
@@ -190,9 +213,33 @@ impl VtScreen {
         }
         self.last_at = at;
         self.flush_sync(Instant::now());
-        self.with_tracker(|processor, tracker| processor.advance(tracker, bytes));
+        if self.held_len == 0 {
+            self.advance_whole_characters(bytes);
+        } else {
+            let mut joined = std::mem::take(&mut self.joined);
+            joined.clear();
+            joined.extend_from_slice(&self.held[..self.held_len]);
+            joined.extend_from_slice(bytes);
+            self.held_len = 0;
+            self.advance_whole_characters(&joined);
+            if joined.capacity() <= KEEP_JOINED {
+                self.joined = joined;
+            }
+        }
         self.offset += bytes.len() as u64;
         self.dirty = true;
+    }
+
+    /// Parse `bytes` but for a UTF-8 character cut off at their end, which waits in
+    /// `held` for the next chunk. Nothing is held when this is called.
+    fn advance_whole_characters(&mut self, bytes: &[u8]) {
+        let keep = incomplete_utf8_suffix(bytes);
+        let (whole, tail) = bytes.split_at(bytes.len() - keep);
+        if !whole.is_empty() {
+            self.with_tracker(|processor, tracker| processor.advance(tracker, whole));
+        }
+        self.held[..keep].copy_from_slice(tail);
+        self.held_len = keep;
     }
 
     /// End a synchronized update (`CSI ? 2026 h`) the device began more than 150 ms
@@ -269,9 +316,10 @@ impl VtScreen {
     }
 
     /// Reset everything as RIS (`ESC c`) does, and forget the scrollback and any
-    /// half-received escape sequence. Line ids keep counting up.
+    /// half-received escape sequence or character. Line ids keep counting up.
     pub fn reset(&mut self) {
         self.processor = Processor::new();
+        self.held_len = 0;
         self.with_tracker(|_, tracker| tracker.reset_state());
         self.dirty = true;
     }
