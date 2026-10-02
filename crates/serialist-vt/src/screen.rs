@@ -34,13 +34,22 @@
 //! [`VtScreen::feed_at`] holds a cut-off character back and parses it with the next chunk,
 //! the way `serialist_core::AnsiParser` does: vte then never sees a character split across
 //! two calls, and the screen does not depend on where the chunks end.
+//!
+//! # Zero-width characters
+//!
+//! A combining mark joins the cell before the cursor and takes no cell of its own, so a
+//! row never scrolls off under a stream of them, and Alacritty keeps as many as arrive:
+//! a cell grows for as long as the device sends, and `CSI n b` (repeat the last
+//! character `n` times) makes eleven bytes add 65535. Every snapshot of the row copies
+//! them too. So the tracker drops a zero-width character once its cell holds
+//! [`MAX_ZERO_WIDTH`] of them.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row};
 use alacritty_terminal::index::Line;
-use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape as VtCursorShape, CursorStyle, Handler, Hyperlink,
@@ -50,6 +59,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use serialist_core::ansi::incomplete_utf8_suffix;
 use serialist_core::{Epoch, LineId, StyledLine};
+use unicode_width::UnicodeWidthChar;
 
 use crate::convert::{Stamp, build_line, same_content};
 use crate::events::{Listener, VtEvent};
@@ -70,6 +80,12 @@ pub const MAX_ROWS: usize = 1024;
 
 /// Scrollback rows kept by [`VtScreen::default`].
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+/// Zero-width characters (combining marks, variation selectors, joiners) a cell keeps
+/// after its character; further ones are dropped. Thirty is the limit of the Unicode
+/// Stream-Safe Text Format (UAX #15), which no conforming text exceeds, so nothing of
+/// such text is lost. See the module docs for why there is a limit at all.
+pub const MAX_ZERO_WIDTH: usize = 30;
 
 /// The largest buffer kept for joining a held-back character to the next chunk.
 const KEEP_JOINED: usize = 64 * 1024;
@@ -577,6 +593,26 @@ impl Tracker<'_> {
             self.rows.absorb(self.term);
         }
     }
+
+    /// Whether the cell a zero-width character would join already holds
+    /// [`MAX_ZERO_WIDTH`] of them. The cell is the one Alacritty's `input` picks: the one
+    /// before the cursor, or the cursor's own when the last character filled the row and
+    /// the next will wrap, and the first cell of a wide character.
+    fn zero_width_full(&self) -> bool {
+        let grid = self.term.grid();
+        let cursor = &grid.cursor;
+        let line = cursor.point.line;
+        let mut column = cursor.point.column;
+        if !cursor.input_needs_wrap {
+            column.0 = column.0.saturating_sub(1);
+        }
+        if grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            column.0 = column.0.saturating_sub(1);
+        }
+        grid[line][column]
+            .zerowidth()
+            .is_some_and(|marks| marks.len() >= MAX_ZERO_WIDTH)
+    }
 }
 
 macro_rules! forward {
@@ -596,7 +632,6 @@ impl Handler for Tracker<'_> {
         set_title(title: Option<String>);
         set_cursor_style(style: Option<CursorStyle>);
         set_cursor_shape(shape: VtCursorShape);
-        input(c: char);
         goto(line: i32, col: usize);
         goto_line(line: i32);
         goto_col(col: usize);
@@ -662,6 +697,16 @@ impl Handler for Tracker<'_> {
         set_modify_other_keys(mode: ModifyOtherKeys);
         report_modify_other_keys();
         set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
+    }
+
+    /// A character. A zero-width one joins a cell (see the module docs) unless that cell
+    /// is full, in which case it is dropped.
+    fn input(&mut self, c: char) {
+        if c.width() == Some(0) && self.zero_width_full() {
+            return;
+        }
+        Handler::input(&mut *self.term, c);
+        self.after();
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {

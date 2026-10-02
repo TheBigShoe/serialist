@@ -17,6 +17,7 @@ alacritty_terminal.workspace = true
 parking_lot.workspace = true
 serialist-core.workspace = true
 tracing.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 crossbeam-channel.workspace = true

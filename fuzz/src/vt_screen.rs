@@ -48,7 +48,10 @@
 //! - Lines: runs cover the text on character boundaries, none is empty, neighbours differ
 //!   in style, the text has no control characters. The text has at most `columns`
 //!   characters below U+0300 (a wide character is one character in two cells; a
-//!   combining mark takes no cell, and every zero-width character is at or above U+0300).
+//!   combining mark takes no cell, and every zero-width character is at or above U+0300),
+//!   and at most `columns * (1 + MAX_ZERO_WIDTH)` characters in all, since a cell keeps
+//!   at most [`MAX_ZERO_WIDTH`] zero-width characters (`regress_zero_width_rep`: a
+//!   repeated `CSI 65535 b` on a combining mark, which grew one cell without bound).
 //!   Scrollback rows are not reflowed by a resize, so for them `columns` is the most the
 //!   screen has had.
 //! - Events: no two bells, no two equal titles and no two title resets in a row; the
@@ -69,8 +72,8 @@ use std::time::Instant;
 
 use serialist_core::{Direction, LineId, LineSource, StyledLine};
 use serialist_vt::{
-    DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_EVENTS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS, VtEvent,
-    VtScreen, VtSnapshot,
+    DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_EVENTS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS,
+    VtEvent, VtScreen, VtSnapshot,
 };
 
 use crate::Input;
@@ -489,6 +492,13 @@ fn check_line(line: &StyledLine, columns: usize) {
     assert!(
         cells <= columns,
         "{cells} cells of text in {columns} columns: {line:?}"
+    );
+    // A cell keeps at most MAX_ZERO_WIDTH zero-width characters after its own.
+    let chars = line.text.chars().count();
+    let most = columns * (1 + MAX_ZERO_WIDTH);
+    assert!(
+        chars <= most,
+        "{chars} characters in {columns} columns, more than {most}: {line:?}"
     );
 }
 
