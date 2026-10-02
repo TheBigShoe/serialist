@@ -1,0 +1,5 @@
+# Written by cargo-fuzz and libFuzzer. Seeds to keep go in seeds/<target>/.
+/target/
+/corpus/
+/artifacts/
+/coverage/

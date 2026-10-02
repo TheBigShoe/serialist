@@ -7,3 +7,7 @@
 
 # Settings-edit fixtures hold CRLF and tabs on purpose: keep their bytes as written.
 crates/serialist-core/tests/fixtures/settings_edit/*.crlf.* -text
+
+# Fuzz seeds and crash reproducers are raw byte streams (CR, LF, escapes): keep every
+# byte as written.
+fuzz/seeds/** binary
