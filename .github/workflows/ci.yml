@@ -356,7 +356,10 @@ jobs:
   # The criterion benches (store append, parse, line lookup, search; the virtual link and
   # firehose): every [[bench]] target in the workspace. The timing gates that hold the
   # budgets (the store gate, the terminal frame cost, the VT firehose) stay in `cargo
-  # test`. `just bench` and `just bench-compare` run the same commands locally.
+  # test`, where their time and rate thresholds are checked on a developer machine and
+  # on CI only with SERIALIST_TIMING_TESTS set (hosted runners are too noisy for them);
+  # their memory and correctness checks run everywhere. `just bench` and
+  # `just bench-compare` run the same commands locally.
   #
   # On a push to main the benches run with --quick: a smoke test that they build and run.
   # Hosted runners are too noisy for absolute numbers, and --quick is too noisy for a
