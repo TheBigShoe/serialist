@@ -23,14 +23,22 @@
 //! `target/screenshots/` by default; each NAME keeps the shots whose file name contains
 //! it (`03`, `race`).
 
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{CommandRef, Direction, LineId, LineSource, PortId, StyleFlags};
+use serialist_core::{
+    CommandRef, Direction, LineId, LineSource, PortId, REPLAY_SCHEME, ReplayEnd, ReplayOptions,
+    ReplaySpeed, ReplayTransportFactory, RoutingTransportFactory, StyleFlags, TCP_SCHEME,
+    TcpAddress, TcpTransportFactory, TimingWriter, VIRTUAL_SCHEME, timing_path,
+};
 use serialist_sim::{
     AtDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator, LinkConfig,
     MenuDevice, SimWorld,
@@ -239,6 +247,24 @@ const SHOTS: &[Shot] = &[
         world: ansi_firehose_world,
         connect: Some("virtual:firehose"),
         drive: firehose_selected,
+    },
+    // The other transports: a TCP stream (a loopback listener the shot starts, the way a
+    // serial-to-network bridge would answer) and a recorded capture played back.
+    Shot {
+        file: "21-tcp-session.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: None,
+        drive: tcp_session,
+    },
+    Shot {
+        file: "22-replay-session.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: None,
+        drive: replay_session,
     },
 ];
 
@@ -553,6 +579,150 @@ fn paused_recording(stage: &mut Stage) {
     });
 }
 
+/// What a serial-to-network bridge says when something connects: its own banner, then the
+/// device's boot lines.
+const BRIDGE_BANNER: &[u8] = b"ESP-Link v3.2.47 ready\r\n\
+uart0: 115200 8N1, bridging to tcp :2323\r\n\
+wifi: bench-lab 192.168.1.54, rssi -52 dBm\r\n\
+[    0.000] reset: power-on\r\n\
+[    0.412] boot: stage 1 ok, slot A, version 1.4.2\r\n\
+[    0.431] boot: stage 2 ok, 12288 bytes\r\n\
+[    0.968] app: sensors 3 of 3 up\r\n\
+[    1.204] app: ready\r\n";
+
+/// "Connect to TCP\u{2026}" to a loopback listener that answers with a bridge's banner: a
+/// tab titled `127.0.0.1:<port>`, `TCP` in the toolbar and no line settings in the status
+/// line.
+fn tcp_session(stage: &mut Stage) {
+    let bridge = Bridge::start(BRIDGE_BANNER);
+    let address = bridge.address();
+    stage.bridge = Some(bridge);
+    let workspace = stage.workspace.clone();
+    stage
+        .cx
+        .update_window(stage.window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.connect_tcp(address, window, cx));
+        })
+        .expect("the window is open");
+    let view = stage.session();
+    run_until(&mut stage.cx, "the banner", |cx| {
+        has_rx_line(cx, &view, "[    1.204] app: ready")
+    });
+}
+
+/// A boot log, with its timing sidecar beside it: what Record writes. About two seconds
+/// of recorded time.
+const BOOT_LOG: &[(u64, &[u8])] = &[
+    (0, b"U-Boot 2024.01 (Mar 12 2026 - 09:41:07 +0000)\r\n"),
+    (40, b"DRAM:  512 MiB\r\n"),
+    (110, b"Loading Environment from SPIFlash... OK\r\n"),
+    (240, b"Hit any key to stop autoboot:  0\r\n"),
+    (
+        900,
+        b"## Booting kernel from FIT Image at 0x42000000 ...\r\n",
+    ),
+    (
+        1200,
+        b"[    0.000000] Booting Linux on physical CPU 0x0\r\n",
+    ),
+    (
+        1210,
+        b"[    0.000000] Linux version 6.6.22 (build@bench) #1 SMP\r\n",
+    ),
+    (
+        1380,
+        b"[    0.412118] mmc0: new high speed SDHC card at address 0001\r\n",
+    ),
+    (
+        1520,
+        b"[    0.968301] EXT4-fs (mmcblk0p2): mounted filesystem\r\n",
+    ),
+    (
+        1760,
+        b"[    1.204775] systemd[1]: Reached target Multi-User System.\r\n",
+    ),
+    (1990, b"bench login: \r\n"),
+];
+
+/// "Open capture\u{2026}" on a recorded capture, played at 4x with its recorded pacing and
+/// held open after the last byte: a tab titled with the file name, the speed in the
+/// toolbar and the transport's description in the status line.
+fn replay_session(stage: &mut Stage) {
+    let raw = stage.dir.join("boot-log.bin");
+    let bytes: Vec<u8> = BOOT_LOG
+        .iter()
+        .flat_map(|(_, chunk)| chunk.to_vec())
+        .collect();
+    std::fs::write(&raw, bytes).expect("write the capture");
+    let origin = Instant::now();
+    let mut timing = TimingWriter::create(&timing_path(&raw), origin).expect("create the sidecar");
+    for (ms, chunk) in BOOT_LOG {
+        timing
+            .rx(origin + Duration::from_millis(*ms), chunk.len())
+            .expect("write the sidecar");
+    }
+    timing.finish().expect("finish the sidecar");
+
+    stage.replay.set_defaults(ReplayOptions {
+        speed: ReplaySpeed::times(4.0).expect("a speed"),
+        end: ReplayEnd::Hold,
+    });
+    let workspace = stage.workspace.clone();
+    stage
+        .cx
+        .update_window(stage.window, |_, window, cx| {
+            workspace.update(cx, |w, cx| w.open_capture(raw, window, cx));
+        })
+        .expect("the window is open");
+    let view = stage.session();
+    run_until(&mut stage.cx, "the capture's last line", |cx| {
+        has_rx_line(cx, &view, "bench login: ")
+    });
+}
+
+/// A loopback listener that writes a banner to the first client and holds the connection
+/// open until it is dropped.
+struct Bridge {
+    port: u16,
+    hold: Option<Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Bridge {
+    fn start(banner: &'static [u8]) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback port");
+        let port = listener.local_addr().expect("a local address").port();
+        let (hold, held) = channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.write_all(banner).ok();
+            held.recv().ok();
+        });
+        Self {
+            port,
+            hold: Some(hold),
+            thread: Some(thread),
+        }
+    }
+
+    fn address(&self) -> TcpAddress {
+        TcpAddress::new("127.0.0.1", self.port)
+    }
+}
+
+impl Drop for Bridge {
+    fn drop(&mut self) {
+        // Let go of the connection, and, in case nothing ever connected, wake `accept`.
+        self.hold.take();
+        TcpStream::connect(("127.0.0.1", self.port)).ok();
+        if let Some(thread) = self.thread.take() {
+            thread.join().ok();
+        }
+    }
+}
+
 // --- Simulated worlds ----------------------------------------------------------------
 
 /// The built-in devices, with the boot menu leaving its cursor on (U-Boot hides it) so
@@ -616,13 +786,18 @@ fn bytes_for_lines(content: FirehoseContent, lines: usize) -> u64 {
 
 /// One shot's app, window and workspace, with its simulator and config directory.
 /// Fields drop in order: the workspace handle, then the app (which flushes the history
-/// into the config directory), then the simulator and the directory.
+/// into the config directory), then the simulator, the directory and the TCP listener.
 struct Stage {
     workspace: Entity<Workspace>,
     window: AnyWindowHandle,
     cx: HeadlessAppContext,
+    /// The factory `replay:` ids open through, as the binary's wiring hands it to the app.
+    replay: Arc<ReplayTransportFactory>,
     world: SimWorld,
     dir: TempDir,
+    /// The loopback listener of a TCP shot. Dropped after the app, which holds the
+    /// connection to it.
+    bridge: Option<Bridge>,
 }
 
 impl Stage {
@@ -655,14 +830,21 @@ impl Stage {
         // The engine's ingest thread rings the session view's doorbell from its own
         // thread, which the test scheduler otherwise treats as nondeterminism.
         cx.allow_parking();
+        // The binary's routing: simulated devices, TCP streams and replayed captures each
+        // by their scheme.
+        let replay = Arc::new(ReplayTransportFactory::new());
+        let router = RoutingTransportFactory::new(world.transport_factory())
+            .with_scheme(VIRTUAL_SCHEME, world.transport_factory())
+            .with_scheme(TCP_SCHEME, Arc::new(TcpTransportFactory::new()))
+            .with_scheme(REPLAY_SCHEME, replay.clone());
         let options = AppOptions {
             port_source: world.port_source(),
-            transport_factory: world.transport_factory(),
+            transport_factory: Arc::new(router),
             baud: None,
             select_port: shot.connect.map(PortId::new),
             open_ports: shot.connect.map(PortId::new).into_iter().collect(),
             store: None,
-            replay: None,
+            replay: Some(replay.clone()),
         };
         let (width, height) = shot.size;
         let (window, workspace) = cx
@@ -690,8 +872,10 @@ impl Stage {
             workspace,
             window,
             cx,
+            replay,
             world,
             dir,
+            bridge: None,
         }
     }
 

@@ -12,6 +12,10 @@
 //! Controls a user did not touch are set with [`PortSettingsForm::set_settings`],
 //! which emits nothing.
 //!
+//! A session on a stream that has no serial line (a `tcp:` port or a replayed capture)
+//! shows the line ending and local echo only: [`PortSettingsForm::set_line_settings`]
+//! turns off the rate, framing, flow control, DTR, RTS and break rows.
+//!
 //! Baud is a text field that takes any positive integer (Enter or leaving the field
 //! applies it) beside a list of the standard rates.
 //!
@@ -164,6 +168,9 @@ pub struct PortSettingsForm {
     live: bool,
     /// A device profile's line settings: no echo, control lines or break.
     profile: bool,
+    /// Whether the line settings and the control lines show. Off for a stream with no
+    /// serial line behind it (TCP, a replay): only the line ending and echo remain.
+    line_settings: bool,
     baud: Entity<InputState>,
     baud_list: Choice,
     data_bits: Choice,
@@ -315,6 +322,7 @@ impl PortSettingsForm {
             settings,
             live,
             profile: false,
+            line_settings: true,
             baud,
             baud_list,
             data_bits,
@@ -327,6 +335,13 @@ impl PortSettingsForm {
             focus_handle: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
+    }
+
+    /// This form without the line settings: no rate, framing, flow control, DTR, RTS or
+    /// break, for a stream that has no serial line (see [`Self::set_line_settings`]).
+    pub fn without_line_settings(mut self) -> Self {
+        self.line_settings = false;
+        self
     }
 
     /// A form for a device profile's line settings: the rate, framing, flow control and
@@ -407,6 +422,19 @@ impl PortSettingsForm {
         select(&self.line_ending, settings.line_ending.label(), window, cx);
         self.settings = settings;
         cx.notify();
+    }
+
+    /// Whether the form shows the line settings, DTR, RTS and break (`true`, the default),
+    /// or only the line ending and local echo.
+    pub fn set_line_settings(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.line_settings != shown {
+            self.line_settings = shown;
+            cx.notify();
+        }
+    }
+
+    pub fn shows_line_settings(&self) -> bool {
+        self.line_settings
     }
 
     /// Whether the control lines and break act on an open session now.
@@ -537,6 +565,7 @@ impl Render for PortSettingsForm {
         let danger = theme.danger;
         let settings = self.settings.clone();
         let profile = self.profile;
+        let lines = self.line_settings;
         v_flex()
             .id("port-settings")
             .track_focus(&self.focus_handle)
@@ -549,28 +578,30 @@ impl Render for PortSettingsForm {
             } else {
                 "PORT SETTINGS (for the next connect)"
             }))
-            .child(Self::row(
-                "Baud",
-                h_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .w(px(100.))
-                            .child(Input::new(&self.baud).id("port-baud").small()),
-                    )
-                    .child(
-                        div().flex_1().child(
-                            Select::new(&self.baud_list)
-                                .small()
-                                .placeholder("Standard")
-                                .menu_width(px(140.)),
+            .when(lines, |form| {
+                form.child(Self::row(
+                    "Baud",
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(100.))
+                                .child(Input::new(&self.baud).id("port-baud").small()),
+                        )
+                        .child(
+                            div().flex_1().child(
+                                Select::new(&self.baud_list)
+                                    .small()
+                                    .placeholder("Standard")
+                                    .menu_width(px(140.)),
+                            ),
                         ),
-                    ),
-            ))
-            .child(Self::row("Data bits", Select::new(&self.data_bits).small()))
-            .child(Self::row("Parity", Select::new(&self.parity).small()))
-            .child(Self::row("Stop bits", Select::new(&self.stop_bits).small()))
-            .child(Self::row("Flow control", Select::new(&self.flow).small()))
+                ))
+                .child(Self::row("Data bits", Select::new(&self.data_bits).small()))
+                .child(Self::row("Parity", Select::new(&self.parity).small()))
+                .child(Self::row("Stop bits", Select::new(&self.stop_bits).small()))
+                .child(Self::row("Flow control", Select::new(&self.flow).small()))
+            })
             .child(Self::row(
                 "Line ending",
                 Select::new(&self.line_ending).small(),
@@ -584,7 +615,9 @@ impl Render for PortSettingsForm {
                             this.change_local_echo(*on, cx);
                         })),
                 ))
-                .child(Self::row(
+            })
+            .when(!profile && lines, |form| {
+                form.child(Self::row(
                     "DTR",
                     Switch::new("port-dtr")
                         .checked(settings.dtr)

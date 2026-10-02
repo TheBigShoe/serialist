@@ -36,7 +36,7 @@ The Airoha RACE example plugin, installed, decoding a simulated board: the log i
 </table>
 
 These pictures are the real workspace, drawn offscreen against Serialist's simulated devices by
-`just screenshots` (macOS; it writes twenty states to `target/screenshots/`).
+`just screenshots` (macOS; it writes twenty-two states to `target/screenshots/`).
 
 ## Status
 

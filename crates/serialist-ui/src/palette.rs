@@ -113,8 +113,10 @@ pub fn humanize(name: &str) -> String {
         .enumerate()
         .map(|(ix, word)| {
             // An initialism Rust's naming spells in title case.
-            if word == "Ui" {
-                return "UI".to_owned();
+            match word.as_str() {
+                "Ui" => return "UI".to_owned(),
+                "Tcp" => return "TCP".to_owned(),
+                _ => {}
             }
             let all_caps = word.len() > 1 && word.chars().all(|c| !c.is_lowercase());
             if ix == 0 || all_caps || word.chars().all(|c| c.is_ascii_digit()) {
@@ -491,6 +493,8 @@ mod tests {
             "Terminal: Toggle hex view"
         );
         assert_eq!(humanize("serial::Connect"), "Serial: Connect");
+        assert_eq!(humanize("serial::ConnectTcp"), "Serial: Connect TCP");
+        assert_eq!(humanize("serial::OpenCapture"), "Serial: Open capture");
         assert_eq!(humanize("tabs::ActivateTab1"), "Tabs: Activate tab 1");
         assert_eq!(
             humanize("command_palette::Toggle"),

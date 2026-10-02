@@ -45,6 +45,7 @@ pub mod settings_io;
 pub mod settings_view;
 pub mod status;
 pub mod tabs;
+pub mod tcp_prompt;
 pub mod terminal;
 pub mod theme_bridge;
 pub mod toolbar;
@@ -76,6 +77,8 @@ mod stream_tests;
 mod tab_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod transport_tests;
 #[cfg(test)]
 mod vt_tests;
 
@@ -111,6 +114,7 @@ pub use status::{
     ConnectionState, Notice, NoticeAction, PauseMark, RecordingStatus, ScriptStatus, StatusLine,
 };
 pub use tabs::{TabId, TabLabel, TabState, TabStatus};
+pub use tcp_prompt::{TcpPrompt, TcpPromptEvent};
 pub use workspace::{AppOptions, Workspace, init, open_main_window};
 
 pub mod prelude {
