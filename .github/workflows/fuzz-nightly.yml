@@ -1,0 +1,154 @@
+name: Fuzz (nightly)
+
+# The long fuzz run. It is the `fuzz` job of ci.yml with 600 s per target instead of 60:
+# the same toolchains, the same cargo-fuzz build, the same loop over fuzz/seeds and the
+# same corpus cache (the `fuzz-corpus-` entries), so it starts from what the push runs
+# found and hands back what it finds. Keep the two in step; ci.yml's comments explain the
+# steps. What it leaves out is the format, clippy and seed-replay step: ci.yml has
+# already run those on every commit that reached main.
+#
+# A red run is a crash or a broken build. The reproducers are in the run's fuzz-artifacts
+# artifact: minimize one, fix the bug, and commit the input as fuzz/seeds/<target>/regress_*.
+# GitHub emails a failed scheduled run to whoever last edited the cron line below.
+on:
+  schedule:
+    # Daily, at an odd minute: the top of the hour is when hosted runners are busiest.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target (the scheduled run uses 600; a short value tries the workflow out)"
+        type: number
+        default: 600
+
+# One run at a time per ref, and never cancel one halfway: a second run would start from
+# the same cache entry, and the one that saves last would discard the other's finds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Every target in turn, FUZZ_SECONDS each, plus a cold build of about ten minutes and
+    # the corpus merge. The limit is for about fifteen targets; hosted jobs may run 360.
+    timeout-minutes: 200
+    env:
+      FUZZ_SECONDS: ${{ inputs.seconds || 600 }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The pinned stable toolchain (rust-toolchain.toml) for `cargo fetch`, and nightly
+      # for cargo-fuzz's instrumented build.
+      - name: Install toolchains
+        run: |
+          rustup toolchain install --profile minimal --no-self-update
+          rustup toolchain install nightly --profile minimal --no-self-update
+
+      # The job is named `fuzz` as in ci.yml, so this shares its build cache. Only main
+      # saves.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # serialport's libudev feature, through serialist-core. No GPUI here.
+      - name: Install Linux system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      # install-action ships cargo-fuzz as a static musl binary, and cargo-fuzz's default
+      # --target is the triple it was built for. Left alone it would build the targets for
+      # x86_64-unknown-linux-musl, which has no std installed here and cannot run
+      # AddressSanitizer, so every build and run names the host triple.
+      - name: Fuzz target triple
+        run: |
+          echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+
+      # cargo-fuzz has no --locked; this fails if fuzz/Cargo.lock is out of date.
+      - name: Check fuzz/Cargo.lock
+        run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Build fuzz targets (nightly)
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET"
+
+      # The newest entry with this prefix, from main's pushes or an earlier nightly run.
+      # The key is unique per run because a cache entry cannot be overwritten.
+      - name: Restore the fuzz corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+
+      # Every target runs even when an earlier one crashes; the step fails at the end. A
+      # target with a libFuzzer dictionary in fuzz/dicts/<target>.dict gets it.
+      - name: Fuzz each target for ${{ env.FUZZ_SECONDS }} s
+        id: fuzz
+        run: |
+          targets=$(cargo +nightly fuzz list --fuzz-dir fuzz)
+          if [ -z "$targets" ]; then
+            echo "No fuzz targets."
+            exit 0
+          fi
+          failed=""
+          for target in $targets; do
+            echo "::group::$target"
+            mkdir -p "fuzz/corpus/$target"
+            args=(-max_total_time="$FUZZ_SECONDS" -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10)
+            if [ -f "fuzz/dicts/$target.dict" ]; then
+              args+=(-dict="fuzz/dicts/$target.dict")
+            fi
+            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+              "fuzz/corpus/$target" "fuzz/seeds/$target" -- "${args[@]}" \
+              || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::Fuzz targets failed:$failed. The reproducers are in the fuzz-artifacts artifact."
+            exit 1
+          fi
+
+      # A crash found at 03:17 may wait out a weekend, so keep the reproducers longer than
+      # ci.yml does.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # Only main writes the cache (a manual run from another branch only reads it), and
+      # both steps run after a crash too. See ci.yml for why.
+      - name: Minimize the fuzz corpus
+        if: always() && github.ref == 'refs/heads/main' && steps.fuzz.outcome != 'skipped'
+        run: |
+          for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
+            echo "::group::$target"
+            mkdir -p "fuzz/corpus/$target"
+            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+              "fuzz/corpus/$target" -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10 \
+              || echo "::warning::Could not minimize the corpus of $target; saving it as it is."
+            echo "::endgroup::"
+          done
+
+      - name: Save the fuzz corpus
+        if: always() && github.ref == 'refs/heads/main' && steps.fuzz.outcome != 'skipped'
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}

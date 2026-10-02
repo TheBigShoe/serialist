@@ -137,6 +137,8 @@ jobs:
   # fuzz/seeds/<target>/, replay first on the pinned stable toolchain; then each target
   # runs for FUZZ_SECONDS from those seeds. `--no-cfg-fuzzing`: nusb 0.2's `cfg(fuzzing)`
   # code does not compile. `just fuzz-check` and `just fuzz <target>` do the same locally.
+  # The corpus the runs find is cached between runs (the cache steps below), and
+  # fuzz-nightly.yml runs the same loop for longer on a schedule, on the same cache.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -188,9 +190,22 @@ jobs:
       - name: Build fuzz targets (nightly)
         run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET"
 
+      # 60 s per target only goes deep if each run starts where the last one stopped, so
+      # the corpus (fuzz/corpus, not committed) is cached. A cache entry cannot be
+      # overwritten, so the key is unique per run and restore-keys picks the newest entry
+      # with the prefix: the last push to main, or the last nightly run, which shares this
+      # prefix. No entry yet is not an error; the seeds in fuzz/seeds replay regardless.
+      - name: Restore the fuzz corpus
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-
+
       # Every target runs even when an earlier one crashes; the step fails at the end. A
       # target with a libFuzzer dictionary in fuzz/dicts/<target>.dict gets it.
       - name: Fuzz each target for ${{ env.FUZZ_SECONDS }} s
+        id: fuzz
         run: |
           targets=$(cargo +nightly fuzz list --fuzz-dir fuzz)
           if [ -z "$targets" ]; then
@@ -223,6 +238,32 @@ jobs:
           path: fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 14
+
+      # Pull requests read the cache and main writes it, as with the rust-cache steps: a PR
+      # entry is never read by main and would only crowd the repository's 10 GB limit. Both
+      # steps also run after a crash, because what a run found before it crashed is worth
+      # keeping, and are skipped when the loop never started (a failed build). The merge
+      # keeps the inputs that add coverage and drops the rest, so the saved corpus stays
+      # small. cargo-fuzz exits 0 when the merge itself fails and leaves the corpus as it
+      # was; the corpus is then saved unminimized.
+      - name: Minimize the fuzz corpus
+        if: always() && github.ref == 'refs/heads/main' && steps.fuzz.outcome != 'skipped'
+        run: |
+          for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
+            echo "::group::$target"
+            mkdir -p "fuzz/corpus/$target"
+            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+              "fuzz/corpus/$target" -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10 \
+              || echo "::warning::Could not minimize the corpus of $target; saving it as it is."
+            echo "::endgroup::"
+          done
+
+      - name: Save the fuzz corpus
+        if: always() && github.ref == 'refs/heads/main' && steps.fuzz.outcome != 'skipped'
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   # Line coverage with cargo-llvm-cov, failing below two floors: 87% for the workspace and
   # 90% for serialist-core (the plan's proposal). Measured on macOS at 8f77082: 90.5% and
