@@ -65,3 +65,10 @@ path = "fuzz_targets/ansi_monitor.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store_ingest"
+path = "fuzz_targets/store_ingest.rs"
+test = false
+doc = false
+bench = false
