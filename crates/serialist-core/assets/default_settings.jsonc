@@ -105,8 +105,11 @@
   "local_echo": false,
   // Reopen the tabs that were open when Serialist last quit: their ports, line
   // settings, codec and input mode, kept in state.json next to this file. A simulated
-  // port, or a real one that is plugged in, connects again; any other waits in its tab
-  // for Connect. Ports named on the command line (--port, --virtual NAME) open instead.
+  // port, or a real one that is plugged in, connects again, and so does a
+  // tcp:<host>:<port> tab (if nothing answers, it waits in its tab with the reason, and
+  // Connect tries again). A replay:<file> tab never plays at startup: it waits in its tab
+  // and Connect plays the capture from the beginning. Any other port waits in its tab for
+  // Connect. Ports named on the command line (--port, --virtual NAME) open instead.
   "restore_session": true,
   // Captures opened with "Open capture…" or a replay:<file> port id. A replay: id's own
   // ?speed= and ?end= win over these.

@@ -26,7 +26,8 @@
 //! with its scrollback and settings ([`SessionView::reconnect`]); the tab keeps its
 //! place, its [`TabId`] and its Script console output. A tab may hold no view: a new tab
 //! (`tabs::NewTab`) before a port is picked, a port being opened for the first time, or
-//! a restored port whose device is not plugged in.
+//! a restored tab that waits for Connect (a device that is not plugged in, a TCP endpoint
+//! that did not answer, a capture not yet played).
 //!
 //! "Connect" in the Devices panel goes to the tab already holding that port if there is
 //! one (and opens it again if it was disconnected), else fills the active tab if it is
@@ -76,9 +77,21 @@
 //! ports and settings (line settings, codec, input mode, monitor or VT) to `state.json`
 //! in the config directory (see
 //! [`session_state`](crate::session_state)), and the next start reopens them, unless
-//! ports were named on the command line or the `restore_session` setting is off. A
-//! restored port connects if the port source lists it (a simulated port with the
-//! simulator on, a real device that is plugged in) and otherwise waits in its tab.
+//! ports were named on the command line or the `restore_session` setting is off. Every
+//! tab comes back with its port id, line settings, codec, mode and emulation, and what
+//! happens next depends on the kind of id (see [`PortAddress`]):
+//!
+//! - A serial port or a `virtual:` port connects if the port source lists it (a simulated
+//!   port with the simulator on, a real device that is plugged in) and otherwise waits in
+//!   its tab.
+//! - A `tcp:` tab connects at startup whether or not anything lists it: the endpoint is
+//!   the one the user chose. If the connection is refused or times out, the open fails as
+//!   a serial reconnect does: the tab stays, the Devices panel says why, and the tab shows
+//!   a Connect button. Nothing retries.
+//! - A `replay:` tab never plays at startup, since replaying a file the moment the app
+//!   opens would be a surprise. It comes back titled with the capture's file name, on the
+//!   id it was saved with (so the same capture and the `?speed=` and `?end=` it named),
+//!   and waits with a Connect button, which plays the capture from the beginning.
 //!
 //! # Commands and scripts
 //!
@@ -102,8 +115,8 @@ use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource, ReplayAddress,
-    ReplayTransportFactory, SerialConfig, StoreConfig, TcpAddress, TransportError,
+    CommandRef, ParamValues, Payload, PortAddress, PortId, PortInfo, PortKind, PortSource,
+    ReplayAddress, ReplayTransportFactory, SerialConfig, StoreConfig, TcpAddress, TransportError,
     TransportFactory,
 };
 use serialist_script::ScriptSource;
@@ -233,6 +246,25 @@ struct Restore {
     emulation: Option<Emulation>,
 }
 
+/// What the center says for a tab with no session view: a title, a line under it, and
+/// the tab to offer a Connect button for, if any.
+struct Placeholder {
+    title: String,
+    message: String,
+    reconnect: Option<TabId>,
+}
+
+impl Placeholder {
+    /// No tab, or one with no port picked.
+    fn none() -> Self {
+        Self {
+            title: "No session".to_owned(),
+            message: "Pick a port in Devices and press Enter, or double-click it.".to_owned(),
+            reconnect: None,
+        }
+    }
+}
+
 /// A tab: a port, and the session view open on it, if any.
 struct SessionTab {
     id: TabId,
@@ -313,6 +345,46 @@ impl SessionTab {
         TabStatus {
             state,
             unseen_bytes: 0,
+        }
+    }
+
+    /// What the center says while this tab has no session view. The wording follows the
+    /// kind of port: a restored capture is no device to plug in, and a TCP endpoint is
+    /// named as the tab names it.
+    fn placeholder(&self) -> Placeholder {
+        let Some(port) = &self.port else {
+            return Placeholder::none();
+        };
+        if self.connecting {
+            return Placeholder {
+                title: format!("Opening {port}\u{2026}"),
+                message: "The port opens in the background.".to_owned(),
+                reconnect: None,
+            };
+        }
+        let name = transport_title(port).unwrap_or_else(|| port.to_string());
+        let (title, waiting) = match PortAddress::parse(port) {
+            Ok(PortAddress::Replay(_)) => (
+                format!("{name} is not playing"),
+                "Connect plays the capture from the beginning.".to_owned(),
+            ),
+            Ok(PortAddress::Tcp(_)) => (
+                format!("{name} is not connected"),
+                "Connect opens the connection.".to_owned(),
+            ),
+            // A `tcp:` or `replay:` id that breaks its grammar (a hand-edited
+            // `state.json`): the grammar says what it should be.
+            Err(error) => (format!("{port} is not connected"), error.to_string()),
+            Ok(_) => (
+                format!("{port} is not connected"),
+                "Plug the device in, then Connect (or pick another port).".to_owned(),
+            ),
+        };
+        Placeholder {
+            title,
+            // Why the last open failed, if it did; it names the port.
+            message: self.error.clone().unwrap_or(waiting),
+            reconnect: Some(self.id),
         }
     }
 }
@@ -399,14 +471,16 @@ impl Focusable for Workspace {
 
 impl Workspace {
     /// The workspace for `options`: the ports it names open in tabs, or, with none,
-    /// the tabs saved at the last quit reopen (see "Session restore").
+    /// the tabs saved at the last quit reopen (see "Session restore": a restored `tcp:`
+    /// tab connects, a restored `replay:` tab waits for Connect).
     pub fn new(options: AppOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let opener = Arc::new(CoreSessionOpener::new(options.transport_factory));
         let mut workspace =
             Self::with_opener(options.port_source, opener, options.baud, window, cx);
         workspace.store = options.store;
-        // Before any tab opens: a `--port replay:...` or a restored replay tab opens with
-        // the settings' speed and end.
+        // Before any tab opens: a `--port replay:...` plays with the settings' speed and
+        // end, and so does a restored replay tab when Connect plays it (a restored replay
+        // tab does not play at startup). An id's own `?speed=` and `?end=` win over them.
         workspace.replay = options.replay;
         workspace.apply_replay_defaults(cx);
         let select = options
@@ -662,6 +736,19 @@ impl Workspace {
             ),
             _ => "No session".to_owned(),
         }
+    }
+
+    /// What the center shows for the active tab while it has no session view.
+    fn placeholder(&self) -> Placeholder {
+        self.active_tab()
+            .map_or_else(Placeholder::none, SessionTab::placeholder)
+    }
+
+    /// The title and message the center shows for the active tab while it has no
+    /// session view (a restored tab that waits for Connect, an open that failed).
+    pub fn placeholder_text(&self) -> (String, String) {
+        let Placeholder { title, message, .. } = self.placeholder();
+        (title, message)
     }
 
     /// Every tab's session view, in tab order.
@@ -1712,8 +1799,9 @@ impl Workspace {
         SessionState::load(&Self::state_file(cx)?)
     }
 
-    /// Reopen the tabs of `state`: each port the port source lists connects with its
-    /// saved settings, then takes its codec and mode; the others wait in their tabs.
+    /// Reopen the tabs of `state`, each with its saved settings. The ports that
+    /// [`Self::restore_connects`] says connect do so, then take their codec and mode; the
+    /// others wait in their tabs, and take them when Connect opens them.
     pub fn restore(&mut self, state: SessionState, window: &mut Window, cx: &mut Context<Self>) {
         let listed: Vec<PortId> = self
             .port_source
@@ -1739,10 +1827,10 @@ impl Workspace {
                 });
             }
             restored.push(id);
-            if listed.contains(&saved.port) {
+            if Self::restore_connects(&saved.port, &listed) {
                 self.open_in_tab(id, saved.port, saved.serial, window, cx);
             } else {
-                tracing::info!(port = %saved.port, "restored a tab whose port is not listed");
+                tracing::info!(port = %saved.port, "restored a tab that waits for Connect");
             }
         }
         tracing::info!(
@@ -1751,6 +1839,27 @@ impl Workspace {
         );
         if let Some(active) = restored.get(state.active).or(restored.first()) {
             self.activate(*active, window, cx);
+        }
+    }
+
+    /// Whether a restored tab on `port` opens its session as the app starts, given the
+    /// ports the port source `listed`:
+    ///
+    /// - `tcp:` does, listed or not (no port source lists one): the endpoint is the user's
+    ///   chosen target. If nothing answers, the open fails like any other, and there is no
+    ///   retry.
+    /// - `replay:` does not: playing a file the moment the app opens would be surprising.
+    ///   Its Connect button plays it from the beginning.
+    /// - A serial path, a `virtual:` id, or a scheme this build has no grammar for does
+    ///   when the port source lists it. A `tcp:` or `replay:` id that breaks its grammar
+    ///   (a hand-edited `state.json`) is not listed either, so it waits and Connect says
+    ///   what is wrong with it.
+    fn restore_connects(port: &PortId, listed: &[PortId]) -> bool {
+        match PortAddress::parse(port) {
+            Ok(PortAddress::Tcp(_)) => true,
+            Ok(PortAddress::Replay(_)) => false,
+            Ok(PortAddress::Serial | PortAddress::Virtual { .. } | PortAddress::Other { .. })
+            | Err(_) => listed.contains(port),
         }
     }
 
@@ -2398,31 +2507,11 @@ impl Workspace {
 
     /// What the center shows for a tab with no session view.
     fn render_placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (title, message, reconnect) = match self.active_tab() {
-            Some(tab) if tab.connecting => (
-                format!(
-                    "Opening {}\u{2026}",
-                    tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
-                ),
-                "The port opens in the background.".to_owned(),
-                None,
-            ),
-            Some(tab) if tab.port.is_some() => (
-                format!(
-                    "{} is not connected",
-                    tab.port.as_ref().map(PortId::as_str).unwrap_or_default()
-                ),
-                tab.error.clone().unwrap_or_else(|| {
-                    "Plug the device in, then Connect (or pick another port).".to_owned()
-                }),
-                Some(tab.id),
-            ),
-            _ => (
-                "No session".to_owned(),
-                "Pick a port in Devices and press Enter, or double-click it.".to_owned(),
-                None,
-            ),
-        };
+        let Placeholder {
+            title,
+            message,
+            reconnect,
+        } = self.placeholder();
         let palette_key = self.palette_binding.clone();
         let theme = cx.theme();
         v_flex()

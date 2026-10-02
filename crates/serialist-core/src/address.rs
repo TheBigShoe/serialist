@@ -36,14 +36,37 @@
 //!
 //! Neither kind of id is discovered by a [`PortSource`](crate::port::PortSource), so they
 //! do not appear in the Devices panel. They open from `--port` (with or without
-//! `--script`), `serial.open{ port = … }` in a headless `--script` run, a restored tab, and
-//! the UI's own "Connect to TCP…" and "Open capture…" actions, all through the same
+//! `--script`), `serial.open{ port = … }` in a headless `--script` run, the UI's own
+//! "Connect to TCP…" and "Open capture…" actions, a restored tab (see below), and a
+//! tab's Connect button, all through the same
 //! [`RoutingTransportFactory`](crate::RoutingTransportFactory). (Scripts in the app reach a
 //! TCP or replay tab through `serial.current()`; the app gives scripts no `serial.open` for
 //! any kind of port.)
+//!
 //! A device profile still applies to them: its `match.path` is a prefix of the id, so
 //! `{ "match": { "path": "tcp:10.0.0.5:4000" }, "plugin": "airoha-race" }` gives that
 //! endpoint a codec, and `"path": "replay:"` matches every replay.
+//!
+//! # Restored tabs
+//!
+//! The app saves its open tabs at quit and reopens them at the next start, and what a
+//! restored tab does depends on its id's kind:
+//!
+//! - A `tcp:` tab **connects at startup**, as a restored serial tab does when its port is
+//!   present: the endpoint is the target the user chose, so no port source has to list it.
+//!   If the connection is refused (or times out), the tab stays, the Devices panel says
+//!   why and the tab shows a Connect button, exactly as when a restored serial port fails
+//!   to open. Nothing retries.
+//! - A `replay:` tab **does not play at startup**: replaying a file the moment the app
+//!   opens would be a surprise. It is restored with its title (the capture's file name),
+//!   the id it was saved with (so the capture and the `speed` and `end` options the id
+//!   names; the options it leaves out are the replay settings' when Connect plays it) and
+//!   its usual tab settings, and waits with a Connect button. Connect plays the capture
+//!   from the beginning.
+//! - A serial port and a `virtual:` device keep what they did before: they connect at
+//!   startup when the port source lists them, and otherwise wait in their tab.
+//!
+//! Callers tell the kinds apart with [`PortAddress::parse`], not by looking at prefixes.
 
 use std::fmt;
 use std::net::Ipv6Addr;
