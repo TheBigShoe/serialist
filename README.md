@@ -20,6 +20,24 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 - Fast: no dropped bytes at 3 Mbaud, frames under 8 ms at a million lines of scrollback.
 - Every test runs without hardware.
 
+![Serialist connected to a simulated Airoha RACE board: the device and saved-command docks on the left, the monitor log in the middle, and the Decoded panel on the right listing the frames the airoha-race plugin parsed, with a hex dump of the selected response below](docs/screenshots/monitor-race-decoded.png)
+
+The Airoha RACE example plugin, installed, decoding a simulated board: the log in the middle, the frames it was split into on the right.
+
+<table>
+<tr>
+<td width="50%" valign="top"><img src="docs/screenshots/script-console-commands.png" alt="The Script console in the right dock after version_probe.lua ran against the simulated AT modem, with its log lines and a finished-in-0.3-s result, and the saved AT commands in the left dock" width="100%"><br><sub><b>Lua scripts</b> run against the open session; the Script console shows what they print. Saved commands sit in the left dock.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/vt-mode-boot-menu.png" alt="VT mode showing a simulated U-Boot style boot menu with three entries, the second highlighted, and the toolbar's VT button lit" width="100%"><br><sub><b>VT mode</b> draws what a device paints with cursor addressing, here a U-Boot style boot menu (the <code>menu</code> simulated device).</sub></td>
+</tr>
+<tr>
+<td width="50%" valign="top"><img src="docs/screenshots/theme-phosphor-ansi.png" alt="The Serialist Phosphor theme, a green-on-black CRT look, showing an ANSI-coloured log with a few lines selected" width="100%"><br><sub><b>Serialist Phosphor</b>, one of six bundled themes, on a log full of ANSI colours.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/theme-paper-ansi.png" alt="The Serialist Paper theme, warm off-white with a teal accent, showing the same ANSI-coloured log" width="100%"><br><sub><b>Serialist Paper</b>, a light theme. Zed theme files load unchanged.</sub></td>
+</tr>
+</table>
+
+These pictures are the real workspace, drawn offscreen against Serialist's simulated devices by
+`just screenshots` (macOS; it writes nineteen states to `target/screenshots/`).
+
 ## Status
 
 Milestones 0 to 5 of `docs/plan.md` have landed: the session engine and GPUI shell, the
@@ -143,6 +161,8 @@ like any save. A value nobody set is marked "default"; the arrow beside one you 
 it again; one a project's `.serialist/settings.json` sets is read-only there. A value the
 loader would reject is never written and the reason shows under it, and a `settings.json`
 that does not load shows its error and an Open settings.json button instead.
+
+![The Settings screen in its own tab beside a session, on the Appearance page: theme mode, the light and dark themes and the UI font, with the other pages (Terminal font, Display, Session, Devices, Keymap, Plugins) listed on the left](docs/screenshots/settings-appearance.png)
 
 ### The config directory
 
