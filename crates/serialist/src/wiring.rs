@@ -3,7 +3,9 @@
 //! Real ports always: `RealPortSource` for the list and `SerialportFactory` to open
 //! them. `tcp:<host>:<port>` ids always open through `TcpTransportFactory` and
 //! `replay:<path>` ids through `ReplayTransportFactory`; neither kind is listed, since
-//! nothing discovers them (see `serialist_core::address` for the grammar). With
+//! nothing discovers them (see `serialist_core::address` for the grammar). The replay
+//! factory also goes out in [`AppOptions::replay`], so the `replay` setting can set its
+//! defaults (the window does at startup and on every reload, `--script` once). With
 //! `--virtual` (or a `virtual:` `--port`), the simulator's devices are listed
 //! alongside the real ports and `virtual:` ids open through the simulator. Every port
 //! named with `--port ID` or `--virtual NAME` opens at startup in a tab of its own, in
@@ -64,9 +66,14 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
     }
 
     let simulate = args.simulator || open.iter().any(|port| is_virtual(&port));
+    // The router keeps the replay factory as an `Arc<dyn TransportFactory>`, so nothing
+    // can reach its defaults through the router. The `Arc` is made here, a clone is
+    // registered and the original goes out in `AppOptions::replay`: the settings set
+    // the defaults of the very factory `replay:` ids open through.
+    let replay = Arc::new(ReplayTransportFactory::new());
     let router = RoutingTransportFactory::new(real.transport_factory)
         .with_scheme(TCP_SCHEME, Arc::new(TcpTransportFactory::new()))
-        .with_scheme(REPLAY_SCHEME, Arc::new(ReplayTransportFactory::new()));
+        .with_scheme(REPLAY_SCHEME, replay.clone());
     let (port_source, transport_factory) = if simulate {
         let source = MergedPortSource::new(vec![real.port_source, world.port_source()]);
         let router = router.with_scheme(VIRTUAL_SCHEME, world.transport_factory());
@@ -87,6 +94,9 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
         open_ports: open,
         // Sized by the `scrollback_budget_bytes` setting.
         store: None,
+        // Its defaults follow the `replay` setting: the UI sets them at startup and on
+        // every reload, `headless::run` once.
+        replay: Some(replay),
     })
 }
 
@@ -102,7 +112,10 @@ fn virtual_names(world: &SimWorld) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use serialist_core::{PortInfo, PortKind, SerialConfig, TransportError, UsbInfo};
+    use serialist_core::{
+        PortInfo, PortKind, ReplayEnd, ReplayOptions, ReplaySpeed, SerialConfig, TransportError,
+        UsbInfo,
+    };
     use serialist_sim::{EchoDevice, LinkConfig};
 
     use super::*;
@@ -222,6 +235,39 @@ mod tests {
                 "nothing lists tcp ports"
             );
         }
+    }
+
+    #[test]
+    fn the_app_gets_the_replay_factory_so_the_settings_can_set_its_defaults() {
+        for flags in [&[][..], &["--virtual"][..]] {
+            let options = options(flags).unwrap();
+            let replay = options.replay.clone().expect("the replay factory");
+            assert_eq!(replay.defaults(), ReplayOptions::default(), "{flags:?}");
+
+            let chosen = ReplayOptions {
+                speed: ReplaySpeed::Max,
+                end: ReplayEnd::Hold,
+            };
+            replay.set_defaults(chosen);
+            assert_eq!(replay.defaults(), chosen, "{flags:?}");
+
+            // The route did not change: the replay scheme still reaches a replay factory
+            // (a bad option is a config error, an unrouted scheme would be NotFound).
+            assert!(
+                matches!(
+                    opens(&options, "replay:/captures/boot.bin?speed=warp"),
+                    Err(TransportError::Config(message)) if message.contains("speed")
+                ),
+                "{flags:?}"
+            );
+        }
+
+        // Each build has a factory of its own, not a shared one.
+        let (first, second) = (options(&[]).unwrap(), options(&[]).unwrap());
+        assert!(!Arc::ptr_eq(
+            first.replay.as_ref().unwrap(),
+            second.replay.as_ref().unwrap()
+        ));
     }
 
     #[test]

@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::address::{ReplayEnd, ReplaySpeed};
 use crate::config::{DataBits, FlowControl, Parity, StopBits};
 use crate::port::{PortId, PortInfo, PortKind, UsbInfo};
+use crate::replay::ReplayOptions;
 use crate::test_util::TempDir;
 
 use super::*;
@@ -158,6 +160,10 @@ fn bundled_defaults_are_complete_and_as_documented() {
     assert_eq!(settings.line_ending, LineEnding::Crlf);
     assert!(!settings.local_echo);
     assert!(settings.restore_session);
+    assert_eq!(settings.replay.speed, ReplaySpeed::REALTIME);
+    assert_eq!(settings.replay.end, ReplayEnd::Disconnect);
+    assert_eq!(settings.replay, ReplaySettings::default());
+    assert_eq!(settings.replay.options(), ReplayOptions::default());
     assert!(settings.devices.is_empty());
     assert!(settings.warnings.is_empty());
     assert_eq!(settings, load_settings(None, None).unwrap());
@@ -558,10 +564,13 @@ fn known_keys_produce_no_warnings() {
                            "baud": 9600, "data_bits": 8, "parity": "none", "stop_bits": 1,
                            "flow_control": "none", "plugin": "p", "eol": "lf", "on_connect": "a.lua" } ],
             "scrollback_budget_bytes": 1048576, "default_baud": 9600,
-            "line_ending": "lf", "local_echo": true
+            "line_ending": "lf", "local_echo": true,
+            "replay": { "speed": "4x", "end": "hold" }
         }"#,
     );
     assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+    assert_eq!(settings.replay.speed, ReplaySpeed::Times(4.0));
+    assert_eq!(settings.replay.end, ReplayEnd::Hold);
 }
 
 #[test]
@@ -1081,4 +1090,197 @@ fn emulation_comes_from_the_terminal_setting_then_the_profile() {
     error_of(r#"{ "terminal": { "emulation": "vt100" } }"#);
     assert_eq!(Emulation::Monitor.toggled(), Emulation::Vt);
     assert_eq!(Emulation::Vt.toggled().label(), "Monitor");
+}
+
+#[test]
+fn replay_settings_read_every_speed_spelling_and_keep_what_the_file_leaves_out() {
+    for (text, speed) in [
+        (r#""1x""#, ReplaySpeed::REALTIME),
+        (r#""4x""#, ReplaySpeed::Times(4.0)),
+        (r#""0.5x""#, ReplaySpeed::Times(0.5)),
+        (r#""2""#, ReplaySpeed::Times(2.0)),
+        (r#""max""#, ReplaySpeed::Max),
+        (r#""MAX""#, ReplaySpeed::Max),
+        ("4", ReplaySpeed::Times(4.0)),
+        ("0.25", ReplaySpeed::Times(0.25)),
+    ] {
+        let settings = user_settings(&format!(r#"{{ "replay": {{ "speed": {text} }} }}"#));
+        assert_eq!(settings.replay.speed, speed, "speed {text}");
+        assert_eq!(
+            settings.replay.end,
+            ReplayEnd::Disconnect,
+            "a key the file leaves out keeps its default"
+        );
+        assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+    }
+
+    let settings = user_settings(r#"{ "replay": { "end": "hold" } }"#);
+    assert_eq!(settings.replay.speed, ReplaySpeed::REALTIME);
+    assert_eq!(
+        settings.replay.options(),
+        ReplayOptions {
+            speed: ReplaySpeed::REALTIME,
+            end: ReplayEnd::Hold,
+        }
+    );
+
+    // Without the loader, the types fill in what is missing from the bundled file.
+    let settings: Settings = serde_json::from_str(r#"{ "replay": { "speed": "max" } }"#).unwrap();
+    assert_eq!(settings.replay.speed, ReplaySpeed::Max);
+    assert_eq!(settings.replay.end, ReplayEnd::Disconnect);
+    let settings: Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(settings.replay, ReplaySettings::default());
+}
+
+#[test]
+fn a_bad_replay_value_is_an_error_naming_the_value_and_its_position() {
+    let err = error_of("{\n  \"replay\": { \"speed\": \"warp\" }\n}");
+    assert!(err.to_string().contains("warp"), "{err}");
+    assert!(err.to_string().contains("1x, 4x, 0.5x or max"), "{err}");
+    assert_eq!(position(&err).0, 2);
+
+    for bad in [
+        r#"{ "replay": { "speed": "0x" } }"#,
+        r#"{ "replay": { "speed": 0 } }"#,
+        r#"{ "replay": { "speed": 2000000 } }"#,
+        r#"{ "replay": { "speed": true } }"#,
+        r#"{ "replay": { "speed": null } }"#,
+        r#"{ "replay": { "end": "later" } }"#,
+        r#"{ "replay": { "end": 1 } }"#,
+        r#"{ "replay": "max" }"#,
+    ] {
+        let err = error_of(bad);
+        assert_eq!(position(&err).0, 1, "{bad}: {err}");
+    }
+    let err = error_of(r#"{ "replay": { "end": "later" } }"#);
+    assert!(err.to_string().contains("later"), "{err}");
+}
+
+#[test]
+fn an_unknown_replay_key_is_reported_and_ignored() {
+    let settings = user_settings(r#"{ "replay": { "speed": "max", "loop": true } }"#);
+    assert_eq!(settings.replay.speed, ReplaySpeed::Max);
+    let keys: Vec<&str> = settings.warnings.iter().map(|w| w.key.as_str()).collect();
+    assert_eq!(keys, ["replay.loop"]);
+}
+
+#[test]
+fn replay_settings_round_trip_through_json() {
+    for text in [
+        r#"{ "replay": { "speed": "4x", "end": "hold" } }"#,
+        r#"{ "replay": { "speed": 0.5 } }"#,
+        r#"{ "replay": { "speed": "max" } }"#,
+    ] {
+        let settings = user_settings(text);
+        let json = serde_json::to_value(&settings).unwrap();
+        let mut back: Settings = serde_json::from_value(json.clone()).unwrap();
+        back.warnings = settings.warnings.clone();
+        assert_eq!(back, settings, "{text}");
+        // The settings editor and the loader's key check both read this shape.
+        assert_eq!(
+            json["replay"]["speed"],
+            settings.replay.speed.to_string(),
+            "{text}"
+        );
+    }
+    let json = serde_json::to_value(Settings::default()).unwrap();
+    assert_eq!(
+        json["replay"],
+        serde_json::json!({ "speed": "1x", "end": "disconnect" })
+    );
+}
+
+#[test]
+fn the_template_documents_and_comments_out_the_replay_key() {
+    let template = settings_template();
+    for line in [
+        "  // \"replay\": {",
+        "    // \"speed\": \"1x\",",
+        "    // \"end\": \"disconnect\"",
+        "  // },",
+    ] {
+        assert!(template.contains(line), "template lacks {line:?}");
+    }
+    // The bundled file explains it, and the template carries the explanation.
+    for text in [DEFAULT_SETTINGS_JSONC, template.as_str()] {
+        assert!(text.contains("replay:<file> port id"), "{text}");
+        assert!(text.contains("?speed= and ?end= win over these"), "{text}");
+        assert!(text.contains("without a .timing file"), "{text}");
+    }
+    // Uncommenting the object and its lines overrides the defaults.
+    let edited = template
+        .replace("  // \"replay\": {", "  \"replay\": {")
+        .replace("    // \"speed\": \"1x\",", "    \"speed\": \"max\",")
+        .replace(
+            "    // \"end\": \"disconnect\"\n  // },",
+            "    \"end\": \"hold\"\n  },",
+        );
+    let settings = user_settings(&edited);
+    assert_eq!(settings.replay.speed, ReplaySpeed::Max);
+    assert_eq!(settings.replay.end, ReplayEnd::Hold);
+    assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+}
+
+/// The lines that differ between two texts with the same number of lines.
+fn changed_lines<'a>(before: &'a str, after: &'a str) -> Vec<(&'a str, &'a str)> {
+    assert_eq!(before.lines().count(), after.lines().count());
+    before
+        .lines()
+        .zip(after.lines())
+        .filter(|(old, new)| old != new)
+        .collect()
+}
+
+#[test]
+fn the_settings_editor_writes_one_replay_key_at_a_time_through_the_template() {
+    // The Settings screen writes a key at a time. `replay` is a block in the template
+    // (not one `// "replay": { ... },` line) so that setting `/replay/speed` goes live
+    // alone: the editor refuses a write that would also bring `end` into the file.
+    let dir = TempDir::new("replay-edit");
+    let path = dir.path().join("settings.json");
+    let template = settings_template();
+    let mut editor = SettingsEditor::open(&path).unwrap();
+    assert_eq!(editor.text(), template, "a new file is the template");
+
+    editor.set("/replay/speed", "4x").unwrap();
+    assert_eq!(
+        changed_lines(&template, editor.text()),
+        [
+            ("  // \"replay\": {", "  \"replay\": {"),
+            ("    // \"speed\": \"1x\",", "    \"speed\": \"4x\","),
+            ("  // },", "  },"),
+        ]
+    );
+    // The other key and every comment are still there, still commented out.
+    assert!(editor.text().contains("    // \"end\": \"disconnect\"\n"));
+    assert_eq!(
+        editor.get("/replay"),
+        Some(serde_json::json!({ "speed": "4x" }))
+    );
+    editor.save().unwrap();
+    let settings = load_settings(Some(&path), None).unwrap();
+    assert_eq!(settings.replay.speed, ReplaySpeed::Times(4.0));
+    assert_eq!(settings.replay.end, ReplayEnd::Disconnect);
+    assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+
+    // The second key of the same block, on its own.
+    let mut editor = SettingsEditor::open(&path).unwrap();
+    editor.set("/replay/end", "hold").unwrap();
+    assert_eq!(
+        editor.get("/replay"),
+        Some(serde_json::json!({ "speed": "4x", "end": "hold" }))
+    );
+    editor.save().unwrap();
+    let settings = load_settings(Some(&path), None).unwrap();
+    assert_eq!(settings.replay.speed, ReplaySpeed::Times(4.0));
+    assert_eq!(settings.replay.end, ReplayEnd::Hold);
+    assert!(settings.warnings.is_empty(), "{:?}", settings.warnings);
+
+    // Taking a key back out leaves the other one.
+    let mut editor = SettingsEditor::open(&path).unwrap();
+    assert!(editor.remove("/replay/speed").unwrap());
+    editor.save().unwrap();
+    let settings = load_settings(Some(&path), None).unwrap();
+    assert_eq!(settings.replay.speed, ReplaySpeed::REALTIME);
+    assert_eq!(settings.replay.end, ReplayEnd::Hold);
 }

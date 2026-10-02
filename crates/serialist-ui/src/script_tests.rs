@@ -87,6 +87,7 @@ fn open(
         select_port: None,
         open_ports: vec![PortId::new(port)],
         store: None,
+        replay: None,
     };
     let paths = ConfigPaths::new(dir.path());
     let (window, workspace) = open_test_window(cx, move |window, cx| {

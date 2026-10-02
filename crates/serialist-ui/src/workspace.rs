@@ -89,8 +89,8 @@ use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource, SerialConfig,
-    StoreConfig, TransportError, TransportFactory,
+    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource,
+    ReplayTransportFactory, SerialConfig, StoreConfig, TransportError, TransportFactory,
 };
 use serialist_script::ScriptSource;
 
@@ -153,6 +153,9 @@ pub struct AppOptions {
     pub open_ports: Vec<PortId>,
     /// Sizes each session's store in place of the `scrollback_budget_bytes` setting.
     pub store: Option<StoreConfig>,
+    /// The factory `replay:` ids open through, so the settings can set its defaults;
+    /// `None` in tests that do not replay.
+    pub replay: Option<Arc<ReplayTransportFactory>>,
 }
 
 /// Global setup: gpui-kit's components, the bundled configuration (theme, fonts and
@@ -362,6 +365,8 @@ pub struct Workspace {
     baud: Option<u32>,
     /// Store sizing over the settings' budget.
     store: Option<StoreConfig>,
+    /// The replay factory whose defaults follow the `replay` setting.
+    replay: Option<Arc<ReplayTransportFactory>>,
     focus_handle: FocusHandle,
     _param_prompt_events: Option<Subscription>,
     _palette_events: Option<Subscription>,
@@ -382,6 +387,10 @@ impl Workspace {
         let mut workspace =
             Self::with_opener(options.port_source, opener, options.baud, window, cx);
         workspace.store = options.store;
+        // Before any tab opens: a `--port replay:...` or a restored replay tab opens with
+        // the settings' speed and end.
+        workspace.replay = options.replay;
+        workspace.apply_replay_defaults(cx);
         let select = options
             .select_port
             .or_else(|| options.open_ports.first().cloned());
@@ -503,6 +512,7 @@ impl Workspace {
             port_source,
             baud,
             store: None,
+            replay: None,
             focus_handle: cx.focus_handle(),
             _param_prompt_events: None,
             _palette_events: None,
@@ -559,12 +569,21 @@ impl Workspace {
         }
     }
 
+    /// Hand the replay factory the `replay` setting as its defaults. A replay already open
+    /// keeps the options it opened with; the next open sees the change.
+    fn apply_replay_defaults(&self, cx: &App) {
+        if let (Some(replay), Some(config)) = (&self.replay, cx.try_global::<Config>()) {
+            replay.set_defaults(config.settings().replay.options());
+        }
+    }
+
     /// The configuration changed: hand every session its new defaults and repaint the
     /// status line.
     fn config_changed(&mut self, cx: &mut Context<Self>) {
         if let Some(config) = cx.try_global::<Config>() {
             self.script_commands.set(config.commands().clone());
         }
+        self.apply_replay_defaults(cx);
         let sessions: Vec<(Entity<SessionView>, PortInfo)> = self
             .tabs
             .iter()

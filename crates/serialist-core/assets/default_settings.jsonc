@@ -108,6 +108,16 @@
   // port, or a real one that is plugged in, connects again; any other waits in its tab
   // for Connect. Ports named on the command line (--port, --virtual NAME) open instead.
   "restore_session": true,
+  // Captures opened with "Open capture…" or a replay:<file> port id. A replay: id's own
+  // ?speed= and ?end= win over these.
+  "replay": {
+    // "1x" plays at the recorded pace, "4x" four times faster, "max" as fast as the
+    // session reads. A capture without a .timing file plays at the port's baud rate
+    // times the speed.
+    "speed": "1x",
+    // "disconnect" ends the session after the last byte, "hold" keeps it open.
+    "end": "disconnect"
+  },
 
   // ---- Inline interactive mode ----
   // Inline mode sends every keystroke to the port as it is typed, like picocom.
