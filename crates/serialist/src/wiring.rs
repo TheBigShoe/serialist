@@ -9,7 +9,7 @@
 //! named with `--port ID` or `--virtual NAME` opens at startup in a tab of its own, in
 //! the order given (so `--virtual firehose` streams right away). A
 //! `RoutingTransportFactory` picks the backend from the id, so the UI, the headless
-//! `--script` runner and a script's `serial.open` never need to know which one a port
+//! `--script` runner and its scripts' `serial.open` never need to know which one a port
 //! belongs to.
 
 use std::sync::Arc;

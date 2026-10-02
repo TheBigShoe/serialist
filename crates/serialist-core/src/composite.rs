@@ -132,8 +132,8 @@ fn forward(mut children: Vec<Child>, tx: &Sender<PortEvent>) {
 /// [`ReplayTransportFactory`](crate::replay::ReplayTransportFactory), and, with the
 /// simulator on, [`VIRTUAL_SCHEME`] with the simulator's factory (see
 /// [`crate::address`] for every id's grammar). Everything that opens a port (the
-/// workspace, `--port`, a restored tab, a script's `serial.open`) goes through this one
-/// router, so a new scheme needs no change anywhere else.
+/// workspace, `--port`, a restored tab, `serial.open` in a headless script) goes
+/// through this one router, so a new scheme needs no change anywhere else.
 pub struct RoutingTransportFactory {
     default: Arc<dyn TransportFactory>,
     schemes: Vec<(String, Arc<dyn TransportFactory>)>,
