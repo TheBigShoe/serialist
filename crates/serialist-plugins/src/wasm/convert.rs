@@ -158,15 +158,18 @@ fn declared(value: Value, ty: FieldType) -> Result<Value, String> {
     }
 }
 
-/// A frame from the plugin, covering stream offsets `raw`. Its fields come out as the
-/// kind declares them (in order, of their types, the required ones present), followed by
-/// any others in the plugin's order.
+/// A frame from the plugin, covering stream offsets `raw`. Its kind must be one
+/// `describe()` lists, and its fields come out as the kind declares them (in order, of
+/// their types, the required ones present), followed by any others in the plugin's order.
 pub(super) fn frame_from_wit(
     frame: &wit::Frame,
     schema: &Schema,
     raw: std::ops::Range<u64>,
     at: Instant,
 ) -> Result<Frame, String> {
+    let Some(declared_fields) = schema.get(&frame.kind) else {
+        return Err(format!("kind `{}` is not one describe() lists", frame.kind));
+    };
     let mut items = Items {
         items: &frame.items,
         used: vec![false; frame.items.len()],
@@ -179,20 +182,17 @@ pub(super) fn frame_from_wit(
         given.push(Some((name.as_str(), value)));
     }
     let mut fields = Vec::with_capacity(given.len());
-    if let Some(declared_fields) = schema.get(&frame.kind) {
-        for (name, ty, optional) in declared_fields {
-            let found = given
-                .iter_mut()
-                .find(|slot| slot.as_ref().is_some_and(|(n, _)| *n == name.as_str()));
-            match found.and_then(Option::take) {
-                Some((_, value)) => {
-                    let value =
-                        declared(value, *ty).map_err(|err| format!("field `{name}` {err}"))?;
-                    fields.push((name.clone(), value));
-                }
-                None if *optional => {}
-                None => return Err(format!("field `{name}` is declared but missing")),
+    for (name, ty, optional) in declared_fields {
+        let found = given
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|(n, _)| *n == name.as_str()));
+        match found.and_then(Option::take) {
+            Some((_, value)) => {
+                let value = declared(value, *ty).map_err(|err| format!("field `{name}` {err}"))?;
+                fields.push((name.clone(), value));
             }
+            None if *optional => {}
+            None => return Err(format!("field `{name}` is declared but missing")),
         }
     }
     fields.extend(
@@ -396,6 +396,16 @@ mod tests {
         assert!(err.contains("deep") || err.contains("lists items"), "{err}");
         assert!(frame_span(&wit_frame(vec![], vec![]), 2).is_err());
         assert_eq!(frame_span(&wit_frame(vec![], vec![]), 3), Ok((1, 3)));
+    }
+
+    #[test]
+    fn a_frame_of_a_kind_describe_does_not_list_is_an_error() {
+        let frame = wit::Frame {
+            kind: "nope".into(),
+            ..wit_frame(vec![("a", wit::Value::Uint(1))], vec![])
+        };
+        let err = frame_from_wit(&frame, &kind_schema(), 0..1, Instant::now()).unwrap_err();
+        assert_eq!(err, "kind `nope` is not one describe() lists");
     }
 
     #[test]

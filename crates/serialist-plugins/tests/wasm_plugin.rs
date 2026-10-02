@@ -236,6 +236,19 @@ fn frames_that_break_the_contract_are_reported_not_trusted() {
 }
 
 #[test]
+fn a_frame_of_a_kind_describe_does_not_list_is_an_error() {
+    let frames = decode_chunks(&mut lines(), &[b"ok\nnope\nafter\n"], Instant::now());
+    assert_eq!(
+        spans(&frames),
+        [("line", 0..3), (PLUGIN_ERROR_KIND, 3..8), ("line", 8..14)]
+    );
+    assert_eq!(
+        error_of(&frames[1]),
+        "frame 2: kind `nope` is not one describe() lists"
+    );
+}
+
+#[test]
 fn holding_back_past_the_limit_is_an_error_for_those_bytes() {
     let factory = WasmCodecFactory::load_dir_with(
         lines_dir(),
