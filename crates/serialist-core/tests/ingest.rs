@@ -15,7 +15,7 @@ use serialist_sim::{
     virtual_port_id,
 };
 
-/// The rate test must not compete with the other test in this binary for CPU.
+/// The rate tests run one at a time, so neither competes with the other for CPU.
 static HEAVY: Mutex<()> = Mutex::new(());
 
 fn heavy() -> MutexGuard<'static, ()> {
@@ -51,6 +51,20 @@ impl ChunkSink for CountingSink {
 
 #[test]
 fn firehose_at_3_mbaud_is_stored_whole() {
+    // 2 s at 300 kB/s is 600 000 bytes; allow for a slow CI runner.
+    firehose_is_stored_whole(3_000_000, 400_000);
+}
+
+#[test]
+fn firehose_at_12_mbaud_is_stored_whole() {
+    // 2 s at 1.2 MB/s is 2 400 000 bytes; allow for a slow CI runner.
+    firehose_is_stored_whole(12_000_000, 1_600_000);
+}
+
+/// Two seconds of firehose text at `baud` through a session and the ingest thread, with
+/// the test playing the UI: at least `min_bytes` arrive in that time, and the store
+/// holds every one of them, in order and undamaged, with a line index that agrees.
+fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
     let _heavy = heavy();
     let world = SimWorld::empty();
     let id = world.add_virtual("hose", "Firehose", LinkConfig::default(), || {
@@ -59,7 +73,7 @@ fn firehose_at_3_mbaud_is_stored_whole() {
         )))
     });
     let session =
-        Session::open(world.factory(), SessionConfig::new(id, serial(3_000_000))).expect("open");
+        Session::open(world.factory(), SessionConfig::new(id, serial(baud))).expect("open");
     let sink_bytes = Arc::new(AtomicU64::new(0));
     let sink_disconnects = Arc::new(AtomicU64::new(0));
     let (wake_tx, wake_rx) = unbounded();
@@ -115,8 +129,7 @@ fn firehose_at_3_mbaud_is_stored_whole() {
     }
     let report = verifier.report();
     assert!(report.is_clean(), "{report:?}");
-    // 2 s at 300 kB/s; allow for a slow CI runner.
-    assert!(report.bytes > 400_000, "{report:?}");
+    assert!(report.bytes > min_bytes, "{baud} baud: {report:?}");
     assert_eq!(sink_bytes.load(Ordering::Relaxed), stats.raw_len);
     assert_eq!(sink_disconnects.load(Ordering::Relaxed), 1);
 
