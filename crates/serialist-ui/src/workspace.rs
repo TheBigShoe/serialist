@@ -57,6 +57,19 @@
 //! `tabs::CloseTab` or their × button, which disconnects the port and stops its script
 //! and recording, asking first while either runs.
 //!
+//! # TCP and replay tabs
+//!
+//! `serial::ConnectTcp` ("Connect to TCP…", a `host:port` dialog) and
+//! `serial::OpenCapture` ("Open capture…", the platform's file dialog) open a tab on a
+//! `tcp:` or `replay:` port, through [`Workspace::connect_tcp`] and
+//! [`Workspace::open_capture`], which are [`Workspace::connect`] on the id the address
+//! writes. The tab is titled `host:port` or with the capture's file name, the status line
+//! carries the transport's description and no line settings (except for a replay with no
+//! timing sidecar, whose baud paces it), and the toolbar's settings button reads `TCP`
+//! (its popover keeps the line ending and local echo) or the replay's speed (a menu whose
+//! choices play the capture again from the start, in the same tab, on the id with the new
+//! `?speed=`). See [`status::LinkKind`](crate::status::LinkKind).
+//!
 //! # Session restore
 //!
 //! When the workspace closes (the window closes, or the app quits) it writes the tabs'
@@ -89,8 +102,9 @@ use std::sync::Arc;
 
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource,
-    ReplayTransportFactory, SerialConfig, StoreConfig, TransportError, TransportFactory,
+    CommandRef, ParamValues, Payload, PortId, PortInfo, PortKind, PortSource, ReplayAddress,
+    ReplayTransportFactory, SerialConfig, StoreConfig, TcpAddress, TransportError,
+    TransportFactory,
 };
 use serialist_script::ScriptSource;
 
@@ -102,8 +116,8 @@ use crate::actions::tabs::{
     ActivateTab7, ActivateTab8, ActivateTab9, CloseTab, NewTab, NextTab, PreviousTab,
 };
 use crate::actions::{
-    self, Clear, Disconnect, Export, OpenSettingsUi, Pause, ToggleEmulation, ToggleInline,
-    ToggleRecord, context,
+    self, Clear, ConnectTcp, Disconnect, Export, OpenCapture, OpenSettingsUi, Pause,
+    ToggleEmulation, ToggleInline, ToggleRecord, context,
 };
 use crate::chrome;
 use crate::codecs::codec_not_installed;
@@ -130,8 +144,9 @@ use crate::session_options::SessionOptions;
 use crate::session_state::{STATE_VERSION, SavedTab, SessionState, state_path};
 use crate::session_view::{SessionView, SessionViewEvent};
 use crate::settings_view::SettingsView;
-use crate::status::{ConnectionState, Notice, NoticeAction, StatusLine};
+use crate::status::{ConnectionState, Notice, NoticeAction, StatusLine, transport_title};
 use crate::tabs::{TabId, TabLabel, TabState, TabStatus};
+use crate::tcp_prompt::{TcpPrompt, TcpPromptEvent};
 
 /// The widest a tab grows; longer names are cut with an ellipsis.
 const TAB_MAX_WIDTH: Pixels = px(240.);
@@ -340,6 +355,8 @@ pub struct Workspace {
     param_prompt: Option<Entity<ParamPrompt>>,
     /// The session the parameter dialog sends to: the active one when it opened.
     param_target: Option<WeakEntity<SessionView>>,
+    /// The "Connect to TCP…" dialog's form, while it is open.
+    tcp_prompt: Option<Entity<TcpPrompt>>,
     /// In the order the tab bar shows them.
     tabs: Vec<SessionTab>,
     active: Option<TabId>,
@@ -369,6 +386,7 @@ pub struct Workspace {
     replay: Option<Arc<ReplayTransportFactory>>,
     focus_handle: FocusHandle,
     _param_prompt_events: Option<Subscription>,
+    _tcp_prompt_events: Option<Subscription>,
     _palette_events: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -498,6 +516,7 @@ impl Workspace {
             history,
             param_prompt: None,
             param_target: None,
+            tcp_prompt: None,
             tabs: Vec::new(),
             active: None,
             last_session: None,
@@ -515,6 +534,7 @@ impl Workspace {
             replay: None,
             focus_handle: cx.focus_handle(),
             _param_prompt_events: None,
+            _tcp_prompt_events: None,
             _palette_events: None,
             _subscriptions: vec![
                 devices_events,
@@ -686,6 +706,11 @@ impl Workspace {
         self.param_prompt.as_ref()
     }
 
+    /// The "Connect to TCP…" dialog's form, while it is open.
+    pub fn tcp_prompt(&self) -> Option<&Entity<TcpPrompt>> {
+        self.tcp_prompt.as_ref()
+    }
+
     /// The port the active tab is opening.
     pub fn connecting(&self) -> Option<&PortId> {
         self.active_tab()
@@ -790,6 +815,11 @@ impl Workspace {
         let Some(port) = &tab.port else {
             return "New tab".to_owned();
         };
+        // A TCP endpoint is `host:port` and a replay its capture's file name: neither is
+        // in the Devices panel to be named there.
+        if let Some(title) = transport_title(port) {
+            return title;
+        }
         let info = tab.info.clone().unwrap_or_else(|| self.port_info(port, cx));
         self.devices.read(cx).display_name(&info, cx)
     }
@@ -814,13 +844,17 @@ impl Workspace {
             .collect()
     }
 
-    /// `<port> — Serialist` for the active tab's port, else `Serialist`.
+    /// `<port> — Serialist` for the active tab's port (`host:port` for a TCP stream, the
+    /// file name for a replay), else `Serialist`.
     pub fn window_title(&self) -> String {
         if self.active_tab().is_some_and(|tab| tab.settings.is_some()) {
             return format!("Settings \u{2014} {APP_TITLE}");
         }
         match self.active_tab().and_then(|tab| tab.port.as_ref()) {
-            Some(port) => format!("{port} \u{2014} {APP_TITLE}"),
+            Some(port) => {
+                let name = transport_title(port).unwrap_or_else(|| port.to_string());
+                format!("{name} \u{2014} {APP_TITLE}")
+            }
             None => APP_TITLE.to_owned(),
         }
     }
@@ -1174,6 +1208,106 @@ impl Workspace {
         }
     }
 
+    /// Open a raw TCP stream to `address` (`tcp:<host>:<port>`) in a tab, as
+    /// [`Self::connect`] opens any port: in the tab already holding it, else the active
+    /// tab if it is a new one, else a new tab. The tab is titled `host:port`.
+    pub fn connect_tcp(
+        &mut self,
+        address: TcpAddress,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = address.port_id();
+        let serial = self.serial_for(&port, cx);
+        self.connect(port, serial, window, cx);
+    }
+
+    /// Play the capture at `path` (`replay:<path>`) in a tab, as [`Self::connect`] opens
+    /// any port. The tab is titled with the file name, and the speed and end are the
+    /// `replay` setting's. A capture whose `<file>.timing` sits beside it plays at the
+    /// recorded pace.
+    pub fn open_capture(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let port = ReplayAddress::new(path).port_id();
+        let serial = self.serial_for(&port, cx);
+        self.connect(port, serial, window, cx);
+    }
+
+    /// Ask for a `host:port` in a dialog, then [`Self::connect_tcp`]. An entry that is not
+    /// an address says so under the field and keeps the dialog open.
+    pub fn prompt_tcp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.new(|cx| TcpPrompt::new(window, cx));
+        self._tcp_prompt_events =
+            Some(
+                cx.subscribe_in(&prompt, window, |this, _, event, window, cx| match event {
+                    TcpPromptEvent::Confirmed(address) => {
+                        this.tcp_prompt = None;
+                        window.close_dialog(cx);
+                        this.connect_tcp(address.clone(), window, cx);
+                    }
+                }),
+            );
+        self.tcp_prompt = Some(prompt.clone());
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let confirm = prompt.clone();
+            let closed = this.clone();
+            dialog
+                .title("Connect to TCP")
+                .w(px(420.))
+                .child(prompt.clone())
+                // The prompt ends in its own Connect and Cancel buttons. Confirming emits
+                // the address; the subscription connects and closes.
+                .on_ok(move |_, _, cx| {
+                    confirm.update(cx, |prompt, cx| prompt.confirm(cx));
+                    false
+                })
+                .on_close(move |_, _, cx| {
+                    closed
+                        .update(cx, |workspace, _| workspace.tcp_prompt = None)
+                        .ok();
+                })
+        });
+        if let Some(prompt) = &self.tcp_prompt {
+            prompt.update(cx, |prompt, cx| prompt.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Ask for a capture file with the platform's open dialog, then
+    /// [`Self::open_capture`].
+    pub fn prompt_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let answer = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            // Cancelled, or the dialog went away.
+            let Ok(Ok(Some(paths))) = answer.await else {
+                return;
+            };
+            if let Some(path) = paths.into_iter().next() {
+                this.update_in(cx, |this, window, cx| this.open_capture(path, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn connect_tcp_action(&mut self, _: &ConnectTcp, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt_tcp(window, cx);
+    }
+
+    fn open_capture_action(
+        &mut self,
+        _: &OpenCapture,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prompt_capture(window, cx);
+    }
+
     /// Open the port of tab `id` again with the settings it has: its session view's
     /// (as the port settings last left them), else those it was restored or opened
     /// with.
@@ -1193,6 +1327,33 @@ impl Workspace {
             .map(|view| view.read(cx).serial().clone())
             .or_else(|| tab.serial.clone())
             .unwrap_or_else(|| self.serial_for(&port, cx));
+        self.open_in_tab(id, port, serial, window, cx);
+    }
+
+    /// Play the replay in tab `id` again from the start under the id `port` (its own with
+    /// a new `?speed=`): the session open now, if any, closes, and the tab goes on in the
+    /// same view, scrollback and all, on the new port. A running recording and script
+    /// end with the session, as they do on Disconnect.
+    fn reopen_tab_as(
+        &mut self,
+        id: TabId,
+        port: PortId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        let (view, connecting) = (tab.view.clone(), tab.connecting);
+        let Some(view) = view else {
+            return;
+        };
+        // An open still in flight for this tab would race the new one.
+        if connecting {
+            return;
+        }
+        let serial = view.read(cx).serial().clone();
+        view.update(cx, |view, cx| view.disconnect(cx));
         self.open_in_tab(id, port, serial, window, cx);
     }
 
@@ -1340,6 +1501,10 @@ impl Workspace {
             tab.port_settings.take()
         });
         view.update(cx, |view, cx| {
+            // A replay at a new speed is a new id on the same tab.
+            if view.port() != &port {
+                view.retarget(port.clone());
+            }
             view.reconnect(session, serial, cx);
             if let Some(settings) = &settings {
                 view.apply_port_settings(settings, cx);
@@ -1400,6 +1565,9 @@ impl Workspace {
                     this.reveal_console(Some(id), cx);
                 }
                 SessionViewEvent::Reconnect => this.reconnect_tab(id, window, cx),
+                SessionViewEvent::Reopen { port } => {
+                    this.reopen_tab_as(id, port.clone(), window, cx);
+                }
             },
         );
         let active = self.active == Some(id);
@@ -2516,8 +2684,15 @@ impl Workspace {
             ConnectionState::Disconnected { error: Some(_) } => theme.danger,
         };
         let disconnected = view.state().is_disconnected();
-        let port = view.port().to_string();
-        let settings = view.serial().summary();
+        // A serial port is named by its id and line settings. A TCP stream or a replay by
+        // the transport's own description (`tcp:host:port (ip:port)`, `replay:boot.bin
+        // (4x)`), with line settings only where they mean something (a replay without a
+        // timing sidecar, paced by the baud).
+        let (port, settings) = if view.link().has_line_settings() {
+            (view.port().to_string(), Some(view.serial().summary()))
+        } else {
+            (status.title.clone(), status.settings.clone())
+        };
         let form = view.port_form().clone();
         let (foreground, warning, danger, info, border) = (
             theme.foreground,
@@ -2534,7 +2709,7 @@ impl Workspace {
             .items_center()
             .child(chrome::state_dot(state_color, disconnected))
             .child(div().text_color(foreground).child(SharedString::from(port)))
-            .child(SharedString::from(settings));
+            .children(settings.map(SharedString::from));
         let connection = if live {
             Popover::new("status-port-popover")
                 .anchor(Anchor::BottomLeft)
@@ -2853,6 +3028,8 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::clear))
             .on_action(cx.listener(Self::disconnect))
+            .on_action(cx.listener(Self::connect_tcp_action))
+            .on_action(cx.listener(Self::open_capture_action))
             .on_action(cx.listener(Self::pause))
             .on_action(cx.listener(Self::export))
             .on_action(cx.listener(Self::toggle_record))

@@ -161,9 +161,9 @@ use serialist_core::{
     ChunkSink, CodecFactory, CodecInfo, CodecRegistry, Command, CommandRef, ConnectionInfo,
     ControlLine, Direction, ExpectResult, Expectation, FrameId, FrameSnapshot, FrameStore,
     FrameStoreReader, Ingest, IngestHandle, IngestPanicked, IngestStats, LineEnding, LineId,
-    LineSource, LinkState, ParamValues, Payload, PortId, SearchMatch, Searcher, SerialConfig,
-    SessionEvent, SessionStats, Snapshot, Store, StyledLine, TIMING_SUFFIX, TextOptions,
-    Timestamps,
+    LineSource, LinkState, ParamValues, Payload, PortId, ReplayAddress, ReplaySpeed, SearchMatch,
+    Searcher, SerialConfig, SessionEvent, SessionStats, Snapshot, Store, StyledLine, TIMING_SUFFIX,
+    TextOptions, Timestamps, TransportError,
 };
 use serialist_script::{ScriptOutcome, ScriptSource};
 use serialist_vt::{DEFAULT_SCROLLBACK, VtScreen, VtSnapshot};
@@ -198,8 +198,9 @@ use crate::scrollback::{Floors, Scrollback};
 use crate::session_handle::SessionHandle;
 use crate::session_options::SessionOptions;
 use crate::status::{
-    ConnectionState, Notice, NoticeAction, PauseMark, RateMeter, RecordingStatus, ScriptStatus,
-    StatusInputs, StatusLine, file_name, format_bytes,
+    ConnectionState, LinkKind, Notice, NoticeAction, PauseMark, RateMeter, RecordingStatus,
+    ScriptStatus, StatusInputs, StatusLine, file_name, format_bytes, replay_speed_label,
+    replay_speed_of, replay_speeds, shows_line_settings,
 };
 use crate::tabs::{TabState, TabStatus};
 use crate::terminal::view::MAX_MARKS;
@@ -321,6 +322,10 @@ pub enum SessionViewEvent {
     /// The toolbar's Connect, on a closed session: open the port again, with the view's
     /// settings, into this view (see [`SessionView::reconnect`]).
     Reconnect,
+    /// The replay speed menu's choice: close the session and open this port id, the
+    /// replay's own with the new `?speed=`, into this view. The capture plays again from
+    /// the start, in the same tab with the same scrollback.
+    Reopen { port: PortId },
 }
 
 /// How long Send break holds the line.
@@ -580,6 +585,8 @@ fn raw_under(source: &dyn LineSource, lines: Range<LineId>) -> Range<u64> {
 
 pub struct SessionView {
     port: PortId,
+    /// What the port is: a serial line, a TCP stream or a replayed capture.
+    link: LinkKind,
     /// The line settings in force: those the port was opened with, then whatever the
     /// port settings changed them to. Connecting again in this view uses them.
     serial: SerialConfig,
@@ -866,13 +873,21 @@ impl SessionView {
         let initial_codec = options.codec.clone();
         let decoded_inline = options.display.decoded_inline;
         let hide_framed = options.display.hide_framed_bytes;
+        let link = LinkKind::of(&port);
         let port_form = cx.new(|cx| {
-            PortSettingsForm::new(
+            let form = PortSettingsForm::new(
                 PortSettings::new(serial.clone(), options.line_ending, options.local_echo),
                 true,
                 window,
                 cx,
-            )
+            );
+            // A stream with no serial line behind it has no rate, framing or control
+            // lines to set.
+            if link.has_line_settings() {
+                form
+            } else {
+                form.without_line_settings()
+            }
         });
         let port_settings_events = cx.subscribe_in(
             &port_form,
@@ -884,6 +899,7 @@ impl SessionView {
 
         let mut view = Self {
             port,
+            link,
             opened_serial: serial.clone(),
             serial,
             connection: ConnectionInfo::default(),
@@ -1084,13 +1100,76 @@ impl SessionView {
                     |prefix| format!("{prefix}{}", self.serial.summary()),
                 ),
             Some(description) => description.clone(),
-            None => format!("{} @ {}", self.port, self.serial.summary()),
+            None if self.link.has_line_settings() => {
+                format!("{} @ {}", self.port, self.serial.summary())
+            }
+            // No line settings to name: just the endpoint or the capture.
+            None => self.port.to_string(),
+        }
+    }
+
+    /// What kind of port this session is on.
+    pub fn link(&self) -> LinkKind {
+        self.link
+    }
+
+    /// What the toolbar's settings button says: the line settings of a serial port,
+    /// `TCP` for a TCP stream, the speed of a replay (`1x`, `4x`, `max`).
+    pub fn connection_label(&self) -> String {
+        match self.link {
+            LinkKind::Serial => self.serial.summary(),
+            LinkKind::Tcp => "TCP".to_owned(),
+            LinkKind::Replay => {
+                replay_speed_label(&self.port, self.connection.description.as_deref())
+            }
         }
     }
 
     /// Where the link stands, as ingest last reported it.
     pub fn connection(&self) -> &ConnectionInfo {
         &self.connection
+    }
+
+    /// Whether `error`, a link's end, is a replay reaching its last byte: the transport
+    /// reports it as the device going away, and the status line should not call it a
+    /// lost connection.
+    fn is_replay_end(&self, error: &str) -> bool {
+        self.link == LinkKind::Replay && error == TransportError::Disconnected.to_string()
+    }
+
+    /// The speed this replay plays at, once its description or its id says. `None` for a
+    /// port that is not a replay.
+    pub fn replay_speed(&self) -> Option<ReplaySpeed> {
+        (self.link == LinkKind::Replay)
+            .then(|| replay_speed_of(&self.port, self.connection.description.as_deref()))
+            .flatten()
+    }
+
+    /// Play this replay again from the start at `speed`: the workspace closes the session
+    /// and opens the replay's id with `?speed=` set to it, into this view (see
+    /// [`SessionViewEvent::Reopen`]). The replay menu's items call it. Nothing happens
+    /// for a port that is not a replay.
+    pub fn choose_replay_speed(&mut self, speed: ReplaySpeed, cx: &mut Context<Self>) {
+        if self.link != LinkKind::Replay {
+            return;
+        }
+        let Ok(address) = ReplayAddress::from_port_id(&self.port) else {
+            return;
+        };
+        let port = address.with_speed(speed).port_id();
+        cx.emit(SessionViewEvent::Reopen { port });
+    }
+
+    /// Name another port of the same kind as the one this view is about, before a
+    /// reconnect opens it (a replay at a new speed is a new id). Call right before
+    /// [`Self::reconnect`].
+    pub fn retarget(&mut self, port: PortId) {
+        debug_assert_eq!(
+            LinkKind::of(&port),
+            self.link,
+            "a view keeps its kind of port"
+        );
+        self.port = port;
     }
 
     pub fn mode(&self) -> Mode {
@@ -1109,7 +1188,8 @@ impl SessionView {
         StatusLine::new(StatusInputs {
             state: &self.state,
             title: self.title(),
-            settings: self.serial.summary(),
+            settings: shows_line_settings(self.link, self.connection.description.as_deref())
+                .then(|| self.serial.summary()),
             session: self.stats,
             store: self.snapshot().stats(),
             paused: self.pause,
@@ -1672,8 +1752,10 @@ impl SessionView {
         if let LinkState::Disconnected { error } = &self.connection.state
             && !self.state.is_disconnected()
         {
-            // The link went away by itself (a local disconnect sets the state first).
-            let error = error.clone();
+            // The link went away by itself (a local disconnect sets the state first). A
+            // replay that plays its last byte ends this way by design, which is not a lost
+            // connection.
+            let error = error.clone().filter(|error| !self.is_replay_end(error));
             tracing::info!(port = %self.port, ?error, "session ended");
             self.state = ConnectionState::Disconnected { error };
             self.close_session(cx);
@@ -3742,7 +3824,7 @@ impl SessionView {
         // Button labels are small text; a character is a little over half its size.
         let char_width = f32::from(window.rem_size()) * 0.875 * 0.6;
         let text = |text: &str| text.chars().count() as f32 * char_width;
-        let summary = self.serial.summary();
+        let summary = self.connection_label();
         let codec = self.codec_label();
         let measured = |width: &Option<(String, f32)>, label: &str| {
             width
@@ -3860,21 +3942,33 @@ impl SessionView {
         let workspace = Some(context::WORKSPACE);
         let terminal = Some(context::TERMINAL);
 
-        let form = self.port_form.clone();
-        let port_settings = Popover::new("port-settings-popover")
-            .trigger(
-                Button::new("port-settings")
-                    .label(SharedString::from(self.serial.summary()))
-                    .tooltip("Port settings: baud, framing, flow control, DTR and RTS")
-                    .small()
-                    .ghost(),
-            )
-            .content(move |_, _, _| form.clone())
-            .on_open_change(cx.listener(|this, open: &bool, window, cx| {
-                if *open {
-                    this.sync_port_form(window, cx);
-                }
-            }));
+        let label = self.connection_label();
+        let port_settings = match self.link {
+            // A replay's control is its speed: a menu, not the port settings.
+            LinkKind::Replay => self.replay_speed_button(&label, &view).into_any_element(),
+            link => {
+                let form = self.port_form.clone();
+                Popover::new("port-settings-popover")
+                    .trigger(
+                        Button::new("port-settings")
+                            .label(SharedString::from(label.clone()))
+                            .tooltip(if link == LinkKind::Tcp {
+                                "TCP stream: line ending and local echo"
+                            } else {
+                                "Port settings: baud, framing, flow control, DTR and RTS"
+                            })
+                            .small()
+                            .ghost(),
+                    )
+                    .content(move |_, _, _| form.clone())
+                    .on_open_change(cx.listener(|this, open: &bool, window, cx| {
+                        if *open {
+                            this.sync_port_form(window, cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+        };
         let connection = if open {
             chrome::icon_button("session-disconnect", IconName::Unplug, cx)
                 .tooltip_with_action(
@@ -3892,7 +3986,6 @@ impl SessionView {
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SessionViewEvent::Reconnect)))
         };
 
-        let summary = self.serial.summary();
         let mut bar = h_flex()
             .id("session-toolbar")
             .flex_none()
@@ -3913,7 +4006,7 @@ impl SessionView {
                     .child(div().pl_1().child(chrome::state_dot(dot_color, !open)))
                     .child(port_settings)
                     .child(connection)
-                    .on_prepaint(Self::measured(&view, ToolControl::Connection, summary)),
+                    .on_prepaint(Self::measured(&view, ToolControl::Connection, label)),
             );
 
         for group in ToolbarItem::GROUPS {
@@ -3963,6 +4056,19 @@ impl SessionView {
         })
         .test_support()
         .into_any_element()
+    }
+
+    /// The replay's speed control: a button saying the speed, with a menu of the others.
+    /// Choosing one plays the capture again from the start at it.
+    fn replay_speed_button(&self, label: &str, view: &WeakEntity<SessionView>) -> impl IntoElement {
+        let (current, menu_view) = (self.replay_speed(), view.clone());
+        Button::new("replay-speed")
+            .label(SharedString::from(label.to_owned()))
+            .small()
+            .ghost()
+            .dropdown_caret(true)
+            .tooltip("Replay speed: choosing one restarts the replay from the beginning")
+            .dropdown_menu(move |menu, _, _| speed_items(menu, current, &menu_view))
     }
 
     /// One control of the toolbar.
@@ -4277,6 +4383,26 @@ fn export_items(
                     view.export(ExportFormat::Csv, cx)
                 })),
         )
+}
+
+/// The replay speed menu: one item per speed, the one in force checked. Each restarts the
+/// replay from the beginning at that speed.
+fn speed_items(
+    menu: PopupMenu,
+    current: Option<ReplaySpeed>,
+    view: &WeakEntity<SessionView>,
+) -> PopupMenu {
+    replay_speeds()
+        .into_iter()
+        .fold(menu.min_w(px(120.)).label("Replay at"), |menu, speed| {
+            menu.item(
+                PopupMenuItem::new(speed.to_string())
+                    .checked(current == Some(speed))
+                    .on_click(on_view(view, move |view, _, cx| {
+                        view.choose_replay_speed(speed, cx)
+                    })),
+            )
+        })
 }
 
 /// The codec menu: the codecs to decode with, what decoding does to the scrollback, the
