@@ -5,7 +5,13 @@
 //!
 //! * **Custom baud rates** are passed straight through. The crate applies `IOSSIOSPEED`
 //!   on macOS (after every `tcsetattr`, so the OS-reported rate is never trustworthy),
-//!   `termios2`/`BOTHER` on Linux and a `DCB` rate on Windows.
+//!   `termios2`/`BOTHER` on Linux and a `DCB` rate on Windows. On Linux it uses `BOTHER`
+//!   for every rate, so rates past the highest `B` constant (`B4000000`), 12 Mbaud
+//!   included, reach the driver; only on powerpc Linux and illumos does it map rates
+//!   through the `B` constants instead, and there anything off that table fails to open
+//!   with `TransportError::Config`. Whether the adapter runs at the rate is the driver's
+//!   business (FTDI's FT232H and FT2232H go to 12 Mbaud) and needs hardware to check:
+//!   see `tests/hardware.rs`.
 //! * **Exclusive access** is the crate default on Unix (`TIOCEXCL` plus a non-blocking
 //!   `flock`) and is requested explicitly here. Windows ports are always opened with a
 //!   share mode of zero, so they are exclusive by construction.
@@ -1080,6 +1086,31 @@ mod tests {
             &["write 1100@0"]
         };
         assert_eq!(port.log(), expected);
+
+        // 12 Mbaud, the top of the standard list, is a fast link too.
+        writer.applied.baud = 12_000_000;
+        assert_eq!(
+            writer.write_chunk(),
+            if cfg!(unix) {
+                FAST_WRITE_CHUNK
+            } else {
+                usize::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn twelve_mbaud_passes_straight_through_to_the_port() {
+        // No rate table and no rounding: the crate gets the integer, and applies it with
+        // IOSSIOSPEED on macOS, termios2/BOTHER on Linux and a DCB rate on Windows.
+        let port = MockPort::idle();
+        let mut writer = mock_writer(&port);
+        writer
+            .reconfigure(&cfg_with(|c| c.baud = 12_000_000))
+            .unwrap();
+        assert_eq!(port.log(), ["baud 12000000@0"]);
+        assert_eq!(port.state().baud, 12_000_000);
+        assert_eq!(writer.applied.baud, 12_000_000);
     }
 
     #[test]
