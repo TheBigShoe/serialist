@@ -134,7 +134,16 @@ where
 
 fn positive_float(raw: Raw<'_>, what: &str) -> Result<f32, String> {
     match raw.number() {
-        Some(v) if v.is_finite() && v > 0.0 => Ok(v as f32),
+        Some(v) if v.is_finite() && v > 0.0 => {
+            // The setting is an f32: a huge number rounds to infinity and a tiny one to
+            // zero, which would reach the font code as a size or height it cannot use.
+            let stored = v as f32;
+            if stored.is_finite() && stored > 0.0 {
+                Ok(stored)
+            } else {
+                Err(format!("a {what} of {v} is out of range"))
+            }
+        }
         Some(v) => Err(format!("a {what} must be a positive number, got {v}")),
         None => Err(format!(
             "invalid value, expected a {what} as a positive number"

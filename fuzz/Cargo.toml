@@ -94,3 +94,10 @@ path = "fuzz_targets/store_ingest.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "config_jsonc"
+path = "fuzz_targets/config_jsonc.rs"
+test = false
+doc = false
+bench = false
