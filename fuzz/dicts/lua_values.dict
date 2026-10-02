@@ -1,0 +1,50 @@
+# libFuzzer dictionary for lua_values: pieces of the test plugin's bytecode (see the
+# opcode table in fuzz/src/lua_values.rs) for decode and the program mode, and JSON
+# tokens for the request mode (config 2). The CI job and `just fuzz` pass
+# fuzz/dicts/<target>.dict when it exists.
+
+# decode: a frame, and what goes in it
+frame_header="\x11\x08\x00\x03\x01\x10"
+frame_typed="\x11\x08\x01\x03\x01\x10"
+frame_loose="\x11\x08\x02\x03\x01\x10"
+frame_other="\x11\x08\x03\x03\x01\x10"
+list_of_one="\x09\x01"
+list_of_two="\x09\x02"
+record_of_one="\x0a\x01"
+record_of_eight="\x0a\x08"
+def_of_one="\x0c\x01"
+ref_first="\x0d\x00"
+share_max="\x0b\x10"
+share_13="\x0b\x0d"
+name_typed="\x08\x01"
+name_x="\x08\x11"
+name_fields="\x08\x17"
+edge_maxint="\x04\x00"
+edge_minint="\x04\x01"
+edge_maxint_less_one="\x04\x02"
+special_nan="\x06\x00"
+special_2_63="\x06\x04"
+special_whole="\x06\x09"
+size="\x10"
+tail_four="\x12\x04"
+tail_all="\x12\xff"
+raise_string="\x13\x00"
+nil_nil="\x00\x00"
+
+# program mode: the error tables encode may return
+code_unknown="\x08\x18\x08\x19"
+code_missing="\x08\x18\x08\x1a"
+code_bad="\x08\x18\x08\x1b"
+
+# request mode
+obj_open="{\"a\":"
+nested_open="[[[[[[[["
+nested_close="]]]]]]]]"
+null="null"
+u64_max="18446744073709551615"
+i64_min="-9223372036854775808"
+big_float="1e300"
+whole_float="2.0"
+nul_escape="\\u0000"
+surrogate="\\ud83d\\ude00"
+command_key="{\"command\":\"run\"}"
