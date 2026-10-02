@@ -136,7 +136,7 @@ bench-compare base="main" *args="":
     cargo bench --workspace --locked --bench '*' -- --baseline-lenient base $times {{args}}
     python3 .github/scripts/bench_regressions.py "$CRITERION_HOME"
 
-# Render the real workspace offscreen with Metal in twenty states (macOS only) and write
+# Render the real workspace offscreen with Metal in twenty-two states (macOS only) and write
 # PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
 screenshots *names:
     cargo run -p serialist-ui --example screenshots --locked -- --out target/screenshots {{names}}
