@@ -301,6 +301,29 @@ fn set_drives_control_lines_and_baud() {
 }
 
 #[test]
+fn set_takes_12_mbaud_to_the_link() {
+    let world = world();
+    let id = PortId::new("virtual:echo");
+    let session = open(&world, "virtual:echo");
+    let host = host_on(&session);
+    let finished = run(
+        &host,
+        "fast.lua",
+        r#"
+        serial.current():set{ baud = 12000000 }
+        "#,
+    );
+    finished.assert_ok();
+    let link = world.link(&id).expect("the link is up");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session.serial_config().baud != 12_000_000 {
+        assert!(Instant::now() < deadline, "the rate never arrived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(link.link_config().serial.baud, 12_000_000);
+}
+
+#[test]
 fn serial_open_and_ports_through_the_headless_opener() {
     let world = world();
     let mut services = services(None, TestUi::new());

@@ -26,10 +26,12 @@ use serialist_core::{
 use crate::devices_panel::parse_baud;
 use crate::prelude::*;
 
-/// The rates the baud list offers; the field takes any other.
+/// The rates the baud list offers; the field takes any other. The top four are the
+/// rates FTDI's high-speed chips (FT232H, FT2232H) reach, up to their 12 Mbaud ceiling.
 pub const STANDARD_BAUDS: &[u32] = &[
     300, 600, 1200, 2400, 4800, 9600, 14_400, 19_200, 28_800, 38_400, 57_600, 115_200, 230_400,
-    460_800, 921_600, 1_000_000, 1_500_000, 2_000_000, 3_000_000,
+    460_800, 921_600, 1_000_000, 1_500_000, 2_000_000, 3_000_000, 4_000_000, 6_000_000, 8_000_000,
+    12_000_000,
 ];
 
 const LABEL_WIDTH: Pixels = px(96.);
@@ -656,7 +658,10 @@ mod tests {
             assert_eq!(by_label(&FLOWS, flow_label, flow_label(flow)), Some(flow));
         }
         assert_eq!(STANDARD_BAUDS.first(), Some(&300));
-        assert_eq!(STANDARD_BAUDS.last(), Some(&3_000_000));
+        assert_eq!(STANDARD_BAUDS.last(), Some(&12_000_000));
+        assert!(
+            STANDARD_BAUDS.ends_with(&[3_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000])
+        );
         assert!(STANDARD_BAUDS.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
@@ -720,6 +725,50 @@ mod tests {
             assert_eq!(form.settings(), &settings);
             assert_eq!(form.baud_text(cx), "115200");
         });
+    }
+
+    #[gpui_test]
+    fn twelve_mbaud_is_listed_and_fast_rates_type_in(cx: &mut TestAppContext) {
+        let fast = SerialConfig {
+            baud: 12_000_000,
+            ..SerialConfig::default()
+        };
+        let settings = PortSettings::new(fast.clone(), LineEnding::Crlf, false);
+        let (window, form) = open_test_window(cx, |window, cx| {
+            PortSettingsForm::new(settings, true, window, cx)
+        });
+        form.read_with(cx, |form, cx| {
+            assert_eq!(form.baud_text(cx), "12000000");
+            let listed = form.baud_list.read(cx).selected_value().cloned();
+            assert_eq!(listed.as_deref(), Some("12000000"));
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&form, move |_, event: &PortSettingsEvent, _| {
+                events.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+        cx.update_window(window, |_, window, cx| {
+            form.update(cx, |form, cx| {
+                form.enter_baud("8_000_000", window, cx);
+                form.enter_baud("6000000", window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let baud = |baud| SerialConfig {
+            baud,
+            ..fast.clone()
+        };
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                PortSettingsEvent::Serial(baud(8_000_000)),
+                PortSettingsEvent::Serial(baud(6_000_000)),
+            ]
+        );
     }
 
     #[gpui_test]
