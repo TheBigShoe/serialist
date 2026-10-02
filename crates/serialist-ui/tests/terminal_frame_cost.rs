@@ -16,8 +16,14 @@ use serialist_ui::prelude::*;
 use serialist_ui::terminal::double::SyntheticLines;
 use serialist_ui::terminal::{FrameSample, TerminalView, TimestampMode};
 
+/// The per-frame budget. A coverage build gets none (`Duration::MAX`): `cargo llvm-cov`
+/// instruments the code, which then costs several times what any budget allows. What else
+/// the test checks (lines fetched and shaped per frame) is counted, not timed, and holds
+/// there too.
 fn budget() -> Duration {
-    if cfg!(debug_assertions) {
+    if cfg!(coverage) {
+        Duration::MAX
+    } else if cfg!(debug_assertions) {
         Duration::from_millis(40)
     } else {
         Duration::from_millis(8)

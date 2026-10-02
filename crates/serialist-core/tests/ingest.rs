@@ -1,4 +1,13 @@
 //! The ingest thread end to end: a `Session` over `SimWorld`, no hardware.
+//!
+//! Rates measured against the wall clock (frames drawn, bytes delivered in two real
+//! seconds) hold on a quiet developer machine but not on a loaded one, a shared CI runner
+//! or a coverage build: starved of CPU, a debug build's ingest thread falls behind at
+//! 12 Mbaud and wakes the UI once per bigger batch. So they follow the rule in
+//! `timing::wall_clock_timing_enabled`, the one the simulator's real-time smoke tests
+//! use. Completeness and ordering are checked everywhere.
+
+mod timing;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -20,16 +29,6 @@ static HEAVY: Mutex<()> = Mutex::new(());
 
 fn heavy() -> MutexGuard<'static, ()> {
     HEAVY.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Rates measured against the wall clock (frames drawn, bytes delivered in two real
-/// seconds) hold on a quiet developer machine but not on a loaded one or a shared CI
-/// runner: starved of CPU, a debug build's ingest thread falls behind at 12 Mbaud and
-/// wakes the UI once per bigger batch. So they follow the rule the simulator's real-time
-/// smoke tests use: checked unless `CI` is set, and under `CI` only with
-/// `SERIALIST_TIMING_TESTS` set. Completeness and ordering are checked everywhere.
-fn wall_clock_timing_enabled() -> bool {
-    std::env::var_os("CI").is_none() || std::env::var_os("SERIALIST_TIMING_TESTS").is_some()
 }
 
 fn serial(baud: u32) -> SerialConfig {
@@ -74,7 +73,7 @@ fn firehose_at_12_mbaud_is_stored_whole() {
 /// Two seconds of firehose text at `baud` through a session and the ingest thread, with
 /// the test playing the UI: the store holds every byte that arrived, in order and
 /// undamaged, with a line index that agrees, and the UI was never woken twice for one
-/// acknowledge. Where wall-clock timing is checked (see [`wall_clock_timing_enabled`]),
+/// acknowledge. Where wall-clock timing is checked (see [`timing::wall_clock_timing_enabled`]),
 /// at least `min_bytes` arrived and the UI drew more than 50 frames in that time.
 fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
     let _heavy = heavy();
@@ -146,13 +145,13 @@ fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
         report.records > 0,
         "{baud} baud: nothing arrived: {report:?}"
     );
-    if wall_clock_timing_enabled() {
+    if timing::wall_clock_timing_enabled() {
         assert!(acks > 50, "only {acks} frames in 2 s");
         assert!(report.bytes > min_bytes, "{baud} baud: {report:?}");
     } else {
         eprintln!(
-            "skipped the frame and byte rate checks under CI \
-             (set SERIALIST_TIMING_TESTS=1 to run them): {acks} frames, {} bytes in 2 s",
+            "skipped the frame and byte rate checks under CI or coverage \
+             (set SERIALIST_TIMING_TESTS=1 to run them on CI): {acks} frames, {} bytes in 2 s",
             report.bytes
         );
     }

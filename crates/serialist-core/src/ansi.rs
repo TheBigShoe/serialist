@@ -1568,8 +1568,15 @@ mod tests {
             let elapsed = start.elapsed();
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0].text, over.repeat(n));
-            // Quadratic editing took over 400 ms in release; linear takes a few ms.
-            let limit = if cfg!(debug_assertions) { 500 } else { 100 };
+            // Quadratic editing took over 400 ms in release; linear takes a few ms. A
+            // coverage build gets no limit: instrumented code is several times slower.
+            let limit = if cfg!(coverage) {
+                u128::MAX
+            } else if cfg!(debug_assertions) {
+                500
+            } else {
+                100
+            };
             assert!(
                 elapsed.as_millis() < limit,
                 "{under:?} overwritten by {over:?}: {elapsed:?}"

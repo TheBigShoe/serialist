@@ -3,7 +3,9 @@
 //!
 //! The bound is loose, since this runs on shared CI machines: a few seconds in a release
 //! build. A debug build of this crate is several times slower and gets a bound to match.
-//! For the numbers:
+//! It is held only where wall-clock timing holds (see `timing_enabled`): a coverage
+//! build, a loaded machine and a shared runner can each overrun even a loose bound, and
+//! the work and every other check run regardless. For the numbers:
 //!
 //! ```text
 //! cargo test --release -p serialist-vt --test firehose -- --nocapture
@@ -29,6 +31,28 @@ fn bound() -> Duration {
         Duration::from_secs(90)
     } else {
         Duration::from_secs(5)
+    }
+}
+
+/// Whether to hold the run to `bound()`. The rule of the other crates' wall-clock tests
+/// (`serialist-core/tests/timing/mod.rs`, `serialist-sim/tests/common/mod.rs`): not in a
+/// coverage build (`cargo llvm-cov` instruments the code, which then runs several times
+/// slower), and under `CI` only with `SERIALIST_TIMING_TESTS` set.
+fn timing_enabled() -> bool {
+    !cfg!(coverage)
+        && (std::env::var_os("CI").is_none()
+            || std::env::var_os("SERIALIST_TIMING_TESTS").is_some())
+}
+
+fn within_bound(elapsed: Duration) {
+    if timing_enabled() {
+        assert!(elapsed < bound(), "{elapsed:?}");
+    } else {
+        eprintln!(
+            "{elapsed:?}: the {:?} bound is not checked here (coverage build, or CI without \
+             SERIALIST_TIMING_TESTS)",
+            bound()
+        );
     }
 }
 
@@ -59,7 +83,7 @@ fn a_32_mib_firehose_feeds_within_the_bound() {
     snapshot.lines(snapshot.first_line()..snapshot.first_visible(), &mut lines);
     let records = lines.iter().filter(|l| l.text.starts_with('#')).count();
     assert!(records > 5_000, "{records} records in {} rows", lines.len());
-    assert!(elapsed < bound(), "{elapsed:?}");
+    within_bound(elapsed);
 }
 
 /// What the sink does: a snapshot after every chunk.
@@ -76,5 +100,5 @@ fn a_32_mib_firehose_with_a_snapshot_per_chunk_stays_within_the_bound() {
     let elapsed = started.elapsed();
     report("feed + snapshot per chunk", elapsed);
     assert_eq!(generations as usize, TOTAL / CHUNK);
-    assert!(elapsed < bound(), "{elapsed:?}");
+    within_bound(elapsed);
 }
