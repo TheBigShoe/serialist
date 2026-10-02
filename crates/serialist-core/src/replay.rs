@@ -150,17 +150,23 @@ impl TransportFactory for ReplayTransportFactory {
             .map_err(|err| TransportError::Config(err.to_string()))?;
         let options = self.options_for(&address);
 
-        let file = File::open(&address.path).map_err(|err| match err.kind() {
+        // Metadata before the open: Windows refuses to open a directory with
+        // PermissionDenied, while Unix opens it and fails on the first read, so the
+        // directory check has to come first to answer the same way everywhere.
+        let metadata = std::fs::metadata(&address.path).map_err(|err| match err.kind() {
             io::ErrorKind::NotFound => TransportError::NotFound(port.clone()),
             _ => io_error(port, &err),
         })?;
-        let metadata = file.metadata().map_err(|err| io_error(port, &err))?;
         if metadata.is_dir() {
             return Err(TransportError::Io(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 format!("{port}: a replay port id names a capture file, not a directory"),
             )));
         }
+        let file = File::open(&address.path).map_err(|err| match err.kind() {
+            io::ErrorKind::NotFound => TransportError::NotFound(port.clone()),
+            _ => io_error(port, &err),
+        })?;
         let raw_len = metadata.len();
 
         let schedule = match Timing::read_file(&address.timing_path()) {
