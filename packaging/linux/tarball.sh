@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build the Linux release tarball: the binary, the .desktop entry, hicolor icons, the
-# licenses and an install script, laid out like an install prefix.
+# licenses (Serialist's own and THIRD_PARTY_LICENSES.md) and an install script, laid out
+# like an install prefix.
 #
 #   tarball.sh <release binary> <output dir> [version]
 #
@@ -48,6 +49,9 @@ install -m 644 "$here/../icons/serialist.svg" "$root/share/icons/hicolor/scalabl
 for doc in LICENSE-MIT LICENSE-APACHE README.md CHANGELOG.md; do
     [[ -f "$REPO_ROOT/$doc" ]] && install -m 644 "$REPO_ROOT/$doc" "$root/share/doc/serialist/$doc"
 done
+# The third-party notices (the bundled Fadetouched theme's MIT license) must ship: no
+# `[[ -f ]] &&` guard, so a missing file fails the build instead of being skipped.
+install -m 644 "$REPO_ROOT/THIRD_PARTY_LICENSES.md" "$root/share/doc/serialist/THIRD_PARTY_LICENSES.md"
 
 mkdir -p "$out"
 archive="$out/$name.tar.gz"

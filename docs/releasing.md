@@ -15,6 +15,15 @@ builds](#unsigned-builds)).
 | Windows (x86_64) | `Serialist-<version>-windows-x86_64.msi` | cargo-wix, from `packaging/windows/main.wxs` and `[package.metadata.wix]` |
 | all | `SHA256SUMS` | the `release` job |
 
+Every package carries `THIRD_PARTY_LICENSES.md`, the copyright and MIT license text of the
+bundled Fadetouched theme (a license condition: the notice must travel with the program, and
+the theme is compiled into the binary). It lands in `Serialist.app/Contents/Resources/`
+(`bundle.sh`), in `share/doc/serialist/` in the tarball (`tarball.sh`) and the `.deb` (the
+`assets` list in `crates/serialist/Cargo.toml`), and next to the program as
+`THIRD_PARTY_LICENSES.txt` in the `.msi` (`packaging/windows/main.wxs`). `tarball.sh` and
+`bundle.sh` fail if the file is missing. When you bundle another third-party file, add its
+notice to that file and check that it still ships.
+
 There is no AppImage. Its point is to bundle shared libraries, and the GPU stack (Vulkan
 loader, Wayland, xkbcommon, fontconfig) has to come from the host to match its drivers. The
 tarball and the `.deb` use the host's libraries instead. The tarball unpacks like an

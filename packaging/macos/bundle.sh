@@ -35,6 +35,9 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 install -m 755 "$binary" "$app/Contents/MacOS/serialist"
 sed "s/@VERSION@/$version/g" "$here/Info.plist.in" >"$app/Contents/Info.plist"
 install -m 644 "$here/../icons/serialist.icns" "$app/Contents/Resources/serialist.icns"
+# The third-party notices (the bundled Fadetouched theme's MIT license). Inside the bundle,
+# so it is covered by the signature below and travels with the app out of the .dmg.
+install -m 644 "$REPO_ROOT/THIRD_PARTY_LICENSES.md" "$app/Contents/Resources/THIRD_PARTY_LICENSES.md"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 
 plutil -lint "$app/Contents/Info.plist" >&2
