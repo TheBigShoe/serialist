@@ -19,7 +19,7 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 - Lua scripting and protocol plugins you install (an Airoha RACE example ships with the app).
 - Fonts and themes configured the way Zed does it; Zed theme files load unchanged.
 - Fast: no dropped bytes at 12 Mbaud (1.2 MB/s, an FT232H at full speed), frames under 8 ms at a million lines of scrollback.
-- Every test runs without hardware.
+- Every test runs without hardware, and CI fuzzes the parsers, codecs and config loaders, holds line coverage to a floor for each crate, and checks pull requests' benchmarks for regressions (`CONTRIBUTING.md` has the details).
 
 ![Serialist connected to a simulated Airoha RACE board: the device and saved-command docks on the left, the monitor log in the middle, and the Decoded panel on the right listing the frames the airoha-race plugin parsed, with a hex dump of the selected response below](docs/screenshots/monitor-race-decoded.png)
 
