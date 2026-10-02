@@ -11,11 +11,17 @@
 //! just fuzz-stable ansi_monitor 60 # the same on stable, without ASan
 //! ```
 //!
+//! [`codec`] is not a target: the checks every codec target shares (the decode contract,
+//! tiling, building an encode request from fuzz bytes).
+//!
 //! Byte-stream targets read their input through [`Input`], so libFuzzer controls the
 //! chunk boundaries as well as the bytes, and a seed stays readable: a config byte, the
 //! chunk lengths, then the stream as it would arrive on the wire.
 
 pub mod ansi_monitor;
+pub mod codec;
+pub mod race_rust;
+pub mod text_lines;
 
 /// The most chunk lengths an [`Input`] carries.
 pub const MAX_CHUNK_LENS: usize = 32;
