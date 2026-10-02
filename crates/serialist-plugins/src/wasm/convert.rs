@@ -1,6 +1,7 @@
 //! Values across the component boundary: descriptions and frames coming out, encode
 //! requests going in. Nothing a plugin returns is trusted: spans are checked against
-//! the input, list items against the arena, fields against the declared kinds.
+//! the input and the frame before, list items against the arena, kinds and fields
+//! against what `describe()` declared.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -99,6 +100,18 @@ pub(super) fn frame_span(frame: &wit::Frame, input_len: usize) -> Result<(u64, u
         ));
     }
     Ok((start, end))
+}
+
+/// That a frame starting at `start` follows frame `prev` (counting from 1), which ends at
+/// `prev_stop`: frames come in order and do not overlap, though they may touch and may be
+/// empty. For the first frame, `prev` is 0 and `prev_stop` is 0.
+pub(super) fn frame_follows(start: u64, prev: usize, prev_stop: u64) -> Result<(), String> {
+    if start < prev_stop {
+        return Err(format!(
+            "starts at {start}, before frame {prev} ends at {prev_stop}"
+        ));
+    }
+    Ok(())
 }
 
 /// The list items of one frame, each usable once.
@@ -406,6 +419,24 @@ mod tests {
         };
         let err = frame_from_wit(&frame, &kind_schema(), 0..1, Instant::now()).unwrap_err();
         assert_eq!(err, "kind `nope` is not one describe() lists");
+    }
+
+    #[test]
+    fn frames_may_touch_but_not_overlap_or_go_back() {
+        assert_eq!(frame_follows(0, 0, 0), Ok(()), "the first frame");
+        assert_eq!(frame_follows(4, 1, 4), Ok(()), "touching");
+        assert_eq!(frame_follows(9, 1, 4), Ok(()), "a gap");
+        assert_eq!(frame_follows(4, 2, 4), Ok(()), "empty and touching");
+        assert_eq!(
+            frame_follows(3, 1, 4),
+            Err("starts at 3, before frame 1 ends at 4".to_owned()),
+            "overlapping"
+        );
+        assert_eq!(
+            frame_follows(0, 2, 4),
+            Err("starts at 0, before frame 2 ends at 4".to_owned()),
+            "going back"
+        );
     }
 
     #[test]

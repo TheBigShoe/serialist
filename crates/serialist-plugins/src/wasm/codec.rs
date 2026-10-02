@@ -332,10 +332,19 @@ impl WasmCodec {
         result
     }
 
-    fn fail(&self, raw: std::ops::Range<u64>, at: Instant, message: &str, out: &mut Vec<Frame>) {
+    /// Log `message` and put a [`PLUGIN_ERROR_KIND`] frame over `raw` into `out` at `index`.
+    fn fail(
+        &self,
+        index: usize,
+        raw: std::ops::Range<u64>,
+        at: Instant,
+        message: &str,
+        out: &mut Vec<Frame>,
+    ) {
         tracing::warn!(plugin = %self.shared.info.name, %message, "a WebAssembly codec failed");
         let first_line = message.lines().next().unwrap_or_default();
-        out.push(
+        out.insert(
+            index,
             Frame::new(PLUGIN_ERROR_KIND, raw, at)
                 .with_severity(Severity::Error)
                 .with_summary(format!("plugin error: {first_line}"))
@@ -346,26 +355,39 @@ impl WasmCodec {
     /// One call to the plugin's `decode` over `input`, which starts at stream offset `base`.
     fn decode_input(&mut self, input: &[u8], base: u64, at: Instant, out: &mut Vec<Frame>) {
         let end = base + input.len() as u64;
+        // An error over the whole call goes in before the call's frames, which start no
+        // earlier, so `out` stays in order of `raw.start`.
+        let first = out.len();
         let result = match self.call(|plugin, store| plugin.call_decode(store, input)) {
             Ok(result) => result,
             Err(message) => {
-                self.fail(base..end, at, &message, out);
+                self.fail(first, base..end, at, &message, out);
                 return;
             }
         };
+        let mut prev_stop = 0;
         for (i, frame) in result.frames.iter().enumerate() {
-            let (start, stop) = match convert::frame_span(frame, input.len()) {
+            let span = convert::frame_span(frame, input.len()).and_then(|(start, stop)| {
+                convert::frame_follows(start, i, prev_stop)?;
+                Ok((start, stop))
+            });
+            let (start, stop) = match span {
                 Ok(span) => span,
                 Err(err) => {
-                    // A frame outside the input spoils the rest of the call.
-                    self.fail(base..end, at, &format!("frame {}: {err}", i + 1), out);
+                    // A frame outside the input or out of order spoils the rest of the call.
+                    let message = format!("frame {}: {err}", i + 1);
+                    self.fail(first, base..end, at, &message, out);
                     return;
                 }
             };
+            prev_stop = stop;
             let raw = base + start..base + stop;
             match convert::frame_from_wit(frame, &self.shared.schema, raw.clone(), at) {
                 Ok(frame) => out.push(frame),
-                Err(err) => self.fail(raw, at, &format!("frame {}: {err}", i + 1), out),
+                Err(err) => {
+                    let message = format!("frame {}: {err}", i + 1);
+                    self.fail(out.len(), raw, at, &message, out);
+                }
             }
         }
         let held = result.held as usize;
@@ -374,13 +396,13 @@ impl WasmCodec {
                 "decode held back {held} bytes of the {} it was given",
                 input.len()
             );
-            self.fail(base..end, at, &message, out);
+            self.fail(first, base..end, at, &message, out);
         } else if held > self.shared.limits.max_held_back {
             let message = format!(
                 "decode held back {held} bytes, more than the limit of {}",
                 self.shared.limits.max_held_back
             );
-            self.fail(end - held as u64..end, at, &message, out);
+            self.fail(out.len(), end - held as u64..end, at, &message, out);
         } else {
             self.held.extend_from_slice(&input[input.len() - held..]);
         }
