@@ -175,8 +175,10 @@ serialist --port virtual:at --script version_probe.lua
 serialist --port /dev/cu.usbserial-1420 --baud 921600 --script probe.lua
 ```
 
-`--script` needs `--port` (a real port path, or `virtual:<NAME>` for a simulated device,
-which turns the simulator on as it does for the window). The port is opened with the line
+`--script` needs `--port` (a real port path, `virtual:<NAME>` for a simulated device,
+which turns the simulator on as it does for the window, `tcp:<HOST>:<PORT>` for a raw TCP
+stream, or `replay:<FILE>[?speed=…&end=…]` for a recorded capture, which plays at the speed
+and end of the `replay` setting unless its id says otherwise). The port is opened with the line
 settings the window would use: the device profile that matches the port, over
 `default_baud`, with `--baud` over both. The script runs with that session as
 `serial.current()`, and the port closes when it ends, letting queued writes go out first.
@@ -190,9 +192,11 @@ How the API behaves without the app around it:
 - `ui.prompt(label, default)` prints the label (and the default in brackets) to stderr and
   reads one line from stdin. An empty line takes the default; end of input answers `nil`.
 - `ui.notify(text)` writes `notice: <text>` to stderr.
-- `serial.open{ port = "<id>" }` works; `match = {...}` does not, because there is no port
-  list to match against (it returns `nil` and a message). `serial.ports()` returns an empty
-  list.
+- `serial.open{ port = "<id>" }` works, and takes any id `--port` does, `tcp:` and `replay:`
+  ones included; `match = {...}` does not, because there is no port list to match against
+  (it returns `nil` and a message). `serial.ports()` returns an empty list. (In the window
+  scripts get no `serial.open`: it returns `nil` and a message, and a script uses
+  `serial.current()`, which works on a `tcp:` or `replay:` tab as on any port.)
 - `commands.send` raises an error (no saved commands).
 - `require` and `dofile` read from the script file's own folder.
 
