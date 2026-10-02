@@ -3,9 +3,9 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use serialist_core::{LineSource, PortId, StoreConfig};
+use serialist_core::{LineSource, PortId, StoreConfig, Timing, TimingRecord, timing_path};
 use serialist_sim::{
     DeviceOutput, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator,
     FirehoseVerifier, LinkConfig, SimDevice, SimWorld,
@@ -406,7 +406,7 @@ fn recording_writes_the_raw_stream_until_stopped(cx: &mut TestAppContext) {
     assert_eq!(
         notice,
         Notice::info(format!(
-            "Recorded {} to capture.bin",
+            "Recorded {} to capture.bin (timing in capture.bin.timing)",
             format_bytes(recorded.len() as u64)
         ))
     );
@@ -440,6 +440,58 @@ fn recording_writes_the_raw_stream_until_stopped(cx: &mut TestAppContext) {
     assert!(report.is_clean(), "{report:?}");
     assert_eq!(report.missing_records, 0);
     assert!(report.records > 10, "{report:?}");
+}
+
+#[gpui_test]
+fn recording_writes_a_replayable_capture(cx: &mut TestAppContext) {
+    let dir = TestDir::new("record-timing");
+    let world = SimWorld::new();
+    let (window, workspace) = open_workspace(cx, &world, Some("virtual:echo"));
+    let view = wait_connected(cx, &workspace);
+    let description = view.read_with(cx, |v, _| v.connection().description.clone());
+    let description = description.expect("a connected session names its link");
+
+    let path = dir.join("echo.bin");
+    view.update(cx, |v, cx| v.start_recording(path.clone(), cx));
+    wait_recording(cx, &view);
+    for line in ["one", "two", "three"] {
+        type_line(cx, window, line);
+    }
+    // The recorder hears a chunk just after the store has it, so wait for the recorder.
+    let stats = view.read_with(cx, |v, _| v.recording().and_then(|r| r.stats.clone()));
+    let stats = stats.expect("an open recording has counters");
+    run_until(cx, "the echo in the recording", |_| stats.bytes() >= 17);
+
+    view.update(cx, |v, cx| v.stop_recording(cx));
+    wait_notice(cx, &view, "Recorded");
+    let raw = fs::read(&path).unwrap();
+    assert_eq!(raw, b"one\r\ntwo\r\nthree\r\n");
+
+    let sidecar = timing_path(&path);
+    assert_eq!(sidecar, dir.join("echo.bin.timing"));
+    let timing = Timing::read_file(&sidecar).expect("the sidecar parses");
+    assert!(!timing.truncated);
+    assert!(
+        matches!(
+            timing.records.first(),
+            Some(TimingRecord::Connect { at, description: named })
+                if *at == Duration::ZERO && *named == description
+        ),
+        "a recording started on a live link opens by naming it: {timing:?}"
+    );
+    let sizes: Vec<u64> = timing.rx().map(|(_, _, len)| len).collect();
+    assert_eq!(
+        sizes.iter().sum::<u64>(),
+        raw.len() as u64,
+        "the rx lengths add up to the raw file: {sizes:?}"
+    );
+    let schedule = timing.schedule(raw.len() as u64);
+    assert_eq!(schedule.len(), sizes.len(), "one chunk per record, no tail");
+    assert_eq!(
+        schedule.last().map(|chunk| chunk.offset + chunk.len),
+        Some(raw.len() as u64),
+        "and the schedule covers the file"
+    );
 }
 
 #[gpui_test]
@@ -506,7 +558,10 @@ fn recording_survives(
 
     end(cx, &world, &view);
     let notice = wait_notice(cx, &view, "Recorded");
-    assert_eq!(notice, Notice::info("Recorded 5 B to session.bin"));
+    assert_eq!(
+        notice,
+        Notice::info("Recorded 5 B to session.bin (timing in session.bin.timing)")
+    );
     assert_eq!(fs::read(&path).unwrap(), b"bye\r\n");
     assert!(view.read_with(cx, |v, _| v.recording().is_none()));
 }
