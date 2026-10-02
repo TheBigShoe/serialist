@@ -846,8 +846,11 @@ fn indexed(n: u8) -> Color {
 }
 
 /// Length of an incomplete UTF-8 sequence at the end of `bytes` (0 if there is none):
-/// a lead byte followed by fewer continuation bytes than it announces.
-fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
+/// a lead byte followed by fewer continuation bytes than it announces, so at most 3.
+///
+/// Public for `serialist-vt`, which feeds vte through Alacritty and holds the same suffix
+/// back for the same reason as [`AnsiParser::feed`] does.
+pub fn incomplete_utf8_suffix(bytes: &[u8]) -> usize {
     let n = bytes.len();
     for back in 1..=n.min(3) {
         let b = bytes[n - back];
