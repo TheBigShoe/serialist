@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# No #[bench] functions; this keeps `cargo bench -- --quick` from reaching libtest,
+# which rejects criterion's flags.
+bench = false
+
 [dependencies]
 alacritty_terminal.workspace = true
 parking_lot.workspace = true
@@ -15,5 +20,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 crossbeam-channel.workspace = true
+criterion.workspace = true
 proptest.workspace = true
 serialist-sim.workspace = true
+
+[[bench]]
+name = "feed"
+harness = false

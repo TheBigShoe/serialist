@@ -7023,6 +7023,7 @@ dependencies = [
 name = "serialist-plugins"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "crossbeam-channel",
  "insta",
  "memchr",
@@ -7093,6 +7094,7 @@ name = "serialist-vt"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "criterion",
  "crossbeam-channel",
  "parking_lot",
  "proptest",
