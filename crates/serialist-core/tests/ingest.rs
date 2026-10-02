@@ -22,6 +22,16 @@ fn heavy() -> MutexGuard<'static, ()> {
     HEAVY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Rates measured against the wall clock (frames drawn, bytes delivered in two real
+/// seconds) hold on a quiet developer machine but not on a loaded one or a shared CI
+/// runner: starved of CPU, a debug build's ingest thread falls behind at 12 Mbaud and
+/// wakes the UI once per bigger batch. So they follow the rule the simulator's real-time
+/// smoke tests use: checked unless `CI` is set, and under `CI` only with
+/// `SERIALIST_TIMING_TESTS` set. Completeness and ordering are checked everywhere.
+fn wall_clock_timing_enabled() -> bool {
+    std::env::var_os("CI").is_none() || std::env::var_os("SERIALIST_TIMING_TESTS").is_some()
+}
+
 fn serial(baud: u32) -> SerialConfig {
     SerialConfig {
         baud,
@@ -51,19 +61,21 @@ impl ChunkSink for CountingSink {
 
 #[test]
 fn firehose_at_3_mbaud_is_stored_whole() {
-    // 2 s at 300 kB/s is 600 000 bytes; allow for a slow CI runner.
+    // 2 s at 300 kB/s is 600 000 bytes; allow for a slow machine.
     firehose_is_stored_whole(3_000_000, 400_000);
 }
 
 #[test]
 fn firehose_at_12_mbaud_is_stored_whole() {
-    // 2 s at 1.2 MB/s is 2 400 000 bytes; allow for a slow CI runner.
+    // 2 s at 1.2 MB/s is 2 400 000 bytes; allow for a slow machine.
     firehose_is_stored_whole(12_000_000, 1_600_000);
 }
 
 /// Two seconds of firehose text at `baud` through a session and the ingest thread, with
-/// the test playing the UI: at least `min_bytes` arrive in that time, and the store
-/// holds every one of them, in order and undamaged, with a line index that agrees.
+/// the test playing the UI: the store holds every byte that arrived, in order and
+/// undamaged, with a line index that agrees, and the UI was never woken twice for one
+/// acknowledge. Where wall-clock timing is checked (see [`wall_clock_timing_enabled`]),
+/// at least `min_bytes` arrived and the UI drew more than 50 frames in that time.
 fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
     let _heavy = heavy();
     let world = SimWorld::empty();
@@ -116,7 +128,8 @@ fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
     session.close();
     let store = handle.join().expect("the ingest thread ran cleanly");
 
-    assert!(acks > 50, "only {acks} frames in 2 s");
+    // The doorbell protocol holds however busy the machine is: one wake per
+    // acknowledge, give or take the ones in flight at either end.
     assert!(wakes <= acks + 2, "{wakes} wakes for {acks} acknowledges");
 
     // Every byte, in order, with nothing damaged.
@@ -129,7 +142,20 @@ fn firehose_is_stored_whole(baud: u32, min_bytes: u64) {
     }
     let report = verifier.report();
     assert!(report.is_clean(), "{report:?}");
-    assert!(report.bytes > min_bytes, "{baud} baud: {report:?}");
+    assert!(
+        report.records > 0,
+        "{baud} baud: nothing arrived: {report:?}"
+    );
+    if wall_clock_timing_enabled() {
+        assert!(acks > 50, "only {acks} frames in 2 s");
+        assert!(report.bytes > min_bytes, "{baud} baud: {report:?}");
+    } else {
+        eprintln!(
+            "skipped the frame and byte rate checks under CI \
+             (set SERIALIST_TIMING_TESTS=1 to run them): {acks} frames, {} bytes in 2 s",
+            report.bytes
+        );
+    }
     assert_eq!(sink_bytes.load(Ordering::Relaxed), stats.raw_len);
     assert_eq!(sink_disconnects.load(Ordering::Relaxed), 1);
 
