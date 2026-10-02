@@ -21,20 +21,37 @@ behind the Zed editor. macOS first, Linux and Windows from the same code.
 - Fast: no dropped bytes at 12 Mbaud (1.2 MB/s, an FT232H at full speed), frames under 8 ms at a million lines of scrollback.
 - Every test runs without hardware, and CI fuzzes the parsers, codecs and config loaders, holds line coverage to a floor for each crate, and checks pull requests' benchmarks for regressions (`CONTRIBUTING.md` has the details).
 
-![Serialist connected to a simulated Airoha RACE board: the device and saved-command docks on the left, the monitor log in the middle, and the Decoded panel on the right listing the frames the airoha-race plugin parsed, with a hex dump of the selected response below](docs/screenshots/monitor-race-decoded.png)
+![Serialist in its dark theme, connected to a simulated device that streams ANSI-coloured log lines: the Devices and Commands docks on the left, the icon toolbar and the log in the middle, and the status bar showing the port, its line settings and the live receive rate](docs/screenshots/monitor-dark.png)
 
-The Airoha RACE example plugin, installed, decoding a simulated board: the log in the middle, the frames it was split into on the right.
+Serialist Dark, on a simulated device that never stops talking. Docks on the left, the log
+in the middle, the port and its live byte rates in the status bar.
 
 <table>
+<tr>
+<td width="50%" valign="top"><img src="docs/screenshots/monitor-light.png" alt="The same session in the Serialist Light theme: an off-white window with the same ANSI-coloured log" width="100%"><br><sub><b>Light and dark.</b> The same session in Serialist Light. The theme follows the system, or you pin one.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/settings-appearance.png" alt="The Settings tab on its Appearance page: a System, Light, Dark mode switch, the light and dark theme pickers and the UI font, with the other pages (Terminal font, Display, Session, Devices, Keymap, Plugins) listed on the left" width="100%"><br><sub><b>Settings</b> open in a tab (<code>cmd-,</code>): mode, themes, fonts, device profiles and the keymap, written back to <code>settings.json</code> one key at a time.</sub></td>
+</tr>
 <tr>
 <td width="50%" valign="top"><img src="docs/screenshots/script-console-commands.png" alt="The Script console in the right dock after version_probe.lua ran against the simulated AT modem, with its log lines and a finished-in-0.3-s result, and the saved AT commands in the left dock" width="100%"><br><sub><b>Lua scripts</b> run against the open session; the Script console shows what they print. Saved commands sit in the left dock.</sub></td>
 <td width="50%" valign="top"><img src="docs/screenshots/vt-mode-boot-menu.png" alt="VT mode showing a simulated U-Boot style boot menu with three entries, the second highlighted, and the toolbar's VT button lit" width="100%"><br><sub><b>VT mode</b> draws what a device paints with cursor addressing, here a U-Boot style boot menu (the <code>menu</code> simulated device).</sub></td>
 </tr>
 <tr>
-<td width="50%" valign="top"><img src="docs/screenshots/theme-phosphor-ansi.png" alt="The Serialist Phosphor theme, a green-on-black CRT look, showing an ANSI-coloured log with a few lines selected" width="100%"><br><sub><b>Serialist Phosphor</b>, one of the bundled themes, on a log full of ANSI colours.</sub></td>
-<td width="50%" valign="top"><img src="docs/screenshots/theme-paper-ansi.png" alt="The Serialist Paper theme, warm off-white with a teal accent, showing the same ANSI-coloured log" width="100%"><br><sub><b>Serialist Paper</b>, a light theme. Zed theme files load unchanged.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/search-hex-view.png" alt="The hex view of a firehose session with a search for the bytes 0d 0a: every match highlighted in the hex columns, the match count beside the search field, and a Jump to bottom button" width="100%"><br><sub><b>Search and hex.</b> Search the scrollback as text or bytes; the hex view shows the same bytes with every match lit.</sub></td>
+<td width="50%" valign="top"><img src="docs/screenshots/save-command-dialog.png" alt="The Save command dialog over a session: name, collection, group, description, a payload with an {{on}} parameter, an expected reply pattern, a timeout and a keybinding field" width="100%"><br><sub><b>Saved commands</b> take parameters, an expected reply and a key. They live in JSON collections under the config directory.</sub></td>
 </tr>
 </table>
+
+<table>
+<tr>
+<td width="25%" valign="top"><img src="docs/screenshots/theme-ember-ansi.png" alt="The Serialist Ember theme, warm charcoal with an amber accent, on an ANSI-coloured log" width="100%"><br><sub><b>Ember</b></sub></td>
+<td width="25%" valign="top"><img src="docs/screenshots/theme-phosphor-ansi.png" alt="The Serialist Phosphor theme, a green-on-black CRT look, on an ANSI-coloured log" width="100%"><br><sub><b>Phosphor</b></sub></td>
+<td width="25%" valign="top"><img src="docs/screenshots/theme-paper-ansi.png" alt="The Serialist Paper theme, warm off-white with a teal accent, on an ANSI-coloured log" width="100%"><br><sub><b>Paper</b></sub></td>
+<td width="25%" valign="top"><img src="docs/screenshots/theme-contrast-ansi.png" alt="The Serialist Contrast theme, pure black with white text at 7:1 or better, on an ANSI-coloured log" width="100%"><br><sub><b>Contrast</b></sub></td>
+</tr>
+</table>
+
+Four of the other bundled themes; the Fadetouched family by Arishawke ships too, and Zed
+theme files load unchanged.
 
 These pictures are the real workspace, drawn offscreen against Serialist's simulated devices by
 `just screenshots` (macOS; it writes twenty-two states to `target/screenshots/`).
@@ -247,8 +264,6 @@ it again; one a project's `.serialist/settings.json` sets is read-only there. A 
 loader would reject is never written and the reason shows under it, and a `settings.json`
 that does not load shows its error and an Open settings.json button instead.
 
-![The Settings screen in its own tab beside a session, on the Appearance page: theme mode, the light and dark themes and the UI font, with the other pages (Terminal font, Display, Session, Devices, Keymap, Plugins) listed on the left](docs/screenshots/settings-appearance.png)
-
 ### The config directory
 
 Settings, key bindings, themes, saved commands, scripts, plugins and history live in one
@@ -401,6 +416,10 @@ the example into `plugins/airoha-race/`, and the codec appears. Then try it:
 `serialist --virtual race`, pick `airoha-race` in the codec menu, and send "RACE version"
 from the Commands panel. "Open plugins folder" (palette, codec menu, or the Serialist menu)
 also writes read-only copies of the examples into `plugins/examples/`, which do not load.
+
+<p align="center"><img src="docs/screenshots/monitor-race-decoded.png" width="760" alt="Serialist connected to a simulated Airoha RACE board with the airoha-race plugin installed: the log in the middle shows each frame summarised on one line, and the Decoded panel on the right lists the frames the plugin parsed, with a hex dump of the selected response below"></p>
+
+<p align="center"><sub>The Airoha RACE example plugin on the simulated board (<code>--virtual race</code>): one line per frame in the log, the parsed frames in the Decoded panel, the selected one as hex.</sub></p>
 
 A device profile's `"plugin"` selects a codec only when that plugin is installed; otherwise
 the port connects without one, the status line names the missing plugin with an Install
