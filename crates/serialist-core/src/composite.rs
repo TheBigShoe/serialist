@@ -125,6 +125,15 @@ fn forward(mut children: Vec<Child>, tx: &Sender<PortEvent>) {
 /// registered for that scheme, and an unregistered scheme fails with `NotFound`. Ids
 /// without a scheme (`/dev/cu.usbserial-1420`, `COM3`) go to the default factory,
 /// normally the serial one.
+///
+/// The app registers [`TCP_SCHEME`](crate::address::TCP_SCHEME) with
+/// [`TcpTransportFactory`](crate::tcp::TcpTransportFactory),
+/// [`REPLAY_SCHEME`](crate::address::REPLAY_SCHEME) with
+/// [`ReplayTransportFactory`](crate::replay::ReplayTransportFactory), and, with the
+/// simulator on, [`VIRTUAL_SCHEME`] with the simulator's factory (see
+/// [`crate::address`] for every id's grammar). Everything that opens a port (the
+/// workspace, `--port`, a restored tab, `serial.open` in a headless script) goes
+/// through this one router, so a new scheme needs no change anywhere else.
 pub struct RoutingTransportFactory {
     default: Arc<dyn TransportFactory>,
     schemes: Vec<(String, Arc<dyn TransportFactory>)>,
@@ -375,8 +384,8 @@ mod tests {
             "serial"
         );
         assert!(matches!(
-            open("tcp:192.168.1.5:4000"),
-            Err(TransportError::NotFound(id)) if id.as_str() == "tcp:192.168.1.5:4000"
+            open("rfc2217:192.168.1.5:4000"),
+            Err(TransportError::NotFound(id)) if id.as_str() == "rfc2217:192.168.1.5:4000"
         ));
         assert_eq!(*sim.opened.lock(), ["virtual:echo"]);
         assert_eq!(serial.opened.lock().len(), 3);

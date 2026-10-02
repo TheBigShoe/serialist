@@ -1,5 +1,10 @@
 //! Where a virtual link gets its time: the [`Clock`] trait, real time
 //! ([`SystemClock`]) and a clock a test moves by hand ([`ManualClock`]).
+//!
+//! `Clock`, `SystemClock` and `Wakeup` are defined in `serialist_core::clock` (the core's
+//! file-replay transport takes a clock too) and re-exported here unchanged, so
+//! `serialist_sim::{Clock, SystemClock, Wakeup}` keep working. `ManualClock` lives here:
+//! it is a test double.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7,101 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+pub use serialist_core::clock::{Clock, SystemClock, Wakeup};
 
 use crate::link::later;
 
 /// How long [`ManualClock::settle`] waits, in real time, before it fails the test.
 const SETTLE_LIMIT: Duration = Duration::from_secs(10);
-
-/// A source of time, and of timed waits against that time.
-///
-/// Every time a virtual link keeps (its release schedule, look-ahead window, latency,
-/// jitter, read timeouts, device tick deadlines and unplug timing) comes from its clock,
-/// and every blocking wait in the link goes through [`Clock::wait`]. [`SystemClock`] is
-/// real time. [`ManualClock`] only moves when a test moves it, which makes timing
-/// assertions exact and independent of how busy the machine is.
-///
-/// # The wait protocol
-///
-/// A thread that has to wait for "some condition, or until a deadline" does this:
-///
-/// 1. Under the lock that guards the condition, check it, then read
-///    [`Wakeup::epoch`] from the [`Wakeup`] that is notified when it changes.
-/// 2. Release the lock and call [`Clock::wait`] with that epoch and the deadline.
-/// 3. Retake the lock and check again. Waits can end early, so this is always a loop.
-///
-/// Whoever changes the condition does so under the same lock and calls
-/// [`Wakeup::notify`] afterwards, which moves the epoch on. A wait that starts after the
-/// change sees a newer epoch and returns at once, so no wake-up is ever lost.
-pub trait Clock: Send + Sync {
-    /// The current time on this clock.
-    fn now(&self) -> Instant;
-
-    /// Block until `wakeup` is notified after `seen` was read from it, or until this
-    /// clock reaches `deadline` (`None`: no deadline). See the trait docs for the
-    /// protocol. May return early, so callers re-check their condition and
-    /// [`Clock::now`] in a loop.
-    fn wait(&self, wakeup: &Arc<Wakeup>, seen: u64, deadline: Option<Instant>);
-}
-
-/// Real time: [`Instant::now`] and condition-variable timeouts.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn wait(&self, wakeup: &Arc<Wakeup>, seen: u64, deadline: Option<Instant>) {
-        wakeup.block(seen, deadline);
-    }
-}
-
-/// What a waiting thread is woken through: an epoch counter plus a condition variable.
-/// The [`Clock`] docs describe how it is used with [`Clock::wait`].
-#[derive(Debug, Default)]
-pub struct Wakeup {
-    epoch: Mutex<u64>,
-    cv: Condvar,
-}
-
-impl Wakeup {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The current epoch. Read it while holding the lock that guards the condition being
-    /// waited for.
-    pub fn epoch(&self) -> u64 {
-        *self.epoch.lock()
-    }
-
-    /// Move the epoch on and wake every thread waiting on this `Wakeup`.
-    pub fn notify(&self) {
-        let mut epoch = self.epoch.lock();
-        *epoch = epoch.wrapping_add(1);
-        self.cv.notify_all();
-    }
-
-    /// Block until the epoch moves past `seen`, or until the real instant `until`.
-    /// Returns whether the epoch moved. This is the blocking step a [`Clock`]
-    /// implementation builds its `wait` on.
-    pub fn block(&self, seen: u64, until: Option<Instant>) -> bool {
-        let mut epoch = self.epoch.lock();
-        while *epoch == seen {
-            match until {
-                Some(t) => {
-                    if self.cv.wait_until(&mut epoch, t).timed_out() {
-                        return *epoch != seen;
-                    }
-                }
-                None => self.cv.wait(&mut epoch),
-            }
-        }
-        true
-    }
-}
 
 /// A clock that only moves when told to. Compiled into the crate (not just its tests)
 /// so integration tests and other crates' tests can drive links with it.
@@ -408,16 +324,5 @@ mod tests {
         clock.wait(&wakeup, seen, None);
         // So does a wait whose deadline has already passed.
         clock.wait(&wakeup, wakeup.epoch(), Some(clock.now()));
-    }
-
-    #[test]
-    fn system_clock_waits_time_out_in_real_time() {
-        let wakeup = Arc::new(Wakeup::new());
-        let started = SystemClock.now();
-        SystemClock.wait(&wakeup, wakeup.epoch(), Some(started + MS));
-        assert!(SystemClock.now() >= started + MS);
-        let seen = wakeup.epoch();
-        wakeup.notify();
-        SystemClock.wait(&wakeup, seen, None);
     }
 }

@@ -193,6 +193,59 @@ mod tests {
         assert_eq!(out, "got OK from\tvirtual:at @ 115200 8N1\n");
     }
 
+    /// Serves one TCP connection on 127.0.0.1: answers `AT\r\n` with `OK\r\n`, then
+    /// waits for the client to hang up. Returns the `tcp:` port id and the server thread.
+    fn at_over_tcp() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Read;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let id = format!("tcp:127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while !line.ends_with(b"\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                line.push(byte[0]);
+            }
+            assert_eq!(line, b"AT\r\n");
+            stream.write_all(b"OK\r\n").unwrap();
+            // Until the script's session closes the connection.
+            let _ = stream.read(&mut byte);
+        });
+        (id, server)
+    }
+
+    #[test]
+    fn a_script_runs_against_a_tcp_port() {
+        let (id, server) = at_over_tcp();
+        let dir = TempDir::new("tcp");
+        let (outcome, out) = run_script(
+            &dir,
+            &["--port", &id],
+            "local port = assert(serial.current())\nport:write('AT\\r\\n')\n\
+             assert(port:expect('^OK$'), 'no OK')\nprint(port:description())\n",
+        );
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, format!("{id}\n"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn serial_open_reaches_a_tcp_port_with_no_scripting_changes() {
+        let (id, server) = at_over_tcp();
+        let dir = TempDir::new("tcp-open");
+        let code = format!(
+            "local port = assert(serial.open{{ port = '{id}' }})\n\
+             port:write('AT\\r\\n')\n\
+             assert(port:expect('^OK$'), 'no OK')\nport:close()\nprint('ok')\n"
+        );
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:at"], &code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, "ok\n");
+        server.join().unwrap();
+    }
+
     #[test]
     fn an_error_exits_one_and_names_the_line() {
         let dir = TempDir::new("error");
