@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-plugins"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memchr",
  "mlua",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "serialist-vt"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "parking_lot",
