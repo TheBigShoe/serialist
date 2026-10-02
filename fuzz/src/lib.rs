@@ -16,6 +16,7 @@
 //! chunk lengths, then the stream as it would arrive on the wire.
 
 pub mod ansi_monitor;
+pub mod config_jsonc;
 
 /// The most chunk lengths an [`Input`] carries.
 pub const MAX_CHUNK_LENS: usize = 32;
