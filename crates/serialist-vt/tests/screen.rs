@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use serialist_core::{LineId, LineSource};
-use serialist_vt::{VtEvent, VtScreen};
+use serialist_vt::{MAX_ZERO_WIDTH, VtEvent, VtScreen};
 
 use common::{in_pieces, one_shot, screen_text, scrollback_text, t0};
 
@@ -374,4 +374,67 @@ fn a_character_cut_off_at_the_end_waits_for_the_rest_and_a_reset_forgets_it() {
     // The reset dropped the cut-off emoji, so its tail is two stray C1 controls, which
     // draw nothing (had the screen kept the bytes, it would show the emoji).
     assert_eq!(screen_text(&screen.snapshot())[0], "z");
+}
+
+#[test]
+fn a_cell_keeps_at_most_max_zero_width_marks() {
+    let mut screen = VtScreen::new(20, 2, 10);
+    let mut bytes = Vec::new();
+    // Far more marks than the cap on a narrow character, on a wide one (they join its
+    // first cell), and then a fresh cell, which is not full.
+    bytes.extend_from_slice("a".as_bytes());
+    bytes.extend_from_slice("\u{301}".repeat(MAX_ZERO_WIDTH + 50).as_bytes());
+    bytes.extend_from_slice("\u{65e5}".as_bytes());
+    bytes.extend_from_slice("\u{302}".repeat(MAX_ZERO_WIDTH + 1).as_bytes());
+    bytes.extend_from_slice("b\u{303}".as_bytes());
+    screen.feed(&bytes);
+    let snap = screen.snapshot();
+    assert_eq!(
+        screen_text(&snap)[0],
+        format!(
+            "a{}\u{65e5}{}b\u{303}",
+            "\u{301}".repeat(MAX_ZERO_WIDTH),
+            "\u{302}".repeat(MAX_ZERO_WIDTH)
+        )
+    );
+    // The cursor did not move for any of the dropped marks: a, the two cells of the
+    // wide character, b.
+    assert_eq!(snap.cursor().expect("a cursor").column, 4);
+}
+
+#[test]
+fn a_mark_on_the_last_column_joins_that_cell_up_to_the_cap() {
+    // After the last column is written the cursor stays on it, waiting to wrap, and a
+    // mark joins that cell rather than the one before.
+    let mut screen = VtScreen::new(4, 2, 10);
+    let mut bytes = b"abcd".to_vec();
+    bytes.extend_from_slice("\u{301}".repeat(MAX_ZERO_WIDTH + 5).as_bytes());
+    bytes.extend_from_slice(b"e");
+    screen.feed(&bytes);
+    let snap = screen.snapshot();
+    assert_eq!(
+        screen_text(&snap),
+        [
+            format!("abcd{}", "\u{301}".repeat(MAX_ZERO_WIDTH)),
+            "e".to_string()
+        ]
+    );
+}
+
+#[test]
+fn repeating_a_mark_does_not_grow_its_cell() {
+    // `CSI 65535 b` repeats the last character that many times: eleven bytes that would
+    // add 65535 marks to one cell, and a snapshot would copy them all.
+    let mut screen = VtScreen::new(20, 2, 10);
+    let mut bytes = "e\u{301}".as_bytes().to_vec();
+    for _ in 0..200 {
+        bytes.extend_from_slice(b"\x1b[65535b");
+    }
+    bytes.extend_from_slice(b"x");
+    screen.feed(&bytes);
+    let snap = screen.snapshot();
+    assert_eq!(
+        screen_text(&snap)[0],
+        format!("e{}x", "\u{301}".repeat(MAX_ZERO_WIDTH))
+    );
 }

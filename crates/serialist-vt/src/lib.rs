@@ -94,7 +94,8 @@ mod snapshot;
 pub use events::{ColorRequest, MAX_EVENTS, VtEvent};
 pub use keys::vt_key_bytes;
 pub use screen::{
-    DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS, STAGING_ROWS, VtScreen,
+    DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS, STAGING_ROWS,
+    VtScreen,
 };
 pub use sink::{VtHandle, VtSink};
 pub use snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};

@@ -10,6 +10,8 @@ publishes the version's section as the draft release's notes.
 
 ## [Unreleased]
 
+- Fixed: in VT mode, a device sending combining marks without end grew one screen cell without bound, since a mark takes no cell of its own and Alacritty keeps every one; `CSI 65535 b` (repeat the last character that many times) made eleven bytes add 65535 of them, and every snapshot of the row copied them all. A cell now keeps at most 30 zero-width characters (`serialist_vt::MAX_ZERO_WIDTH`, the Unicode Stream-Safe Text Format's limit, which no conforming text exceeds) and drops the rest. Found by the `vt_screen` fuzz target's nightly run.
+
 ## [0.2.0] - 2026-10-02
 
 - Added: nine cargo-fuzz targets in `fuzz/` (outside the workspace, with its own lock file): `ansi_monitor`, `store_ingest`, `vt_screen`, `config_jsonc`, `lua_values`, `text_lines`, `race_rust`, `race_lua` and `race_wasm` (behind the fuzz crate's `wasm` feature). They feed arbitrary bytes in arbitrary chunks to the ANSI parser, the page store, the VT screen, the config loaders, the Lua adapter and the codecs, and check what each promises beyond not panicking. `just fuzz-check` replays their seeds, and the reproducers of the bugs they found, on stable; `just fuzz` and `just fuzz-stable` run one target. CI runs each target for 60 s on nightly with AddressSanitizer from a corpus kept in the Actions cache, and a daily run gives each one 600 s.

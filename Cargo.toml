@@ -52,6 +52,8 @@ vte = "0.15"
 # a PTY. It re-exports the vte it is built on as `alacritty_terminal::vte`, the same 0.15
 # as above. The default feature only adds serde derives.
 alacritty_terminal = { version = "=0.26.0", default-features = false }
+# The character widths Alacritty uses, for telling a zero-width character apart.
+unicode-width = "0.2"
 notify = "8"
 notify-debouncer-full = "0.7"
 rand = "0.9"

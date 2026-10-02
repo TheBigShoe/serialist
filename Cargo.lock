@@ -7101,6 +7101,7 @@ dependencies = [
  "serialist-core",
  "serialist-sim",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]
