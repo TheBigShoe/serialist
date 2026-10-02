@@ -1,0 +1,40 @@
+PÈ	[   0.000000] platform soc:00: probe of device 0 done
+[   0.370000] platform soc:01: probe of device 1 done
+[   0.740000] platform soc:02: probe of device 2 done
+[   1.110000] platform soc:03: probe of device 3 done
+[   1.480000] platform soc:04: probe of device 4 done
+[   1.850000] platform soc:05: probe of device 5 done
+[   2.220000] platform soc:06: probe of device 6 done
+[   2.590000] platform soc:07: probe of device 7 done
+[   2.960000] platform soc:08: probe of device 8 done
+[   3.330000] platform soc:09: probe of device 9 done
+[   3.700000] platform soc:10: probe of device 10 done
+[   4.070000] platform soc:11: probe of device 11 done
+[   4.440000] platform soc:12: probe of device 12 done
+[   4.810000] platform soc:13: probe of device 13 done
+[   5.180000] platform soc:14: probe of device 14 done
+[   5.550000] platform soc:15: probe of device 15 done
+[   5.920000] platform soc:16: probe of device 16 done
+[   6.290000] platform soc:17: probe of device 17 done
+[   6.660000] platform soc:18: probe of device 18 done
+[   7.030000] platform soc:19: probe of device 19 done
+[   7.400000] platform soc:20: probe of device 20 done
+[   7.770000] platform soc:21: probe of device 21 done
+[   8.140000] platform soc:22: probe of device 22 done
+[   8.510000] platform soc:23: probe of device 23 done
+[   8.880000] platform soc:24: probe of device 24 done
+[   9.250000] platform soc:25: probe of device 25 done
+[   9.620000] platform soc:26: probe of device 26 done
+[   9.990000] platform soc:27: probe of device 27 done
+[  10.360000] platform soc:28: probe of device 28 done
+[  10.730000] platform soc:29: probe of device 29 done
+[1;32m[  OK  [0m] Started Network Time Synchronization.
+[1;31m[FAILED[0m] Failed to start Load Kernel Modules.
+[38;5;208morange[0m [48;2;10;20;30mrgb bg[0m
+Starting login: spinner |[1D/[1D-[1D\[2K
+Welcome to Buildroot
+buildroot login: root
+Password: [?25l
+# [?25hls --color
+[01;34mbin[0m  [01;34metc[0m  init
+# [1;1H[J# 

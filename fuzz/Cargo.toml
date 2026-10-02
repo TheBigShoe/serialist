@@ -114,3 +114,10 @@ test = false
 doc = false
 bench = false
 required-features = ["wasm"]
+
+[[bin]]
+name = "vt_screen"
+path = "fuzz_targets/vt_screen.rs"
+test = false
+doc = false
+bench = false

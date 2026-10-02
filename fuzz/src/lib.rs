@@ -27,6 +27,7 @@ pub mod race_rust;
 pub mod race_wasm;
 pub mod store_ingest;
 pub mod text_lines;
+pub mod vt_screen;
 
 /// The most chunk lengths an [`Input`] carries.
 pub const MAX_CHUNK_LENS: usize = 32;
