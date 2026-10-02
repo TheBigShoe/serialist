@@ -333,18 +333,25 @@ pub fn take_data(events: &Receiver<SessionEvent>) -> Vec<u8> {
 /// Wall-clock timing assertions are reliable on a developer machine but not on shared CI
 /// runners (a macOS runner has returned a 10 ms timeout after 63 ms). Link timing is
 /// tested exactly on a [`ManualClock`]; the few smoke tests of the real-time path that
-/// remain skip themselves under `CI` unless `SERIALIST_TIMING_TESTS` is set.
+/// remain skip themselves under `CI` unless `SERIALIST_TIMING_TESTS` is set, and in a
+/// coverage build (`cargo llvm-cov`, which passes `--cfg coverage`) always: instrumented
+/// code runs several times slower, so the rates mean nothing. The same rule is in
+/// `serialist-core/tests/timing/mod.rs`.
 pub fn wall_clock_timing_enabled() -> bool {
-    std::env::var_os("CI").is_none() || std::env::var_os("SERIALIST_TIMING_TESTS").is_some()
+    !cfg!(coverage)
+        && (std::env::var_os("CI").is_none()
+            || std::env::var_os("SERIALIST_TIMING_TESTS").is_some())
 }
 
-/// Return early from a wall-clock smoke test on CI. See [`wall_clock_timing_enabled`].
+/// Return early from a wall-clock smoke test on CI or in a coverage build. See
+/// [`wall_clock_timing_enabled`].
 #[macro_export]
 macro_rules! skip_unless_wall_clock_timing {
     () => {
         if !$crate::common::wall_clock_timing_enabled() {
             eprintln!(
-                "skipped: wall-clock timing test under CI (set SERIALIST_TIMING_TESTS=1 to run)"
+                "skipped: wall-clock timing test under CI or coverage (set SERIALIST_TIMING_TESTS=1 \
+                 to run it on CI)"
             );
             return;
         }

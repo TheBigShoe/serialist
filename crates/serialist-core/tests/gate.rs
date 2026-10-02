@@ -4,6 +4,13 @@
 //! times (memory is the same in both). Timings take the best of a few rounds so a busy
 //! machine does not fail the gate on one unlucky sample. Heap use is measured with a
 //! counting global allocator, which is why this test lives alone in its own binary.
+//!
+//! The timing thresholds are checked only where wall-clock timing holds (see
+//! `timing::wall_clock_timing_enabled`: not under coverage, not on CI unless asked). The
+//! work is done and the timings are printed either way, and every memory and correctness
+//! check runs everywhere.
+
+mod timing;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -81,6 +88,20 @@ fn relaxed(d: Duration) -> Duration {
     if cfg!(debug_assertions) { d * 5 } else { d }
 }
 
+/// Hold `took` to `limit` (relaxed for a debug build) where wall-clock timing holds.
+/// Anywhere else say what was measured and let it pass.
+fn within(what: &str, took: Duration, limit: Duration) {
+    if timing::wall_clock_timing_enabled() {
+        assert!(took < relaxed(limit), "{what} took {took:?}");
+    } else {
+        eprintln!(
+            "{what} took {took:?}: the {:?} limit is not checked here (coverage build, or CI \
+             without SERIALIST_TIMING_TESTS)",
+            relaxed(limit)
+        );
+    }
+}
+
 /// Best of `rounds` runs of `f`, each timed as a whole.
 fn best_of(rounds: usize, mut f: impl FnMut()) -> Duration {
     (0..rounds)
@@ -154,9 +175,10 @@ fn one_million_lines_gate() {
         "accounted {} vs heap {live}",
         stats.memory
     );
-    assert!(
-        append_time < relaxed(Duration::from_secs(2)),
-        "appending {LINES} lines took {append_time:?}"
+    within(
+        &format!("appending {LINES} lines"),
+        append_time,
+        Duration::from_secs(2),
     );
 
     let reader = store.reader();
@@ -169,10 +191,7 @@ fn one_million_lines_gate() {
             black_box(reader.snapshot());
         }
     }) / rounds;
-    assert!(
-        snapshot_time < relaxed(Duration::from_micros(10)),
-        "snapshot took {snapshot_time:?}"
-    );
+    within("snapshot", snapshot_time, Duration::from_micros(10));
 
     // line() costs the same at either end of a million lines and in a 100-line store.
     let first: Vec<LineId> = (0..10_000).map(LineId).collect();
@@ -183,18 +202,20 @@ fn one_million_lines_gate() {
     fill(&mut small, 100, &mut buf);
     let small_ids: Vec<LineId> = (0..100).cycle().take(10_000).map(LineId).collect();
     let t_small = lookup_time(&small.snapshot(), &small_ids);
-    let limit = relaxed(Duration::from_micros(2));
     for (name, t) in [("first", t_first), ("last", t_last), ("small", t_small)] {
-        assert!(t < limit, "line() near {name} took {t:?}");
+        within(&format!("line() near {name}"), t, Duration::from_micros(2));
     }
     let (fast, slow) = (
         t_first.min(t_last).min(t_small),
         t_first.max(t_last).max(t_small),
     );
-    assert!(
-        slow < fast * 3 + Duration::from_nanos(100),
-        "lookups not constant: first {t_first:?}, last {t_last:?}, 100-line store {t_small:?}"
-    );
+    // A ratio of two timings is as much a wall-clock check as a limit is.
+    if timing::wall_clock_timing_enabled() {
+        assert!(
+            slow < fast * 3 + Duration::from_nanos(100),
+            "lookups not constant: first {t_first:?}, last {t_last:?}, 100-line store {t_small:?}"
+        );
+    }
 
     // Search: the only match is the last line, so this is a full scan either way.
     let cancel = AtomicBool::new(false);
@@ -212,9 +233,8 @@ fn one_million_lines_gate() {
             .expect("pattern");
     });
     assert_eq!(hits.first().map(|m| m.line), Some(LineId(0)));
-    let limit = relaxed(Duration::from_millis(50));
-    assert!(forward < limit, "forward search took {forward:?}");
-    assert!(backward < limit, "backward search took {backward:?}");
+    within("forward search", forward, Duration::from_millis(50));
+    within("backward search", backward, Duration::from_millis(50));
 }
 
 #[test]

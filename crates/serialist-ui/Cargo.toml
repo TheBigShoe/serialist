@@ -39,6 +39,11 @@ serde_json.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 
+# `cargo llvm-cov` builds with `--cfg coverage`; the tests that hold a wall-clock budget
+# skip it then (see the coverage job in .github/workflows/ci.yml).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 # Measures the terminal element with the platform's real text system, which on macOS
 # must be created on the main thread, so it runs as a plain binary.
 [[test]]

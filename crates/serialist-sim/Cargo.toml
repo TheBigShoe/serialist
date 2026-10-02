@@ -19,6 +19,11 @@ tracing.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 
+# `cargo llvm-cov` builds with `--cfg coverage`; the tests that hold a wall-clock budget
+# skip it then (see the coverage job in .github/workflows/ci.yml).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [[bench]]
 name = "link_throughput"
 harness = false

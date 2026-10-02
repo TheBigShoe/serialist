@@ -38,6 +38,11 @@ proptest.workspace = true
 # serialist-core the simulator does. Unit tests must not use it.
 serialist-sim.workspace = true
 
+# `cargo llvm-cov` builds with `--cfg coverage`; the tests that hold a wall-clock budget
+# skip it then (see the coverage job in .github/workflows/ci.yml).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+
 [[bench]]
 name = "parse"
 harness = false
