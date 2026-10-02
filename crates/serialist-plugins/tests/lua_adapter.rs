@@ -179,27 +179,28 @@ fn frames_that_break_the_contract_are_reported_not_trusted() {
             )
         })
         .collect();
-    assert_eq!(got[0].0, PLUGIN_ERROR_KIND);
-    assert_eq!(got[0].1, 0..8, "a bad frame's error covers that frame");
+    assert!(got.iter().all(|f| f.0 == PLUGIN_ERROR_KIND), "{got:?}");
+    // A frame outside the input spoils the rest of the call; the error for the whole
+    // call comes ahead of the frames before it, keeping the order of `raw.start`.
+    assert_eq!(got[0].1, 0..29);
+    assert!(got[0].2.contains("fall outside"), "{got:?}");
+    assert_eq!(got[1].1, 0..8, "a bad frame's error covers that frame");
     assert!(
-        got[0]
+        got[1]
             .2
             .contains("field `n` is a string but is declared uint"),
         "{got:?}"
     );
-    assert_eq!(got[1].1, 8..16);
+    assert_eq!(got[2].1, 8..16);
     assert!(
-        got[1].2.contains("field `n` is declared but missing"),
+        got[2].2.contains("field `n` is declared but missing"),
         "{got:?}"
     );
-    // A frame outside the input spoils the rest of the call.
-    assert_eq!(got[2].1, 0..29);
-    assert!(got[2].2.contains("fall outside"), "{got:?}");
     assert_eq!(got.len(), 3);
 
     let mut codec = lines();
     let frames = decode_chunks(&mut codec, &[b"x\n#"], Instant::now());
-    assert_eq!(texts(&frames), [("line", 0..2), (PLUGIN_ERROR_KIND, 0..3)]);
+    assert_eq!(texts(&frames), [(PLUGIN_ERROR_KIND, 0..3), ("line", 0..2)]);
     assert_eq!(codec.held_back(), 0);
 
     let frames = decode_chunks(&mut lines(), &[b"warn\n"], Instant::now());
@@ -270,6 +271,96 @@ fn a_frame_position_at_the_edge_of_an_integer_is_an_error_not_an_overflow() {
     );
     let frames = decode_chunks(&mut codec, &[b"abc"], Instant::now());
     assert_eq!(texts(&frames), [("k", 2..3), ("k", 3..3)]);
+}
+
+/// The error of a frame that starts before the previous one ends: one `plugin_error`
+/// frame over the whole call, ahead of the frames that came before.
+fn order_error(frames: &[Frame]) -> &str {
+    assert_eq!(frames[0].kind, PLUGIN_ERROR_KIND, "{frames:?}");
+    frames[0].field("error").and_then(Value::as_str).unwrap()
+}
+
+#[test]
+fn frames_out_of_order_spoil_the_rest_of_the_call() {
+    let mut codec = returning(
+        "return { { kind = 'k', pos = 3, len = 1 }, { kind = 'k', pos = 1, len = 1 } }, ''",
+    );
+    let frames = decode_chunks(&mut codec, &[b"abc"], Instant::now());
+    assert_eq!(texts(&frames), [(PLUGIN_ERROR_KIND, 0..3), ("k", 2..3)]);
+    assert_eq!(
+        order_error(&frames),
+        "frame 2: starts at 0, before frame 1 ends at 3"
+    );
+}
+
+#[test]
+fn overlapping_frames_spoil_the_rest_of_the_call() {
+    let mut codec = returning(
+        "return { { kind = 'k', pos = 1, len = 2 }, { kind = 'k', pos = 2, len = 2 } }, ''",
+    );
+    let frames = decode_chunks(&mut codec, &[b"abcd"], Instant::now());
+    assert_eq!(texts(&frames), [(PLUGIN_ERROR_KIND, 0..4), ("k", 0..2)]);
+    assert_eq!(
+        order_error(&frames),
+        "frame 2: starts at 1, before frame 1 ends at 2"
+    );
+}
+
+#[test]
+fn frames_before_one_out_of_order_are_kept() {
+    // Adjacent frames, an empty one and one right after it are in order; the fifth
+    // goes back, so it and the sixth are dropped.
+    let mut codec = returning(
+        r#"return {
+          { kind = "k", pos = 1, len = 1 }, { kind = "k", pos = 2, len = 1 },
+          { kind = "k", pos = 3, len = 0 }, { kind = "k", pos = 3, len = 1 },
+          { kind = "k", pos = 2, len = 1 }, { kind = "k", pos = 4, len = 1 },
+        }, """#,
+    );
+    let frames = decode_chunks(&mut codec, &[b"abcd"], Instant::now());
+    assert_eq!(
+        texts(&frames),
+        [
+            (PLUGIN_ERROR_KIND, 0..4),
+            ("k", 0..1),
+            ("k", 1..2),
+            ("k", 2..2),
+            ("k", 2..3)
+        ]
+    );
+    assert_eq!(
+        order_error(&frames),
+        "frame 5: starts at 1, before frame 4 ends at 3"
+    );
+}
+
+#[test]
+fn decoding_goes_on_after_frames_out_of_order() {
+    // A chunk starting `x` gets its two frames backwards; any other is one frame.
+    let mut codec = returning(
+        r#"
+        if bytes:sub(1, 1) == "x" then
+          return { { kind = "k", pos = 2, len = 1 }, { kind = "k", pos = 1, len = 1 } }, ""
+        end
+        return { { kind = "k", pos = 1, len = #bytes } }, ""
+        "#,
+    );
+    let frames = decode_chunks(&mut codec, &[b"xy", b"ok", b"xy"], Instant::now());
+    assert_eq!(
+        texts(&frames),
+        [
+            (PLUGIN_ERROR_KIND, 0..2),
+            ("k", 1..2),
+            ("k", 2..4),
+            (PLUGIN_ERROR_KIND, 4..6),
+            ("k", 5..6)
+        ]
+    );
+    // The offsets are the stream's, as the frames' are.
+    assert_eq!(
+        order_error(&frames[3..]),
+        "frame 2: starts at 4, before frame 1 ends at 6"
+    );
 }
 
 #[test]
@@ -343,12 +434,12 @@ fn text_shared_by_many_frames_is_charged_every_time() {
         local text = string.rep("x", 1 << 20)
         local frames = {}
         for i = 1, 80 do
-          frames[i] = { kind = "k", pos = 1, len = 1, summary = text }
+          frames[i] = { kind = "k", pos = i, len = 1, summary = text }
         end
         return frames, ""
         "#,
     );
-    let frames = decode_chunks(&mut codec, &[b"a"], Instant::now());
+    let frames = decode_chunks(&mut codec, &[&[b'a'; 80]], Instant::now());
     assert_eq!(frames.len(), 80);
     let ok = frames.iter().take_while(|f| f.kind == "k").count();
     assert!((60..=64).contains(&ok), "{ok} frames came out whole");

@@ -60,12 +60,13 @@
 //! not from the code that converts:
 //!
 //! - `decode` raising, or its two values being malformed, gives one `plugin_error` frame
-//!   covering all the bytes it was given.
+//!   covering all the bytes it was given, ahead of any frames the call produced.
 //! - A frame is a table with a string `kind` that `describe` lists, integer `pos` and
 //!   `len` that fit the bytes, an optional `severity` (`info`, `warning`, `error`) and
 //!   `summary`, and optional `fields`. A frame whose conversion fails becomes a
 //!   `plugin_error` frame over its own bytes and the others still come out; but a list
-//!   that is not a list of frames with positions that fit, fails the whole call.
+//!   that is not a list of frames with positions that fit, each starting at or after the
+//!   end of the one before, fails the whole call from that item on.
 //! - Declared fields come first, in declared order and in their declared types (a
 //!   string is `bytes` or `str`; whole floats and integers are `int` or `uint`; a
 //!   `uint` is not negative); a declared field that is not optional must be there.
@@ -106,16 +107,13 @@
 //! # Known deviation
 //!
 //! The `Codec` contract says frames come out in order of `raw.start`. The Lua adapter
-//! does not keep it in two cases. When a plugin's answer turns out bad after some of its
-//! frames were converted (an item that is not a frame, a position that does not fit, a
-//! suffix that is not one or is too long), the `plugin_error` frame for the call comes
-//! after those frames, and starts at or before them. And frames a plugin returns out of
-//! order are passed on as they are. The adapter's test
-//! `frames_that_break_the_contract_are_reported_not_trusted` asserts the first, so it is
-//! not fixed here (a fix is to convert the frames into a scratch list, and to put into
-//! `out` either all of them or only the failure frame). When the model predicts frames
-//! out of order, the codec runs without [`codec::decode_chunks`]'s checks and is still
-//! held to the model, so any other change in what it does is a failure.
+//! keeps it within a call, but not in two cases. When a plugin holds back more than
+//! [`HELD_BACK_LIMIT`], the `plugin_error` frame over those bytes comes after the call's
+//! frames, and starts before any of them that lie in those bytes. And a plugin may return
+//! a frame over bytes it then holds back, so the next call, which starts at those bytes,
+//! can produce frames that start before it. When the model predicts frames out of order,
+//! the codec runs without [`codec::decode_chunks`]'s checks and is still held to the
+//! model, so any other change in what it does is a failure.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -472,22 +470,25 @@ impl Model {
             return 0;
         };
         let mut budget = Budget(FRAME_BYTES);
+        // A failure of the whole call goes ahead of the frames the call produced.
+        let mut whole_call = out.len();
         let collected = machine.collect_frames(&frames, base, at, input.len(), &mut budget, out);
         if collected.is_err() {
-            out.push(failure(base..end));
+            out.insert(whole_call, failure(base..end));
+            whole_call += 1;
         }
         match rest {
             M::Nil => {}
             M::Str(rest) => {
                 if !input.ends_with(&rest) {
-                    out.push(failure(base..end));
+                    out.insert(whole_call, failure(base..end));
                 } else if rest.len() > HELD_BACK_LIMIT {
                     out.push(failure(end - rest.len() as u64..end));
                 } else {
                     self.held.extend_from_slice(&rest);
                 }
             }
-            _ => out.push(failure(base..end)),
+            _ => out.insert(whole_call, failure(base..end)),
         }
         FRAME_BYTES - budget.0
     }
@@ -700,7 +701,7 @@ impl<'a> Machine<'a> {
     }
 
     /// Convert the frames `decode` returned, pushing what comes out. `Err` when the list
-    /// itself is malformed, which fails the whole call.
+    /// itself is malformed or out of order, which fails the whole call.
     fn collect_frames(
         &self,
         frames: &M,
@@ -715,12 +716,17 @@ impl<'a> Machine<'a> {
             M::Table(t) => *t,
             _ => return Err(()),
         };
+        let mut prev_stop = base;
         for item in self.sequence(t) {
             let M::Table(item) = item else {
                 return Err(());
             };
             let (start, len) = self.span(*item, input_len)?;
             let raw = base + start as u64..base + (start + len) as u64;
+            if raw.start < prev_stop {
+                return Err(());
+            }
+            prev_stop = raw.end;
             out.push(match self.frame(*item, raw.clone(), at, budget) {
                 Ok(frame) => Expect::Frame(frame),
                 Err(()) => Expect::Failure(raw, at),
@@ -1140,25 +1146,47 @@ mod tests {
         run(&cat(&[b"\x00\x00", &program]));
     }
 
+    /// Frames out of order, frames that overlap, and a list that goes bad after a frame
+    /// fail the whole call, ahead of the frames before the fault.
+    #[test]
+    fn the_adapter_keeps_the_frame_order_of_a_call() {
+        let frame = |pos: u8| cat(&[b"\x11\x08\x00\x03", &[pos], b"\x03\x02\x00\x00\x00"]);
+        for (program, kept) in [
+            (cat(&[b"\x09\x02", &frame(9), &frame(1)]), 8..10),
+            (cat(&[b"\x09\x02", &frame(1), &frame(2)]), 0..2),
+            (cat(&[b"\x09\x02", &frame(3), b"\x03\x05"]), 2..4),
+        ] {
+            let frames = decode_one(&program);
+            assert_eq!(frames.len(), 2, "{frames:?}");
+            assert_eq!(frames[0].kind, PLUGIN_ERROR_KIND);
+            assert_eq!(frames[0].raw, 0..program.len() as u64);
+            assert_eq!(frames[1].raw, kept);
+            run(&cat(&[b"\x00\x00", &program]));
+        }
+    }
+
     /// The deviation in the module docs. When this fails the adapter keeps the order, and
     /// `decode`'s use of `decode_unchecked` can go.
     #[test]
-    fn the_adapter_still_breaks_the_frame_order_in_two_ways() {
+    fn the_adapter_still_breaks_the_frame_order_with_held_back_bytes() {
         let t0 = Instant::now();
-        let frame = |pos: u8| cat(&[b"\x11\x08\x00\x03", &[pos], b"\x03\x02\x00\x00\x00"]);
-        // A plugin's frames out of order are passed on as they are.
-        let program = cat(&[b"\x09\x02", &frame(9), &frame(1)]);
+        let raws = |frames: &[Frame]| frames.iter().map(|f| f.raw.clone()).collect::<Vec<_>>();
+        // A frame over 12..14, then the last 20 bytes held back: more than the limit, so
+        // their failure comes after the frame and starts before it.
+        let program = cat(&[
+            b"\x09\x01\x11\x08\x00\x03\x0d\x03\x02\x00\x00\x00\x12\x14",
+            &[0; 10],
+        ]);
         let frames = decode_unchecked(&mut new_codec(), &[&program], t0);
-        assert_eq!(
-            frames.iter().map(|f| f.raw.start).collect::<Vec<_>>(),
-            [8, 0]
-        );
-        // A list that goes bad after a frame fails the whole call, after that frame.
-        let program = cat(&[b"\x09\x02", &frame(3), b"\x03\x05"]);
-        let frames = decode_unchecked(&mut new_codec(), &[&program], t0);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].raw.start, 2);
+        assert_eq!(raws(&frames), [12..14, 4..24]);
         assert_eq!(frames[1].kind, PLUGIN_ERROR_KIND);
-        assert_eq!(frames[1].raw, 0..program.len() as u64);
+        run(&cat(&[b"\x00\x00", &program]));
+        // A frame over the last byte, held back with the one before it: the next call
+        // starts at 12 and fails (its program, `tail 2`, is not a list), before 13.
+        let first = b"\x09\x01\x11\x08\x00\x03\x0e\x03\x01\x00\x00\x00\x12\x02";
+        let frames = decode_unchecked(&mut new_codec(), &[first, b"\x00"], t0);
+        assert_eq!(raws(&frames), [13..14, 12..15]);
+        assert_eq!(frames[1].kind, PLUGIN_ERROR_KIND);
+        run(&cat(&[b"\x00\x02\x0e\x01", first, b"\x00"]));
     }
 }

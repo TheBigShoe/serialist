@@ -52,7 +52,10 @@
 //! ```
 //!
 //! **Kinds.** A frame's `kind` must be one `describe` lists; a frame of another kind is
-//! a [`PLUGIN_ERROR_KIND`] frame over its bytes.
+//! a [`PLUGIN_ERROR_KIND`] frame over its bytes. Frames must come in stream order and
+//! not overlap: a frame that starts before the previous one ends is dropped with every
+//! frame after it, and one [`PLUGIN_ERROR_KIND`] frame over all of the call's bytes goes
+//! ahead of the frames before it.
 //!
 //! **Field types** are `bool`, `int`, `uint`, `float`, `str`, `bytes` and `list`. A frame's
 //! declared fields come out in declared order and are converted to their declared types
@@ -309,26 +312,22 @@ impl LuaCodec {
         self.held.len()
     }
 
-    fn fail(
-        &mut self,
-        raw: std::ops::Range<u64>,
-        at: Instant,
-        message: &str,
-        out: &mut Vec<Frame>,
-    ) {
+    /// A [`PLUGIN_ERROR_KIND`] frame over `raw` saying what went wrong, which is logged.
+    fn failure(&self, raw: std::ops::Range<u64>, at: Instant, message: &str) -> Frame {
         tracing::warn!(plugin = %self.loaded.info.name, %message, "a Lua codec failed");
         let first_line = message.lines().next().unwrap_or_default();
-        out.push(
-            Frame::new(PLUGIN_ERROR_KIND, raw, at)
-                .with_severity(Severity::Error)
-                .with_summary(format!("plugin error: {first_line}"))
-                .with_field("error", message),
-        );
+        Frame::new(PLUGIN_ERROR_KIND, raw, at)
+            .with_severity(Severity::Error)
+            .with_summary(format!("plugin error: {first_line}"))
+            .with_field("error", message)
     }
 
     /// One call to the plugin's `decode` over `input`, which starts at stream offset `base`.
     fn decode_input(&mut self, input: &[u8], base: u64, at: Instant, out: &mut Vec<Frame>) {
         let end = base + input.len() as u64;
+        // Where an error over the whole call goes: ahead of the frames the call produced,
+        // which all start at or after `base`, so `raw.start` stays in order.
+        let mut whole_call = out.len();
         let result = {
             let loaded = &self.loaded;
             loaded
@@ -345,13 +344,14 @@ impl LuaCodec {
         let (frames, rest) = match result {
             Ok(values) => values,
             Err(message) => {
-                self.fail(base..end, at, &message, out);
+                out.push(self.failure(base..end, at, &message));
                 self.loaded.fresh_state();
                 return;
             }
         };
         if let Err(message) = self.collect_frames(frames, input.len(), base, at, out) {
-            self.fail(base..end, at, &message, out);
+            out.insert(whole_call, self.failure(base..end, at, &message));
+            whole_call += 1;
         }
         match rest {
             LuaValue::Nil => {}
@@ -359,14 +359,14 @@ impl LuaCodec {
                 let rest = rest.as_bytes();
                 if !input.ends_with(&rest) {
                     let message = "decode must hold back a suffix of the bytes it was given";
-                    self.fail(base..end, at, message, out);
+                    out.insert(whole_call, self.failure(base..end, at, message));
                 } else if rest.len() > self.limits.max_held_back {
                     let message = format!(
                         "decode held back {} bytes, more than the limit of {}",
                         rest.len(),
                         self.limits.max_held_back
                     );
-                    self.fail(end - rest.len() as u64..end, at, &message, out);
+                    out.push(self.failure(end - rest.len() as u64..end, at, &message));
                 } else {
                     self.held.extend_from_slice(&rest);
                 }
@@ -376,13 +376,13 @@ impl LuaCodec {
                     "decode's second result must be the bytes to hold back, not {}",
                     other.type_name()
                 );
-                self.fail(base..end, at, &message, out);
+                out.insert(whole_call, self.failure(base..end, at, &message));
             }
         }
     }
 
     fn collect_frames(
-        &mut self,
+        &self,
         frames: LuaValue,
         input_len: usize,
         base: u64,
@@ -400,6 +400,7 @@ impl LuaCodec {
             }
         };
         let mut budget = convert::Budget::new(self.limits.max_frame_bytes);
+        let mut prev_stop = base;
         for (i, item) in frames.sequence_values::<LuaValue>().enumerate() {
             let item = item.map_err(|err| vm::describe_error(&err))?;
             let LuaValue::Table(table) = item else {
@@ -412,12 +413,21 @@ impl LuaCodec {
             let (start, len) = convert::frame_span(&table, input_len)
                 .map_err(|err| format!("frame {}: {err}", i + 1))?;
             let raw = base + start as u64..base + (start + len) as u64;
+            if raw.start < prev_stop {
+                return Err(format!(
+                    "frame {}: starts at {}, before frame {} ends at {prev_stop}",
+                    i + 1,
+                    raw.start,
+                    i
+                ));
+            }
+            prev_stop = raw.end;
             let frame =
                 convert::frame_from_lua(&table, &self.loaded.schema, raw.clone(), at, &mut budget);
-            match frame {
-                Ok(frame) => out.push(frame),
-                Err(err) => self.fail(raw, at, &format!("frame {}: {err}", i + 1), out),
-            }
+            out.push(match frame {
+                Ok(frame) => frame,
+                Err(err) => self.failure(raw, at, &format!("frame {}: {err}", i + 1)),
+            });
         }
         Ok(())
     }
