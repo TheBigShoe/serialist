@@ -306,7 +306,7 @@ fn soak_at_12_mbaud() {
             if warm.is_none() {
                 warm = Some(mark());
             }
-            if elapsed.as_secs() % 10 == 0 || elapsed.as_secs() <= 1 {
+            if elapsed.as_secs().is_multiple_of(10) || elapsed.as_secs() <= 1 {
                 let store = handle.stats().store;
                 eprintln!(
                     "{:>5.1}s {:>10} {:>8.1} {:>11.1} {:>10.1}",
