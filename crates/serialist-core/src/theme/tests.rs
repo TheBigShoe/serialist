@@ -345,13 +345,15 @@ fn broken_theme_files_are_errors_with_positions() {
 // ---- Bundled themes ----
 
 /// Every bundled theme and its appearance, in the order the registry lists them.
-const BUNDLED: [(&str, Appearance); 6] = [
+const BUNDLED: [(&str, Appearance); 8] = [
     ("Serialist Dark", Appearance::Dark),
     ("Serialist Light", Appearance::Light),
     ("Serialist Ember", Appearance::Dark),
     ("Serialist Phosphor", Appearance::Dark),
     ("Serialist Paper", Appearance::Light),
     ("Serialist Contrast", Appearance::Dark),
+    ("Fadetouched", Appearance::Dark),
+    ("Fadetouched Blur", Appearance::Dark),
 ];
 
 #[test]
@@ -615,7 +617,7 @@ fn default_settings_resolve_to_the_bundled_themes() {
 
     // A Zed setting naming a theme that is not installed degrades to the default.
     let zed = Settings::from_jsonc(
-        r#"{ "theme": { "mode": "dark", "light": "One Light", "dark": "Fadetouched Blur" } }"#,
+        r#"{ "theme": { "mode": "dark", "light": "One Light", "dark": "Ayu Dark" } }"#,
     )
     .unwrap();
     assert_eq!(registry.resolve(&zed.theme, false).name, "Serialist Dark");
