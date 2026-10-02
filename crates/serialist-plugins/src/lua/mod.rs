@@ -51,6 +51,9 @@
 //! return M
 //! ```
 //!
+//! **Kinds.** A frame's `kind` must be one `describe` lists; a frame of another kind is
+//! a [`PLUGIN_ERROR_KIND`] frame over its bytes.
+//!
 //! **Field types** are `bool`, `int`, `uint`, `float`, `str`, `bytes` and `list`. A frame's
 //! declared fields come out in declared order and are converted to their declared types
 //! (a Lua string is `bytes` or `str` as declared; an integer is `int` or `uint`); a
@@ -81,6 +84,15 @@
 //! raises an error, runs out of memory or spends its budget does not stall ingest: the
 //! bytes it was given become one [`PLUGIN_ERROR_KIND`] frame (severity error), and the
 //! plugin starts over with a fresh `state` and nothing held back.
+//!
+//! What `decode` returns is capped too. A table or a string can be shared by many fields
+//! and frames, so a few lines of Lua can describe far more than the VM's memory holds
+//! once every use is copied into a frame. The frames of one call may take
+//! [`max_frame_bytes`](LuaLimits::max_frame_bytes) (64 MiB) between them: a value, a
+//! field name or a frame counts for 32 bytes, and text for its length (the exact charges
+//! are in the `Budget` docs in `convert.rs`). A frame past that, and every frame after
+//! it in the call, is a [`PLUGIN_ERROR_KIND`] frame over its bytes. The next call starts
+//! over with a full budget.
 //!
 //! # Threads
 //!
@@ -123,6 +135,11 @@ pub struct LuaLimits {
     /// Most bytes `decode` may hold back; a plugin that holds back more gets a
     /// [`PLUGIN_ERROR_KIND`] frame for them instead.
     pub max_held_back: usize,
+    /// Most bytes the frames of one `decode` call may take on the host between them,
+    /// counted as the sandbox notes in the module docs say; a frame past it, and the rest
+    /// of the call, are [`PLUGIN_ERROR_KIND`] frames. The VM's memory cap bounds what a
+    /// plugin builds, not what it returns.
+    pub max_frame_bytes: usize,
 }
 
 impl LuaLimits {
@@ -132,6 +149,7 @@ impl LuaLimits {
     pub const DEFAULT_INSTRUCTIONS_PER_CALL: u64 = 20_000_000;
     pub const DEFAULT_CHECK_EVERY: u32 = 10_000;
     pub const DEFAULT_MAX_HELD_BACK: usize = 1024 * 1024;
+    pub const DEFAULT_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 }
 
 impl Default for LuaLimits {
@@ -141,6 +159,7 @@ impl Default for LuaLimits {
             instructions_per_call: Self::DEFAULT_INSTRUCTIONS_PER_CALL,
             check_every: Self::DEFAULT_CHECK_EVERY,
             max_held_back: Self::DEFAULT_MAX_HELD_BACK,
+            max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
         }
     }
 }
@@ -380,6 +399,7 @@ impl LuaCodec {
                 ));
             }
         };
+        let mut budget = convert::Budget::new(self.limits.max_frame_bytes);
         for (i, item) in frames.sequence_values::<LuaValue>().enumerate() {
             let item = item.map_err(|err| vm::describe_error(&err))?;
             let LuaValue::Table(table) = item else {
@@ -392,7 +412,9 @@ impl LuaCodec {
             let (start, len) = convert::frame_span(&table, input_len)
                 .map_err(|err| format!("frame {}: {err}", i + 1))?;
             let raw = base + start as u64..base + (start + len) as u64;
-            match convert::frame_from_lua(&table, &self.loaded.schema, raw.clone(), at) {
+            let frame =
+                convert::frame_from_lua(&table, &self.loaded.schema, raw.clone(), at, &mut budget);
+            match frame {
                 Ok(frame) => out.push(frame),
                 Err(err) => self.fail(raw, at, &format!("frame {}: {err}", i + 1), out),
             }

@@ -104,6 +104,20 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "vt_screen"
+path = "fuzz_targets/vt_screen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lua_values"
+path = "fuzz_targets/lua_values.rs"
+test = false
+doc = false
+bench = false
+
 # Needs the `wasm` feature (wasmtime): `cargo fuzz run --features wasm race_wasm`. Without
 # it cargo skips the target, so a plain `cargo build` or `cargo test` never compiles
 # wasmtime.
@@ -114,10 +128,3 @@ test = false
 doc = false
 bench = false
 required-features = ["wasm"]
-
-[[bin]]
-name = "vt_screen"
-path = "fuzz_targets/vt_screen.rs"
-test = false
-doc = false
-bench = false
