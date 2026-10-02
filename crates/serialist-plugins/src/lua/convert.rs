@@ -21,7 +21,8 @@ const MAX_DEPTH: usize = 32;
 const UNIT: usize = 32;
 
 /// What the frames of one `decode` call have left to take, of
-/// [`LuaLimits::max_frame_bytes`](super::LuaLimits::max_frame_bytes).
+/// [`LuaLimits::max_frame_bytes`](super::LuaLimits::max_frame_bytes), or what `describe`
+/// returns, of [`LuaLimits::max_describe_bytes`](super::LuaLimits::max_describe_bytes).
 ///
 /// The VM's memory limit bounds what a plugin builds, not what it returns: a table or a
 /// string can be shared by many fields and frames, and every use is copied into a frame.
@@ -39,16 +40,35 @@ const UNIT: usize = 32;
 /// - each value costs `UNIT` (a list's items are values too), and the length of a string
 ///   or bytes value.
 ///
+/// A description costs `UNIT` for each kind, command and field, charged before the item
+/// is converted, and the length of every string taken from it.
+///
 /// Text is charged before it is copied. The order is fixed (declared fields, then the
 /// others by name), so what a call spends does not depend on how Lua orders a table.
 pub(super) struct Budget {
     left: usize,
     limit: usize,
+    /// The error once the budget is spent, given the limit.
+    over: fn(usize) -> String,
 }
 
 impl Budget {
-    pub(super) fn new(limit: usize) -> Self {
-        Self { left: limit, limit }
+    /// The budget of one `decode` call's frames.
+    pub(super) fn frames(limit: usize) -> Self {
+        Self {
+            left: limit,
+            limit,
+            over: |limit| format!("the frames of one decode call hold more than {limit} bytes"),
+        }
+    }
+
+    /// The budget of what `describe` returns.
+    fn describe(limit: usize) -> Self {
+        Self {
+            left: limit,
+            limit,
+            over: |limit| format!("describe() is larger than the limit of {limit} bytes"),
+        }
     }
 
     /// Take `bytes`, or take everything that is left and say no.
@@ -60,10 +80,7 @@ impl Budget {
             }
             None => {
                 self.left = 0;
-                Err(format!(
-                    "the frames of one decode call hold more than {} bytes",
-                    self.limit
-                ))
+                Err((self.over)(self.limit))
             }
         }
     }
@@ -107,121 +124,114 @@ fn lua_err(err: mlua::Error) -> String {
     describe_error(&err)
 }
 
-fn string_of(value: &LuaValue, what: &str) -> Result<String, String> {
-    match value {
-        LuaValue::String(s) => Ok(s.to_string_lossy()),
-        other => Err(format!(
-            "{what} must be a string, not {}",
-            other.type_name()
-        )),
-    }
-}
-
-fn opt_string(table: &Table, key: &str, what: &str) -> Result<Option<String>, String> {
+fn opt_string(
+    table: &Table,
+    key: &str,
+    what: &str,
+    budget: &mut Budget,
+) -> Result<Option<String>, String> {
     match table.raw_get::<LuaValue>(key).map_err(lua_err)? {
         LuaValue::Nil => Ok(None),
-        value => string_of(&value, &format!("{what}.{key}")).map(Some),
+        value => budget.text(&value, &format!("{what}.{key}")).map(Some),
     }
 }
 
-fn req_string(table: &Table, key: &str, what: &str) -> Result<String, String> {
-    opt_string(table, key, what)?.ok_or_else(|| format!("{what}.{key} is missing"))
+fn req_string(table: &Table, key: &str, what: &str, budget: &mut Budget) -> Result<String, String> {
+    opt_string(table, key, what, budget)?.ok_or_else(|| format!("{what}.{key} is missing"))
 }
 
-fn list(table: &Table, key: &str, what: &str) -> Result<Vec<Table>, String> {
-    match table.raw_get::<LuaValue>(key).map_err(lua_err)? {
-        LuaValue::Nil => Ok(Vec::new()),
-        LuaValue::Table(items) => items
-            .sequence_values::<LuaValue>()
-            .enumerate()
-            .map(|(i, item)| match item.map_err(lua_err)? {
-                LuaValue::Table(t) => Ok(t),
-                other => Err(format!(
-                    "{what}.{key}[{}] must be a table, not {}",
-                    i + 1,
+/// The tables listed at `table[key]`, each charged [`UNIT`] before `item` converts it, so
+/// a list too long for the budget is refused before it is read to the end.
+fn list<T>(
+    table: &Table,
+    key: &str,
+    what: &str,
+    budget: &mut Budget,
+    mut item: impl FnMut(&Table, &str, &mut Budget) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let items = match table.raw_get::<LuaValue>(key).map_err(lua_err)? {
+        LuaValue::Nil => return Ok(Vec::new()),
+        LuaValue::Table(items) => items,
+        other => {
+            return Err(format!(
+                "{what}.{key} must be a list, not {}",
+                other.type_name()
+            ));
+        }
+    };
+    let mut out = Vec::new();
+    for (i, entry) in items.sequence_values::<LuaValue>().enumerate() {
+        budget.spend(UNIT)?;
+        let what = format!("{what}.{key}[{}]", i + 1);
+        match entry.map_err(lua_err)? {
+            LuaValue::Table(t) => out.push(item(&t, &what, budget)?),
+            other => {
+                return Err(format!("{what} must be a table, not {}", other.type_name()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn fields_info(table: &Table, what: &str, budget: &mut Budget) -> Result<Vec<FieldInfo>, String> {
+    list(table, "fields", what, budget, |field, what, budget| {
+        let name = req_string(field, "name", what, budget)?;
+        let ty = req_string(field, "type", what, budget)?;
+        let ty = FieldType::from_name(&ty).ok_or_else(|| {
+            format!("{what}.type is {ty:?}; use bool, int, uint, float, str, bytes or list")
+        })?;
+        let optional = match field.raw_get::<LuaValue>("optional").map_err(lua_err)? {
+            LuaValue::Nil => false,
+            LuaValue::Boolean(b) => b,
+            other => {
+                return Err(format!(
+                    "{what}.optional must be a boolean, not {}",
                     other.type_name()
-                )),
-            })
-            .collect(),
-        other => Err(format!(
-            "{what}.{key} must be a list, not {}",
-            other.type_name()
-        )),
-    }
-}
-
-fn fields_info(table: &Table, what: &str) -> Result<Vec<FieldInfo>, String> {
-    list(table, "fields", what)?
-        .iter()
-        .enumerate()
-        .map(|(i, field)| {
-            let what = format!("{what}.fields[{}]", i + 1);
-            let name = req_string(field, "name", &what)?;
-            let ty = req_string(field, "type", &what)?;
-            let ty = FieldType::from_name(&ty).ok_or_else(|| {
-                format!("{what}.type is {ty:?}; use bool, int, uint, float, str, bytes or list")
-            })?;
-            let optional = match field.raw_get::<LuaValue>("optional").map_err(lua_err)? {
-                LuaValue::Nil => false,
-                LuaValue::Boolean(b) => b,
-                other => {
-                    return Err(format!(
-                        "{what}.optional must be a boolean, not {}",
-                        other.type_name()
-                    ));
-                }
-            };
-            Ok(FieldInfo {
-                name,
-                ty,
-                description: opt_string(field, "description", &what)?.unwrap_or_default(),
-                optional,
-            })
+                ));
+            }
+        };
+        Ok(FieldInfo {
+            name,
+            ty,
+            description: opt_string(field, "description", what, budget)?.unwrap_or_default(),
+            optional,
         })
-        .collect()
+    })
 }
 
-/// What `describe()` returned, as a [`CodecInfo`].
-pub(super) fn info_from_lua(value: LuaValue) -> Result<CodecInfo, String> {
+/// What `describe()` returned, as a [`CodecInfo`] that may take `max_bytes` as [`Budget`]
+/// counts them.
+pub(super) fn info_from_lua(value: LuaValue, max_bytes: usize) -> Result<CodecInfo, String> {
     let LuaValue::Table(table) = value else {
         return Err(format!(
             "describe() must return a table, not {}",
             value.type_name()
         ));
     };
+    let budget = &mut Budget::describe(max_bytes);
     let what = "describe()";
-    let name = req_string(&table, "name", what)?;
+    let name = req_string(&table, "name", what, budget)?;
     if name.trim().is_empty() {
         return Err("describe().name is empty".to_owned());
     }
-    let kinds = list(&table, "kinds", what)?
-        .iter()
-        .enumerate()
-        .map(|(i, kind)| {
-            let what = format!("describe().kinds[{}]", i + 1);
-            Ok(FrameKindInfo {
-                kind: req_string(kind, "kind", &what)?,
-                description: opt_string(kind, "description", &what)?.unwrap_or_default(),
-                fields: fields_info(kind, &what)?,
-            })
+    let kinds = list(&table, "kinds", what, budget, |kind, what, budget| {
+        Ok(FrameKindInfo {
+            kind: req_string(kind, "kind", what, budget)?,
+            description: opt_string(kind, "description", what, budget)?.unwrap_or_default(),
+            fields: fields_info(kind, what, budget)?,
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    let commands = list(&table, "commands", what)?
-        .iter()
-        .enumerate()
-        .map(|(i, command)| {
-            let what = format!("describe().commands[{}]", i + 1);
-            Ok(CommandInfo {
-                name: req_string(command, "name", &what)?,
-                description: opt_string(command, "description", &what)?.unwrap_or_default(),
-                fields: fields_info(command, &what)?,
-            })
+    })?;
+    let commands = list(&table, "commands", what, budget, |command, what, budget| {
+        Ok(CommandInfo {
+            name: req_string(command, "name", what, budget)?,
+            description: opt_string(command, "description", what, budget)?.unwrap_or_default(),
+            fields: fields_info(command, what, budget)?,
         })
-        .collect::<Result<Vec<_>, String>>()?;
+    })?;
     Ok(CodecInfo {
         name,
-        version: opt_string(&table, "version", what)?.unwrap_or_default(),
-        description: opt_string(&table, "description", what)?.unwrap_or_default(),
+        version: opt_string(&table, "version", what, budget)?.unwrap_or_default(),
+        description: opt_string(&table, "description", what, budget)?.unwrap_or_default(),
         kinds,
         commands,
     })
