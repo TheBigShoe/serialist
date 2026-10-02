@@ -94,6 +94,42 @@ coverage:
 bench *args="--quick":
     cargo bench --workspace --locked --bench '*' -- {{args}}
 
+# What the CI bench job does on a pull request: the base first, then the head (this
+# working tree, uncommitted changes included), one after the other with fuller sampling
+# than --quick (the job's flags), then bench_regressions.py's table of changes. It fails
+# when a bench is confidently more than 30% slower (BENCH_REGRESSION_THRESHOLD changes
+# that). Unlike CI it does not measure a regressed bench a second time, so repeat one
+# yourself: `just bench-compare main --exact parse/overwrite_non_ascii`. Extra arguments go
+# to criterion on both runs; a filter keeps it short: `just bench-compare main parse`. The
+# base is a worktree in target/bench-base (reused, and moved to the commit asked for) that
+# builds into its own target/ directory: sharing the head's makes cargo run the head with
+# the base's binaries (see the job comment in ci.yml). Criterion's results are in
+# target/bench-criterion (emptied first).
+# Benchmark this working tree against another commit and fail on a regression.
+bench-compare base="main" *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git rev-parse --verify --quiet "{{base}}" > /dev/null || { echo "bench-compare: no such revision: {{base}}" >&2; exit 1; }
+    export CRITERION_HOME="$PWD/target/bench-criterion"
+    worktree=target/bench-base
+    if [ -d "$worktree" ]; then
+        git -C "$worktree" checkout --quiet --force --detach "{{base}}"
+    else
+        git worktree add --force --detach "$worktree" "{{base}}"
+    fi
+    rm -rf "$CRITERION_HOME"
+    # `cargo bench --bench '*'` is an error when nothing matches, as at a base that
+    # predates the benches.
+    metadata=$(cd "$worktree" && cargo metadata --no-deps --format-version 1 --locked)
+    if ! grep -q '"kind":\["bench"\]' <<< "$metadata"; then
+        echo "bench-compare: {{base}} has no bench targets, so there is nothing to compare with"
+        exit 0
+    fi
+    times="--warm-up-time 1 --measurement-time 3"
+    (cd "$worktree" && CARGO_TARGET_DIR="$PWD/target" cargo bench --workspace --locked --bench '*' -- --save-baseline base $times {{args}})
+    cargo bench --workspace --locked --bench '*' -- --baseline-lenient base $times {{args}}
+    python3 .github/scripts/bench_regressions.py "$CRITERION_HOME"
+
 # Render the real workspace offscreen with Metal in twenty states (macOS only) and write
 # PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
 screenshots *names:
