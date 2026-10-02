@@ -6,13 +6,14 @@
 //! crash reproducer committed there stays a regression test:
 //!
 //! ```text
-//! cargo test --manifest-path fuzz/Cargo.toml          # replay the seeds (stable)
-//! cargo +nightly fuzz run ansi_monitor                # fuzz (nightly, cargo-fuzz)
+//! just fuzz-check                  # fmt, clippy and the seed replay (stable)
+//! just fuzz ansi_monitor 60        # fuzz for 60 s (nightly, ASan, cargo-fuzz)
+//! just fuzz-stable ansi_monitor 60 # the same on stable, without ASan
 //! ```
 //!
 //! Byte-stream targets read their input through [`Input`], so libFuzzer controls the
-//! chunk boundaries as well as the bytes, and a seed is readable: two header bytes, then
-//! the stream as it would arrive on the wire.
+//! chunk boundaries as well as the bytes, and a seed stays readable: a config byte, the
+//! chunk lengths, then the stream as it would arrive on the wire.
 
 pub mod ansi_monitor;
 
