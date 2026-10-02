@@ -373,6 +373,15 @@ fn the_bundled_themes_define_every_key_the_app_reads() {
     for (name, appearance) in BUNDLED {
         let theme = registry.get(name).unwrap();
         assert_eq!(theme.appearance, appearance, "{name}");
+        if registry.is_third_party(name) {
+            // A third-party theme ships verbatim, so it cannot be held to the full set
+            // below. It must load without warnings (checked above; background.appearance
+            // and accents are known non-color keys, skipped without one) and declare a
+            // player. That every key the app reads resolves through the fallbacks the
+            // bridge uses at run time is checked in serialist-ui, next to the lists.
+            assert!(!theme.players.is_empty(), "{name} declares no player");
+            continue;
+        }
         for key in USED_STYLE_KEYS {
             assert!(theme.color(key).is_some(), "{name} lacks {key}");
         }
@@ -405,6 +414,40 @@ fn the_bundled_themes_define_every_key_the_app_reads() {
         assert!(theme.syntax.keys().eq(reference.syntax.keys()), "{name}");
         assert_eq!(theme.players.len(), reference.players.len(), "{name}");
     }
+}
+
+#[test]
+fn only_the_bundled_fadetouched_themes_are_third_party() {
+    let registry = ThemeRegistry::bundled();
+    let third_party: Vec<&str> = registry
+        .names()
+        .filter(|name| registry.is_third_party(name))
+        .collect();
+    assert_eq!(third_party, ["Fadetouched", "Fadetouched Blur"]);
+    assert!(!registry.is_third_party("Serialist Dark"));
+    assert!(!registry.is_third_party("Not Loaded"));
+
+    // Every third-party theme is credited in the notice that ships with each package.
+    let notice = include_str!("../../../../THIRD_PARTY_LICENSES.md");
+    for name in &third_party {
+        assert!(
+            notice.contains(name),
+            "THIRD_PARTY_LICENSES.md omits {name}"
+        );
+    }
+    assert!(notice.contains("Arishawke"));
+
+    // A user file with the same name replaces the theme, and it is then a user theme.
+    let dir = TempDir::new("themes-third-party");
+    dir.write(
+        "fadetouched.json",
+        r##"{ "name": "Mine", "themes": [
+            { "name": "Fadetouched", "appearance": "dark",
+              "style": { "terminal.background": "#010203" } } ] }"##,
+    );
+    let registry = ThemeRegistry::load(Some(dir.path()));
+    assert!(!registry.is_third_party("Fadetouched"));
+    assert!(registry.is_third_party("Fadetouched Blur"));
 }
 
 #[test]
