@@ -1,0 +1,67 @@
+# Fuzz targets for Serialist, run with cargo-fuzz (libFuzzer). `just fuzz <target>` runs
+# one locally; the `fuzz` job in .github/workflows/ci.yml runs every target for a bounded
+# time on nightly.
+#
+# Not a member of the root workspace (the root lists it in `exclude`), for three reasons:
+#
+# - cargo-fuzz instruments the build with nightly-only flags (`cargo +nightly fuzz
+#   build`), while the workspace is pinned to stable in rust-toolchain.toml.
+# - libfuzzer-sys compiles libFuzzer's C++ runtime, licensed (MIT OR Apache-2.0) AND
+#   NCSA. NCSA is not on deny.toml's allow-list; outside the root workspace, libFuzzer
+#   stays out of the dependency graph that cargo-deny checks.
+# - `cargo test --workspace` and clippy on macOS, Linux and Windows would otherwise
+#   build and link libFuzzer for nothing.
+#
+# So the crate has its own `[workspace]` and its own Cargo.lock, committed and checked by
+# the CI job with `cargo fetch --locked`. It was seeded from the root lock so both
+# resolve the same versions; do the same (copy the root Cargo.lock over, then run
+# `cargo metadata --manifest-path fuzz/Cargo.toml`) if a dependency ever has to change.
+#
+# Layout:
+# - src/: the shared input format (`Input` in src/lib.rs) and one module per target with
+#   a `pub fn run(data: &[u8])`. The bodies live in the library so the seed replay test
+#   runs them on stable: `cargo test --manifest-path fuzz/Cargo.toml`.
+# - fuzz_targets/<name>.rs: the libFuzzer entry point, one line calling `<module>::run`.
+# - seeds/<name>/: committed seed inputs, plus the reproducer of every crash found, which
+#   the replay test then runs on every CI run.
+# - corpus/, artifacts/, coverage/, target/: written by cargo-fuzz, not committed.
+
+[package]
+name = "serialist-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# The WebAssembly codec tier (wasmtime): `cargo +nightly fuzz build --features wasm`.
+wasm = ["serialist-plugins/wasm"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Every crate a target exercises is declared up front, so adding a target never changes
+# the lock file.
+serialist-core = { path = "../crates/serialist-core" }
+serialist-plugins = { path = "../crates/serialist-plugins" }
+serialist-vt = { path = "../crates/serialist-vt" }
+# Encode requests carry JSON fields (`serialist_core::EncodeRequest::fields`).
+serde_json = "1"
+
+[workspace]
+members = ["."]
+
+# cargo-fuzz builds in release with debug assertions and overflow checks on. Keep line
+# tables so a crash's backtrace names the frame.
+[profile.release]
+debug = "line-tables-only"
+
+[[bin]]
+name = "ansi_monitor"
+path = "fuzz_targets/ansi_monitor.rs"
+test = false
+doc = false
+bench = false

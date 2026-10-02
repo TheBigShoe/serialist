@@ -5,6 +5,10 @@ resolver = "2"
 # build reproducibly (a path member's metadata hash does not depend on where the
 # checkout lives).
 members = ["crates/*", "examples/plugins/*", "crates/serialist-plugins/tests/plugins/*"]
+# The cargo-fuzz crate is its own workspace with its own lock file: it builds with nightly
+# (cargo +nightly fuzz), and libfuzzer-sys compiles libFuzzer's C++ runtime under a license
+# (NCSA) the policy in deny.toml does not list. See fuzz/Cargo.toml.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
