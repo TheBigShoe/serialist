@@ -61,7 +61,17 @@ actions!(
         ScrollToTop,
     ]
 );
-actions!(serial, [Connect, Disconnect]);
+actions!(
+    serial,
+    [
+        Connect,
+        Disconnect,
+        /// Ask for a host and port, then open a raw TCP stream to it in a tab.
+        ConnectTcp,
+        /// Pick a recorded capture file and play it back in a tab.
+        OpenCapture,
+    ]
+);
 actions!(devices, [SelectNext, SelectPrevious]);
 
 /// The Commands panel's actions and [`commands::Send`](Send), in a module of their own:
@@ -345,9 +355,9 @@ pub fn init(cx: &mut App) {
 /// Most scripts the Scripts menu lists; the console lists them all.
 const MENU_SCRIPTS: usize = 40;
 
-/// The app menu, which is the palette: the Serialist menu, and a Scripts menu with a
-/// Run entry per script in the scripts folder. The configuration calls it again when
-/// the list of scripts changes.
+/// The app menu, which is the palette: the Serialist menu, a Serial menu (Connect to
+/// TCP, Open Capture, Disconnect), and a Scripts menu with a Run entry per script in the
+/// scripts folder. The configuration calls it again when the list of scripts changes.
 pub fn set_menus(cx: &mut App) {
     let listed = cx
         .try_global::<Config>()
@@ -383,6 +393,12 @@ pub fn set_menus(cx: &mut App) {
             MenuItem::action("Reload Configuration", ReloadConfig),
             MenuItem::separator(),
             MenuItem::action("Quit Serialist", Quit),
+        ]),
+        Menu::new("Serial").items([
+            MenuItem::action("Connect to TCP\u{2026}", ConnectTcp),
+            MenuItem::action("Open Capture\u{2026}", OpenCapture),
+            MenuItem::separator(),
+            MenuItem::action("Disconnect", Disconnect),
         ]),
         Menu::new("Scripts").items(script_items),
     ]);
