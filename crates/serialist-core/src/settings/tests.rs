@@ -461,6 +461,30 @@ fn out_of_range_values_are_errors_with_positions() {
     assert!(Settings::from_jsonc(r#"{ "display": { "hex_bytes_per_row": 999 } }"#).is_err());
 }
 
+/// Found by the `config_jsonc` fuzz target: a size or height is read as an f64, checked,
+/// then stored as an f32, so 1e300 passed the check and loaded as infinity, and 1e-300 as
+/// zero.
+#[test]
+fn sizes_and_heights_that_do_not_fit_an_f32_are_errors() {
+    for bad in [
+        r#"{ "buffer_font_size": 1e300 }"#,
+        r#"{ "ui_font_size": 3.5e38 }"#,
+        r#"{ "terminal": { "font_size": 1e39 } }"#,
+        r#"{ "buffer_font_size": 1e-300 }"#,
+        r#"{ "ui_font_size": 1e-46 }"#,
+        r#"{ "buffer_line_height": 1e300 }"#,
+        r#"{ "buffer_line_height": { "custom": 1e-300 } }"#,
+        r#"{ "terminal": { "line_height": 1e300 } }"#,
+    ] {
+        let err = Settings::from_jsonc(bad).expect_err(bad);
+        assert!(err.to_string().contains("out of range"), "{bad}: {err}");
+    }
+    // The largest and smallest an f32 holds still load, as finite positive numbers.
+    let settings = user_settings(r#"{ "buffer_font_size": 3.4e38, "ui_font_size": 2e-45 }"#);
+    assert!(settings.buffer_font_size.is_finite() && settings.buffer_font_size > 0.0);
+    assert!(settings.ui_font_size.is_finite() && settings.ui_font_size > 0.0);
+}
+
 #[test]
 fn errors_carry_file_line_column_and_message() {
     let dir = TempDir::new("errors");
