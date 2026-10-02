@@ -1,19 +1,25 @@
 //! Which ports the app lists and how it opens them.
 //!
 //! Real ports always: `RealPortSource` for the list and `SerialportFactory` to open
-//! them. With `--virtual` (or a `virtual:` `--port`), the simulator's devices are listed
-//! alongside them and `virtual:` ids open through the simulator. Every port named with
-//! `--port PATH` or `--virtual NAME` opens at startup in a tab of its own, in the order
-//! given (so `--virtual firehose` streams right away). A `RoutingTransportFactory` picks
-//! the backend from the id, so the UI never needs to know which one a port belongs to.
+//! them. `tcp:<host>:<port>` ids always open through `TcpTransportFactory` and
+//! `replay:<path>` ids through `ReplayTransportFactory`; neither kind is listed, since
+//! nothing discovers them (see `serialist_core::address` for the grammar). With
+//! `--virtual` (or a `virtual:` `--port`), the simulator's devices are listed
+//! alongside the real ports and `virtual:` ids open through the simulator. Every port
+//! named with `--port ID` or `--virtual NAME` opens at startup in a tab of its own, in
+//! the order given (so `--virtual firehose` streams right away). A
+//! `RoutingTransportFactory` picks the backend from the id, so the UI, the headless
+//! `--script` runner and a script's `serial.open` never need to know which one a port
+//! belongs to.
 
 use std::sync::Arc;
 
 use anyhow::bail;
 use serialist_core::composite::scheme_of;
 use serialist_core::{
-    MergedPortSource, PortId, PortSource, RealPortSource, RoutingTransportFactory,
-    SerialportFactory, TransportFactory, VIRTUAL_SCHEME,
+    MergedPortSource, PortId, PortSource, REPLAY_SCHEME, RealPortSource, ReplayTransportFactory,
+    RoutingTransportFactory, SerialportFactory, TCP_SCHEME, TcpTransportFactory, TransportFactory,
+    VIRTUAL_SCHEME,
 };
 use serialist_sim::SimWorld;
 use serialist_ui::AppOptions;
@@ -58,7 +64,9 @@ pub fn build(args: &Args, real: Backend, world: SimWorld) -> anyhow::Result<AppO
     }
 
     let simulate = args.simulator || open.iter().any(|port| is_virtual(&port));
-    let router = RoutingTransportFactory::new(real.transport_factory);
+    let router = RoutingTransportFactory::new(real.transport_factory)
+        .with_scheme(TCP_SCHEME, Arc::new(TcpTransportFactory::new()))
+        .with_scheme(REPLAY_SCHEME, Arc::new(ReplayTransportFactory::new()));
     let (port_source, transport_factory) = if simulate {
         let source = MergedPortSource::new(vec![real.port_source, world.port_source()]);
         let router = router.with_scheme(VIRTUAL_SCHEME, world.transport_factory());
@@ -184,9 +192,44 @@ mod tests {
             "paths go to the serial backend"
         );
         assert!(matches!(
-            opens(&options, "tcp:localhost:4000"),
+            opens(&options, "rfc2217:localhost:4000"),
             Err(TransportError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn tcp_and_replay_ids_route_with_or_without_the_simulator() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = format!("tcp:127.0.0.1:{}", listener.local_addr().unwrap().port());
+        for flags in [&[][..], &["--virtual"][..]] {
+            let options = options(flags).unwrap();
+            assert_eq!(opens(&options, &tcp).unwrap(), tcp, "{flags:?}");
+            // The replay factory parses the id before anything else, so a bad option
+            // proves the route; an unregistered scheme would be NotFound instead.
+            assert!(
+                matches!(
+                    opens(&options, "replay:/captures/boot.bin?speed=warp"),
+                    Err(TransportError::Config(message)) if message.contains("speed")
+                ),
+                "{flags:?}: routed to the replay factory"
+            );
+            assert!(
+                matches!(opens(&options, "tcp:nope"), Err(TransportError::Config(_))),
+                "{flags:?}: a malformed id is a config error"
+            );
+            assert!(
+                !listed(&options).iter().any(|id| id.starts_with("tcp:")),
+                "nothing lists tcp ports"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tcp_port_opens_at_startup_like_any_other() {
+        let options = options(&["--port", "tcp:10.0.0.5:4000"]).unwrap();
+        assert_eq!(options.open_ports, [PortId::new("tcp:10.0.0.5:4000")]);
+        assert_eq!(options.select_port, Some(PortId::new("tcp:10.0.0.5:4000")));
+        assert_eq!(listed(&options), [FAKE_ADAPTER], "the simulator stays off");
     }
 
     #[test]
