@@ -141,7 +141,10 @@ jobs:
   # fuzz-nightly.yml runs the same loop for longer on a schedule, on the same cache.
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold rust-cache compiles wasmtime (race_wasm's dependency) for clippy, for the
+    # tests and for the instrumented build, which is most of the job. Raised from 45
+    # without a timing from a hosted runner; a warm run needs a fraction of it.
+    timeout-minutes: 75
     env:
       FUZZ_SECONDS: 60
     steps:
@@ -181,14 +184,23 @@ jobs:
       - name: Check fuzz/Cargo.lock
         run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
 
+      # The race_wasm target is behind the fuzz crate's `wasm` feature (wasmtime). The tests
+      # run twice: without it, as a plain build sees the crate, and with it, which adds that
+      # target and replays its seeds. Clippy covers both with --all-features.
       - name: Format, clippy and seed replay (stable)
         run: |
           cargo fmt --manifest-path fuzz/Cargo.toml --check
-          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --all-features --locked -- -D warnings
           cargo test --manifest-path fuzz/Cargo.toml --locked
+          cargo test --manifest-path fuzz/Cargo.toml --locked --features wasm
 
+      # `--features wasm` here and in the run and cmin steps below, always together: it
+      # builds race_wasm (cargo skips a target whose required feature is off, and `fuzz
+      # list` lists it regardless), and cargo-fuzz rebuilds every target when the features
+      # of a run differ from the build's. wasmtime makes this build the long part of the
+      # job when the rust-cache has nothing for it.
       - name: Build fuzz targets (nightly)
-        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET"
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET"
 
       # 60 s per target only goes deep if each run starts where the last one stopped, so
       # the corpus (fuzz/corpus, not committed) is cached. A cache entry cannot be
@@ -220,7 +232,7 @@ jobs:
             if [ -f "fuzz/dicts/$target.dict" ]; then
               args+=(-dict="fuzz/dicts/$target.dict")
             fi
-            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET" "$target" \
               "fuzz/corpus/$target" "fuzz/seeds/$target" -- "${args[@]}" \
               || failed="$failed $target"
             echo "::endgroup::"
@@ -252,7 +264,7 @@ jobs:
           for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
             echo "::group::$target"
             mkdir -p "fuzz/corpus/$target"
-            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET" "$target" \
               "fuzz/corpus/$target" -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10 \
               || echo "::warning::Could not minimize the corpus of $target; saving it as it is."
             echo "::endgroup::"
