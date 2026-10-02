@@ -52,7 +52,7 @@ use serialist_core::{
 use crate::{Clock, DeviceOutput, LinkConfig, LinkStats, SimDevice, SystemClock, Wakeup};
 
 /// How often a paced wire hands a packet to the reader, like a USB-serial adapter's
-/// poll interval. At 3 Mbaud that is about 300 bytes per packet.
+/// poll interval. At 3 Mbaud that is 300 bytes per packet, at 12 Mbaud 1 200.
 pub const PACKET_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The most wire time a paced link commits ahead of now (longer only at baud rates so

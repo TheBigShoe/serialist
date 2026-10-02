@@ -788,6 +788,35 @@ mod tests {
     }
 
     #[test]
+    fn rate_limited_device_keeps_pace_at_12_mbaud() {
+        // 12 Mbaud 8N1 is 1 200 000 bytes/s: 2 400 bytes per 2 ms tick.
+        let cfg = FirehoseConfig::new(FirehoseContent::Mixed).with_rate(1_200_000);
+        let mut dev = FirehoseDevice::new(cfg);
+        let mut out = CaptureOutput::new();
+        let t0 = SystemClock.now();
+        let mut now = t0;
+        for _ in 0..500 {
+            let next = dev.on_tick(now, &mut out).expect("streams forever");
+            assert_eq!(next - now, Duration::from_millis(2));
+            now = next;
+        }
+        dev.on_tick(now, &mut out);
+        assert_eq!(dev.emitted(), 1_200_000);
+
+        // Woken 100 ms late it owes 120 000 bytes, more than one batch: it sends a batch
+        // at a time and asks to run again at once until it has caught up.
+        now += Duration::from_millis(100);
+        let mut batches = 0;
+        while dev.on_tick(now, &mut out) == Some(now) {
+            batches += 1;
+        }
+        assert_eq!(batches, 7, "120 000 bytes in 16 KiB batches");
+        assert_eq!(dev.emitted(), 1_320_000);
+        assert_eq!(out.sent.len(), 1_320_000);
+        assert_eq!(out.sent, stream(FirehoseContent::Mixed, 0, 1_320_000));
+    }
+
+    #[test]
     fn tick_is_clamped_and_saturates() {
         let t0 = SystemClock.now();
         let mut zero = FirehoseDevice::new(FirehoseConfig {

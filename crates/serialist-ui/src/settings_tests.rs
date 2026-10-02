@@ -15,7 +15,7 @@ use crate::prelude::*;
 use crate::session_view::FRAME;
 use crate::settings_io::{self, Origin};
 use crate::settings_view::{
-    BindingSource, DEBOUNCE, Field, MatchKey, ProfileEditor, Section, SettingsView,
+    BindingSource, DEBOUNCE, Field, MatchKey, Pick, ProfileEditor, Section, SettingsView,
 };
 use crate::test_support::{
     TestDir, draw, has_rx_line, open_workspace, run_until, type_line, usb_port, wait_connected,
@@ -319,6 +319,32 @@ fn a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched(cx: &mut 
         file_value(&paths.settings, "/inline/escape_chord"),
         Some(json!("ctrl-alt-x"))
     );
+}
+
+#[gpui_test]
+fn twelve_mbaud_as_the_default_baud_reaches_the_file_and_the_list(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-12-mbaud");
+    start(cx, &paths);
+    let view = open_settings(cx, window, &workspace);
+
+    show(cx, window, Section::Session);
+    type_into(cx, window, &view, Field::DefaultBaud, "12000000");
+    assert_eq!(
+        file_value(&paths.settings, "/default_baud"),
+        Some(json!(12_000_000))
+    );
+    // Once the watcher has reloaded the file, the Standard list shows it as picked.
+    let picked = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            v.picker(Pick::Baud).read(cx).selected_value().cloned()
+        })
+    };
+    run_until(cx, "the list to show 12000000", |cx| {
+        picked(cx).as_deref() == Some("12000000")
+    });
+    assert!(view.read_with(cx, |v, _| v.error("/default_baud").is_none()));
 }
 
 #[gpui_test]

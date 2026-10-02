@@ -1,7 +1,7 @@
 //! The virtual link on its own, driven through the raw transport halves.
 //!
 //! Timing is asserted exactly, on a [`ManualClock`]; `common` describes the pattern.
-//! Tests with no timing assertions run in real time. Three smoke tests of the real-time
+//! Tests with no timing assertions run in real time. Four smoke tests of the real-time
 //! path (`system_clock_*`) keep loose wall-clock bounds so a regression there still shows
 //! locally; they skip themselves under CI, where shared runners cannot keep time.
 
@@ -177,6 +177,8 @@ fn paced_rate_matches_the_schedule_in_every_window() {
         (9_600, 10 * MS),
         (1_000_000, 7 * MS),
         (3_000_000, 24 * MS),
+        (12_000_000, 24 * MS),
+        (12_000_000, 3 * MS),
     ] {
         let (clock, mut t, _link) = on_manual_clock(firehose(16 * 1024), paced(baud));
         let t0 = clock.now();
@@ -198,6 +200,11 @@ fn paced_rate_matches_the_schedule_in_every_window() {
                 // 11 520 bytes/s in 12-byte packets: exactly 1 152 bytes per 100 ms,
                 // less one packet for the 1 ms latency in the first window.
                 assert_eq!(got.len(), if window == 1 { 1_140 } else { 1_152 });
+            }
+            if baud == 12_000_000 {
+                // 1 200 000 bytes/s in 1 200-byte packets: exactly 120 000 bytes per
+                // 100 ms, less one packet in the first window.
+                assert_eq!(got.len(), if window == 1 { 118_800 } else { 120_000 });
             }
         }
         assert!(verifier.report().is_clean(), "{:?}", verifier.report());
@@ -606,6 +613,28 @@ fn system_clock_paced_rate_smoke() {
     assert!(within(rate, 100_000.0, 0.25), "{rate:.0} B/s over 2 s");
 }
 
+#[test]
+fn system_clock_paced_rate_at_12_mbaud_smoke() {
+    skip_unless_wall_clock_timing!();
+    // 12 Mbaud 8N1 is 1 200 000 bytes/s: the device thread has to wake on time on a
+    // real clock to keep the wire busy, and the reader to keep up, with every byte
+    // checked on the way.
+    let (mut t, link) = VirtualLink::connect(firehose(16 * 1024), paced(12_000_000));
+    let mut verifier = FirehoseVerifier::new(FirehoseContent::Text);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut bytes = 0;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        let n = t.reader.read(&mut buf, 10 * MS).unwrap();
+        verifier.feed(&buf[..n]);
+        bytes += n;
+    }
+    let rate = bytes as f64 / started.elapsed().as_secs_f64();
+    assert!(within(rate, 1_200_000.0, 0.25), "{rate:.0} B/s over 2 s");
+    assert!(verifier.report().is_clean(), "{:?}", verifier.report());
+    assert_eq!(link.stats().dropped_bytes, 0);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
@@ -645,13 +674,14 @@ proptest! {
     #[test]
     fn device_output_preserves_bytes_and_order(
         data in prop::collection::vec(any::<u8>(), 0..4000),
+        baud in prop::sample::select(vec![3_000_000u32, 12_000_000]),
         max_chunk in 1usize..5000,
         latency_us in 0u64..3_000,
         jitter_us in 0u64..3_000,
         seed in any::<u64>(),
     ) {
         let cfg = LinkConfig {
-            serial: serial(3_000_000),
+            serial: serial(baud),
             max_chunk,
             latency: Duration::from_micros(latency_us),
             jitter: Duration::from_micros(jitter_us),

@@ -13,10 +13,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
+use parking_lot::Mutex;
 use serialist_core::{ControlLine, PortId, Session, SessionConfig, SessionEvent, TransportError};
 use serialist_sim::{
-    AtDevice, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseVerifier, LinkConfig,
-    ManualClock, SimWorld, virtual_port_id,
+    AtDevice, DeviceOutput, FirehoseConfig, FirehoseContent, FirehoseDevice, FirehoseGenerator,
+    FirehoseReport, FirehoseVerifier, LinkConfig, ManualClock, SimDevice, SimWorld,
+    virtual_port_id,
 };
 
 use common::{
@@ -123,8 +125,11 @@ fn at_conversation() {
     assert_eq!(ask("AT\r"), "AT\r\r\nOK\r\n");
 }
 
-#[test]
-fn firehose_at_3_mbaud_is_complete_and_on_rate() {
+/// Two seconds of mixed firehose traffic through a session at `baud`, in 100 ms windows
+/// moved in 20 ms steps. After every window the session has delivered exactly what the
+/// paced wire has released, and the link has dropped and damaged nothing. Returns the
+/// bytes received and the verifier's report on them.
+fn firehose_through_a_session(baud: u32) -> (usize, FirehoseReport) {
     let clock = Arc::new(ManualClock::new());
     let world = SimWorld::empty_with_clock(clock.clone());
     let id = world.add_virtual("hose", "Firehose", LinkConfig::default(), || {
@@ -132,16 +137,14 @@ fn firehose_at_3_mbaud_is_complete_and_on_rate() {
             FirehoseContent::Mixed,
         )))
     });
-    let session = open(&world, &id, 3_000_000);
-    let _unplug = UnplugOnPanic(world.link(&id).expect("link is up"));
+    let session = open(&world, &id, baud);
+    let link = world.link(&id).expect("link is up");
+    let _unplug = UnplugOnPanic(link.clone());
     let events = session.events();
     expect_connected(&events);
     clock.settle(2);
     let t0 = clock.now();
 
-    // Two seconds in 100 ms windows, in 20 ms steps. 3 Mbaud 8N1 is 300 000 bytes/s in
-    // 300-byte packets: 30 000 bytes a window, less one packet for the 1 ms latency in
-    // the first.
     let mut verifier = FirehoseVerifier::new(FirehoseContent::Mixed);
     let mut received = 0;
     for window in 1..=20u32 {
@@ -150,14 +153,108 @@ fn firehose_at_3_mbaud_is_complete_and_on_rate() {
         let data = take_data(&events);
         verifier.feed(&data);
         received += data.len();
-        assert_eq!(received, released(3_000_000, elapsed), "after {elapsed:?}");
+        assert_eq!(
+            received,
+            released(baud, elapsed),
+            "{baud} baud after {elapsed:?}"
+        );
         assert_eq!(session.stats().rx_bytes, received as u64);
     }
+    let stats = link.stats();
+    assert_eq!(stats.dropped_bytes + stats.corrupted_bytes, 0, "{stats:?}");
+    close_on(&clock, session, MS);
+    (received, verifier.into_report())
+}
+
+#[test]
+fn firehose_at_3_mbaud_is_complete_and_on_rate() {
+    // 3 Mbaud 8N1 is 300 000 bytes/s in 300-byte packets: 30 000 bytes a window, less
+    // one packet for the 1 ms latency in the first.
+    let (received, report) = firehose_through_a_session(3_000_000);
     assert_eq!(received, 599_700);
-    let report = verifier.report();
     assert!(report.is_clean(), "{report:?}");
     // Mixed records average about 650 bytes, so 2 s at 300 kB/s is roughly 900 of them.
     assert!(report.records > 500, "{report:?}");
+}
+
+#[test]
+fn firehose_at_12_mbaud_is_complete_and_on_rate() {
+    // 12 Mbaud 8N1, an FT232H or FT2232H at full speed, is 1 200 000 bytes/s in
+    // 1 200-byte packets: 120 000 bytes a window, less one packet in the first.
+    let (received, report) = firehose_through_a_session(12_000_000);
+    assert_eq!(received, 2_398_800);
+    assert!(report.is_clean(), "{report:?}");
+    // Roughly 3 700 records of about 650 bytes.
+    assert!(report.records > 2_000, "{report:?}");
+}
+
+/// Feeds everything the host writes into a verifier the test reads.
+struct VerifyingSink(Arc<Mutex<FirehoseVerifier>>);
+
+impl SimDevice for VerifyingSink {
+    fn name(&self) -> &str {
+        "sink"
+    }
+
+    fn on_receive(&mut self, bytes: &[u8], _out: &mut dyn DeviceOutput) {
+        self.0.lock().feed(bytes);
+    }
+}
+
+#[test]
+fn a_large_write_at_12_mbaud_reaches_the_device_whole_and_on_rate() {
+    const BAUD: u32 = 12_000_000;
+    // Two seconds of wire time at 1 200 000 bytes/s.
+    const TOTAL: usize = 2_400_000;
+    let clock = Arc::new(ManualClock::new());
+    let world = SimWorld::empty_with_clock(clock.clone());
+    let verifier = Arc::new(Mutex::new(FirehoseVerifier::new(FirehoseContent::Binary)));
+    let device_verifier = Arc::clone(&verifier);
+    let id = world.add_virtual("sink", "Byte sink", LinkConfig::default(), move || {
+        Box::new(VerifyingSink(Arc::clone(&device_verifier)))
+    });
+    let session = open(&world, &id, BAUD);
+    let link = world.link(&id).expect("link is up");
+    let _unplug = UnplugOnPanic(link.clone());
+    let events = session.events();
+    expect_connected(&events);
+    clock.settle(2);
+    let t0 = clock.now();
+
+    // Binary frames carry every byte value. They are queued all at once in 64 KiB
+    // writes, as a file send would; the link takes each write like a large OS buffer, so
+    // with the clock standing still they all start on the wire at `t0`, back to back.
+    let mut payload = Vec::with_capacity(TOTAL);
+    FirehoseGenerator::new(FirehoseContent::Binary, 7).fill(&mut payload, TOTAL);
+    for piece in payload.chunks(64 * 1024) {
+        session.write(piece.to_vec()).unwrap();
+    }
+    wait_for(
+        Duration::from_secs(5),
+        "the writer to hand over every write",
+        || link.stats().host_to_device_bytes == TOTAL as u64,
+    );
+    assert_eq!(session.stats().tx_bytes, TOTAL as u64);
+    clock.settle(2);
+
+    // The device sees the host's bytes on the schedule the host sees the device's.
+    for window in 1..=20u32 {
+        let elapsed = 100 * MS * window;
+        advance_to(&clock, t0 + elapsed, 20 * MS, 2);
+        let got = verifier.lock().report().bytes;
+        assert_eq!(got as usize, released(BAUD, elapsed), "after {elapsed:?}");
+    }
+    // The last byte finishes at 2 000 ms and lands one latency later.
+    advance_to(&clock, t0 + 2_001 * MS, MS, 2);
+    let report = verifier.lock().report().clone();
+    assert_eq!(report.bytes, TOTAL as u64);
+    assert!(report.is_clean(), "{report:?}");
+    // Frames average about 140 bytes, so roughly 17 000 of them.
+    assert!(report.records > 10_000, "{report:?}");
+    let stats = link.stats();
+    assert_eq!(stats.host_to_device_bytes, TOTAL as u64);
+    assert_eq!(stats.dropped_bytes + stats.corrupted_bytes, 0, "{stats:?}");
+    assert!(take_data(&events).is_empty(), "the sink sends nothing back");
     close_on(&clock, session, MS);
 }
 
