@@ -1,6 +1,7 @@
 //! Store benchmarks: append throughput by content, snapshot cost, line lookup and
-//! search over a million lines. Input comes from the simulator's firehose generator,
-//! so no hardware or link is involved.
+//! search over a million lines, and the line index under a window read, eviction and
+//! tiny lines. Input comes from the simulator's firehose generator, so no hardware or
+//! link is involved. The parser alone is in parse.rs.
 
 use std::hint::black_box;
 use std::io::Write as _;
@@ -8,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use serialist_core::{AnsiParser, LineId, LineSource, Searcher, Store, StoreConfig};
+use serialist_core::{LineId, LineSource, Searcher, Store, StoreConfig};
 use serialist_sim::{FirehoseContent, FirehoseGenerator};
 
 const APPEND_BYTES: usize = 4 * 1024 * 1024;
@@ -119,25 +120,92 @@ fn reads(c: &mut Criterion) {
     group.finish();
 }
 
-/// CR overwrite of a long line of multi-byte characters: the cell-mode path.
-fn overwrite(c: &mut Criterion) {
-    let n = 15 * 1024;
-    let mut input = "\u{e9}".repeat(n).into_bytes();
-    input.push(b'\r');
-    input.extend_from_slice("\u{e8}".repeat(n).as_bytes());
-    input.push(b'\n');
-    let mut group = c.benchmark_group("parse");
-    group.throughput(Throughput::Bytes(input.len() as u64));
-    group.bench_function("overwrite_non_ascii", |b| {
+/// One xorshift64 step, for ids that jump around the store the way a scrollbar drag does.
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// A store held at its minimum budget after four times what it can keep, so the oldest
+/// lines were evicted and `first_line` is well past zero.
+fn evicted_store() -> Store {
+    let mut store = Store::new(StoreConfig::with_budget(0));
+    let data = firehose(FirehoseContent::Text);
+    let now = Instant::now();
+    for _ in 0..4 {
+        for chunk in data.chunks(CHUNK) {
+            store.append(chunk, now);
+        }
+    }
+    let stats = store.stats();
+    assert!(
+        stats.first_line.0 > 0,
+        "the bench needs a store that evicted"
+    );
+    assert!(
+        stats.memory <= stats.budget,
+        "the store stays within budget"
+    );
+    store
+}
+
+/// What the line index costs on the paths the UI and the appender use: a frame's worth of
+/// lines, a lookup once the front of the index has been evicted, and an append where
+/// every line is two bytes, so index work dominates.
+fn line_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("line_index");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(3));
+
+    // What a frame does: read the 60 consecutive lines on screen, wherever the view is.
+    const WINDOW: u64 = 60;
+    let store = million_lines();
+    let snap = store.snapshot();
+    let mut next = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(WINDOW as usize);
+    group.throughput(Throughput::Elements(WINDOW));
+    group.bench_function("visible_window_1m", |b| {
         b.iter(|| {
-            let mut parser = AnsiParser::new();
-            parser.feed(&input, |line| {
-                black_box(line.text.len());
-            });
+            let first = xorshift(&mut next) % (LINES - WINDOW);
+            out.clear();
+            snap.lines(LineId(first)..LineId(first + WINDOW), &mut out);
+            black_box(out.len())
         });
+    });
+
+    // Lookups in a store whose index front was evicted: ids start at `first_line`, not 0.
+    let evicted = evicted_store();
+    let snap = evicted.snapshot();
+    let (first, end) = (snap.first_line().0, snap.end().0);
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("lookup_after_eviction", |b| {
+        b.iter(|| {
+            let id = first + xorshift(&mut next) % (end - first);
+            black_box(snap.line(LineId(id)).expect("retained line"))
+        });
+    });
+
+    // 4 MiB of one-character lines: two million index entries.
+    let tiny = "x\n".repeat(APPEND_BYTES / 2).into_bytes();
+    group.sample_size(10);
+    group.throughput(Throughput::Bytes(tiny.len() as u64));
+    group.bench_function("append_tiny_lines", |b| {
+        b.iter_batched(
+            || Store::new(StoreConfig::default()),
+            |mut store| {
+                let now = Instant::now();
+                for chunk in tiny.chunks(CHUNK) {
+                    store.append(chunk, now);
+                }
+                store
+            },
+            BatchSize::LargeInput,
+        );
     });
     group.finish();
 }
 
-criterion_group!(benches, append, overwrite, reads);
+criterion_group!(benches, append, reads, line_index);
 criterion_main!(benches);
