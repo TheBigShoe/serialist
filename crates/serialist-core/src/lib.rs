@@ -5,6 +5,7 @@
 //! so the whole engine can be exercised without hardware.
 
 pub mod ansi;
+pub mod clock;
 pub mod codec;
 pub mod commands;
 pub mod composite;
@@ -29,6 +30,7 @@ pub mod transport;
 mod test_util;
 
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
+pub use clock::{Clock, SystemClock, Wakeup};
 pub use codec::{
     Codec, CodecError, CodecFactory, CodecInfo, CodecRegistry, CommandInfo, EncodeRequest,
     FieldInfo, FieldType, FnCodecFactory, Frame, FrameKindInfo, Severity, SmolStr, Value,
