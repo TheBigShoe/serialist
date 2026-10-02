@@ -1,0 +1,36 @@
+# libFuzzer dictionary for text_lines: line endings for decode mode, and the JSON keys and
+# values of a `line` command for encode mode (config bit 0 on).
+# The CI job and `just fuzz` pass fuzz/dicts/<target>.dict when it exists.
+
+cr="\x0d"
+lf="\x0a"
+crlf="\x0d\x0a"
+lfcr="\x0a\x0d"
+crcrlf="\x0d\x0d\x0a"
+nul="\x00"
+utf8_2="\xc3\xa9"
+utf8_lead3="\xe2\x82"
+utf8_4="\xf0\x9f\x98\x80"
+utf8_lead4="\xf0\x9f\x98"
+invalid="\xff\xfe"
+lone_continuation="\xa9"
+
+# encode mode
+object_open="{"
+object_close="}"
+colon=":"
+comma=","
+k_command="\"command\":"
+k_text="\"text\":"
+k_eol="\"eol\":"
+v_line="\"line\""
+v_crlf="\"crlf\""
+v_lf="\"lf\""
+v_cr="\"cr\""
+v_none="\"none\""
+v_unknown_eol="\"crlf!\""
+v_escape_nul="\\u0000"
+v_escape_surrogate="\\ud83d"
+v_escape_pair="\\ud83d\\ude00"
+v_null="null"
+v_number="5"

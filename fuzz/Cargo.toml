@@ -20,7 +20,8 @@
 # Layout:
 # - src/: the shared input format (`Input` in src/lib.rs) and one module per target with
 #   a `pub fn run(data: &[u8])`. The bodies live in the library so the seed replay test
-#   runs them on stable: `cargo test --manifest-path fuzz/Cargo.toml`.
+#   runs them on stable: `cargo test --manifest-path fuzz/Cargo.toml`. src/codec.rs is
+#   not a target: the checks the codec targets share.
 # - fuzz_targets/<name>.rs: the libFuzzer entry point, one line calling `<module>::run`.
 # - seeds/<name>/: committed seed inputs, plus the reproducer of every crash found, which
 #   the replay test then runs on every CI run.
@@ -62,6 +63,20 @@ debug = "line-tables-only"
 [[bin]]
 name = "ansi_monitor"
 path = "fuzz_targets/ansi_monitor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "race_rust"
+path = "fuzz_targets/race_rust.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_lines"
+path = "fuzz_targets/text_lines.rs"
 test = false
 doc = false
 bench = false
