@@ -43,6 +43,37 @@ wasm-fixtures:
 # Everything the CI test job runs.
 ci: fmt-check lint test
 
+# Fuzzing. fuzz/ is a cargo-fuzz crate outside the workspace, with its own Cargo.lock (see
+# fuzz/Cargo.toml for why): cargo-fuzz builds it with nightly, so `cargo test --workspace`
+# and `just ci` never see it. These mirror the `fuzz` job in .github/workflows/ci.yml.
+# `--no-cfg-fuzzing`: nusb 0.2 has `cfg(fuzzing)` code that does not compile.
+fuzz_flags := "--fuzz-dir fuzz --no-cfg-fuzzing"
+fuzz_limits := "-rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10"
+
+# Format check, clippy and the seed replay for fuzz/, on the pinned stable toolchain.
+fuzz-check:
+    cargo fmt --manifest-path fuzz/Cargo.toml --check
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+    cargo test --manifest-path fuzz/Cargo.toml --locked
+
+# Fuzz one target for `secs` seconds; `just fuzz-list` names them. New inputs go to
+# fuzz/corpus/<target> (not committed), crashes to fuzz/artifacts/<target>. Copy a crash
+# into fuzz/seeds/<target>/ once fixed so `just fuzz-check` replays it from then on.
+# Needs `rustup toolchain install nightly` and `cargo install cargo-fuzz --locked`.
+fuzz target secs="60":
+    mkdir -p fuzz/corpus/{{target}}
+    cargo +nightly fuzz run {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}}
+
+# The same run without nightly: the pinned stable toolchain with coverage guidance but no
+# AddressSanitizer. Good for a quick local look; CI fuzzes with nightly and ASan.
+fuzz-stable target secs="60":
+    mkdir -p fuzz/corpus/{{target}}
+    cargo fuzz run --sanitizer none {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}}
+
+# List the fuzz targets.
+fuzz-list:
+    cargo fuzz list --fuzz-dir fuzz
+
 # Render the real workspace offscreen with Metal in nineteen states (macOS only) and write
 # PNGs to target/screenshots/. Names pick shots by file name: `just screenshots 03 light`.
 screenshots *names:
