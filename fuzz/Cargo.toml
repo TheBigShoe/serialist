@@ -80,3 +80,10 @@ path = "fuzz_targets/text_lines.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store_ingest"
+path = "fuzz_targets/store_ingest.rs"
+test = false
+doc = false
+bench = false

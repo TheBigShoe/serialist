@@ -21,6 +21,7 @@
 pub mod ansi_monitor;
 pub mod codec;
 pub mod race_rust;
+pub mod store_ingest;
 pub mod text_lines;
 
 /// The most chunk lengths an [`Input`] carries.
