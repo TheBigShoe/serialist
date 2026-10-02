@@ -43,6 +43,18 @@ adapter is marked `#[ignore]` with a comment saying what hardware it needs, and 
 gates a merge. A bug first seen on hardware gets a recorded capture and a regression
 test that reproduces it without hardware. See "Testing strategy" in `docs/plan.md`.
 
+Two opt-in runs sit outside `just ci`, both `#[ignore]`d:
+
+- The soak: a 12 Mbaud firehose through a session, the ingest thread and the store for
+  a minute, simulated, printing the rate, heap growth and each thread's share of a core.
+  `cargo test --release -p serialist-core --test soak -- --ignored --nocapture`
+  (`SERIALIST_SOAK_SECS`, `SERIALIST_SOAK_BAUD` and `SERIALIST_SOAK_BUDGET_MB` change it).
+- The hardware tier: a loopback at 12 Mbaud on a real adapter (an FTDI FT232H or
+  FT2232H) with TX wired to RX, named by `SERIALIST_HW_PORT`.
+  `SERIALIST_HW_PORT=/dev/cu.usbserial-XXXX cargo test --release -p serialist-core --test hardware -- --ignored --nocapture`
+  (`SERIALIST_HW_BAUD`, `SERIALIST_HW_BYTES` and `SERIALIST_HW_FLOW=hardware` change it).
+  Without the variable it prints "skipped".
+
 ## Licensing
 
 Serialist is licensed under MIT OR Apache-2.0, and contributions are accepted under the
