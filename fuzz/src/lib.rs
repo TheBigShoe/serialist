@@ -24,6 +24,8 @@ pub mod config_jsonc;
 pub mod race_lua;
 pub mod race_rust;
 pub mod store_ingest;
+#[cfg(feature = "wasm")]
+pub mod race_wasm;
 pub mod text_lines;
 
 /// The most chunk lengths an [`Input`] carries.

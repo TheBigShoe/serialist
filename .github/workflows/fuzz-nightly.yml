@@ -81,8 +81,10 @@ jobs:
       - name: Check fuzz/Cargo.lock
         run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
 
+      # `--features wasm` here and in the run and cmin steps, as in ci.yml: it builds the
+      # race_wasm target, and cargo-fuzz rebuilds when a run's features differ.
       - name: Build fuzz targets (nightly)
-        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET"
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET"
 
       # The newest entry with this prefix, from main's pushes or an earlier nightly run.
       # The key is unique per run because a cache entry cannot be overwritten.
@@ -111,7 +113,7 @@ jobs:
             if [ -f "fuzz/dicts/$target.dict" ]; then
               args+=(-dict="fuzz/dicts/$target.dict")
             fi
-            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET" "$target" \
               "fuzz/corpus/$target" "fuzz/seeds/$target" -- "${args[@]}" \
               || failed="$failed $target"
             echo "::endgroup::"
@@ -140,7 +142,7 @@ jobs:
           for target in $(cargo +nightly fuzz list --fuzz-dir fuzz); do
             echo "::group::$target"
             mkdir -p "fuzz/corpus/$target"
-            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
+            cargo +nightly fuzz cmin --fuzz-dir fuzz --no-cfg-fuzzing --features wasm --target "$FUZZ_TARGET" "$target" \
               "fuzz/corpus/$target" -- -rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10 \
               || echo "::warning::Could not minimize the corpus of $target; saving it as it is."
             echo "::endgroup::"
