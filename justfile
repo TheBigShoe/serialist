@@ -51,14 +51,20 @@ ci: fmt-check lint test
 # a crash into fuzz/seeds/<target>/ once fixed so `just fuzz-check` replays it from then
 # on. fuzz/dicts/<target>.dict, when it exists, is passed as the libFuzzer dictionary.
 # Running a target needs `cargo install cargo-fuzz --locked`, and `just fuzz` nightly too.
+# race_wasm needs the fuzz crate's `wasm` feature (wasmtime, a long first build), which
+# `fuzz` and `fuzz-stable` add for that target only. cargo-fuzz rebuilds when the features
+# change, so the next target after it builds without wasmtime again.
 fuzz_flags := "--fuzz-dir fuzz --no-cfg-fuzzing"
 fuzz_limits := "-rss_limit_mb=1024 -malloc_limit_mb=256 -timeout=10"
 
-# Format check, clippy and the seed replay for fuzz/, on the pinned stable toolchain.
+# Format check, clippy and the seed replay for fuzz/, on the pinned stable toolchain. The
+# tests run twice: as a plain build sees the crate, and with the `wasm` feature, which adds
+# the race_wasm target and its seeds.
 fuzz-check:
     cargo fmt --manifest-path fuzz/Cargo.toml --check
-    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --all-features --locked -- -D warnings
     cargo test --manifest-path fuzz/Cargo.toml --locked
+    cargo test --manifest-path fuzz/Cargo.toml --locked --features wasm
 
 # Fuzz one target for `secs` seconds with nightly and AddressSanitizer, as CI does.
 fuzz target secs="60": (_fuzz-run "+nightly" "address" target secs)
@@ -69,7 +75,7 @@ fuzz-stable target secs="60": (_fuzz-run "" "none" target secs)
 [private]
 _fuzz-run toolchain sanitizer target secs:
     mkdir -p fuzz/corpus/{{target}}
-    cargo {{toolchain}} fuzz run --sanitizer {{sanitizer}} {{fuzz_flags}} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}} $(test -f fuzz/dicts/{{target}}.dict && echo -dict=fuzz/dicts/{{target}}.dict)
+    cargo {{toolchain}} fuzz run --sanitizer {{sanitizer}} {{fuzz_flags}} {{ if target == "race_wasm" { "--features wasm" } else { "" } }} {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{secs}} {{fuzz_limits}} $(test -f fuzz/dicts/{{target}}.dict && echo -dict=fuzz/dicts/{{target}}.dict)
 
 # List the fuzz targets.
 fuzz-list:
