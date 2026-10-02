@@ -10,8 +10,10 @@ use crate::settings::{ConfigPaths, ThemeSelection};
 use super::family::{Appearance, Theme, ThemeError, ThemeFamily, ThemeWarning};
 
 /// The bundled theme files, in the order [`ThemeRegistry::names`] lists them: the two
-/// defaults first.
-const BUNDLED: [(&str, &str); 6] = [
+/// defaults first. `fadetouched.json` is Arishawke's Fadetouched family (MIT; see
+/// `THIRD_PARTY_LICENSES.md`), kept byte for byte as upstream publishes it, and holds two
+/// themes: Fadetouched and Fadetouched Blur.
+const BUNDLED: [(&str, &str); 7] = [
     (
         include_str!("../../assets/themes/serialist-dark.json"),
         "serialist-dark.json",
@@ -35,6 +37,10 @@ const BUNDLED: [(&str, &str); 6] = [
     (
         include_str!("../../assets/themes/serialist-contrast.json"),
         "serialist-contrast.json",
+    ),
+    (
+        include_str!("../../assets/themes/fadetouched.json"),
+        "fadetouched.json",
     ),
 ];
 
