@@ -19,7 +19,7 @@ use notify::event::{AccessKind, CreateKind, MetadataKind, ModifyKind, RemoveKind
 use notify::{Event, EventKind};
 
 use crate::settings::ConfigPaths;
-use crate::test_util::TempDir;
+use crate::test_util::{TempDir, wall_clock_timing_enabled};
 
 use super::*;
 
@@ -435,11 +435,17 @@ fn dropping_the_watcher_is_synchronous() {
     } = f;
     let started = Instant::now();
     drop(watcher);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "drop took {:?}",
-        started.elapsed()
-    );
+    let took = started.elapsed();
+    // The bound is a wall-clock one: it follows the timing rule. That the channel is
+    // disconnected below is what proves the join happened, and is checked everywhere.
+    if wall_clock_timing_enabled() {
+        assert!(took < Duration::from_secs(2), "drop took {took:?}");
+    } else {
+        eprintln!(
+            "drop took {took:?}: the 2 s bound is not checked here (coverage build, or CI \
+             without SERIALIST_TIMING_TESTS)"
+        );
+    }
 
     // Anything sent before the drop can still be read; after that the channel is
     // disconnected, because the forwarding thread that owned the sender has been joined.

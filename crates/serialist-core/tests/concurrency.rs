@@ -1,4 +1,9 @@
 //! One thread appends a firehose while another snapshots and reads continuously.
+//!
+//! What the reader sees is checked on every run. How many reads fit in the second is a
+//! rate, and is checked only where wall-clock timing holds (`timing::wall_clock_timing_enabled`).
+
+mod timing;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +60,10 @@ fn check_line(snap: &Snapshot, line: &StyledLine, id: LineId) {
     }
 }
 
+/// The writer keeps going until this much has gone in, even past `run_for`, so eviction
+/// has run (the smallest budget is about 3 MiB) however slowly the machine writes.
+const MIN_APPENDED: u64 = 16 << 20;
+
 #[test]
 fn appends_and_reads_run_concurrently() {
     // The smallest budget allowed, so eviction runs all the time.
@@ -71,7 +80,7 @@ fn appends_and_reads_run_concurrently() {
         let start = Instant::now();
         let mut appended = 0u64;
         let mut n = 0u64;
-        while start.elapsed() < run_for {
+        while start.elapsed() < run_for || appended < MIN_APPENDED {
             chunk.clear();
             generator.fill(&mut chunk, 1 + (sizes.next() % 6000) as usize);
             store.append(&chunk, Instant::now());
@@ -132,5 +141,12 @@ fn appends_and_reads_run_concurrently() {
         stats.evicted_lines > 0,
         "the budget should have forced eviction: {stats:?}"
     );
-    assert!(reads > 1000, "only {reads} reads in {snapshots} snapshots");
+    if timing::wall_clock_timing_enabled() {
+        assert!(reads > 1000, "only {reads} reads in {snapshots} snapshots");
+    } else {
+        eprintln!(
+            "{reads} reads in {snapshots} snapshots: the rate check (over 1000 reads) is not \
+             made here (coverage build, or CI without SERIALIST_TIMING_TESTS)"
+        );
+    }
 }

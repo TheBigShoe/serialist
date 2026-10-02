@@ -81,17 +81,26 @@ _fuzz-run toolchain sanitizer target secs:
 fuzz-list:
     cargo fuzz list --fuzz-dir fuzz
 
-# Everything but serialist-core, for its coverage floor.
-not_core := "crates/serialist-(sim|script|plugins|plugin-sdk|ui|vt)/|crates/serialist/|examples/"
+# Code no hardware-free native test can run, left out of every coverage report: the
+# binary's entry point (it installs the global log subscriber, exits the process and starts
+# the GPUI event loop). Not for code that is merely untested. The same string is
+# COVERAGE_IGNORE in the coverage job of .github/workflows/ci.yml; change both together.
+coverage_ignore := 'crates/serialist/src/main\.rs'
 
-# The store gate is skipped: its timing budget is for uninstrumented builds. Needs `cargo
-# install cargo-llvm-cov --locked` and `rustup component add llvm-tools-preview`. For a
-# browsable report afterwards: `cargo llvm-cov report --html --open`.
-# Line coverage held to the CI floors: 87% of the workspace, 90% of serialist-core.
+# One run of every test under cargo-llvm-cov, nothing skipped: a test that holds a
+# wall-clock threshold skips just that threshold in a coverage build, and keeps its memory
+# and correctness checks. Then the JSON summary and the lcov file, and a floor for each
+# crate and the workspace: .github/scripts/coverage_floors.py holds the floors and prints
+# the table. The reports are in target/coverage/; for a browsable one afterwards, repeat the
+# --ignore-filename-regex of the report lines below: `cargo llvm-cov report --html --open`.
+# Needs `cargo install cargo-llvm-cov --locked` and `rustup component add llvm-tools-preview`.
+# Line coverage of every test, each crate held to its floor, as the CI coverage job does.
 coverage:
-    cargo llvm-cov --workspace --locked --no-report -- --skip one_million_lines_gate
-    cargo llvm-cov report --summary-only --fail-under-lines 87
-    cargo llvm-cov report --summary-only --fail-under-lines 90 --ignore-filename-regex '{{not_core}}'
+    cargo llvm-cov --workspace --locked --no-report --no-fail-fast
+    mkdir -p target/coverage
+    cargo llvm-cov report --json --summary-only --output-path target/coverage/summary.json --ignore-filename-regex '{{coverage_ignore}}'
+    cargo llvm-cov report --lcov --output-path target/coverage/lcov.info --ignore-filename-regex '{{coverage_ignore}}'
+    python3 .github/scripts/coverage_floors.py target/coverage/summary.json
 
 # `--bench '*'` picks the [[bench]] targets only: a library's libtest harness rejects
 # criterion's flags. `--quick` proves they build and run; for real numbers pass other
