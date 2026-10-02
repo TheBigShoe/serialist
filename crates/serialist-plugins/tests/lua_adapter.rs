@@ -206,6 +206,203 @@ fn frames_that_break_the_contract_are_reported_not_trusted() {
     assert_eq!(frames[0].severity, Severity::Warning);
 }
 
+/// A plugin whose `decode` runs `body` (Lua source, with `bytes` and `state` in scope)
+/// and returns what it does. It describes the kind `k` with no fields and the kind `u`
+/// with one required `uint`, `n`.
+fn returning(body: &str) -> LuaCodec {
+    returning_within(body, limits())
+}
+
+fn returning_within(body: &str, limits: LuaLimits) -> LuaCodec {
+    let code = format!(
+        r#"
+        local M = {{}}
+        function M.describe()
+          return {{
+            name = "returning",
+            kinds = {{
+              {{ kind = "k" }},
+              {{ kind = "u", fields = {{ {{ name = "n", type = "uint" }} }} }},
+            }},
+          }}
+        end
+        function M.decode(bytes, state) {body} end
+        function M.encode() return "" end
+        return M
+        "#
+    );
+    LuaCodec::from_source("returning.lua", &code, limits).expect("the test plugin loads")
+}
+
+/// The one `plugin_error` frame there must be, and what it says.
+fn only_error(frames: &[Frame]) -> (std::ops::Range<u64>, String) {
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0].kind, PLUGIN_ERROR_KIND, "{frames:?}");
+    let message = frames[0].field("error").and_then(Value::as_str);
+    (frames[0].raw.clone(), message.unwrap().to_owned())
+}
+
+#[test]
+fn a_frame_position_at_the_edge_of_an_integer_is_an_error_not_an_overflow() {
+    let cases = [
+        ("math.maxinteger", "1"),
+        ("math.maxinteger", "2"),
+        ("math.maxinteger - 1", "3"),
+        ("math.mininteger", "1"),
+        ("math.mininteger + 1", "1"),
+        ("2", "math.maxinteger"),
+        ("1", "math.maxinteger"),
+        ("1", "math.mininteger"),
+        ("math.maxinteger", "math.maxinteger"),
+    ];
+    for (pos, len) in cases {
+        let mut codec = returning(&format!(
+            "return {{ {{ kind = 'k', pos = {pos}, len = {len} }} }}, ''"
+        ));
+        let frames = decode_chunks(&mut codec, &[b"abc"], Instant::now());
+        let (raw, message) = only_error(&frames);
+        assert_eq!(raw, 0..3, "pos {pos}, len {len}");
+        assert!(message.contains("fall outside"), "{message}");
+    }
+    // The last byte, and the empty frame after it, still fit.
+    let mut codec = returning(
+        "return { { kind = 'k', pos = 3, len = 1 }, { kind = 'k', pos = 4, len = 0 } }, ''",
+    );
+    let frames = decode_chunks(&mut codec, &[b"abc"], Instant::now());
+    assert_eq!(texts(&frames), [("k", 2..3), ("k", 3..3)]);
+}
+
+#[test]
+fn a_frame_of_a_kind_describe_does_not_list_is_an_error() {
+    let mut codec = returning(
+        "return { { kind = 'k', pos = 1, len = 1 }, { kind = 'nope', pos = 2, len = 2 } }, ''",
+    );
+    let frames = decode_chunks(&mut codec, &[b"abcd"], Instant::now());
+    assert_eq!(texts(&frames), [("k", 0..1), (PLUGIN_ERROR_KIND, 1..3)]);
+    let message = frames[1].field("error").and_then(Value::as_str).unwrap();
+    assert!(
+        message.contains("`nope`") || message.contains("\"nope\""),
+        "{message}"
+    );
+    assert!(message.contains("describe()"), "{message}");
+}
+
+/// A plugin can share one table between many places, so a few lines of Lua describe a
+/// list of lists of lists that holds hundreds of millions of values. What the host
+/// copies out of it is capped per call, however it is shaped.
+#[test]
+fn a_returned_graph_cannot_be_bigger_than_the_budget() {
+    let mut codec = returning(
+        r#"
+        if bytes:sub(1, 1) == "b" then
+          local t = 1
+          for _ = 1, 12 do
+            local n = {}
+            for i = 1, 13 do n[i] = t end
+            t = n
+          end
+          return {
+            { kind = "k", pos = 1, len = 1, fields = { x = t } },
+            { kind = "k", pos = 2, len = 1 },
+          }, ""
+        end
+        return { { kind = "k", pos = 1, len = 1, fields = { x = { 1, 2, 3 } } } }, ""
+        "#,
+    );
+    let started = Instant::now();
+    let frames = decode_chunks(&mut codec, &[b"bb", b"ok"], started);
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    // The graph spent the call's budget: its frame, and every frame after it in that
+    // call, are plugin errors. The next call starts with a full budget.
+    assert_eq!(
+        texts(&frames),
+        [
+            (PLUGIN_ERROR_KIND, 0..1),
+            (PLUGIN_ERROR_KIND, 1..2),
+            ("k", 2..3)
+        ]
+    );
+    let message = frames[0].field("error").and_then(Value::as_str).unwrap();
+    assert!(message.contains("hold more than"), "{message}");
+    assert_eq!(
+        frames[2].field("x"),
+        Some(&Value::List(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3)
+        ]))
+    );
+}
+
+#[test]
+fn text_shared_by_many_frames_is_charged_every_time() {
+    // 80 frames sharing one 1 MiB summary: 80 MiB once copied out, against a budget of
+    // 64 MiB, so the first frames come out and the rest are errors.
+    let mut codec = returning(
+        r#"
+        local text = string.rep("x", 1 << 20)
+        local frames = {}
+        for i = 1, 80 do
+          frames[i] = { kind = "k", pos = 1, len = 1, summary = text }
+        end
+        return frames, ""
+        "#,
+    );
+    let frames = decode_chunks(&mut codec, &[b"a"], Instant::now());
+    assert_eq!(frames.len(), 80);
+    let ok = frames.iter().take_while(|f| f.kind == "k").count();
+    assert!((60..=64).contains(&ok), "{ok} frames came out whole");
+    assert!(frames[ok..].iter().all(|f| f.kind == PLUGIN_ERROR_KIND));
+    assert_eq!(frames[0].summary.len(), 1 << 20);
+}
+
+#[test]
+fn the_frame_budget_is_a_limit_like_the_others() {
+    assert_eq!(LuaLimits::default().max_frame_bytes, 64 * 1024 * 1024);
+    let limits = LuaLimits {
+        max_frame_bytes: 1000,
+        ..limits()
+    };
+    // A frame costs 32 bytes and the length of its kind and summary: the first 800 fits,
+    // the second does not, and the next call starts with a full budget again.
+    let body = r#"
+        local s = string.rep("x", 800)
+        return {
+          { kind = "k", pos = 1, len = 1, summary = s },
+          { kind = "k", pos = 2, len = 1, summary = s },
+        }, "" "#;
+    let mut codec = returning_within(body, limits);
+    let frames = decode_chunks(&mut codec, &[b"ab", b"cd"], Instant::now());
+    assert_eq!(
+        texts(&frames),
+        [
+            ("k", 0..1),
+            (PLUGIN_ERROR_KIND, 1..2),
+            ("k", 2..3),
+            (PLUGIN_ERROR_KIND, 3..4)
+        ]
+    );
+    let message = frames[1].field("error").and_then(Value::as_str).unwrap();
+    assert!(message.contains("more than 1000 bytes"), "{message}");
+}
+
+#[test]
+fn field_names_that_differ_only_in_invalid_utf8_come_out_in_byte_order() {
+    // Both names read as U+FFFD once converted: the bytes decide the order, not the
+    // order Lua keeps its table in.
+    let mut codec = returning(
+        r#"return { { kind = "k", pos = 1, len = 1, fields = {
+          ["\xff"] = 1, ["\xfe"] = 2, ["\xfd"] = 3, a = 0,
+        } } }, """#,
+    );
+    let frames = decode_chunks(&mut codec, &[b"a"], Instant::now());
+    let values: Vec<_> = frames[0].fields.iter().map(|(_, v)| v.clone()).collect();
+    assert_eq!(
+        values,
+        [Value::Int(0), Value::Int(3), Value::Int(2), Value::Int(1)]
+    );
+}
+
 #[test]
 fn encode_maps_results_and_errors() {
     let mut codec = lines();

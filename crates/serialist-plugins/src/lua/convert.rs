@@ -16,6 +16,76 @@ use super::vm::{bytes_arg, describe_error};
 /// Deepest nesting of lists (frames) or arrays and objects (requests) converted.
 const MAX_DEPTH: usize = 32;
 
+/// What a frame, a field name or a field value costs besides its text; about what the
+/// host spends on one.
+const UNIT: usize = 32;
+
+/// What the frames of one `decode` call have left to take, of
+/// [`LuaLimits::max_frame_bytes`](super::LuaLimits::max_frame_bytes).
+///
+/// The VM's memory limit bounds what a plugin builds, not what it returns: a table or a
+/// string can be shared by many fields and frames, and every use is copied into a frame.
+/// A few lines of Lua make a list of 13 lists of 13 lists (and so on) that holds one
+/// number and converts to hundreds of millions of values. The budget is spent as the
+/// frames are converted, so such a call fails with an error frame instead of exhausting
+/// the app's memory or its ingest thread's time.
+///
+/// It is spent frame after frame, whether or not a frame turns out well:
+///
+/// - a frame costs [`UNIT`], then the length of its `kind`, `severity` and `summary`
+///   text;
+/// - each pair in its `fields` costs `UNIT` and the length of the key, whether or not
+///   it is a usable field;
+/// - each value costs `UNIT` (a list's items are values too), and the length of a string
+///   or bytes value.
+///
+/// Text is charged before it is copied. The order is fixed (declared fields, then the
+/// others by name), so what a call spends does not depend on how Lua orders a table.
+pub(super) struct Budget {
+    left: usize,
+    limit: usize,
+}
+
+impl Budget {
+    pub(super) fn new(limit: usize) -> Self {
+        Self { left: limit, limit }
+    }
+
+    /// Take `bytes`, or take everything that is left and say no.
+    fn spend(&mut self, bytes: usize) -> Result<(), String> {
+        match self.left.checked_sub(bytes) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => {
+                self.left = 0;
+                Err(format!(
+                    "the frames of one decode call hold more than {} bytes",
+                    self.limit
+                ))
+            }
+        }
+    }
+
+    /// A Lua string as text, charged for before it is copied.
+    fn string(&mut self, s: &LuaString) -> Result<String, String> {
+        self.spend(s.as_bytes().len())?;
+        Ok(s.to_string_lossy())
+    }
+
+    /// A value that must be a string, as text.
+    fn text(&mut self, value: &LuaValue, what: &str) -> Result<String, String> {
+        match value {
+            LuaValue::String(s) => self.string(s),
+            other => Err(format!(
+                "{what} must be a string, not {}",
+                other.type_name()
+            )),
+        }
+    }
+}
+
 /// Declared fields of each frame kind, in order.
 pub(super) type Schema = HashMap<String, Vec<(SmolStr, FieldType, bool)>>;
 
@@ -169,7 +239,13 @@ fn integer(value: &LuaValue) -> Option<i64> {
 }
 
 /// A Lua value as a field value, of type `ty` if the kind declares one.
-fn to_value(value: &LuaValue, ty: Option<FieldType>, depth: usize) -> Result<Value, String> {
+fn to_value(
+    value: &LuaValue,
+    ty: Option<FieldType>,
+    depth: usize,
+    budget: &mut Budget,
+) -> Result<Value, String> {
+    budget.spend(UNIT)?;
     let mismatch = |ty: FieldType| {
         Err(format!(
             "is a {} but is declared {}",
@@ -179,11 +255,14 @@ fn to_value(value: &LuaValue, ty: Option<FieldType>, depth: usize) -> Result<Val
     };
     match ty {
         Some(FieldType::Bytes) => match value {
-            LuaValue::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
+            LuaValue::String(s) => {
+                budget.spend(s.as_bytes().len())?;
+                Ok(Value::Bytes(s.as_bytes().to_vec()))
+            }
             _ => mismatch(FieldType::Bytes),
         },
         Some(FieldType::Str) => match value {
-            LuaValue::String(s) => Ok(Value::Str(s.to_string_lossy())),
+            LuaValue::String(s) => budget.string(s).map(Value::Str),
             _ => mismatch(FieldType::Str),
         },
         Some(FieldType::UInt) => match integer(value) {
@@ -204,15 +283,15 @@ fn to_value(value: &LuaValue, ty: Option<FieldType>, depth: usize) -> Result<Val
             _ => mismatch(FieldType::Bool),
         },
         Some(FieldType::List) => match value {
-            LuaValue::Table(t) => list_value(t, depth),
+            LuaValue::Table(t) => list_value(t, depth, budget),
             _ => mismatch(FieldType::List),
         },
         None => match value {
             LuaValue::Boolean(b) => Ok(Value::Bool(*b)),
             LuaValue::Integer(n) => Ok(Value::Int(*n)),
             LuaValue::Number(x) => Ok(Value::Float(*x)),
-            LuaValue::String(s) => Ok(Value::Str(s.to_string_lossy())),
-            LuaValue::Table(t) => list_value(t, depth),
+            LuaValue::String(s) => budget.string(s).map(Value::Str),
+            LuaValue::Table(t) => list_value(t, depth, budget),
             other => Err(format!(
                 "is a {}, which a field cannot hold",
                 other.type_name()
@@ -221,13 +300,13 @@ fn to_value(value: &LuaValue, ty: Option<FieldType>, depth: usize) -> Result<Val
     }
 }
 
-fn list_value(table: &Table, depth: usize) -> Result<Value, String> {
+fn list_value(table: &Table, depth: usize, budget: &mut Budget) -> Result<Value, String> {
     if depth >= MAX_DEPTH {
         return Err(format!("nests lists more than {MAX_DEPTH} deep"));
     }
     table
         .sequence_values::<LuaValue>()
-        .map(|item| to_value(&item.map_err(lua_err)?, None, depth + 1))
+        .map(|item| to_value(&item.map_err(lua_err)?, None, depth + 1, budget))
         .collect::<Result<Vec<_>, _>>()
         .map(Value::List)
 }
@@ -236,29 +315,39 @@ fn list_value(table: &Table, depth: usize) -> Result<Value, String> {
 /// to their declared types, then any others sorted by name with their types inferred.
 fn fields_from_lua(
     table: &Table,
-    declared: Option<&[(SmolStr, FieldType, bool)]>,
+    declared: &[(SmolStr, FieldType, bool)],
+    budget: &mut Budget,
 ) -> Result<Vec<(SmolStr, Value)>, String> {
     let mut given: Vec<(LuaString, LuaValue)> = Vec::new();
+    // A key that is not a string fails the frame, but only after every pair is counted:
+    // what the call spends must not depend on where Lua puts that key.
+    let mut bad_key = None;
     for pair in table.pairs::<LuaValue, LuaValue>() {
         let (key, value) = pair.map_err(lua_err)?;
-        let LuaValue::String(key) = key else {
-            return Err(format!(
-                "field names must be strings, not {}",
-                key.type_name()
-            ));
-        };
-        given.push((key, value));
+        match key {
+            LuaValue::String(key) => {
+                budget.spend(UNIT + key.as_bytes().len())?;
+                given.push((key, value));
+            }
+            other => {
+                budget.spend(UNIT)?;
+                bad_key.get_or_insert(other.type_name());
+            }
+        }
+    }
+    if let Some(ty) = bad_key {
+        return Err(format!("field names must be strings, not {ty}"));
     }
     let mut out = Vec::with_capacity(given.len());
     let mut used = vec![false; given.len()];
-    for (name, ty, optional) in declared.unwrap_or_default() {
+    for (name, ty, optional) in declared {
         match given
             .iter()
             .position(|(key, _)| *key.as_bytes() == *name.as_bytes())
         {
             Some(i) => {
                 used[i] = true;
-                let value = to_value(&given[i].1, Some(*ty), 0)
+                let value = to_value(&given[i].1, Some(*ty), 0, budget)
                     .map_err(|err| format!("field `{name}` {err}"))?;
                 out.push((name.clone(), value));
             }
@@ -266,15 +355,21 @@ fn fields_from_lua(
             None => return Err(format!("field `{name}` is declared but missing")),
         }
     }
-    let mut extra: Vec<(SmolStr, &LuaValue)> = given
+    // By name; names that differ only in invalid UTF-8 are one name once converted, and
+    // then the bytes decide, not the order Lua happens to keep the table in.
+    let mut extra: Vec<(SmolStr, &LuaString, &LuaValue)> = given
         .iter()
         .zip(&used)
         .filter(|(_, used)| !**used)
-        .map(|((key, value), _)| (SmolStr::new(key.to_string_lossy()), value))
+        .map(|((key, value), _)| (SmolStr::new(key.to_string_lossy()), key, value))
         .collect();
-    extra.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, value) in extra {
-        let value = to_value(value, None, 0).map_err(|err| format!("field `{name}` {err}"))?;
+    extra.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| (*a.1.as_bytes()).cmp(&*b.1.as_bytes()))
+    });
+    for (name, _, value) in extra {
+        let value =
+            to_value(value, None, 0, budget).map_err(|err| format!("field `{name}` {err}"))?;
         out.push((name, value));
     }
     Ok(out)
@@ -287,13 +382,17 @@ pub(super) fn frame_span(table: &Table, input_len: usize) -> Result<(usize, usiz
     let (Some(pos), Some(len)) = (pos, len) else {
         return Err("a frame needs integer `pos` and `len`".to_owned());
     };
-    let start = pos - 1;
-    if start < 0 || len < 0 || start + len > input_len as i64 {
-        return Err(format!(
+    // A plugin may say any integer: checked sums, so `pos` or `len` near the edges of
+    // an i64 is an error, not an overflow (a panic here, a wrapped range in a release).
+    let end = pos.checked_sub(1).and_then(|start| start.checked_add(len));
+    match end {
+        Some(end) if pos >= 1 && len >= 0 && end <= input_len as i64 => {
+            Ok(((pos - 1) as usize, len as usize))
+        }
+        _ => Err(format!(
             "pos {pos} and len {len} fall outside the {input_len} bytes given to decode"
-        ));
+        )),
     }
-    Ok((start as usize, len as usize))
 }
 
 /// A Lua frame table as a [`Frame`] covering `raw`.
@@ -302,32 +401,36 @@ pub(super) fn frame_from_lua(
     schema: &Schema,
     raw: std::ops::Range<u64>,
     at: Instant,
+    budget: &mut Budget,
 ) -> Result<Frame, String> {
-    let kind = string_of(
+    budget.spend(UNIT)?;
+    let kind = budget.text(
         &table.raw_get::<LuaValue>("kind").map_err(lua_err)?,
         "a frame's kind",
     )?;
     let severity = match table.raw_get::<LuaValue>("severity").map_err(lua_err)? {
         LuaValue::Nil => Severity::Info,
         value => {
-            let name = string_of(&value, "a frame's severity")?;
+            let name = budget.text(&value, "a frame's severity")?;
             Severity::from_name(&name)
                 .ok_or_else(|| format!("severity {name:?} is not info, warning or error"))?
         }
     };
     let summary = match table.raw_get::<LuaValue>("summary").map_err(lua_err)? {
         LuaValue::Nil => String::new(),
-        value => string_of(&value, "a frame's summary")?,
+        value => budget.text(&value, "a frame's summary")?,
     };
-    let declared = schema.get(&kind).map(Vec::as_slice);
+    let Some(declared) = schema.get(&kind).map(Vec::as_slice) else {
+        return Err(format!("kind {kind:?} is not one describe() lists"));
+    };
     let fields = match table.raw_get::<LuaValue>("fields").map_err(lua_err)? {
         LuaValue::Nil => {
-            if let Some(missing) = declared.and_then(|d| d.iter().find(|f| !f.2)) {
+            if let Some(missing) = declared.iter().find(|f| !f.2) {
                 return Err(format!("field `{}` is declared but missing", missing.0));
             }
             Vec::new()
         }
-        LuaValue::Table(fields) => fields_from_lua(&fields, declared)?,
+        LuaValue::Table(fields) => fields_from_lua(&fields, declared, budget)?,
         other => {
             return Err(format!(
                 "a frame's fields must be a table, not {}",
