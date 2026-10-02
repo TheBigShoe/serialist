@@ -203,28 +203,29 @@ fn frames_that_break_the_contract_are_reported_not_trusted() {
         .iter()
         .map(|f| (f.kind.as_str(), f.raw.clone(), error_of(f).to_owned()))
         .collect();
-    assert_eq!(got[0].0, PLUGIN_ERROR_KIND);
-    assert_eq!(got[0].1, 0..8, "a bad frame's error covers that frame");
+    assert!(got.iter().all(|f| f.0 == PLUGIN_ERROR_KIND), "{got:?}");
+    // A frame outside the input spoils the rest of the call. The error covers the whole
+    // call, so it comes before the frames the call made.
+    assert_eq!(got[0].1, 0..29);
+    assert!(got[0].2.contains("fall outside"), "{got:?}");
+    assert_eq!(got[1].1, 0..8, "a bad frame's error covers that frame");
     assert!(
-        got[0]
+        got[1]
             .2
             .contains("field `n` is of type str but is declared uint"),
         "{got:?}"
     );
-    assert_eq!(got[1].1, 8..16);
+    assert_eq!(got[2].1, 8..16);
     assert!(
-        got[1].2.contains("field `n` is declared but missing"),
+        got[2].2.contains("field `n` is declared but missing"),
         "{got:?}"
     );
-    // A frame outside the input spoils the rest of the call.
-    assert_eq!(got[2].1, 0..29);
-    assert!(got[2].2.contains("fall outside"), "{got:?}");
     assert_eq!(got.len(), 3);
 
     // Holding back more than it was given.
     let mut codec = lines();
     let frames = decode_chunks(&mut codec, &[b"x\n#"], Instant::now());
-    assert_eq!(spans(&frames), [("line", 0..2), (PLUGIN_ERROR_KIND, 0..3)]);
+    assert_eq!(spans(&frames), [(PLUGIN_ERROR_KIND, 0..3), ("line", 0..2)]);
     assert_eq!(codec.held_back(), 0);
 
     let frames = decode_chunks(&mut lines(), &[b"warn\n", b"chatty\n"], Instant::now());
@@ -246,6 +247,24 @@ fn a_frame_of_a_kind_describe_does_not_list_is_an_error() {
         error_of(&frames[1]),
         "frame 2: kind `nope` is not one describe() lists"
     );
+}
+
+#[test]
+fn a_frame_out_of_order_spoils_the_rest_of_the_call() {
+    let mut codec = lines();
+    let frames = decode_chunks(&mut codec, &[b"ok\nrewind\nlost\n", b"x\n"], Instant::now());
+    // The error covers the whole call and comes before the frame already made; `lost`
+    // never comes out.
+    assert_eq!(
+        spans(&frames),
+        [(PLUGIN_ERROR_KIND, 0..15), ("line", 0..3), ("line", 15..17)]
+    );
+    assert_eq!(
+        error_of(&frames[0]),
+        "frame 2: starts at 0, before frame 1 ends at 3"
+    );
+    // Not a trap: the instance carries on.
+    assert_eq!(frames[2].field("calls"), Some(&Value::Int(2)));
 }
 
 #[test]
