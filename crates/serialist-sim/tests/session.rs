@@ -229,12 +229,16 @@ fn a_large_write_at_12_mbaud_reaches_the_device_whole_and_on_rate() {
     for piece in payload.chunks(64 * 1024) {
         session.write(piece.to_vec()).unwrap();
     }
+    // The link counts a write as it lands and the session counts it once the write has
+    // returned, so wait for both: on a slow runner the session's count trails by a write.
     wait_for(
         Duration::from_secs(5),
         "the writer to hand over every write",
-        || link.stats().host_to_device_bytes == TOTAL as u64,
+        || {
+            link.stats().host_to_device_bytes == TOTAL as u64
+                && session.stats().tx_bytes == TOTAL as u64
+        },
     );
-    assert_eq!(session.stats().tx_bytes, TOTAL as u64);
     clock.settle(2);
 
     // The device sees the host's bytes on the schedule the host sees the device's.
