@@ -24,6 +24,7 @@ pub mod serial;
 pub mod session;
 pub mod settings;
 pub mod store;
+pub mod tcp;
 pub mod text;
 pub mod theme;
 pub mod transport;
@@ -78,6 +79,7 @@ pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,
     TextExportReport, TextOptions, Timestamps,
 };
+pub use tcp::{TCP_CONNECT_TIMEOUT, TCP_WRITE_TIMEOUT, TcpTransportFactory};
 pub use text::{
     Color, Direction, Epoch, LineId, LineSource, SearchMatch, Searcher, Style, StyleFlags,
     StyleRun, StyledLine,
