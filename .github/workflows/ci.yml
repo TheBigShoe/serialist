@@ -167,6 +167,14 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # install-action ships cargo-fuzz as a static musl binary, and cargo-fuzz's default
+      # --target is the triple it was built for. Left alone it would build the targets for
+      # x86_64-unknown-linux-musl, which has no std installed here and cannot run
+      # AddressSanitizer, so every build and run names the host triple.
+      - name: Fuzz target triple
+        run: |
+          echo "FUZZ_TARGET=$(rustc +nightly -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+
       # cargo-fuzz has no --locked; this fails if fuzz/Cargo.lock is out of date.
       - name: Check fuzz/Cargo.lock
         run: cargo fetch --manifest-path fuzz/Cargo.toml --locked
@@ -178,7 +186,7 @@ jobs:
           cargo test --manifest-path fuzz/Cargo.toml --locked
 
       - name: Build fuzz targets (nightly)
-        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET"
 
       # Every target runs even when an earlier one crashes; the step fails at the end. A
       # target with a libFuzzer dictionary in fuzz/dicts/<target>.dict gets it.
@@ -197,7 +205,7 @@ jobs:
             if [ -f "fuzz/dicts/$target.dict" ]; then
               args+=(-dict="fuzz/dicts/$target.dict")
             fi
-            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing "$target" \
+            cargo +nightly fuzz run --fuzz-dir fuzz --no-cfg-fuzzing --target "$FUZZ_TARGET" "$target" \
               "fuzz/corpus/$target" "fuzz/seeds/$target" -- "${args[@]}" \
               || failed="$failed $target"
             echo "::endgroup::"
