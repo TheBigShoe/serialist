@@ -372,11 +372,22 @@ impl ReplaySpeed {
         }
     }
 
-    /// How long `recorded` takes at this speed: `recorded / factor`, `None` for `Max`
-    /// (no wait at all). Saturates rather than overflowing.
+    /// How long `recorded` takes at this speed: `recorded / factor` rounded to the
+    /// nanosecond, `None` for `Max` (no wait at all). Exact at 1x and whenever the
+    /// quotient is a whole number of nanoseconds (below about 104 days), so a replay
+    /// schedule on a manual clock lands on exact instants. Saturates at
+    /// [`Duration::MAX`] rather than overflowing.
     pub fn scale(self, recorded: Duration) -> Option<Duration> {
         let factor = self.factor()?;
-        Some(Duration::try_from_secs_f64(recorded.as_secs_f64() / factor).unwrap_or(Duration::MAX))
+        if factor == 1.0 {
+            return Some(recorded);
+        }
+        let nanos = (recorded.as_nanos() as f64 / factor).round();
+        Some(if nanos < u64::MAX as f64 {
+            Duration::from_nanos(nanos as u64)
+        } else {
+            Duration::MAX
+        })
     }
 }
 
@@ -695,6 +706,18 @@ mod tests {
         );
         assert_eq!(ReplaySpeed::Times(0.5).scale(second), Some(2 * second));
         assert_eq!(ReplaySpeed::Max.scale(second), None);
+        let odd = Duration::new(3, 123_456_789);
+        assert_eq!(ReplaySpeed::REALTIME.scale(odd), Some(odd), "1x is exact");
+        assert_eq!(
+            ReplaySpeed::Times(4.0).scale(Duration::from_millis(10)),
+            Some(Duration::from_micros(2500)),
+            "a whole number of nanoseconds is exact"
+        );
+        assert_eq!(
+            ReplaySpeed::Times(3.0).scale(Duration::from_nanos(10)),
+            Some(Duration::from_nanos(3)),
+            "rounded to the nanosecond"
+        );
         assert_eq!(
             ReplaySpeed::Times(ReplaySpeed::MIN_FACTOR).scale(Duration::MAX),
             Some(Duration::MAX),
