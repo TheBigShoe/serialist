@@ -53,6 +53,7 @@ fn open_selecting(
         select_port: select.map(PortId::new),
         open_ports: ports.iter().map(|port| PortId::new(*port)).collect(),
         store: None,
+        replay: None,
     };
     let paths = dir.map(|dir| ConfigPaths::new(dir.path()));
     let (window, workspace) = open_test_window_sized(cx, size, move |window, cx| {

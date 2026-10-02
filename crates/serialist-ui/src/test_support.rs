@@ -11,8 +11,9 @@ use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{
-    Direction, LineSource, PortEvent, PortId, PortInfo, PortKind, PortSource, SerialConfig,
-    SessionClosed, SessionEvent, SessionStats, StoreConfig, StyledLine, TransportError, UsbInfo,
+    Direction, LineSource, PortEvent, PortId, PortInfo, PortKind, PortSource,
+    ReplayTransportFactory, SerialConfig, SessionClosed, SessionEvent, SessionStats, StoreConfig,
+    StyledLine, TransportError, UsbInfo,
 };
 use serialist_sim::SimWorld;
 
@@ -405,7 +406,18 @@ pub(crate) fn open_workspace(
     world: &SimWorld,
     connect_to: Option<&str>,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
-    open_workspace_options(cx, world, connect_to, None)
+    open_workspace_options(cx, world, connect_to, None, None)
+}
+
+/// [`open_workspace`] with `replay` handed over as the factory the `replay` setting
+/// configures (the binary's wiring does the same with the factory `replay:` ids open
+/// through).
+pub(crate) fn open_workspace_replaying(
+    cx: &mut TestAppContext,
+    world: &SimWorld,
+    replay: Arc<ReplayTransportFactory>,
+) -> (AnyWindowHandle, Entity<Workspace>) {
+    open_workspace_options(cx, world, None, None, Some(replay))
 }
 
 /// [`open_workspace`] with sessions stored as `store` says.
@@ -415,7 +427,7 @@ pub(crate) fn open_workspace_with(
     connect_to: Option<&str>,
     store: StoreConfig,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
-    open_workspace_options(cx, world, connect_to, Some(store))
+    open_workspace_options(cx, world, connect_to, Some(store), None)
 }
 
 fn open_workspace_options(
@@ -423,6 +435,7 @@ fn open_workspace_options(
     world: &SimWorld,
     connect_to: Option<&str>,
     store: Option<StoreConfig>,
+    replay: Option<Arc<ReplayTransportFactory>>,
 ) -> (AnyWindowHandle, Entity<Workspace>) {
     allow_engine_threads(cx);
     let options = AppOptions {
@@ -432,6 +445,7 @@ fn open_workspace_options(
         select_port: None,
         open_ports: connect_to.map(PortId::new).into_iter().collect(),
         store,
+        replay,
     };
     open_test_window(cx, move |window, cx| Workspace::new(options, window, cx))
 }

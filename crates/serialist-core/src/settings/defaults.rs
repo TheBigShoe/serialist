@@ -12,8 +12,10 @@ use super::font::{FontFeatures, LineHeight};
 use super::inline::{BackspaceKey, InlineSettings};
 use super::profile::DeviceProfile;
 use super::types::{
-    DisplaySettings, DisplayView, LineEnding, Settings, ThemeSelection, TimestampMode,
+    DisplaySettings, DisplayView, LineEnding, ReplaySettings, Settings, ThemeSelection,
+    TimestampMode,
 };
+use crate::address::{ReplayEnd, ReplaySpeed};
 
 /// The bundled defaults file, with its comments.
 pub const DEFAULT_SETTINGS_JSONC: &str = include_str!("../../assets/default_settings.jsonc");
@@ -67,6 +69,8 @@ defaults! {
     line_ending: LineEnding = "line_ending";
     local_echo: bool = "local_echo";
     restore_session: bool = "restore_session";
+    replay_speed: ReplaySpeed = "replay"."speed";
+    replay_end: ReplayEnd = "replay"."end";
     devices: Vec<DeviceProfile> = "devices";
     display_timestamps: TimestampMode = "display"."timestamps";
     display_timestamp_format: String = "display"."timestamp_format";
@@ -89,6 +93,14 @@ pub(super) fn inline() -> InlineSettings {
         escape_chord: inline_escape_chord(),
         paste_chunk_bytes: inline_paste_chunk_bytes(),
         paste_chunk_delay_ms: inline_paste_chunk_delay_ms(),
+    }
+}
+
+/// The whole `replay` object, for a settings file that leaves it out.
+pub(super) fn replay() -> ReplaySettings {
+    ReplaySettings {
+        speed: replay_speed(),
+        end: replay_end(),
     }
 }
 

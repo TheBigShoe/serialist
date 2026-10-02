@@ -35,6 +35,7 @@ fn options(world: &SimWorld, ports: &[&str]) -> AppOptions {
         select_port: None,
         open_ports: ports.iter().map(|port| PortId::new(*port)).collect(),
         store: None,
+        replay: None,
     }
 }
 

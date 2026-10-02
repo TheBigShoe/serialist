@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{PortId, PortInfo, PortKind, UsbInfo};
+use serialist_core::{
+    PortId, PortInfo, PortKind, ReplayEnd, ReplayOptions, ReplaySpeed, ReplayTransportFactory,
+    UsbInfo,
+};
 use serialist_sim::{EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::{OpenSettings, ReloadConfig};
@@ -21,7 +24,7 @@ use crate::terminal::double::MemoryLines;
 use crate::terminal::palette::ensure_contrast;
 use crate::test_support::{
     FakeOpener, FakePortSource, TestDir, allow_engine_threads, displayed, open_test_window,
-    open_workspace, port, run_until, wait_connected,
+    open_workspace, open_workspace_replaying, port, run_until, wait_connected,
 };
 use crate::workspace::Workspace;
 
@@ -876,6 +879,70 @@ fn display_settings_start_each_session_and_reloads_change_only_what_changed(
         !terminal.read_with(cx, |t, _| t.wrap()),
         "the user's toggle stands"
     );
+}
+
+#[gpui_test]
+fn the_replay_setting_sets_the_factorys_defaults_at_startup_and_on_every_reload(
+    cx: &mut TestAppContext,
+) {
+    // A factory that starts with other defaults than the settings'.
+    let replay = Arc::new(ReplayTransportFactory::new());
+    let elsewhere = ReplayOptions {
+        speed: ReplaySpeed::Max,
+        end: ReplayEnd::Hold,
+    };
+    replay.set_defaults(elsewhere);
+
+    // The workspace sets them from the settings it starts with, before any tab opens.
+    let world = SimWorld::empty();
+    let (_window, _workspace) = open_workspace_replaying(cx, &world, replay.clone());
+    assert_eq!(
+        replay.defaults(),
+        ReplayOptions::default(),
+        "applied at startup"
+    );
+
+    // A reload with new values changes them.
+    let dir =
+        ConfigDir::new("replay").with_settings(r#"{ "replay": { "speed": "4x", "end": "hold" } }"#);
+    load(cx, &dir);
+    assert_eq!(
+        replay.defaults(),
+        ReplayOptions {
+            speed: ReplaySpeed::Times(4.0),
+            end: ReplayEnd::Hold,
+        },
+        "applied on the first load"
+    );
+
+    // A reload that changes only the speed; the key left out falls back to its default.
+    dir.write_settings(r#"{ "replay": { "speed": "max" } }"#);
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        replay.defaults(),
+        ReplayOptions {
+            speed: ReplaySpeed::Max,
+            end: ReplayEnd::Disconnect,
+        },
+        "applied on reload"
+    );
+
+    // A settings file that does not load keeps the last good settings, so the defaults.
+    dir.write_settings(r#"{ "replay": { "speed": "warp" } }"#);
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        replay.defaults().speed,
+        ReplaySpeed::Max,
+        "the last good one"
+    );
+
+    // Removing the key goes back to the bundled default, in the same factory.
+    dir.write_settings("{}");
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    cx.run_until_parked();
+    assert_eq!(replay.defaults(), ReplayOptions::default());
 }
 
 // --- Actions -----------------------------------------------------------------------
