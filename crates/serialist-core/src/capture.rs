@@ -43,9 +43,15 @@
 //! **Append-only and crash-tolerant.** [`TimingWriter`] only appends through a buffer
 //! and never seeks or syncs per record; the recorder flushes it on its own cadence (with
 //! the raw file) and syncs once at the end. A crash can therefore leave the last line
-//! cut short: [`Timing::read`] skips an unterminated last line that does not parse and
-//! reports it in [`Timing::truncated`]. The two files are flushed independently, so
-//! either can be a little ahead of the other; [`Timing::schedule`] reconciles them.
+//! cut short, and a cut line can still parse with a wrong value (`rx 100 0 50` cut to
+//! `rx 100 0 5` reads as five bytes). Every line [`TimingWriter`] writes ends with `\n`,
+//! so a complete sidecar ends with one: [`Timing::read`] drops a last line that has no
+//! `\n`, whether or not it parses, and reports that in [`Timing::truncated`]. The header
+//! is the exception to "drop and carry on": a first line without its `\n` is not a
+//! sidecar ([`TimingError::NotTiming`], as for an empty file), since `serialist-timing 1`
+//! is also what a cut `serialist-timing 10` looks like. The two files are flushed
+//! independently, so either can be a little ahead of the other; [`Timing::schedule`]
+//! reconciles them.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -111,7 +117,7 @@ pub enum TimingError {
 pub struct Timing {
     /// Every record, in file order.
     pub records: Vec<TimingRecord>,
-    /// The last line had no `\n` and did not parse, so it was skipped: the recording
+    /// The last line had no `\n`, so it was dropped, parsed or not: the recording
     /// stopped mid-write.
     pub truncated: bool,
 }
@@ -144,9 +150,10 @@ impl Timing {
             Ok(Some(terminated))
         };
 
-        if next_line(&mut line)?.is_none() {
+        // A header without its `\n` may be cut short, so it is not a header.
+        let Some(true) = next_line(&mut line)? else {
             return Err(TimingError::NotTiming);
-        }
+        };
         let header = String::from_utf8_lossy(&line);
         let version = header
             .trim_end_matches('\r')
@@ -163,15 +170,15 @@ impl Timing {
         let mut last_at = Duration::ZERO;
         let mut number = 1;
         while let Some(terminated) = next_line(&mut line)? {
+            // Only the last line of the input can lack its `\n`. It may be cut short
+            // and still parse, with a wrong value, so it is dropped unread.
+            if !terminated {
+                timing.truncated = true;
+                break;
+            }
             number += 1;
-            // Only the last line of the input can lack its `\n`.
-            let unterminated = !terminated;
             let text = match std::str::from_utf8(&line) {
                 Ok(text) => text.trim_end_matches('\r'),
-                Err(_) if unterminated => {
-                    timing.truncated = true;
-                    break;
-                }
                 Err(_) => {
                     return Err(TimingError::Line {
                         line: number,
@@ -185,10 +192,6 @@ impl Timing {
             let record = match parse_record(text) {
                 Ok(Some(record)) => record,
                 Ok(None) => continue,
-                Err(_) if unterminated => {
-                    timing.truncated = true;
-                    break;
-                }
                 Err(message) => {
                     return Err(TimingError::Line {
                         line: number,
@@ -538,12 +541,13 @@ mod tests {
         assert!(timing.truncated);
         assert_eq!(timing.records, [rx(10, 0, 4)]);
 
-        let complete = read("serialist-timing 1\nrx 10 0 4\nrx 12 4 1").unwrap();
-        assert!(
-            !complete.truncated,
-            "an unterminated line that parses counts"
-        );
+        let complete = read("serialist-timing 1\nrx 10 0 4\nrx 12 4 1\n").unwrap();
+        assert!(!complete.truncated);
         assert_eq!(complete.records.len(), 2);
+
+        let not_utf8 = Timing::read(&b"serialist-timing 1\nrx 10 0 4\nrx 1\xff"[..]).unwrap();
+        assert!(not_utf8.truncated);
+        assert_eq!(not_utf8.records, [rx(10, 0, 4)]);
 
         let error = read("serialist-timing 1\nrx 12 4\nrx 13 0 1\n").unwrap_err();
         assert!(
@@ -553,8 +557,66 @@ mod tests {
     }
 
     #[test]
+    fn an_unterminated_last_line_is_dropped_even_when_it_parses() {
+        // `rx 100 0 50` cut after its `5` is a valid record for five bytes.
+        let timing = read("serialist-timing 1\nrx 100 0 5").unwrap();
+        assert!(timing.truncated);
+        assert_eq!(timing.records, []);
+        assert_eq!(timing.rx().count(), 0, "the record is absent");
+        assert_eq!(
+            timing.schedule(50),
+            [ScheduledChunk {
+                at: Duration::ZERO,
+                offset: 0,
+                len: 50
+            }],
+            "the raw file is still covered, as one chunk"
+        );
+
+        // After a complete record, the raw bytes the lost line described land in the
+        // tail chunk, due with the last record that survived.
+        let timing = read("serialist-timing 1\nrx 100 0 20\nrx 900 20 5").unwrap();
+        assert!(timing.truncated);
+        assert_eq!(timing.records, [rx(100, 0, 20)]);
+        assert_eq!(
+            timing.schedule(50),
+            [
+                ScheduledChunk {
+                    at: Duration::ZERO,
+                    offset: 0,
+                    len: 20
+                },
+                ScheduledChunk {
+                    at: Duration::ZERO,
+                    offset: 20,
+                    len: 30
+                }
+            ]
+        );
+
+        // Other kinds of last line are dropped the same way, and the same line with its
+        // `\n` is read.
+        for last in ["connect 5 tcp:h:1", "disconnect 5", "# note", ""] {
+            let cut = read(&format!("serialist-timing 1\nrx 1 0 4\n{last}")).unwrap();
+            assert_eq!(cut.truncated, !last.is_empty(), "{last:?}");
+            assert_eq!(cut.records, [rx(1, 0, 4)], "{last:?}");
+        }
+        assert_eq!(
+            read("serialist-timing 1\nrx 1 0 4\ndisconnect 5\n")
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn bad_sidecars_are_errors() {
         assert!(matches!(read(""), Err(TimingError::NotTiming)));
+        assert!(
+            matches!(read("serialist-timing 1"), Err(TimingError::NotTiming)),
+            "a header without its newline may be a cut `serialist-timing 10`"
+        );
         assert!(matches!(read("rx 1 0 1\n"), Err(TimingError::NotTiming)));
         assert!(matches!(
             read("serialist-timing x\n"),
