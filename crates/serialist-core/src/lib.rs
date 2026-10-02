@@ -4,7 +4,9 @@
 //! and every abstraction here has an in-process implementation in `serialist-sim`
 //! so the whole engine can be exercised without hardware.
 
+pub mod address;
 pub mod ansi;
+pub mod capture;
 pub mod clock;
 pub mod codec;
 pub mod commands;
@@ -29,7 +31,15 @@ pub mod transport;
 #[cfg(test)]
 mod test_util;
 
+pub use address::{
+    AddressError, PortAddress, REPLAY_SCHEME, ReplayAddress, ReplayEnd, ReplaySpeed, TCP_SCHEME,
+    TcpAddress,
+};
 pub use ansi::{AnsiParser, OwnedLine, ParsedLine};
+pub use capture::{
+    ScheduledChunk, TIMING_MAGIC, TIMING_SUFFIX, TIMING_VERSION, Timing, TimingError, TimingRecord,
+    TimingWriter, timing_path,
+};
 pub use clock::{Clock, SystemClock, Wakeup};
 pub use codec::{
     Codec, CodecError, CodecFactory, CodecInfo, CodecRegistry, CommandInfo, EncodeRequest,
