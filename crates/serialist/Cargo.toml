@@ -42,6 +42,7 @@ assets = [
     ["../../packaging/icons/png/serialist-512.png", "usr/share/icons/hicolor/512x512/apps/serialist.png", "644"],
     ["../../LICENSE-MIT", "usr/share/doc/serialist/", "644"],
     ["../../LICENSE-APACHE", "usr/share/doc/serialist/", "644"],
+    ["../../THIRD_PARTY_LICENSES.md", "usr/share/doc/serialist/", "644"],
     ["../../README.md", "usr/share/doc/serialist/", "644"],
 ]
 

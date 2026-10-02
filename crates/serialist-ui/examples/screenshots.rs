@@ -51,6 +51,8 @@ const EMBER: &str = "Serialist Ember";
 const PHOSPHOR: &str = "Serialist Phosphor";
 const PAPER: &str = "Serialist Paper";
 const CONTRAST: &str = "Serialist Contrast";
+/// The second theme of the bundled Fadetouched family by Arishawke (see THIRD_PARTY_LICENSES.md).
+const FADETOUCHED_BLUR: &str = "Fadetouched Blur";
 /// The simulated RACE device, which the shots that decode connect to.
 const RACE_PORT: &str = "virtual:race";
 
@@ -226,6 +228,14 @@ const SHOTS: &[Shot] = &[
         file: "19-theme-contrast.png",
         size: WIDE,
         theme: CONTRAST,
+        world: ansi_firehose_world,
+        connect: Some("virtual:firehose"),
+        drive: firehose_selected,
+    },
+    Shot {
+        file: "20-theme-fadetouched-blur.png",
+        size: WIDE,
+        theme: FADETOUCHED_BLUR,
         world: ansi_firehose_world,
         connect: Some("virtual:firehose"),
         drive: firehose_selected,
