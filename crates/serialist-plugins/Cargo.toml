@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[lib]
+# No #[bench] functions; this keeps `cargo bench -- --quick` from reaching libtest,
+# which rejects criterion's flags.
+bench = false
+
 [features]
 default = []
 # Tier 2 plugins: plugin.wasm components run by wasmtime. Off by default because wasmtime
@@ -27,6 +32,11 @@ serde = { workspace = true, optional = true }
 [dev-dependencies]
 serialist-sim.workspace = true
 crossbeam-channel.workspace = true
+criterion.workspace = true
 insta.workspace = true
 proptest.workspace = true
 wat.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

@@ -39,5 +39,9 @@ proptest.workspace = true
 serialist-sim.workspace = true
 
 [[bench]]
+name = "parse"
+harness = false
+
+[[bench]]
 name = "store"
 harness = false
