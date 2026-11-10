@@ -441,9 +441,9 @@ returns `nil` and a message; headless, `serial.open{ match = … }` does and
 Scripts menu, `scripts::Run`, a saved command's `{ "script" }` payload, a device profile's
 `on_connect`, or `--script`.
 
-Another change is adding `codecs.<name>.encode`, timers and `port:on_frame` to this API
-now. They are not described here; if they land before 1.0 they are part of the 1.0
-surface.
+`codecs.<name>.encode`, `timer.after` and `timer.every`, and `port:on_frame` were added
+alongside this page. `docs/scripting.md` describes them, and they are part of the proposed
+1.0 surface with the rest of the table.
 
 **Versioned.** No. A script cannot ask which version of the API it runs against.
 
@@ -865,8 +865,9 @@ Not fixed, because they are not errors in a document this change may edit:
    WIT inside the crate and a version line of its own.
 4. **Whether Lua plugins declare an API before 1.0.** Without a declared number, a later
    incompatible Lua codec interface cannot tell old plugins from new ones.
-5. **What the Lua scripting API is at 1.0.** Whether `codecs.<name>.encode`, timers and
-   `port:on_frame` land before the tag, and whether scripts get a version value to check.
+5. **What the Lua scripting API is at 1.0.** `codecs.<name>.encode`, timers and
+   `port:on_frame` are in now; what is left is whether scripts get a version value to
+   check.
 6. **Whether defaults are promised.** Default setting values, default key chords and the
    bundled theme names reach every user who has not overridden them; promise them, or
    promise only file formats and names and announce default changes in the changelog.
