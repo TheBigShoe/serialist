@@ -15,8 +15,22 @@ use crate::port::{Port, PortState, bytes_arg, duration_ms};
 use crate::services::{LogLevel, OpenRequest};
 use crate::vm::{RunCtx, runtime_error};
 
+/// The scripting API number, `serialist.api` in Lua. The API only gains things within
+/// 1.x, and this goes up by one in each release that adds something, so a script that
+/// needs a later addition can check `serialist.api >= n` and fail clearly.
+pub const SCRIPT_API: i64 = 1;
+
+/// `serialist`: the app version (`version`) and the API number (`api`).
+fn serialist_table(lua: &Lua) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("version", env!("CARGO_PKG_VERSION"))?;
+    table.set("api", SCRIPT_API)?;
+    Ok(table)
+}
+
 pub(crate) fn install(lua: &Lua, ctx: &Rc<RunCtx>) -> mlua::Result<()> {
     let globals = lua.globals();
+    globals.set("serialist", serialist_table(lua)?)?;
     let tostring: Function = globals.get("tostring")?;
     globals.set("print", print_fn(lua, ctx, tostring.clone())?)?;
     globals.set("log", log_table(lua, ctx, &tostring)?)?;

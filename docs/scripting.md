@@ -106,9 +106,23 @@ days).
 | `hex.decode(text)` | hex text | byte string; error if malformed | no |
 | `bytes.from_table(t)`, `bytes.to_table(s)` | byte table / string | string / byte table | no |
 | `codecs.<name>.encode(fields)` | a saved command's codec `fields`, as a table (`command` picks the codec's command) | the command's bytes; error if the codec refuses the fields | no |
+| `serialist.version`, `serialist.api` | | the app version (a string such as `"1.0.0"`) and the API number (an integer, `1` at 1.0) | no |
 | `require(name)`, `dofile(path)` | `"lib.util"` / `"lib/util.lua"` in the scripts directory | the module's value / the file's results | yes (worker thread) |
 
 `string.pack` and `string.unpack` are there for binary frames.
+
+**Versions.** Within 1.x the API only gains things, and `serialist.api` goes up by one in
+each release that adds something. A script that needs a later addition starts with
+
+```lua
+assert(serialist.api >= 2, "this script needs a newer Serialist")
+```
+
+On a build older than the one that added `serialist`, the global is `nil`, so a script
+that must fail with the message there too writes
+`assert(serialist and serialist.api >= 2, "this script needs a newer Serialist")`.
+`serialist.version` is the app version, for logging; check `serialist.api` to decide
+what to call.
 
 **Reading is a stream.** Each port object has one read position that `read`,
 `read_line` and `expect` consume from, like a socket, so nothing is lost between
