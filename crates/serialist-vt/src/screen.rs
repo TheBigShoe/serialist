@@ -1304,5 +1304,42 @@ mod tests {
             prop_assert_eq!(ours.cursor.input_needs_wrap, theirs.cursor.input_needs_wrap);
             prop_assert_eq!(screen.term.mode(), alacritty.mode());
         }
+
+        /// Every character of a screen row's text is in the cell the device put it in,
+        /// counting cells with `cell_width`, and a wide one has its spacer after it: what
+        /// the terminal element lays the row out by. Inserted and deleted cells split wide
+        /// characters from their spacers on the way.
+        #[test]
+        fn text_cells_are_the_rows_cells(
+            columns in 2usize..10,
+            rows in 1usize..5,
+            stream in proptest::collection::vec(sent(), 1..40),
+        ) {
+            let mut bytes = Vec::new();
+            for sent in &stream {
+                sent.write(&mut bytes, columns * rows);
+            }
+            let mut screen = VtScreen::new(columns, rows, 100);
+            screen.feed(&bytes);
+            let snapshot = screen.snapshot();
+            let grid = screen.term.grid();
+            for row in 0..rows {
+                let text = &snapshot.visible_line(row).expect("a row").text;
+                let cells = &grid[Line(row as i32)][..];
+                let mut at = 0;
+                for c in text.chars() {
+                    let width = crate::cell_width(c);
+                    if width == 0 {
+                        continue;
+                    }
+                    prop_assert!(at + width <= columns, "row {} {:?} is too wide", row, text);
+                    prop_assert!(cells[at].c == c || c == ' ', "row {} {:?} at {}", row, text, at);
+                    if width == 2 {
+                        prop_assert!(cells[at + 1].flags.contains(Flags::WIDE_CHAR_SPACER));
+                    }
+                    at += width;
+                }
+            }
+        }
     }
 }

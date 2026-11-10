@@ -3,15 +3,22 @@
 //! A row is `columns` cells. The line's text is the cells in order with trailing blank
 //! cells dropped, and its runs merge neighbouring cells of the same style:
 //!
+//! Every character of the text takes [`cell_width`] cells, and the cells of the text in
+//! order are the cells of the row: the character a device put in column `n` is the one
+//! whose cells before it add up to `n`. That is what the terminal element lays a screen
+//! line out by.
+//!
 //! - A wide character (CJK, most emoji) fills two cells: the character, then a spacer.
-//!   The text has the character once and the spacer is skipped, so from that point on the
-//!   text is one character shorter than the row is wide. The terminal element draws one
-//!   character per column, so text after a wide character sits one column left of where
-//!   the device put it. That is a known limitation, not handled here.
+//!   The text has the character once and the spacer is skipped; its cell width of 2
+//!   covers both.
+//! - Half of a wide character, the other half gone (a delete or insert of cells moved
+//!   one half away, which Alacritty does not repair), is a blank cell and shows as a
+//!   space, as xterm erases both halves when one is overwritten. Otherwise a lone wide
+//!   character would take two cells in the text and one in the row.
 //! - The spacer Alacritty leaves in the last column when a wide character did not fit
 //!   (it wraps to the next row) is a blank column, and shows as a space.
 //! - Combining marks and other zero-width characters are stored with the cell they
-//!   follow and are appended right after its character, so `e` + U+0301 stays one column.
+//!   follow and are appended right after its character, so `e` + U+0301 stays one cell.
 //! - A tab leaves `\t` in the first cell it skipped (Alacritty keeps it for copying); the
 //!   text shows a space. Any other control character shows as a space too.
 //! - A cell is blank (and dropped when trailing) if it holds a space in the default
@@ -24,6 +31,7 @@ use alacritty_terminal::grid::Row;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor};
 use serialist_core::{Color, Direction, LineId, Style, StyleFlags, StyleRun, StyledLine};
+use unicode_width::UnicodeWidthChar;
 
 /// Flags that make a space visible.
 const VISIBLE_ON_SPACE: Flags = Flags::INVERSE
@@ -48,12 +56,26 @@ pub(crate) fn row_content(row: &Row<Cell>) -> (String, Vec<StyleRun>) {
         .map_or(0, |i| i + 1);
     let mut text = String::with_capacity(end);
     let mut runs: Vec<StyleRun> = Vec::new();
-    for cell in &cells[..end] {
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
+    for (column, cell) in cells[..end].iter().enumerate() {
+        // A pair is a wide character and the spacer after it; half of one is a blank.
+        let paired_spacer = |column: usize| {
+            cells
+                .get(column)
+                .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+        };
+        let paired_wide = |column: Option<usize>| {
+            column.is_some_and(|column| cells[column].flags.contains(Flags::WIDE_CHAR))
+        };
+        let lone = if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            if paired_wide(column.checked_sub(1)) {
+                continue;
+            }
+            true
+        } else {
+            cell.flags.contains(Flags::WIDE_CHAR) && !paired_spacer(column + 1)
+        };
         let start = text.len();
-        if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+        if lone || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
             text.push(' ');
         } else {
             text.push(printable(cell.c));
@@ -69,6 +91,15 @@ pub(crate) fn row_content(row: &Row<Cell>) -> (String, Vec<StyleRun>) {
         }
     }
     (text, runs)
+}
+
+/// The cells a character of a screen line's text takes: 2 for a wide character, 0 for a
+/// combining mark or another zero-width character, 1 for the rest. The screen measures
+/// characters with this when the device writes them, so the cells of a line's text add
+/// up to the columns the device put it in (see the module docs). It is the measure
+/// Alacritty's `Term` writes characters by.
+pub fn cell_width(c: char) -> usize {
+    c.width().unwrap_or(1)
 }
 
 /// `row` as a received line with id `id`.
@@ -238,6 +269,43 @@ mod tests {
         let (text, runs) = row_content(&row(vec![wide, spacer, e, cell('x')]));
         assert_eq!(text, "日e\u{301}x");
         assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), text.len());
+        // Two cells for the wide character, one for `e` and its mark, one for `x`.
+        assert_eq!(text.chars().map(cell_width).sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn half_of_a_wide_character_is_a_blank() {
+        let wide = || {
+            let mut wide = cell('日');
+            wide.flags.insert(Flags::WIDE_CHAR);
+            wide
+        };
+        let spacer = || {
+            let mut spacer = cell(' ');
+            spacer.flags.insert(Flags::WIDE_CHAR_SPACER);
+            spacer
+        };
+        // The spacer moved away from its character (a delete of one cell at the
+        // character), and a character whose spacer was deleted.
+        let (text, _) = row_content(&row(vec![spacer(), cell('a'), wide(), cell('b')]));
+        assert_eq!(text, " a b");
+        // A lone character in the last column has no spacer either.
+        let (text, _) = row_content(&row(vec![cell('a'), wide()]));
+        assert_eq!(text, "a ");
+        // Each case keeps the row's cells.
+        let (text, _) = row_content(&row(vec![wide(), spacer(), spacer(), wide(), spacer()]));
+        assert_eq!(text, "日 日");
+        assert_eq!(text.chars().map(cell_width).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn cell_widths() {
+        assert_eq!(cell_width('a'), 1);
+        assert_eq!(cell_width('─'), 1);
+        assert_eq!(cell_width('日'), 2);
+        assert_eq!(cell_width('\u{1f600}'), 2);
+        assert_eq!(cell_width('\u{301}'), 0);
+        assert_eq!(cell_width('\u{200d}'), 0);
     }
 
     #[test]

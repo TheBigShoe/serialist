@@ -45,9 +45,9 @@
 //!   scrollback rows are `complete` and screen rows are not; the cursor is on a screen
 //!   row and inside the columns.
 //! - Lines: runs cover the text on character boundaries, none is empty, neighbours differ
-//!   in style, the text has no control characters. The text has at most `columns`
-//!   characters below U+0300 (a wide character is one character in two cells; a
-//!   combining mark takes no cell, and every zero-width character is at or above U+0300),
+//!   in style, the text has no control characters. The text's characters take at most
+//!   `columns` cells by `serialist_vt::cell_width` (a wide character is one character in
+//!   two cells, a combining mark takes none; the terminal element lays them out so),
 //!   and at most `columns * (1 + MAX_ZERO_WIDTH)` characters in all, since a cell keeps
 //!   at most [`MAX_ZERO_WIDTH`] zero-width characters (`regress_zero_width_rep`: a
 //!   repeated `CSI 65535 b` on a combining mark, which grew one cell without bound).
@@ -79,7 +79,7 @@ use std::time::Instant;
 use serialist_core::{Direction, LineId, LineSource, StyledLine};
 use serialist_vt::{
     DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_EVENTS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS,
-    VtEvent, VtScreen, VtSnapshot,
+    VtEvent, VtScreen, VtSnapshot, cell_width,
 };
 
 use crate::Input;
@@ -490,9 +490,9 @@ fn check_line(line: &StyledLine, columns: usize) {
         !line.text.chars().any(char::is_control),
         "control character in the text: {line:?}"
     );
-    // One character per cell, and a wide character fills two cells but is one character.
-    // Combining marks take no cell, and every zero-width character is at or above U+0300.
-    let cells = line.text.chars().filter(|&c| c < '\u{300}').count();
+    // The terminal element puts each character in the cells `cell_width` gives it: two for
+    // a wide character, none for a combining mark. They must fit the row.
+    let cells: usize = line.text.chars().map(cell_width).sum();
     assert!(
         cells <= columns,
         "{cells} cells of text in {columns} columns: {line:?}"

@@ -9,6 +9,7 @@
 //! [`LineSource`]: serialist_core::LineSource
 
 pub mod cache;
+pub mod cells;
 pub mod demo;
 pub mod double;
 pub mod element;

@@ -747,3 +747,138 @@ fn search_reads_the_log_under_the_screen_and_says_so(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// Writes wide characters, an underlined `X` after them and a red cell after that, and
+/// leaves the cursor after the red cell.
+struct Wide;
+
+impl SimDevice for Wide {
+    fn name(&self) -> &str {
+        "wide"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        // 日 and 本 in cells 0 to 3, X in cell 4, the red blank in cell 5.
+        out.send("日本\x1b[4mX\x1b[24m\x1b[41m \x1b[0m".as_bytes());
+    }
+
+    fn on_receive(&mut self, _: &[u8], _: &mut dyn DeviceOutput) {}
+}
+
+fn dispatch(cx: &mut TestAppContext, window: AnyWindowHandle, event: PlatformInput) {
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(event, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// The left edges and widths of the underlines and the solid quads painted last, in
+/// logical pixels.
+type Painted = (Vec<(Pixels, Pixels)>, Vec<(Hsla, Pixels, Pixels)>);
+
+fn painted(cx: &mut TestAppContext, window: AnyWindowHandle) -> Painted {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let scale = window.scale_factor();
+        let left = |b: Bounds<ScaledPixels>| px(b.origin.x.0 / scale);
+        let width = |b: Bounds<ScaledPixels>| px(b.size.width.0 / scale);
+        let underlines = window
+            .painted_underlines()
+            .iter()
+            .map(|u| (left(u.bounds), width(u.bounds)))
+            .collect();
+        let quads = window
+            .painted_quads()
+            .iter()
+            .filter_map(|q| Some((q.background.as_solid()?, left(q.bounds), width(q.bounds))))
+            .collect();
+        (underlines, quads)
+    })
+    .unwrap()
+}
+
+#[gpui_test]
+fn wide_characters_are_drawn_selected_and_copied_in_their_cells(cx: &mut TestAppContext) {
+    let dir = vt_config("vt-wide");
+    let world = SimWorld::empty();
+    world.add_virtual("wide", "Wide", LinkConfig::unpaced(), || Box::new(Wide));
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:wide", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    let snapshot = wait_for_screen(cx, &view, "the text", |snap| {
+        snap.screen_text()[0] == "日本X "
+    });
+    assert_eq!(snapshot.cursor().unwrap().column, 6, "a cell column");
+    settle_size(cx, window, &view);
+
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    let (bounds, metrics, palette) = terminal.read_with(cx, |t, _| {
+        (
+            t.scroll_handle().state().bounds,
+            t.cell_metrics().unwrap(),
+            t.palette().clone(),
+        )
+    });
+    let x_of = |cell: f32| bounds.left() + PADDING_LEFT + metrics.cell_width * cell;
+    let near = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+    // The quads of `color` inside the terminal (the toolbar uses the cursor's color too).
+    let of_color = |quads: &[(Hsla, Pixels, Pixels)], color: Hsla| -> Vec<(Pixels, Pixels)> {
+        quads
+            .iter()
+            .filter(|(c, x, _)| *c == color && *x >= bounds.left())
+            .map(|(_, x, width)| (*x, *width))
+            .collect()
+    };
+
+    // The X is drawn in cell 4, after the two wide characters, and the red background
+    // and the cursor are in cells 5 and 6.
+    let (underlines, quads) = painted(cx, window);
+    assert_eq!(underlines.len(), 1, "{underlines:?}");
+    assert!(near(underlines[0].0, x_of(4.)), "{underlines:?}");
+    let reds = of_color(&quads, palette.indexed(1));
+    assert_eq!(reds.len(), 1, "{quads:?}");
+    assert!(near(reds[0].0, x_of(5.)) && near(reds[0].1, metrics.cell_width));
+    let cursors = of_color(&quads, palette.cursor);
+    assert_eq!(cursors.len(), 1, "{quads:?}");
+    assert!(near(cursors[0].0, x_of(6.)), "{cursors:?}");
+
+    // A drag from the second half of 日 to the middle of X selects 本 and X: the caret
+    // goes in front of a wide character it lands in. The selection is painted over their
+    // three cells, and copy gives each character once.
+    let y = bounds.top() + metrics.row_height * 0.5;
+    let (from, to) = (point(x_of(1.6), y), point(x_of(4.6), y));
+    let modifiers = Modifiers::default();
+    let down = MouseDownEvent {
+        button: MouseButton::Left,
+        position: from,
+        modifiers,
+        click_count: 1,
+        first_mouse: false,
+    };
+    dispatch(cx, window, down.to_platform_input());
+    let drag = MouseMoveEvent {
+        position: to,
+        pressed_button: Some(MouseButton::Left),
+        modifiers,
+    };
+    dispatch(cx, window, drag.to_platform_input());
+    let up = MouseUpEvent {
+        button: MouseButton::Left,
+        position: to,
+        modifiers,
+        click_count: 1,
+    };
+    dispatch(cx, window, up.to_platform_input());
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("本X".into())
+    );
+    let (_, quads) = painted(cx, window);
+    let selected = of_color(&quads, palette.selection);
+    assert_eq!(selected.len(), 1, "{quads:?}");
+    assert!(
+        near(selected[0].0, x_of(2.)) && near(selected[0].1, metrics.cell_width * 3.),
+        "{selected:?}"
+    );
+}
