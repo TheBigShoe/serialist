@@ -79,6 +79,28 @@ fn position(err: &SettingsError) -> (usize, usize) {
     }
 }
 
+/// Loads `text` and returns the one value the loader left out of it.
+fn skipped_one(text: &str) -> SettingsWarning {
+    let settings = user_settings(text);
+    let mut skipped: Vec<SettingsWarning> = settings
+        .warnings
+        .into_iter()
+        .filter(SettingsWarning::is_invalid_value)
+        .collect();
+    assert_eq!(skipped.len(), 1, "{text}: {skipped:?}");
+    skipped.remove(0)
+}
+
+/// Loads `text`, which sets one key to a value this build cannot read, and checks that
+/// the key was left out, so every setting is the bundled default. Returns the warning.
+fn rejected(text: &str) -> SettingsWarning {
+    let mut settings = user_settings(text);
+    let warning = skipped_one(text);
+    settings.warnings.clear();
+    assert_eq!(settings, Settings::default(), "{text}");
+    warning
+}
+
 #[test]
 fn plan_sample_parses_and_resolves() {
     let settings = user_settings(PLAN_SAMPLE);
@@ -320,13 +342,15 @@ fn font_features_read_booleans_and_integers() {
 
 #[test]
 fn font_features_reject_bad_tags_and_values() {
-    let err = error_of(r#"{ "buffer_font_features": { "ligatures": true } }"#);
-    assert!(err.to_string().contains("four ASCII"), "{err}");
-    let err = error_of("{\n \"buffer_font_features\": { \"calt\": \"off\" }\n}");
-    assert!(err.to_string().contains("true, false"), "{err}");
-    assert_eq!(position(&err).0, 2);
-    let err = error_of(r#"{ "buffer_font_features": { "calt": -1 } }"#);
-    assert!(err.to_string().contains("non-negative"), "{err}");
+    let warning = rejected(r#"{ "buffer_font_features": { "ligatures": true } }"#);
+    assert!(warning.to_string().contains("four ASCII"), "{warning}");
+    let warning = rejected("{\n \"buffer_font_features\": { \"calt\": \"off\" }\n}");
+    assert!(warning.to_string().contains("true, false"), "{warning}");
+    assert_eq!((warning.line, warning.column), (2, 36));
+    assert_eq!(warning.key, "buffer_font_features.calt");
+    let warning = rejected(r#"{ "buffer_font_features": { "calt": -1 } }"#);
+    assert!(warning.to_string().contains("non-negative"), "{warning}");
+    rejected(r#"{ "buffer_font_features": [] }"#);
 }
 
 #[test]
@@ -366,10 +390,7 @@ fn line_height_has_three_forms_and_zeds_custom_object() {
         r#"{ "buffer_line_height": {} }"#,
         r#"{ "buffer_line_height": true }"#,
     ] {
-        assert!(
-            Settings::from_jsonc(bad).is_err(),
-            "{bad} should be rejected"
-        );
+        rejected(bad);
     }
 }
 
@@ -446,26 +467,44 @@ fn the_ui_font_uses_the_ui_keys() {
 }
 
 #[test]
-fn out_of_range_values_are_errors_with_positions() {
-    let err = error_of("{\n  \"buffer_font_weight\": 950\n}");
-    assert!(err.to_string().contains("100 to 900"), "{err}");
-    assert_eq!(position(&err), (2, 25));
+fn out_of_range_values_are_warnings_with_positions() {
+    let warning = rejected("{\n  \"buffer_font_weight\": 950\n}");
+    assert!(warning.to_string().contains("100 to 900"), "{warning}");
+    assert_eq!((warning.line, warning.column), (2, 25));
+    assert_eq!(warning.key, "buffer_font_weight");
+    assert!(
+        warning
+            .to_string()
+            .starts_with("<settings>:2:25: setting `buffer_font_weight` is ignored: "),
+        "{warning}"
+    );
 
-    let err = error_of("{\n  \"buffer_font_size\": 0\n}");
-    assert!(err.to_string().contains("positive"), "{err}");
-    assert_eq!(position(&err).0, 2);
+    let warning = rejected("{\n  \"buffer_font_size\": 0\n}");
+    assert!(warning.to_string().contains("positive"), "{warning}");
+    assert_eq!((warning.line, warning.column), (2, 23));
 
-    assert!(Settings::from_jsonc(r#"{ "default_baud": 0 }"#).is_err());
-    assert!(Settings::from_jsonc(r#"{ "default_baud": "fast" }"#).is_err());
-    assert!(Settings::from_jsonc(r#"{ "display": { "hex_bytes_per_row": 0 } }"#).is_err());
-    assert!(Settings::from_jsonc(r#"{ "display": { "hex_bytes_per_row": 999 } }"#).is_err());
+    for bad in [
+        r#"{ "default_baud": 0 }"#,
+        r#"{ "default_baud": "fast" }"#,
+        r#"{ "display": { "hex_bytes_per_row": 0 } }"#,
+    ] {
+        rejected(bad);
+    }
+    let warning = rejected(r#"{ "display": { "hex_bytes_per_row": 999 } }"#);
+    assert_eq!(warning.key, "display.hex_bytes_per_row");
+    assert_eq!((warning.line, warning.column), (1, 37));
+    assert!(
+        matches!(&warning.kind, SettingsWarningKind::InvalidValue { reason }
+            if reason == "hex_bytes_per_row must be from 1 to 256, got 999"),
+        "{warning:?}"
+    );
 }
 
 /// Found by the `config_jsonc` fuzz target: a size or height is read as an f64, checked,
 /// then stored as an f32, so 1e300 passed the check and loaded as infinity, and 1e-300 as
 /// zero.
 #[test]
-fn sizes_and_heights_that_do_not_fit_an_f32_are_errors() {
+fn sizes_and_heights_that_do_not_fit_an_f32_are_left_out() {
     for bad in [
         r#"{ "buffer_font_size": 1e300 }"#,
         r#"{ "ui_font_size": 3.5e38 }"#,
@@ -476,8 +515,12 @@ fn sizes_and_heights_that_do_not_fit_an_f32_are_errors() {
         r#"{ "buffer_line_height": { "custom": 1e-300 } }"#,
         r#"{ "terminal": { "line_height": 1e300 } }"#,
     ] {
-        let err = Settings::from_jsonc(bad).expect_err(bad);
-        assert!(err.to_string().contains("out of range"), "{bad}: {err}");
+        let warning = rejected(bad);
+        assert!(
+            warning.to_string().contains("out of range"),
+            "{bad}: {warning}"
+        );
+        assert_eq!(warning.line, 1, "{bad}");
     }
     // The largest and smallest an f32 holds still load, as finite positive numbers.
     let settings = user_settings(r#"{ "buffer_font_size": 3.4e38, "ui_font_size": 2e-45 }"#);
@@ -510,34 +553,61 @@ fn errors_carry_file_line_column_and_message() {
             .starts_with(&bad_syntax.display().to_string())
     );
 
-    let bad_type = dir.write("type.json", "{\n  \"buffer_font_size\": \"big\",\n}\n");
-    let err = load_settings(None, Some(&bad_type)).unwrap_err();
-    let SettingsError::Invalid {
-        file,
-        line,
-        column,
-        message,
-    } = &err
-    else {
-        panic!("expected Invalid, got {err:?}");
-    };
-    assert_eq!(file, &bad_type);
-    assert_eq!((*line, *column), (2, 23));
-    assert!(message.contains("expected a font size"), "{message}");
+    // A root that is not an object is an error for the whole file too.
+    let array = dir.write("array.json", "[1, 2]");
+    let err = load_settings(Some(&array), None).unwrap_err();
+    assert_eq!(position(&err), (1, 1));
+    assert!(err.to_string().contains("must be a JSON object"), "{err}");
+}
 
-    // The error names the file that is wrong even when an earlier layer is fine.
+#[test]
+fn a_value_of_the_wrong_type_is_a_warning_with_file_line_column_and_message() {
+    let dir = TempDir::new("warnings");
+    let bad_type = dir.write("type.json", "{\n  \"buffer_font_size\": \"big\",\n}\n");
+    let settings = load_settings(None, Some(&bad_type)).unwrap();
+    let [warning] = settings.warnings.as_slice() else {
+        panic!("{:?}", settings.warnings);
+    };
+    assert_eq!(warning.file, bad_type);
+    assert_eq!((warning.line, warning.column), (2, 23));
+    assert_eq!(warning.key, "buffer_font_size");
+    assert!(warning.is_invalid_value());
+    assert!(
+        warning.message.contains("expected a font size"),
+        "{warning}"
+    );
+    assert!(
+        warning
+            .to_string()
+            .starts_with(&format!("{}:2:23: ", bad_type.display())),
+        "{warning}"
+    );
+    assert_eq!(
+        settings.buffer_font_size,
+        Settings::default().buffer_font_size
+    );
+
+    // The warning names the file that is wrong even when an earlier layer is fine, and
+    // that layer's value stays.
     let good = dir.write("good.json", "{ \"buffer_font_size\": 12 }");
-    let err = load_settings(Some(&good), Some(&bad_type)).unwrap_err();
-    assert_eq!(err.file(), Some(bad_type.as_path()));
+    let settings = load_settings(Some(&good), Some(&bad_type)).unwrap();
+    assert_eq!(settings.warnings.len(), 1);
+    assert_eq!(settings.warnings[0].file, bad_type);
+    assert_eq!(settings.buffer_font_size, 12.0);
 
     let bad_enum = dir.write(
         "enum.json",
-        "{\n \"display\": {\n  \"view\": \"binary\"\n }\n}",
+        "{\n \"display\": {\n  \"view\": \"binary\",\n  \"wrap\": true\n }\n}",
     );
-    let err = load_settings(Some(&bad_enum), None).unwrap_err();
-    let (line, _) = position(&err);
-    assert_eq!(line, 3);
-    assert!(err.to_string().contains("binary"), "{err}");
+    let settings = load_settings(Some(&bad_enum), None).unwrap();
+    let [warning] = settings.warnings.as_slice() else {
+        panic!("{:?}", settings.warnings);
+    };
+    assert_eq!((warning.line, warning.column), (3, 11));
+    assert_eq!(warning.key, "display.view");
+    assert!(warning.to_string().contains("binary"), "{warning}");
+    assert_eq!(settings.display.view, DisplayView::Text);
+    assert!(settings.display.wrap, "the rest of the object applies");
 }
 
 #[test]
@@ -605,7 +675,7 @@ fn null_unsets_optional_keys() {
     assert_eq!(settings.buffer_font_family, None);
     assert_eq!(settings.resolved_terminal_font().family, None);
     // A key that has a default is not optional.
-    assert!(Settings::from_jsonc(r#"{ "buffer_font_size": null }"#).is_err());
+    rejected(r#"{ "buffer_font_size": null }"#);
 }
 
 #[test]
@@ -650,10 +720,16 @@ fn usb_ids_accept_hex_strings_and_integers() {
         r#"{ "devices": [ { "match": { "vid": true } } ] }"#,
         r#"{ "devices": [ { "match": { "vid": -1 } } ] }"#,
     ] {
-        assert!(Settings::from_jsonc(bad).is_err(), "{bad}");
+        // A profile whose `match` does not read is left out whole: without the key it
+        // would match more ports than it was written for.
+        let warning = skipped_one(bad);
+        assert_eq!(warning.key, "devices[0]", "{bad}");
+        assert!(user_settings(bad).devices.is_empty(), "{bad}");
     }
     // `match` is required, so a profile cannot apply to everything by accident.
-    assert!(Settings::from_jsonc(r#"{ "devices": [ { "baud": 9600 } ] }"#).is_err());
+    let text = r#"{ "devices": [ { "baud": 9600 } ] }"#;
+    assert_eq!(skipped_one(text).key, "devices[0]");
+    assert!(user_settings(text).devices.is_empty());
 }
 
 #[test]
@@ -789,7 +865,14 @@ fn line_settings_accept_numbers_and_names() {
         r#"{ "devices": [ { "match": {}, "baud": 0 } ] }"#,
         r#"{ "devices": [ { "match": {}, "eol": "lfcr" } ] }"#,
     ] {
-        assert!(Settings::from_jsonc(bad).is_err(), "{bad}");
+        // The key is left out of the profile and the profile stays.
+        let warning = skipped_one(bad);
+        assert!(warning.key.starts_with("devices[0]."), "{bad}: {warning}");
+        assert_eq!(
+            user_settings(bad).devices,
+            [DeviceProfile::default()],
+            "{bad}"
+        );
     }
 }
 
@@ -1111,7 +1194,7 @@ fn emulation_comes_from_the_terminal_setting_then_the_profile() {
     let other = usb_port("/dev/cu.usbserial-1", 0x0403, 0x6001, None, None, None);
     assert_eq!(settings.emulation_for(&other), Emulation::Vt);
 
-    error_of(r#"{ "terminal": { "emulation": "vt100" } }"#);
+    rejected(r#"{ "terminal": { "emulation": "vt100" } }"#);
     assert_eq!(Emulation::Monitor.toggled(), Emulation::Vt);
     assert_eq!(Emulation::Vt.toggled().label(), "Monitor");
 }
@@ -1157,11 +1240,15 @@ fn replay_settings_read_every_speed_spelling_and_keep_what_the_file_leaves_out()
 }
 
 #[test]
-fn a_bad_replay_value_is_an_error_naming_the_value_and_its_position() {
-    let err = error_of("{\n  \"replay\": { \"speed\": \"warp\" }\n}");
-    assert!(err.to_string().contains("warp"), "{err}");
-    assert!(err.to_string().contains("1x, 4x, 0.5x or max"), "{err}");
-    assert_eq!(position(&err).0, 2);
+fn a_bad_replay_value_is_a_warning_naming_the_value_and_its_position() {
+    let warning = rejected("{\n  \"replay\": { \"speed\": \"warp\" }\n}");
+    assert!(warning.to_string().contains("warp"), "{warning}");
+    assert!(
+        warning.to_string().contains("1x, 4x, 0.5x or max"),
+        "{warning}"
+    );
+    assert_eq!((warning.line, warning.column), (2, 24));
+    assert_eq!(warning.key, "replay.speed");
 
     for bad in [
         r#"{ "replay": { "speed": "0x" } }"#,
@@ -1173,11 +1260,16 @@ fn a_bad_replay_value_is_an_error_naming_the_value_and_its_position() {
         r#"{ "replay": { "end": 1 } }"#,
         r#"{ "replay": "max" }"#,
     ] {
-        let err = error_of(bad);
-        assert_eq!(position(&err).0, 1, "{bad}: {err}");
+        let warning = rejected(bad);
+        assert_eq!(warning.line, 1, "{bad}: {warning}");
     }
-    let err = error_of(r#"{ "replay": { "end": "later" } }"#);
-    assert!(err.to_string().contains("later"), "{err}");
+    let warning = rejected(r#"{ "replay": { "end": "later" } }"#);
+    assert!(warning.to_string().contains("later"), "{warning}");
+    // One bad key of the object leaves the other in force.
+    let settings = user_settings(r#"{ "replay": { "speed": "warp", "end": "hold" } }"#);
+    assert_eq!(settings.replay.speed, ReplaySpeed::REALTIME);
+    assert_eq!(settings.replay.end, ReplayEnd::Hold);
+    assert_eq!(settings.warnings.len(), 1);
 }
 
 #[test]

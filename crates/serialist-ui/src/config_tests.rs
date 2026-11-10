@@ -606,6 +606,20 @@ fn a_broken_settings_file_keeps_the_last_good_settings_and_shows_why(cx: &mut Te
         "{notice:?}"
     );
 
+    // So is a value this build cannot read, such as one from a later release: that key
+    // alone is left out, with its position, and the rest of the file applies.
+    dir.write_settings("{\n  \"buffer_font_size\": 23,\n  \"line_ending\": \"crcrlf\"\n}");
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    assert_eq!(config(cx).terminal_font().size, px(23.));
+    let notice = workspace.read_with(cx, |w, cx| w.config_notice(cx));
+    assert!(
+        notice.as_ref().is_some_and(|n| !n.is_error
+            && n.text.contains("settings.json:3:18: ")
+            && n.text.contains("`line_ending` is ignored")
+            && n.text.contains("crcrlf")),
+        "{notice:?}"
+    );
+
     dir.write_settings(r#"{ "buffer_font_size": 21 }"#);
     cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
     assert_eq!(workspace.read_with(cx, |w, cx| w.config_notice(cx)), None);
@@ -628,21 +642,23 @@ fn the_inline_settings_come_from_the_core_settings(cx: &mut TestAppContext) {
     assert_eq!(inline.paste_chunk_delay, Duration::from_millis(30));
     assert_eq!(loaded.settings().inline.backspace.byte(), 0x08);
 
-    // A reload that drops the object goes back to the defaults; a bad value keeps the
-    // last good settings and says why, as for any other key.
+    // A reload that drops the object goes back to the defaults; a bad value is left out
+    // with a warning that says why, as for any other key, and the rest of the object
+    // applies.
     dir.write_settings("{}");
     cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
     assert_eq!(
         cx.update(|cx| cx.global::<Config>().inline().backspace),
         0x7f
     );
-    dir.write_settings(r#"{ "inline": { "backspace": "0x20" } }"#);
+    dir.write_settings(r#"{ "inline": { "backspace": "0x20", "paste_chunk_bytes": 4 } }"#);
     cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
     let kept = config(cx);
-    assert_eq!(kept.inline().backspace, 0x7f, "the last good settings");
+    assert_eq!(kept.inline().backspace, 0x7f, "the default stays");
+    assert_eq!(kept.inline().paste_chunk_bytes, 4, "the rest applies");
     let notice = kept.notice().expect("the status line says why");
     assert!(
-        notice.is_error && notice.text.contains("inline.backspace"),
+        !notice.is_error && notice.text.contains("inline.backspace"),
         "{notice:?}"
     );
 }
@@ -959,14 +975,26 @@ fn the_replay_setting_sets_the_factorys_defaults_at_startup_and_on_every_reload(
         "applied on reload"
     );
 
-    // A settings file that does not load keeps the last good settings, so the defaults.
-    dir.write_settings(r#"{ "replay": { "speed": "warp" } }"#);
+    // A settings file that does not parse keeps the last good settings.
+    dir.write_settings(r#"{ "replay": { "speed": "#);
     cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
     cx.run_until_parked();
     assert_eq!(
         replay.defaults().speed,
         ReplaySpeed::Max,
         "the last good one"
+    );
+
+    // A speed this build cannot read is left out: the default speed, the file's end.
+    dir.write_settings(r#"{ "replay": { "speed": "warp", "end": "hold" } }"#);
+    cx.update(|cx| config::reload(ConfigPiece::Settings, cx));
+    cx.run_until_parked();
+    assert_eq!(
+        replay.defaults(),
+        ReplayOptions {
+            speed: ReplaySpeed::REALTIME,
+            end: ReplayEnd::Hold,
+        }
     );
 
     // Removing the key goes back to the bundled default, in the same factory.
