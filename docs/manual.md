@@ -230,6 +230,7 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Where | Action | What it does | macOS | Linux and Windows |
 |---|---|---|---|---|
 | Anywhere | `serialist::Quit` | Quit | `cmd-q` | `ctrl-q` |
+| Workspace | `command_palette::Toggle` | Open the command palette | `cmd-shift-p` | `ctrl-shift-p` |
 | Workspace | `serialist::OpenSettingsUi` | Open the Settings screen in a tab | `cmd-,` | `ctrl-,` |
 | Workspace | `terminal::Clear` | Clear the terminal | `cmd-k` | `ctrl-shift-k` |
 | Workspace | `serial::Disconnect` | Disconnect the port (asking first while it records or runs a script) | `cmd-shift-w` | `ctrl-alt-w` |
@@ -250,6 +251,8 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Commands panel | `commands::SendSelected` | Send the selected command | `enter` | `enter` |
 | Commands panel filter | `commands::SelectPrevious` | Select the previous command | `up` | `up` |
 | Commands panel filter | `commands::SelectNext` | Select the next command | `down` | `down` |
+| Command palette input | `command_palette::SelectPrevious` | Select the previous entry | `up` | `up` |
+| Command palette input | `command_palette::SelectNext` | Select the next entry | `down` | `down` |
 | Compose bar input | `compose::HistoryPrevious` | Previous compose-bar history entry | `up` | `up` |
 | Compose bar input | `compose::HistoryNext` | Next compose-bar history entry | `down` | `down` |
 | Compose bar | `compose::CycleLineEnding` | Cycle the line ending (None, CR, LF, CRLF) | `cmd-e` | `ctrl-shift-e` |
