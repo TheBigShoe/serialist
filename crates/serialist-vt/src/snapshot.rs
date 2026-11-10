@@ -117,9 +117,10 @@ impl VtSnapshot {
         self.title.as_deref()
     }
 
-    /// Increases by one for every snapshot whose content (rows, cursor, modes or title)
-    /// differs from the one before. Equal generations from one screen mean equal
-    /// snapshots, so the UI can skip everything.
+    /// Increases with every snapshot whose content (rows, cursor, modes or title) differs
+    /// from the one before, by one or, when the screen took a snapshot of its own in
+    /// between (it does when a synchronized update begins), by more. Equal generations
+    /// from one screen mean equal snapshots, so the UI can skip everything.
     pub fn generation(&self) -> u64 {
         self.generation
     }

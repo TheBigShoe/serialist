@@ -474,3 +474,143 @@ fn a_repeat_in_insert_mode_fills_rows_and_pushes_text_off() {
     screen.feed(b"\x1b[3;1Hab\x1b[3;1H\xe6\x97\xa5");
     assert_eq!(screen_text(&screen.snapshot())[2], "\u{65e5}ab");
 }
+
+const BEGIN: &[u8] = b"\x1b[?2026h";
+const END: &[u8] = b"\x1b[?2026l";
+
+fn bytes(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
+#[test]
+fn what_arrives_ahead_of_an_update_in_the_same_chunk_shows_at_once() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    screen.feed(&bytes(&[b"before", BEGIN, b"\x1b[2;1Hduring"]));
+    assert!(screen.sync_pending());
+    assert_eq!(screen_text(&screen.snapshot()), ["before", "", ""]);
+    screen.feed(END);
+    assert_eq!(screen_text(&screen.snapshot()), ["before", "during", ""]);
+}
+
+#[test]
+fn one_update_after_another_shows_each_when_the_next_begins() {
+    // A device that redraws without pause: every chunk ends inside an update, so the
+    // screen is never seen between two. Each frame shows when the next one begins.
+    let mut screen = VtScreen::new(20, 3, 100);
+    screen.feed(&bytes(&[BEGIN, b"\x1b[1;1Hframe"]));
+    assert_eq!(screen_text(&screen.snapshot())[0], "");
+    screen.feed(&bytes(&[b" one", END, BEGIN, b"\x1b[1;1Hframe"]));
+    assert!(screen.sync_pending());
+    assert_eq!(screen_text(&screen.snapshot())[0], "frame one");
+    screen.feed(&bytes(&[b" two", END, BEGIN, b"\x1b[1;1Hframe thr"]));
+    assert_eq!(screen_text(&screen.snapshot())[0], "frame two");
+    screen.feed(&bytes(&[b"ee", END]));
+    assert_eq!(screen_text(&screen.snapshot())[0], "frame three");
+}
+
+#[test]
+fn a_chunk_of_many_updates_takes_one_snapshot_for_them() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    let before = screen.snapshot().generation();
+    let mut chunk = Vec::new();
+    for n in 0..500 {
+        chunk.extend_from_slice(&bytes(&[BEGIN, format!("\x1b[1;1H{n}").as_bytes(), END]));
+    }
+    screen.feed(&chunk);
+    let snap = screen.snapshot();
+    assert_eq!(screen_text(&snap)[0], "499");
+    assert!(
+        snap.generation() <= before + 2,
+        "{} snapshots for one chunk",
+        snap.generation() - before
+    );
+}
+
+#[test]
+fn a_begin_spelled_another_way_opens_an_update_in_any_chunks() {
+    // `CSI ? 2026 ; 1 h` sets two modes. vte, holding the bytes of an update back itself,
+    // found the end and the next begin by searching for their exact bytes, and so opened
+    // an update for this one or not depending on where the chunks were cut.
+    let stream = bytes(&[
+        b"q",
+        BEGIN,
+        b"held",
+        END,
+        b"\x1b[?2026;1h\x1b[2;1Hztail\r\nend",
+    ]);
+    let whole = {
+        let mut screen = VtScreen::new(20, 4, 100);
+        screen.feed_at(&stream, t0());
+        assert!(screen.sync_pending());
+        assert!(screen.end_sync());
+        common::print(&screen.snapshot(), screen.take_events())
+    };
+    assert_eq!(whole.lines[0].1, "qheld");
+    assert_eq!(whole.lines[1].1, "ztail");
+    for cut in 0..=stream.len() {
+        let mut screen = VtScreen::new(20, 4, 100);
+        screen.feed_at(&stream[..cut], t0());
+        let _ = screen.snapshot();
+        screen.feed_at(&stream[cut..], t0());
+        assert!(screen.sync_pending(), "cut at {cut}");
+        assert!(screen.end_sync());
+        let split = common::print(&screen.snapshot(), screen.take_events());
+        assert_eq!(split, whole, "cut at {cut}");
+    }
+}
+
+#[test]
+fn queries_inside_an_update_are_answered_at_once() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    // Where is the cursor, and is mode 2026 set?
+    screen.feed(&bytes(&[BEGIN, b"ab\x1b[6n\x1b[?2026$p"]));
+    assert!(screen.sync_pending());
+    assert_eq!(
+        screen.take_events(),
+        [
+            VtEvent::Respond(b"\x1b[1;3R".to_vec()),
+            VtEvent::Respond(b"\x1b[?2026;1$y".to_vec())
+        ]
+    );
+    assert_eq!(screen_text(&screen.snapshot())[0], "", "the view is held");
+    screen.feed(&bytes(&[END, b"\x1b[?2026$p"]));
+    assert_eq!(
+        screen.take_events(),
+        [VtEvent::Respond(b"\x1b[?2026;2$y".to_vec())]
+    );
+}
+
+#[test]
+fn a_second_begin_does_not_extend_an_update() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    let began = Instant::now();
+    screen.feed_at(&bytes(&[BEGIN, b"a"]), began);
+    screen.feed_at(&bytes(&[BEGIN, b"b"]), began + Duration::from_millis(100));
+    assert!(!screen.flush_sync(began + Duration::from_millis(140)));
+    assert_eq!(screen_text(&screen.snapshot())[0], "");
+    // 150 ms after the first begin, whatever the second said. Feeding checks the clock
+    // too, before it parses.
+    screen.feed_at(b"c", began + Duration::from_millis(160));
+    assert!(!screen.sync_pending());
+    assert_eq!(screen_text(&screen.snapshot())[0], "abc");
+}
+
+#[test]
+fn a_resize_and_a_reset_end_an_update() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    screen.feed(&bytes(&[BEGIN, b"x"]));
+    screen.resize(30, 4);
+    assert!(!screen.sync_pending());
+    let snap = screen.snapshot();
+    assert_eq!((snap.columns(), snap.viewport_rows()), (30, 4));
+    assert_eq!(screen_text(&snap)[0], "x");
+
+    // RIS from the device, and the app's own reset.
+    screen.feed(&bytes(&[BEGIN, b"y\x1bc"]));
+    assert!(!screen.sync_pending());
+    assert_eq!(screen_text(&screen.snapshot())[0], "");
+    screen.feed(&bytes(&[BEGIN, b"z"]));
+    screen.reset();
+    assert!(!screen.sync_pending());
+    assert_eq!(screen_text(&screen.snapshot())[0], "");
+}
