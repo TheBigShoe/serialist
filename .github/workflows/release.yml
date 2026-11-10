@@ -47,8 +47,8 @@ jobs:
     # thin LTO. The cache below shortens warm runs.
     timeout-minutes: 90
     # A row marked `extra` may fail without failing the run: the draft is made from the
-    # rows that passed, as long as the three required packages are there (see the
-    # `release` job).
+    # rows that passed, as long as the packages of the three required rows are there (see
+    # the `release` job).
     continue-on-error: ${{ matrix.extra == true }}
     strategy:
       fail-fast: false
