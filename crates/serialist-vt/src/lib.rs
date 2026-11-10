@@ -79,9 +79,14 @@
 //!   drops them.
 //! - **Growing the screen** adds blank rows at the bottom; rows are not pulled back out
 //!   of the scrollback.
-//! - **Synchronized updates** (`CSI ? 2026 h`) are honored: bytes are held until the
-//!   device ends the update or 150 ms pass. Parsing starts the clock but nothing ticks
-//!   it, so the screen checks on every chunk and [`VtSink`] on every idle tick.
+//! - **Long repeats.** `CSI n b` repeats the last character at most a screenful of times
+//!   (rows times columns); the rest of a longer repeat is dropped. Past a screenful it
+//!   would only scroll rows of the same character by, and at 65535 characters for eight
+//!   bytes a device could keep the screen from keeping up.
+//! - **Synchronized updates** (`CSI ? 2026 h`) are honored: the snapshot stays as it was
+//!   when the update began until the device ends the update or 150 ms pass
+//!   ([`SYNC_TIMEOUT`]). Nothing ticks that clock, so the screen checks on every chunk
+//!   and [`VtSink`] on every idle tick. Queries inside an update are answered at once.
 
 mod convert;
 mod events;
@@ -95,7 +100,7 @@ pub use events::{ColorRequest, MAX_EVENTS, VtEvent};
 pub use keys::vt_key_bytes;
 pub use screen::{
     DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS, STAGING_ROWS,
-    VtScreen,
+    SYNC_TIMEOUT, VtScreen,
 };
 pub use sink::{VtHandle, VtSink};
 pub use snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};

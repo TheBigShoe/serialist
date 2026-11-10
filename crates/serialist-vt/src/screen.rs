@@ -43,19 +43,66 @@
 //! character `n` times) makes eleven bytes add 65535. Every snapshot of the row copies
 //! them too. So the tracker drops a zero-width character once its cell holds
 //! [`MAX_ZERO_WIDTH`] of them.
+//!
+//! # Synchronized updates
+//!
+//! A device brackets a redraw with `CSI ? 2026 h` and `CSI ? 2026 l` so that it shows in
+//! one piece. vte would do this by holding the bytes back, up to 2 MiB of them, and
+//! parsing them all in one call when the update ends. The screen does it instead, and
+//! holds back the view: vte is given a timeout that never holds anything
+//! ([`NoHold`]), bytes are parsed as they arrive, and while an update is open
+//! [`VtScreen::snapshot`] returns the snapshot before it. That snapshot is taken when the
+//! update begins, so what arrived ahead of the begin in the same chunk shows at once, and
+//! a device sending one update after another shows each when the next begins. For that
+//! the parsing stops after an `h` that may end the begin ([`Stops`]), and if an
+//! update did begin the snapshot is taken there, at most once per chunk: a device does
+//! not get a snapshot for every eight bytes.
+//!
+//! An update ends at its `CSI ? 2026 l`, on a full reset, on a resize, or
+//! [`SYNC_TIMEOUT`] after it began; a second begin inside it does not extend it. Answers
+//! to the device's queries and its other events are not held: a device that asks inside
+//! an update gets its answer when it asks.
+//!
+//! # Repeats
+//!
+//! `CSI n b` repeats the last character `n` times, up to 65535: eight bytes for about a
+//! millisecond of parsing, or ten when each character scrolls a row off a narrow screen,
+//! which is more than a link delivers them in. vte does the repeating, as that many
+//! calls for one character, so the tracker cannot tell a repeat from text by what it is
+//! asked to do. It can by when: a repeat runs while the `b` that ends its sequence is
+//! parsed. So the screen looks for each `b` that may end one ([`Stops`]) and parses
+//! it in a call of its own, in which the tracker takes one screenful of characters, rows
+//! times columns, and drops the rest. Past a screenful a repeat only scrolls rows of the same
+//! character by. (This is why the screen and not vte holds a synchronized update: vte
+//! would parse a held repeat in one call with everything around it.) A screen of 65535
+//! cells or more caps nothing.
+//!
+//! # Insert mode
+//!
+//! In insert mode (`CSI 4 h`) Alacritty makes room for every character by moving the cells
+//! from the cursor to the end of the row one to the right, a cell at a time, so a
+//! character costs as much as the row is wide. `CSI 65535 b` then makes eight bytes cost
+//! 65535 times the row: 57 ms on a 1024-column screen, where a device at 115200 baud can
+//! send over a thousand of them a second. When those cells are all equal, as on a blank
+//! row or one the repeat has already filled, moving them changes nothing, so the tracker
+//! has the character written without the move. It looks along the row once and then
+//! remembers where it is, for as long as only characters arrive. What is left costs what
+//! typing into a row of text in insert mode costs: one move of the row for each character
+//! until the text has left it, which a repeat can ask for once a row.
 
+use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row};
-use alacritty_terminal::index::Line;
+use alacritty_terminal::index::{Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape as VtCursorShape, CursorStyle, Handler, Hyperlink,
-    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode,
-    Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
-    cursor_icon::CursorIcon,
+    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedMode,
+    NamedPrivateMode, PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset,
+    TabulationClearMode, Timeout, cursor_icon::CursorIcon,
 };
 use serialist_core::ansi::incomplete_utf8_suffix;
 use serialist_core::{Epoch, LineId, StyledLine};
@@ -90,6 +137,29 @@ pub const MAX_ZERO_WIDTH: usize = 30;
 /// The largest buffer kept for joining a held-back character to the next chunk.
 const KEEP_JOINED: usize = 64 * 1024;
 
+/// How long a synchronized update (`CSI ? 2026 h`) holds the view back when the device
+/// does not end it: what vte and Alacritty allow.
+pub const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
+const SYNC_UPDATE: PrivateMode = PrivateMode::Named(NamedPrivateMode::SyncUpdate);
+
+/// The timeout vte keeps for a synchronized update, as one that is never pending: vte
+/// then holds no bytes back and parses every chunk as it comes. It still tells the
+/// handler when an update begins and ends, which is all the screen needs (see the module
+/// docs).
+#[derive(Default)]
+struct NoHold;
+
+impl Timeout for NoHold {
+    fn set_timeout(&mut self, _duration: Duration) {}
+
+    fn clear_timeout(&mut self) {}
+
+    fn pending_timeout(&self) -> bool {
+        false
+    }
+}
+
 struct Size {
     columns: usize,
     rows: usize,
@@ -122,12 +192,14 @@ fn clamp_size(columns: usize, rows: usize) -> Size {
 pub struct VtScreen {
     term: Term<Listener>,
     listener: Listener,
-    processor: Processor,
+    processor: Processor<NoHold>,
     scrollback: Scrollback,
     /// The snapshot handed out last: rows are reused from it when unchanged.
     last: Option<VtSnapshot>,
     /// Something may have changed since `last`.
     dirty: bool,
+    /// When the open synchronized update times out; `None` when none is open.
+    sync: Option<Instant>,
     generation: u64,
     epoch: Epoch,
     /// Bytes fed so far: the stream offset of the next byte.
@@ -183,6 +255,7 @@ impl VtScreen {
             scrollback: Scrollback::new(scrollback_lines),
             last: None,
             dirty: true,
+            sync: None,
             generation: 0,
             epoch,
             offset: 0,
@@ -222,13 +295,14 @@ impl VtScreen {
     }
 
     /// Feed received bytes that arrived at `at` (the session's chunk time). Rows the
-    /// chunk changes get `at` as their `received_at`.
+    /// chunk changes get `at` as their `received_at`, and a synchronized update it begins
+    /// times out [`SYNC_TIMEOUT`] after `at`.
     pub fn feed_at(&mut self, bytes: &[u8], at: Instant) {
         if bytes.is_empty() {
             return;
         }
         self.last_at = at;
-        self.flush_sync(Instant::now());
+        self.flush_sync(at);
         if self.held_len == 0 {
             self.advance_whole_characters(bytes);
         } else {
@@ -252,32 +326,74 @@ impl VtScreen {
         let keep = incomplete_utf8_suffix(bytes);
         let (whole, tail) = bytes.split_at(bytes.len() - keep);
         if !whole.is_empty() {
-            self.with_tracker(|processor, tracker| processor.advance(tracker, whole));
+            self.parse(whole);
         }
         self.held[..keep].copy_from_slice(tail);
         self.held_len = keep;
     }
 
-    /// End a synchronized update (`CSI ? 2026 h`) the device began more than 150 ms
-    /// before `now` and never ended, applying what it buffered. Feeding does this on its
-    /// own; call it when no bytes arrive (the sink does, on idle) so a device that stops
-    /// mid-update does not freeze the screen. Returns whether an update was ended.
+    /// Parse `bytes`, which end on a character boundary, in pieces (see the module docs
+    /// and [`Stops`]):
+    ///
+    /// - A `b` that may end a repeat is parsed alone, with a screenful of characters
+    ///   allowed.
+    /// - After an `h` that may begin a synchronized update the parsing stops; if one did
+    ///   begin, for a snapshot of the screen as it is, the one shown while the update is
+    ///   open. The first time in these bytes only.
+    fn parse(&mut self, bytes: &[u8]) {
+        let mut start = 0;
+        let mut captured = false;
+        for stop in Stops::new(bytes) {
+            if bytes[stop] == b'b' {
+                self.advance(&bytes[start..stop], None);
+                let screenful = self.rows() * self.columns();
+                self.advance(&bytes[stop..=stop], Some(screenful));
+                start = stop + 1;
+            } else if !captured {
+                if self.advance(&bytes[start..=stop], None) {
+                    self.refresh();
+                    captured = true;
+                }
+                start = stop + 1;
+            }
+        }
+        self.advance(&bytes[start..], None);
+    }
+
+    /// Hand `bytes` to the parser, which may write `characters` characters at most, if
+    /// that is given. Returns whether the last thing they did was begin a synchronized
+    /// update.
+    fn advance(&mut self, bytes: &[u8], characters: Option<usize>) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        self.with_tracker(characters, |processor, tracker| {
+            processor.advance(tracker, bytes)
+        })
+    }
+
+    /// End a synchronized update (`CSI ? 2026 h`) that the device began [`SYNC_TIMEOUT`]
+    /// or more before `now` and never ended, so the screen shows what has arrived since.
+    /// Feeding does this on its own; call it when no bytes arrive (the sink does, on
+    /// idle) so a device that stops mid-update does not freeze the screen. Returns
+    /// whether an update was ended.
     pub fn flush_sync(&mut self, now: Instant) -> bool {
-        let expired = self
-            .processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| now >= deadline);
+        let expired = self.sync.is_some_and(|deadline| now >= deadline);
         if expired {
-            self.with_tracker(|processor, tracker| processor.stop_sync(tracker));
-            self.dirty = true;
+            self.end_sync();
         }
         expired
     }
 
     /// Run `f` with the parser and a tracker over this screen, stamping rows with the
-    /// time of the last chunk.
-    fn with_tracker(&mut self, f: impl FnOnce(&mut Processor, &mut Tracker<'_>)) {
+    /// time of the last chunk; the tracker takes `characters` characters, if that is
+    /// given, and drops any more. Returns whether the last mode `f` had the tracker set
+    /// began a synchronized update.
+    fn with_tracker(
+        &mut self,
+        characters: Option<usize>,
+        f: impl FnOnce(&mut Processor<NoHold>, &mut Tracker<'_>),
+    ) -> bool {
         let mut tracker = Tracker {
             term: &mut self.term,
             listener: &self.listener,
@@ -287,24 +403,28 @@ impl VtScreen {
                 at: self.last_at,
                 offset: self.offset,
             },
+            equal_from: None,
+            sync: &mut self.sync,
+            begun: false,
+            characters,
         };
         f(&mut self.processor, &mut tracker);
+        tracker.begun
     }
 
-    /// Whether a synchronized update is holding bytes back.
+    /// Whether a synchronized update is open, holding the view back.
     pub fn sync_pending(&self) -> bool {
-        self.processor.sync_timeout().sync_timeout().is_some()
+        self.sync.is_some()
     }
 
-    /// End a synchronized update now, timed out or not, applying what it buffered (the
-    /// link is gone, say). Returns whether one was open.
+    /// End a synchronized update now, timed out or not, so the screen shows what has
+    /// arrived (the link is gone, say). Returns whether one was open.
     pub fn end_sync(&mut self) -> bool {
-        if !self.sync_pending() {
-            return false;
+        let open = self.sync.take().is_some();
+        if open {
+            self.dirty = true;
         }
-        self.with_tracker(|processor, tracker| processor.stop_sync(tracker));
-        self.dirty = true;
-        true
+        open
     }
 
     /// Resize the screen to `columns` by `rows` (clamped as in [`new`](Self::new)).
@@ -312,12 +432,14 @@ impl VtScreen {
     /// Alacritty keeps the cursor row on screen: shrinking pushes rows off the top into
     /// the scrollback, and a narrower primary screen rewraps its rows. Growing adds blank
     /// rows at the bottom; rows are not pulled back out of the scrollback, whose lines
-    /// and ids never change.
+    /// and ids never change. A synchronized update left open ends: the snapshot it
+    /// holds is of the old size.
     pub fn resize(&mut self, columns: usize, rows: usize) {
         let size = clamp_size(columns, rows);
         if size.columns == self.columns() && size.rows == self.rows() {
             return;
         }
+        self.sync = None;
         self.term.resize(size);
         // Rows the resize pushed off the primary screen. On the alternate screen they
         // wait in the primary's history until it is back.
@@ -336,7 +458,7 @@ impl VtScreen {
     pub fn reset(&mut self) {
         self.processor = Processor::new();
         self.held_len = 0;
-        self.with_tracker(|_, tracker| tracker.reset_state());
+        self.with_tracker(None, |_, tracker| tracker.reset_state());
         self.dirty = true;
     }
 
@@ -364,15 +486,22 @@ impl VtScreen {
         responses
     }
 
-    /// The screen and scrollback now. Cheap when nothing changed (the same snapshot
-    /// again), and otherwise proportional to the rows that changed: rows Alacritty did
-    /// not damage are shared with the previous snapshot.
+    /// The screen and scrollback now, or as they were when the synchronized update that
+    /// is open began. Cheap when nothing changed (the same snapshot again), and otherwise
+    /// proportional to the rows that changed: rows Alacritty did not damage are shared
+    /// with the previous snapshot.
     pub fn snapshot(&mut self) -> VtSnapshot {
-        if !self.dirty
-            && let Some(last) = &self.last
+        if let Some(last) = &self.last
+            && (self.sync.is_some() || !self.dirty)
         {
             return last.clone();
         }
+        self.refresh()
+    }
+
+    /// The screen and scrollback now, open update or not, as the snapshot to hand out
+    /// from here on.
+    fn refresh(&mut self) -> VtSnapshot {
         self.dirty = false;
         let snapshot = self.build();
         if let Some(last) = &self.last
@@ -470,6 +599,154 @@ impl VtScreen {
             title,
             generation: self.generation,
             epoch: self.epoch,
+        }
+    }
+}
+
+const ESC: u8 = 0x1b;
+
+/// How many bytes [`Stops`] looks through at once.
+const BLOCK: usize = 32;
+
+/// The bytes of a chunk that may be the `b` ending a repeat (`CSI n b`) or the `h` ending
+/// the begin of a synchronized update (`CSI ? 2026 h`), by their offsets in order, going
+/// by the bytes before each in the chunk. It errs only towards yes: every such `b` and
+/// `h` is found, wherever the chunk begins and ends, and so are a few that are text or
+/// end some other sequence, which costs a call and changes nothing.
+///
+/// vte acts on a sequence when its final byte comes, and it reads that byte as the final
+/// one of a CSI sequence only in a state that ESC and then `[` put it in and that any
+/// byte from `@` to `~` takes it out of. From that:
+///
+/// - The byte before the final one ([`may_precede`]). A repeat has no intermediate bytes
+///   (blank to `/`) and no private marker (`<` to `?`), and the begin of an update has
+///   its `?` before a parameter. So that byte is the `[`, part of a parameter (a digit,
+///   `:` or `;`), or one vte passes over inside a sequence: a control character, DEL, or
+///   a byte above ASCII. Most of what a device sends has no such pair in it, and is
+///   passed over a block at a time in a loop that is all comparisons.
+/// - The bytes before that ([`may_end_csi`]): none from `@` to `~` back to a `[`, and
+///   from there none from blank to `~` back to an ESC. Where the chunk begins first, the
+///   answer is yes.
+/// - So a sequence whose ESC came in an earlier chunk ends by the second byte from `@`
+///   to `~` of this one. From there to this chunk's first ESC nothing is looked at, which
+///   for text with no ESC in it is nearly all of it.
+struct Stops<'a> {
+    bytes: &'a [u8],
+    /// The next byte to look at.
+    at: usize,
+    /// From `skip.start` nothing can be a stop before `skip.end`.
+    skip: Range<usize>,
+    /// Up to here the bytes are in a block that holds a pair, and are gone through one by
+    /// one.
+    slow: usize,
+}
+
+impl<'a> Stops<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        let finals = |&(_, byte): &(usize, &u8)| (b'@'..=b'~').contains(byte);
+        let second = bytes.iter().enumerate().filter(finals).nth(1);
+        let head = second.map_or(bytes.len(), |(at, _)| at + 1);
+        Self {
+            bytes,
+            at: 0,
+            skip: head..find_escape(bytes).unwrap_or(bytes.len()),
+            slow: 0,
+        }
+    }
+}
+
+impl Iterator for Stops<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let bytes = self.bytes;
+        while self.at < bytes.len() {
+            if self.skip.contains(&self.at) {
+                self.at = self.skip.end;
+                continue;
+            }
+            let at = self.at;
+            if at >= self.slow {
+                if let Some(before) = at.checked_sub(1)
+                    && let Some(before) = bytes[before..].first_chunk::<BLOCK>()
+                    && let Some(block) = bytes[at..].first_chunk::<BLOCK>()
+                {
+                    let mut any = 0;
+                    for i in 0..BLOCK {
+                        any |= may_stop(before[i], block[i]);
+                    }
+                    if any == 0 {
+                        self.at += BLOCK;
+                        continue;
+                    }
+                }
+                self.slow = at + BLOCK;
+            }
+            self.at += 1;
+            let alone = match at.checked_sub(1) {
+                Some(before) => may_stop(bytes[before], bytes[at]) != 0,
+                None => matches!(bytes[at], b'b' | b'h'),
+            };
+            if alone && may_end_csi(bytes, at) {
+                return Some(at);
+            }
+        }
+        None
+    }
+}
+
+/// The offset of the first ESC in `bytes`. Blocks with none are passed over in a loop
+/// that is all comparisons.
+fn find_escape(bytes: &[u8]) -> Option<usize> {
+    let (blocks, _) = bytes.as_chunks::<BLOCK>();
+    let mut offset = 0;
+    for block in blocks {
+        if block.iter().fold(false, |any, &byte| any | (byte == ESC)) {
+            break;
+        }
+        offset += BLOCK;
+    }
+    bytes[offset..]
+        .iter()
+        .position(|&byte| byte == ESC)
+        .map(|at| offset + at)
+}
+
+/// 1 when `byte` is a `b` or an `h` that, after `before`, may be a stop (see [`Stops`]),
+/// and 0 when not: a number, so that a block of them is one sum.
+#[inline(always)]
+fn may_stop(before: u8, byte: u8) -> u8 {
+    (u8::from(byte == b'b') | u8::from(byte == b'h')) & may_precede(before)
+}
+
+/// 1 when `byte` may come right before the final byte of a repeat or of the begin of a
+/// synchronized update: `[`, `0` to `;`, a control character, DEL, or above ASCII.
+#[inline(always)]
+fn may_precede(byte: u8) -> u8 {
+    u8::from(byte == b'[')
+        | u8::from((b'0'..=b';').contains(&byte))
+        | u8::from(!(0x20..0x7f).contains(&byte))
+}
+
+/// Whether the byte at `at` may be the final byte of a CSI sequence, going by the bytes
+/// before it: see [`Stops`].
+fn may_end_csi(bytes: &[u8], at: usize) -> bool {
+    let mut before = bytes[..at].iter().rev();
+    // Back to the `[`, and no other byte that would have ended the sequence.
+    loop {
+        match before.next() {
+            None => return true,
+            Some(b'[') => break,
+            Some(b'@'..=b'~') => return false,
+            Some(_) => {}
+        }
+    }
+    // From there back to the ESC, over what vte lets stand between the two.
+    loop {
+        match before.next() {
+            None | Some(&ESC) => return true,
+            Some(b' '..=b'~') => return false,
+            Some(_) => {}
         }
     }
 }
@@ -584,14 +861,56 @@ struct Tracker<'a> {
     term: &'a mut Term<Listener>,
     listener: &'a Listener,
     rows: Absorb<'a>,
+    /// Where the cursor is, when the cells from it to the end of its row are known to be
+    /// all equal and no part of a wide character: set by an insert-mode character
+    /// written without moving them, and forgotten on any other call. See the module docs.
+    equal_from: Option<Point>,
+    /// The screen's open synchronized update: when it times out.
+    sync: &'a mut Option<Instant>,
+    /// The last private mode set began a synchronized update. The bytes of a call end
+    /// with the sequence that sets it (see [`VtScreen::parse`]), so nothing came after.
+    begun: bool,
+    /// How many more characters to take in this call; the rest are dropped. A screenful
+    /// when the call parses the end of what may be a repeat, and `None`, for no limit,
+    /// otherwise. See the module docs.
+    characters: Option<usize>,
 }
 
 impl Tracker<'_> {
+    /// After every call but a character: whatever it did, the row may have changed.
     #[inline(always)]
     fn after(&mut self) {
+        self.equal_from = None;
+        self.absorb_scrolled();
+    }
+
+    #[inline(always)]
+    fn absorb_scrolled(&mut self) {
         if self.term.grid().history_size() != 0 {
             self.rows.absorb(self.term);
         }
+    }
+
+    /// Whether Alacritty's `input` would, for a character `width` cells wide, move the
+    /// cells from the cursor to the end of the row and leave the row as it was: insert
+    /// mode is on, the character goes on this row with room after it (otherwise `input`
+    /// wraps first or moves nothing), and those cells are all equal. Cells of a wide
+    /// character do not count as equal: writing over one changes its neighbour.
+    fn insert_moves_nothing(&self, width: usize) -> bool {
+        if !self.term.mode().contains(TermMode::INSERT) {
+            return false;
+        }
+        let grid = self.term.grid();
+        let point = grid.cursor.point;
+        if grid.cursor.input_needs_wrap || point.column.0 + width >= grid.columns() {
+            return false;
+        }
+        if self.equal_from == Some(point) {
+            return true;
+        }
+        let rest = &grid[point.line][point.column..];
+        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        !rest[0].flags.intersects(wide) && rest.windows(2).all(|pair| pair[0] == pair[1])
     }
 
     /// Whether the cell a zero-width character would join already holds
@@ -670,9 +989,6 @@ impl Handler for Tracker<'_> {
         set_mode(mode: Mode);
         unset_mode(mode: Mode);
         report_mode(mode: Mode);
-        set_private_mode(mode: PrivateMode);
-        unset_private_mode(mode: PrivateMode);
-        report_private_mode(mode: PrivateMode);
         set_scrolling_region(top: usize, bottom: Option<usize>);
         set_keypad_application_mode();
         unset_keypad_application_mode();
@@ -699,13 +1015,67 @@ impl Handler for Tracker<'_> {
         set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
     }
 
-    /// A character. A zero-width one joins a cell (see the module docs) unless that cell
-    /// is full, in which case it is dropped.
+    /// A character, unless this call has had its fill of them (a long repeat). A
+    /// zero-width one joins a cell unless that cell is full, in which case it is dropped.
+    /// In insert mode, one that would move a run of equal cells is written without the
+    /// move. See the module docs for all three.
     fn input(&mut self, c: char) {
-        if c.width() == Some(0) && self.zero_width_full() {
+        if let Some(left) = &mut self.characters {
+            if *left == 0 {
+                return;
+            }
+            *left -= 1;
+        }
+        let width = c.width();
+        if width == Some(0) && self.zero_width_full() {
             return;
         }
-        Handler::input(&mut *self.term, c);
+        if width.is_some_and(|width| width > 0 && self.insert_moves_nothing(width)) {
+            // Insert mode is all that makes `input` move the cells. Turning it off marks
+            // the whole screen damaged, which a screen in insert mode is anyway.
+            let insert = Mode::Named(NamedMode::Insert);
+            Handler::unset_mode(&mut *self.term, insert);
+            Handler::input(&mut *self.term, c);
+            Handler::set_mode(&mut *self.term, insert);
+            // The cells after the character were not touched. On the last column the
+            // cursor stays on the character instead, waiting to wrap.
+            let cursor = &self.term.grid().cursor;
+            self.equal_from = (!cursor.input_needs_wrap).then_some(cursor.point);
+        } else {
+            Handler::input(&mut *self.term, c);
+            self.equal_from = None;
+        }
+        self.absorb_scrolled();
+    }
+
+    /// `CSI ? Pm h`. Mode 2026 begins a synchronized update, unless one is open: a
+    /// second begin does not extend the first.
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        Handler::set_private_mode(&mut *self.term, mode);
+        self.after();
+        self.begun = mode == SYNC_UPDATE && self.sync.is_none();
+        if self.begun {
+            *self.sync = Some(self.rows.at + SYNC_TIMEOUT);
+        }
+    }
+
+    /// `CSI ? Pm l`. Mode 2026 ends the synchronized update.
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        Handler::unset_private_mode(&mut *self.term, mode);
+        self.after();
+        if mode == SYNC_UPDATE {
+            *self.sync = None;
+        }
+    }
+
+    /// `CSI ? Ps $ p`. Alacritty reports mode 2026 as reset, since with vte holding the
+    /// bytes it never saw the question inside an update. Here it can.
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        if mode == SYNC_UPDATE && self.sync.is_some() {
+            self.listener.0.lock().respond(b"\x1b[?2026;1$y");
+        } else {
+            Handler::report_private_mode(&mut *self.term, mode);
+        }
         self.after();
     }
 
@@ -733,8 +1103,206 @@ impl Handler for Tracker<'_> {
     fn reset_state(&mut self) {
         Handler::reset_state(&mut *self.term);
         self.after();
+        *self.sync = None;
         self.rows.scrollback.clear();
         // Alacritty clears its title on a full reset without telling its listener.
         self.listener.0.lock().reset_title();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::event::VoidListener;
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One thing a device sends.
+    #[derive(Clone, Debug)]
+    enum Sent {
+        Text(String),
+        /// `CSI n b`: repeat the last character.
+        Repeat(u16),
+        InsertMode(bool),
+        Wrap(bool),
+        Goto(u8, u8),
+        Control(u8),
+        Color(u8),
+        /// `CSI n` and this final byte: erase in line, and insert, delete or erase cells.
+        Edit(u8, u8),
+        ReverseIndex,
+    }
+
+    impl Sent {
+        fn write(&self, out: &mut Vec<u8>, screenful: usize) {
+            match self {
+                Sent::Text(text) => out.extend_from_slice(text.as_bytes()),
+                // No more than the screen caps it at, which Alacritty does not.
+                Sent::Repeat(n) => {
+                    let n = usize::from(*n).min(screenful);
+                    out.extend_from_slice(format!("\x1b[{n}b").as_bytes())
+                }
+                Sent::InsertMode(on) => {
+                    out.extend_from_slice(if *on { b"\x1b[4h" } else { b"\x1b[4l" })
+                }
+                Sent::Wrap(on) => {
+                    out.extend_from_slice(if *on { b"\x1b[?7h" } else { b"\x1b[?7l" })
+                }
+                Sent::Goto(row, column) => {
+                    out.extend_from_slice(format!("\x1b[{row};{column}H").as_bytes())
+                }
+                Sent::Control(byte) => out.push(*byte),
+                Sent::Color(n) => out.extend_from_slice(format!("\x1b[{n}m").as_bytes()),
+                Sent::Edit(n, last) => {
+                    out.extend_from_slice(format!("\x1b[{n}{}", char::from(*last)).as_bytes())
+                }
+                Sent::ReverseIndex => out.extend_from_slice(b"\x1bM"),
+            }
+        }
+    }
+
+    fn sent() -> impl Strategy<Value = Sent> {
+        prop_oneof![
+            // Narrow and wide characters, and blanks. No combining marks: the screen
+            // caps them and Alacritty does not.
+            4 => "[ab \u{65e5}]{1,6}".prop_map(Sent::Text),
+            4 => (0u16..40).prop_map(Sent::Repeat),
+            3 => any::<bool>().prop_map(Sent::InsertMode),
+            1 => any::<bool>().prop_map(Sent::Wrap),
+            3 => (1u8..6, 1u8..12).prop_map(|(row, column)| Sent::Goto(row, column)),
+            2 => prop_oneof![Just(b'\r'), Just(b'\n'), Just(0x08u8), Just(b'\t')]
+                .prop_map(Sent::Control),
+            2 => prop_oneof![Just(0u8), Just(7), Just(31), Just(44)].prop_map(Sent::Color),
+            2 => (0u8..4, prop_oneof![Just(b'K'), Just(b'@'), Just(b'P'), Just(b'X')])
+                .prop_map(|(n, last)| Sent::Edit(n, last)),
+            1 => Just(Sent::ReverseIndex),
+        ]
+    }
+
+    /// Notes where vte acts on a repeat or on the begin of a synchronized update, by
+    /// stopping the parser there.
+    #[derive(Default)]
+    struct Finder {
+        found: bool,
+    }
+
+    impl alacritty_terminal::vte::Perform for Finder {
+        fn csi_dispatch(
+            &mut self,
+            params: &alacritty_terminal::vte::Params,
+            intermediates: &[u8],
+            ignore: bool,
+            action: char,
+        ) {
+            // As vte's `ansi` module reads them.
+            self.found |= !ignore
+                && match (action, intermediates) {
+                    ('b', []) => true,
+                    ('h', [b'?']) => params.iter().any(|param| param[0] == 2026),
+                    _ => false,
+                };
+        }
+
+        fn terminated(&self) -> bool {
+            self.found
+        }
+    }
+
+    /// The offsets in `stream` of the final bytes of the repeats and update begins vte
+    /// finds in it.
+    fn stops_vte_acts_on(stream: &[u8]) -> Vec<usize> {
+        let mut parser = alacritty_terminal::vte::Parser::new();
+        let mut stops = Vec::new();
+        let mut at = 0;
+        while at < stream.len() {
+            let mut finder = Finder::default();
+            at += parser.advance_until_terminated(&mut finder, &stream[at..]);
+            if finder.found {
+                stops.push(at - 1);
+            }
+        }
+        stops
+    }
+
+    /// Bytes that sequences are made of, with the ones that matter here made likely.
+    fn sequence_soup() -> impl Strategy<Value = Vec<u8>> {
+        let byte = prop_oneof![
+            6 => Just(ESC),
+            6 => Just(b'['),
+            6 => Just(b'b'),
+            3 => Just(b'h'),
+            2 => Just(b'?'),
+            8 => prop_oneof![Just(b'2'), Just(b'0'), Just(b'6'), Just(b'9'), Just(b';'), Just(b':')],
+            // Intermediates, private markers, controls (CAN and SUB among them), DEL,
+            // bytes above ASCII, other final bytes, and what begins a string.
+            8 => prop::sample::select(
+                &b" !/<>=\n\r\t\x18\x1a\x7f\x80\x9b\xc3\xa9\xf0\x9fmlHa@~]PX^_\\\x07"[..]
+            ),
+        ];
+        proptest::collection::vec(byte, 0..120)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// However a stream is cut into chunks, `Stops` finds every repeat and every begin
+        /// of a synchronized update that vte acts on.
+        #[test]
+        fn stops_are_where_vte_acts(
+            stream in sequence_soup(),
+            chunk in 1usize..90,
+            lead in 0usize..90,
+        ) {
+            let wanted = stops_vte_acts_on(&stream);
+            let mut found = Vec::new();
+            // A first chunk of another length, so that cuts fall everywhere.
+            let (first, rest) = stream.split_at(lead.min(stream.len()));
+            let mut offset = 0;
+            for piece in std::iter::once(first).chain(rest.chunks(chunk)) {
+                found.extend(Stops::new(piece).map(|stop| offset + stop));
+                offset += piece.len();
+            }
+            for stop in &wanted {
+                prop_assert!(found.contains(stop), "missed {} in {:x?}", stop, stream);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Insert mode without Alacritty's move of equal cells leaves every cell, the
+        /// cursor and the modes as Alacritty alone leaves them.
+        #[test]
+        fn insert_mode_matches_alacritty(
+            columns in 2usize..10,
+            rows in 1usize..5,
+            stream in proptest::collection::vec(sent(), 1..40),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut bytes = Vec::new();
+            for sent in &stream {
+                sent.write(&mut bytes, columns * rows);
+            }
+
+            // The screen in two chunks: what it remembers about a row does not outlive one.
+            let cut = cut.index(bytes.len() + 1);
+            let mut screen = VtScreen::new(columns, rows, 100);
+            screen.feed(&bytes[..cut]);
+            screen.feed(&bytes[cut..]);
+
+            let mut alacritty = Term::new(Config::default(), &Size { columns, rows }, VoidListener);
+            Processor::<NoHold>::new()
+                .advance(&mut alacritty, &bytes);
+
+            let (ours, theirs) = (screen.term.grid(), alacritty.grid());
+            for row in 0..rows {
+                let line = Line(row as i32);
+                prop_assert_eq!(&ours[line][..], &theirs[line][..], "row {}", row);
+            }
+            prop_assert_eq!(ours.cursor.point, theirs.cursor.point);
+            prop_assert_eq!(ours.cursor.input_needs_wrap, theirs.cursor.input_needs_wrap);
+            prop_assert_eq!(screen.term.mode(), alacritty.mode());
+        }
     }
 }
