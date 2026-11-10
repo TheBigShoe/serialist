@@ -34,8 +34,8 @@ use std::time::Duration;
 use serialist_core::store::DEFAULT_TIMESTAMP_FORMAT;
 use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
 use serialist_vt::{
-    CursorState, MouseAction, MouseButton as VtMouseButton, MouseEvent as VtMouseEvent,
-    MouseReporting,
+    CursorState, DefaultColors, MouseAction, MouseButton as VtMouseButton,
+    MouseEvent as VtMouseEvent, MouseReporting,
 };
 
 use crate::actions::{
@@ -103,6 +103,8 @@ pub struct ScreenState {
     pub first_visible: LineId,
     /// The mouse reports the device asked for, if any.
     pub mouse: Option<MouseReporting>,
+    /// The default colors the device set instead of the theme's.
+    pub colors: DefaultColors,
 }
 
 impl Default for ScreenState {
@@ -113,6 +115,7 @@ impl Default for ScreenState {
             cursor: None,
             first_visible: LineId::ZERO,
             mouse: None,
+            colors: DefaultColors::default(),
         }
     }
 }
@@ -186,6 +189,8 @@ pub struct TerminalView {
     /// `display.timestamp_format` as last seen, to notice a change to it alone.
     timestamp_format: String,
     palette: Rc<TerminalPalette>,
+    /// `palette` with the default colors a screen's device set, while it set any.
+    screen_palette: Option<Rc<TerminalPalette>>,
     font: TerminalFont,
     /// Bumped whenever what the element draws from changes wholesale, dropping its
     /// caches.
@@ -282,6 +287,7 @@ impl TerminalView {
             timestamps: TimestampMode::Off,
             timestamp_format,
             palette: Rc::new(palette),
+            screen_palette: None,
             font,
             generation: 1,
             clock,
@@ -449,8 +455,27 @@ impl TerminalView {
     /// when it equals the current one.
     pub fn set_palette(&mut self, palette: TerminalPalette, cx: &mut Context<Self>) {
         self.palette = Rc::new(palette);
+        self.sync_screen_palette();
         self.generation += 1;
         cx.notify();
+    }
+
+    /// Rebuild [`Self::drawn_palette`]'s screen palette from the theme's and the
+    /// screen's default colors.
+    fn sync_screen_palette(&mut self) {
+        let colors = self.screen.as_ref().map(|screen| screen.state.colors);
+        self.screen_palette = colors
+            .filter(|colors| *colors != DefaultColors::default())
+            .map(|colors| Rc::new(self.palette.with_screen_colors(colors)));
+    }
+
+    /// The palette the terminal draws in: the theme's, with the default colors of a
+    /// screen's device when it set any and the screen is on display.
+    pub fn drawn_palette(&self) -> &Rc<TerminalPalette> {
+        match &self.screen_palette {
+            Some(palette) if self.display == DisplayMode::Text => palette,
+            _ => &self.palette,
+        }
     }
 
     /// The font the terminal draws with.
@@ -544,6 +569,10 @@ impl TerminalView {
         if self.screen.is_none() {
             self.log = None;
         }
+        if self.screen_palette.is_some() {
+            self.screen_palette = None;
+            self.generation += 1;
+        }
         self.sync_blink(cx);
         cx.notify();
     }
@@ -557,7 +586,13 @@ impl TerminalView {
             if state.mouse.is_none() {
                 self.mouse = MouseReports::default();
             }
+            let recolored = screen.state.colors != state.colors;
             screen.state = state;
+            if recolored {
+                // Shaped lines carry their colors.
+                self.sync_screen_palette();
+                self.generation += 1;
+            }
             self.sync_blink(cx);
             cx.notify();
         }
@@ -1469,7 +1504,7 @@ impl Render for TerminalView {
             scroll: self.scroll.clone(),
             cache: self.cache.clone(),
             stats: self.stats.clone(),
-            palette: self.palette.clone(),
+            palette: self.drawn_palette().clone(),
             generation: self.generation,
             font: self.font.font.clone(),
             font_size: self.font.size,

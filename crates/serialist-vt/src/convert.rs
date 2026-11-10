@@ -29,6 +29,7 @@ use std::time::Instant;
 
 use alacritty_terminal::grid::Row;
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor};
 use serialist_core::{Color, Direction, LineId, Style, StyleFlags, StyleRun, StyledLine};
 use unicode_width::UnicodeWidthChar;
@@ -47,8 +48,9 @@ pub(crate) struct Stamp {
     pub complete: bool,
 }
 
-/// The text and runs of `row`. See the module docs for the rules.
-pub(crate) fn row_content(row: &Row<Cell>) -> (String, Vec<StyleRun>) {
+/// The text and runs of `row`, its palette colors as `colors` has them (see [`color`]).
+/// See the module docs for the rules.
+pub(crate) fn row_content(row: &Row<Cell>, colors: &Colors) -> (String, Vec<StyleRun>) {
     let cells = &row[..];
     let end = cells
         .iter()
@@ -84,7 +86,7 @@ pub(crate) fn row_content(row: &Row<Cell>) -> (String, Vec<StyleRun>) {
             }
         }
         let len = text.len() - start;
-        let style = style_of(cell);
+        let style = style_of(cell, colors);
         match runs.last_mut() {
             Some(run) if run.style == style => run.len += len,
             _ => runs.push(StyleRun { len, style }),
@@ -102,9 +104,9 @@ pub fn cell_width(c: char) -> usize {
     c.width().unwrap_or(1)
 }
 
-/// `row` as a received line with id `id`.
-pub(crate) fn build_line(row: &Row<Cell>, id: LineId, stamp: Stamp) -> StyledLine {
-    let (text, runs) = row_content(row);
+/// `row` as a received line with id `id`, in the palette `colors`.
+pub(crate) fn build_line(row: &Row<Cell>, id: LineId, stamp: Stamp, colors: &Colors) -> StyledLine {
+    let (text, runs) = row_content(row, colors);
     StyledLine {
         id,
         text,
@@ -133,7 +135,7 @@ fn printable(c: char) -> char {
     if c.is_control() { ' ' } else { c }
 }
 
-fn style_of(cell: &Cell) -> Style {
+fn style_of(cell: &Cell, colors: &Colors) -> Style {
     let f = cell.flags;
     let mut flags = StyleFlags::NONE;
     for (from, to) in [
@@ -153,8 +155,8 @@ fn style_of(cell: &Cell) -> Style {
         flags.insert(StyleFlags::UNDERLINE);
     }
     Style {
-        fg: color(cell.fg),
-        bg: color(cell.bg),
+        fg: color(cell.fg, colors),
+        bg: color(cell.bg, colors),
         flags,
     }
 }
@@ -167,20 +169,29 @@ fn style_of(cell: &Cell) -> Style {
 /// [`Color::Default`]; the element picks the foreground or background default by where
 /// the color is used. Alacritty only produces the dim named colors when rendering, never
 /// in a cell, but they map to their normal color for completeness.
-pub(crate) fn color(color: VtColor) -> Color {
-    match color {
-        VtColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
-        VtColor::Indexed(n) if n < 16 => Color::Ansi(n),
-        VtColor::Indexed(n) => Color::Indexed(n),
+///
+/// A palette entry the device set (OSC 4, in `colors`) is that color, as
+/// [`Color::Rgb`]: the theme's no longer applies to it. The defaults the device set
+/// (OSC 10, 11 and 12) stay [`Color::Default`]; the snapshot carries them for the
+/// element, which also paints the screen's background with them.
+pub(crate) fn color(color: VtColor, colors: &Colors) -> Color {
+    let slot = match color {
+        VtColor::Spec(rgb) => return Color::Rgb(rgb.r, rgb.g, rgb.b),
+        VtColor::Indexed(n) => n,
         VtColor::Named(named) => {
             let n = named as usize;
             let dim_black = NamedColor::DimBlack as usize;
             match n {
-                0..=15 => Color::Ansi(n as u8),
-                _ if (dim_black..dim_black + 8).contains(&n) => Color::Ansi((n - dim_black) as u8),
-                _ => Color::Default,
+                0..=15 => n as u8,
+                _ if (dim_black..dim_black + 8).contains(&n) => (n - dim_black) as u8,
+                _ => return Color::Default,
             }
         }
+    };
+    match colors[slot as usize] {
+        Some(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
+        None if slot < 16 => Color::Ansi(slot),
+        None => Color::Indexed(slot),
     }
 }
 
@@ -189,6 +200,32 @@ mod tests {
     use alacritty_terminal::vte::ansi::Rgb;
 
     use super::*;
+
+    /// In the theme's palette: nothing set by the device.
+    fn row_content(row: &Row<Cell>) -> (String, Vec<StyleRun>) {
+        super::row_content(row, &Colors::default())
+    }
+
+    fn color(c: VtColor) -> Color {
+        super::color(c, &Colors::default())
+    }
+
+    #[test]
+    fn colors_the_device_set_are_rgb() {
+        let mut colors = Colors::default();
+        colors[1] = Some(Rgb { r: 1, g: 2, b: 3 });
+        colors[200] = Some(Rgb { r: 4, g: 5, b: 6 });
+        colors[NamedColor::Foreground as usize] = Some(Rgb { r: 7, g: 8, b: 9 });
+        let set = |c| super::color(c, &colors);
+        assert_eq!(set(VtColor::Named(NamedColor::Red)), Color::Rgb(1, 2, 3));
+        assert_eq!(set(VtColor::Indexed(1)), Color::Rgb(1, 2, 3));
+        assert_eq!(set(VtColor::Named(NamedColor::DimRed)), Color::Rgb(1, 2, 3));
+        assert_eq!(set(VtColor::Indexed(200)), Color::Rgb(4, 5, 6));
+        assert_eq!(set(VtColor::Indexed(2)), Color::Ansi(2), "not set");
+        assert_eq!(set(VtColor::Indexed(201)), Color::Indexed(201));
+        // The defaults stay defaults: the element applies them.
+        assert_eq!(set(VtColor::Named(NamedColor::Foreground)), Color::Default);
+    }
 
     fn row(cells: Vec<Cell>) -> Row<Cell> {
         let occ = cells.len();

@@ -1664,6 +1664,7 @@ impl SessionView {
             cursor: snapshot.cursor().filter(|cursor| cursor.visible),
             first_visible: snapshot.first_visible(),
             mouse: snapshot.modes().mouse,
+            colors: snapshot.default_colors(),
         })
     }
 
