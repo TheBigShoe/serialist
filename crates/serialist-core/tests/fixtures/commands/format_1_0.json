@@ -1,0 +1,73 @@
+// A collection in the 1.0 format that uses every key, every payload form, every escape,
+// both placeholder forms, every param kind and both `expect` forms. Every 1.x build must
+// read it, without warnings, as `tests/command_collections.rs` says it means.
+{
+  "name": "Format 1.0",
+  "groups": [
+    {
+      "name": "Text",
+      "commands": [
+        {
+          "name": "Every escape",
+          "description": "The text escapes and a text placeholder",
+          "payload": { "text": "A\\r\\n\\t\\0\\\\\\{\\}\\x7F {{who}}" },
+          "eol": "none",
+          "expect": { "pattern": "^OK|^ERROR", "timeout_ms": 250 },
+          "keybinding": "ctrl-alt-1",
+          "params": [
+            { "name": "who", "label": "Who", "default": "world", "kind": "text" }
+          ]
+        },
+        {
+          "name": "Numbers in text",
+          "payload": { "text": "AT+N={{n}},{{id}}" },
+          "eol": "cr",
+          "params": [
+            { "name": "n", "default": 42, "kind": "int" },
+            { "name": "id", "default": "0x0f15", "kind": "hex16" }
+          ]
+        },
+        {
+          "name": "Session ending",
+          "payload": { "text": "AT" },
+          "expect": { "pattern": "^OK" }
+        }
+      ]
+    },
+    {
+      "name": "Binary",
+      "commands": [
+        {
+          "name": "Hex",
+          "payload": { "hex": "0x05, 5A {{id}} {{id:le}} {{id:be}} {{n}} {{raw}}" },
+          "eol": "lf",
+          "params": [
+            { "name": "id", "default": "0F15", "kind": "hex16" },
+            { "name": "n", "default": "7", "kind": "int" },
+            { "name": "raw", "default": "AA BB" }
+          ]
+        },
+        {
+          "name": "Codec",
+          "payload": { "codec": "airoha-race", "fields": { "command": "race_version", "cmd_id": "{{id}}" } },
+          "expect": { "frame": { "kind": "response", "cmd_id": "0x0F15" }, "timeout_ms": 500 },
+          "params": [ { "name": "id", "default": "0x0F15", "kind": "hex16" } ]
+        },
+        {
+          "name": "Both expects",
+          "payload": { "codec": "airoha-race" },
+          "expect": { "pattern": "^RACE", "frame": { "kind": "response" }, "timeout_ms": 1000 }
+        },
+        {
+          "name": "Script",
+          "payload": { "script": "probe.lua" },
+          "keybinding": "cmd-shift-9"
+        }
+      ]
+    },
+    {
+      "name": "Empty",
+      "commands": []
+    }
+  ]
+}
