@@ -508,7 +508,8 @@ pub fn load_settings_from_layers(layers: &[SettingsLayer]) -> Result<Settings, S
         }
         .apply(&mut merged, value);
         // Keys are visited in sorted order; report them in the order the file has them.
-        warnings[first..].sort_by_key(|warning| (warning.line, warning.column));    }
+        warnings[first..].sort_by_key(|warning| (warning.line, warning.column));
+    }
     let mut settings: Settings =
         serde_json::from_value(merged).map_err(|err| SettingsError::Merged(err.to_string()))?;
     settings.warnings = warnings;
