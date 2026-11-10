@@ -161,10 +161,15 @@ the MSVC linker. It does nothing on other targets.
   tarball and `.deb` link the host's shared libraries: the `.deb` depends on what
   `dpkg-shlibdeps` finds plus `libvulkan1` (loaded at run time); a tarball user installs the
   libraries named in the README.
-- **Linux window icon.** Wayland compositors match a window to `serialist.desktop` by its
-  app id, and the app does not set one yet. Setting `app_id: Some("serialist".into())` in the
-  main window's options would make the taskbar icon show. The `.desktop` file already has
-  `StartupWMClass=serialist`.
+- **Linux window icon, untried on a desktop.** A desktop finds a window's icon and name
+  through its `.desktop` entry: on Wayland it matches the window's app id against the
+  entry's file name (`serialist` for `serialist.desktop`), on X11 the window's `WM_CLASS`
+  against `StartupWMClass`. GPUI sends the main window's `app_id` as the Wayland app id
+  and writes it as both halves of `WM_CLASS` on X11, so the app id is `serialist`
+  (`open_main_window` in `crates/serialist-ui/src/workspace.rs`), the file installed by the
+  `.deb` and the tarball is `serialist.desktop`, and the entry says
+  `StartupWMClass=serialist`. Keep the three equal. Nobody has yet looked at the taskbar
+  of a GNOME or KDE session, on Wayland or X11, with an installed package.
 - **No version resource on Windows.** `serialist.exe` has an icon but no VERSIONINFO, so
   Explorer's Details tab is empty.
 - **Windows on ARM and Linux arm64** are not built.
