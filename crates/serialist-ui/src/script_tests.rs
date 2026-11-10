@@ -156,6 +156,52 @@ fn press(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
 }
 
 #[gpui_test]
+fn a_script_encodes_with_a_plugin_and_sees_the_session_s_frames(cx: &mut TestAppContext) {
+    let dir = config_dir(
+        "script-frames",
+        &[(
+            "race.lua",
+            r#"
+            local port = serial.current()
+            local got, timer_ran = nil, false
+            local h <close> = port:on_frame({ kind = "response", cmd_id = 0x0F15 }, function(f)
+              got = f
+            end)
+            local t <close> = timer.after(10, function() timer_ran = true end)
+            port:write(codecs["airoha-race"].encode{ cmd_id = 0x0F15 })
+            for _ = 1, 300 do
+              if got and timer_ran then break end
+              sleep(10)
+            end
+            print(got and string.format("%s 0x%04X", got.kind, got.fields.cmd_id), timer_ran)
+            "#,
+        )],
+    );
+    let paths = ConfigPaths::new(dir.path());
+    let example = serialist_plugins::EXAMPLE_PLUGINS
+        .iter()
+        .find(|example| example.name == "airoha-race")
+        .unwrap();
+    paths.install_example_plugin(example).unwrap();
+    write(
+        &paths.settings,
+        r#"{ "devices": [ { "match": { "path": "virtual:race" }, "plugin": "airoha-race" } ] }"#,
+    );
+    let (world, _) = world();
+    let (window, workspace, _view) = open(cx, &world, &dir, "virtual:race", false);
+    assert!(run_path(cx, window, &workspace, "race.lua"));
+    run_until(cx, "race.lua ends", |cx| {
+        has_line(cx, &workspace, "\u{2713} race.lua")
+            || has_line(cx, &workspace, "\u{2717} race.lua")
+    });
+    let texts = texts(cx, &workspace);
+    assert!(
+        texts.iter().any(|text| text == "response 0x0F15\ttrue"),
+        "{texts:#?}"
+    );
+}
+
+#[gpui_test]
 fn version_probe_runs_from_the_console_against_the_at_modem(cx: &mut TestAppContext) {
     let dir = config_dir("script-probe", &[]);
     let (world, _) = world();

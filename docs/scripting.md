@@ -90,6 +90,7 @@ days).
 | `port:read_line(opts)` | `{timeout_ms}` | next received line (text only), or `nil, "timeout" \| "closed"` | yes |
 | `port:expect(pattern, opts)` | regex (Rust syntax, smart case), `{timeout_ms}` | `captures, elapsed_ms` (`captures[1]` the match, `[2..]` groups, `false` for a group that did not take part, `.line` the whole line), or `nil, elapsed_ms, "timeout" \| "closed"` | yes |
 | `port:on_line(fn)` | `fn(line)` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs for each later line, may wait |
+| `port:on_frame(filter, fn)` | optional `filter` (`{ kind = ..., <field> = ... }`), `fn(frame)` | handle with `cancel()`, `active()`, and `<close>` support; error if the session decodes nothing | no; `fn` runs for each later decoded frame `filter` matches, may wait |
 | `port:discard()` | | nothing: skips everything unread | no |
 | `port:set{dtr=, rts=, baud=}` | booleans, positive integer | nothing | no (queued) |
 | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
@@ -143,9 +144,39 @@ local keepalive <close> = timer.every(500, function() port:write("AT\r\n") end)
 local ready = port:expect("^READY$", { timeout_ms = 10000 })
 ```
 
-**Ending.** A run ends when its main chunk returns; `on_line` handlers and timers still
-active then are cancelled. An error in an `on_line` or timer callback ends the run with
-that error.
+**Frames.** `port:on_frame(fn)` calls `fn(frame)` for each frame the session's codec
+decodes from the call on, and `port:on_frame(filter, fn)` for those `filter` matches,
+read the way a saved command's frame predicate is: `kind` names the frame's kind and
+every other key a field with an equal value, an integer field matching a number or hex
+text (`cmd_id = 0x0F15` or `"0x0F15"`), a bytes field hex text or a table of byte
+values. `frame` is a table: `kind`, `severity` (`"info"`, `"warning"` or `"error"`),
+`summary`, `fields` (by name; integers as integers, bytes as byte strings, lists as
+tables) and `bytes`, the frame's bytes from the scrollback (`nil` once they have been
+evicted). Handlers run like `on_line` callbacks and timers, one call at a time, and an
+error in one ends the run. Nothing is queued: frames wait in the session's frame store,
+which keeps the newest 100 000 within 64 MiB, so a handler that falls further behind
+than that skips the frames evicted meanwhile. A handler counts toward the run's 1024
+timers and frame handlers. In the window a tab's session decodes with the codec its
+toolbar or device profile picks; a handler made before a codec is picked starts
+receiving frames when one is, and a frame a codec could not be made for arrives as kind
+`codec_error`. A session that decodes nothing at all (headless without a profile
+`plugin`, or a port from `serial.open`) raises an error instead.
+
+```lua
+local port = serial.current()
+local race = assert(codecs["airoha-race"])
+local reply
+local h <close> = port:on_frame({ kind = "response", cmd_id = 0x0F15 }, function(frame)
+  reply = frame
+end)
+port:write(race.encode{ cmd_id = 0x0F15 })
+for _ = 1, 100 do if reply then break end sleep(10) end
+log.info("version", reply and reply.fields.payload:sub(2))
+```
+
+**Ending.** A run ends when its main chunk returns; `on_line` and `on_frame` handlers
+and timers still active then are cancelled. An error in any of their callbacks ends the
+run with that error.
 
 In the table, `ScriptEvent::Output` is one line of script output (a line in the Script
 console, or on stdout when headless), `ScriptEvent::Prompt` is a prompt asking for an
@@ -187,8 +218,8 @@ reloaded meanwhile is used from its next call, and one that panics is made again
 `ui.notify(text)` prints `notice: <text>` in the Script console and shows a notice; headless
 it goes to stderr as `notice: <text>`.
 
-The plan (`docs/plan.md`) lists `port:on_frame` in the scripting API. The table above
-does not have it.
+Everything the plan (`docs/plan.md`) lists for the scripting API is in the table above:
+`port:on_frame`, timers and `codecs.<name>.encode` included.
 
 ## Sandbox and limits
 
@@ -204,9 +235,9 @@ does not have it.
   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
   run, but every later wait fails the same way and the executor drops the script at
   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-- Waiting calls work in the main body, required modules, `on_line` and timer callbacks, not
-  inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
-  (they fail with a message saying so).
+- Waiting calls work in the main body, required modules, and `on_line`, `on_frame` and
+  timer callbacks, not inside coroutines the script creates with `coroutine.create` or
+  `coroutine.wrap` (they fail with a message saying so).
 
 ## Headless runs with `--script`
 
@@ -240,6 +271,10 @@ How the API behaves without the app around it:
 - `commands.send` raises an error (no saved commands).
 - `codecs.<name>` sees the plugins installed in the config directory's `plugins/`, read
   once when the run starts; a plugin that does not load is reported on stderr.
+- The port decodes with the plugin its device profile names (`plugin`), so
+  `port:on_frame` works on it; without one, or with a plugin that is not installed (a
+  warning on stderr), `port:on_frame` raises an error. Ports from `serial.open` never
+  decode.
 - `require` and `dofile` read from the script file's own folder.
 
 ### Exit codes
@@ -247,5 +282,5 @@ How the API behaves without the app around it:
 | Code | Meaning |
 |---|---|
 | 0 | The script's main chunk returned. (`--help` and `--version` also exit 0.) |
-| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line` or timer callback, or the port could not be opened. |
+| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line`, `on_frame` or timer callback, or the port could not be opened. |
 | 2 | The script was stopped, or nothing ran: a bad flag, `--script` without `--port` or with more than one, a script file that cannot be read, or a `--virtual` device that does not exist. |
