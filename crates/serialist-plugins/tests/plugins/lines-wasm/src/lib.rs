@@ -11,6 +11,8 @@
 //! | `badtype` | gives field `n` as a string although it is declared `uint` |
 //! | `missing` | leaves out the required field `n` |
 //! | `outside` | reports a frame beyond the input |
+//! | `rewind` | reports its frame from offset 0, over the lines before it |
+//! | `nope` | gives the frame a kind `describe` does not list |
 //! | `warn` | marks the frame a warning |
 //! | `chatty` | writes 100 log lines |
 //! | `list` | adds a nested list field |
@@ -92,6 +94,8 @@ impl Plugin for Lines {
                     black_box(deep(u64::MAX));
                 }
                 "outside" => frame.offset = input.len() + 5,
+                "rewind" => frame.offset = 0,
+                "nope" => frame.kind = "nope".into(),
                 "warn" => frame = frame.with_severity(Severity::Warning),
                 "chatty" => {
                     for k in 0..100 {
