@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+# Not publishable as it stands: it reads its WIT files from ../serialist-plugins/wit/v1,
+# outside this directory, so they would have to be copied into this crate first.
+publish = false
 
 [features]
 default = []
