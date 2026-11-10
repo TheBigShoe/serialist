@@ -159,7 +159,7 @@ return M
 
 | Key | Required | Meaning |
 |---|---|---|
-| `kind` | yes | A string, normally one of the kinds `describe` lists. |
+| `kind` | yes | One of the kinds `describe` lists. A frame of any other kind becomes a `plugin_error` frame over its bytes. |
 | `pos`, `len` | yes | Where the frame sits in `bytes`: `pos` is 1-based, like `string.sub`, and `len` is a byte count. They must lie inside `bytes`. |
 | `severity` | no | `"info"` (the default), `"warning"` or `"error"`. |
 | `summary` | no | A one-line description for a list or the terminal. |
@@ -170,6 +170,9 @@ return M
   `uint`, a sequence is a `list`. Fields the kind does not declare follow, sorted by name,
   with their types inferred (string `str`, integer `int`, float `float`, boolean `bool`,
   sequence `list`). Lists nest at most 32 deep.
+- **Order.** Frames come in stream order and do not overlap. A frame that starts before
+  the previous one ends is dropped with every frame after it in the call, and one
+  `plugin_error` frame over all of the call's bytes goes ahead of the frames before it.
 - **Held-back bytes.** The second result of `decode` is a suffix of `bytes` (or `nil`) that
   the host prepends to the next chunk, so your plugin sees one contiguous stream and never
   needs to know where chunks were cut. It must be a suffix of what you were given and at
@@ -193,8 +196,9 @@ return M
   runs out of memory or spends its budget does not stall ingest: the bytes it was given
   become one `plugin_error` frame (severity `error`, its `error` field holds the message)
   and the plugin starts over with a fresh `state` and nothing held back. A frame whose
-  `fields` are wrong becomes a `plugin_error` frame for just its own bytes; a frame outside
-  `bytes`, or a result that is not a list of tables, fails the whole call.
+  `fields` are wrong, or whose kind `describe` does not list, becomes a `plugin_error` frame
+  for just its own bytes; a frame outside `bytes`, or a result that is not a list of tables,
+  fails the whole call.
 - **Refused at load.** A `plugin.lua` that does not return a table with `describe`,
   `decode` and `encode` functions, or whose `describe` result is not valid.
 - **Reloading.** `LuaCodec::reload` loads the file again into a fresh VM and starts decoding
@@ -246,8 +250,11 @@ import log: func(level: log-level, message: string);
 `decode` gets whatever it held back last time followed by the new chunk, as the Lua tier
 does, so a plugin never needs to know where chunks were cut. Each frame names its bytes by
 offset and length in that input, and `held` says how many trailing bytes to present again
-next time. Frame fields are typed (`bool`, `int`, `uint`, `float`, `str`, `bytes`, `list`);
-declared fields come out in declared order and must have their declared type (an integer
+next time. As in the Lua tier, a frame of a kind `describe` does not list becomes a
+`plugin_error` frame over its bytes. A frame that starts before the previous one ends is
+dropped with every frame after it in the call, and one `plugin_error` frame over all of
+the call's bytes goes ahead of the frames before it. Frame fields are typed (`bool`,
+`int`, `uint`, `float`, `str`, `bytes`, `list`); declared fields come out in declared order and must have their declared type (an integer
 may cross between `int` and `uint` if it fits), and other fields follow in the plugin's
 order. Requests arrive as typed JSON: numbers as `int` when they fit an `s64`, `uint` when
 they are larger, `float` otherwise.
