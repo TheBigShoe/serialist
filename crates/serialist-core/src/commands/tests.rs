@@ -786,14 +786,14 @@ fn unknown_keys_and_problems_become_warnings() {
 #[test]
 fn writing_produces_plain_pretty_json() {
     let mut collection = CommandCollection::new("Demo", CollectionSource::Bundled);
-    collection.groups.push(CommandGroup {
-        name: "Basics".into(),
-        commands: vec![
+    collection.groups.push(CommandGroup::new(
+        "Basics",
+        vec![
             Command::text("Version", "AT+VER?")
                 .with_eol(LineEnding::Crlf)
                 .with_expect("^OK", 500),
         ],
-    });
+    ));
     let want = r#"{
   "name": "Demo",
   "groups": [
@@ -1137,20 +1137,90 @@ fn save_writes_atomically_and_reloads_equal() {
     assert_eq!(fs::read_dir(paths.commands_dir()).unwrap().count(), 1);
 }
 
+/// A collection with a key this build does not know at every level.
+const UNKNOWN_EVERYWHERE: &str = r#"// my notes
+{ "name": "Mine", "extra": 1, "groups": [
+  { "name": "G", "colour": "red", "commands": [
+    { "name": "c", "since": "1.4",
+      "payload": { "text": "x{{p}}", "encoding": "latin1" },
+      "expect": { "pattern": "^OK", "timeout_ms": 1000, "retries": 3 },
+      "params": [ { "name": "p", "kind": "int", "min": 0 }, { "name": "q", "kind": "text" } ] },
+    { "name": "d", "payload": { "hex": "00" } }
+  ] }
+] }"#;
+
 #[test]
-fn saving_drops_comments_and_unknown_keys() {
+fn saving_drops_comments_and_keeps_unknown_keys() {
     let root = TempDir::new("cmd-drop");
     let paths = config(&root);
-    let file = root.write(
-        "config/commands/mine.json",
-        "// my notes\n{ \"name\": \"Mine\", \"extra\": 1, \"groups\": [ { \"name\": \"G\", \"commands\": [ { \"name\": \"c\", \"payload\": { \"text\": \"x\" } } ] } ] }",
-    );
+    let file = root.write("config/commands/mine.json", UNKNOWN_EVERYWHERE);
     let store = CommandStore::load(&paths);
     store.save_collection("Mine").unwrap();
     let text = fs::read_to_string(file).unwrap();
+    assert!(!text.contains("my notes"), "{text}");
+    let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let original: serde_json::Value =
+        jsonc_parser::parse_to_serde_value(UNKNOWN_EVERYWHERE, &Default::default()).unwrap();
+    assert_eq!(saved, original);
+}
+
+#[test]
+fn edits_keep_what_a_command_carries_and_deletes_drop_it() {
+    let root = TempDir::new("cmd-carry");
+    let paths = config(&root);
+    let file = root.write("config/commands/mine.json", UNKNOWN_EVERYWHERE);
+    let mut store = CommandStore::load(&paths);
+    let c = CommandRef::new("Mine", "G", "c");
+    // An edit from a form builds the command afresh, carrying nothing; the store gives
+    // it what the old one carried. A rename keeps it too.
+    let old = store.get(&c).unwrap().clone();
+    let mut edited = Command::text("c", "y{{p}}").with_expect("^OK", 5);
+    edited.params = old.params.clone();
+    let c = store.update_command(&c, edited).unwrap();
+    store.rename_command(&c, "c2").unwrap();
+    store.rename_group("Mine", "G", "H").unwrap();
+    let c = CommandRef::new("Mine", "H", "c2");
+    store.save_collection("Mine").unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let mut want: serde_json::Value =
+        jsonc_parser::parse_to_serde_value(UNKNOWN_EVERYWHERE, &Default::default()).unwrap();
+    want["groups"][0]["name"] = json!("H");
+    let command = &mut want["groups"][0]["commands"][0];
+    command["name"] = json!("c2");
+    command["payload"]["text"] = json!("y{{p}}");
+    command["expect"]["timeout_ms"] = json!(5);
+    assert_eq!(saved, want);
+
+    // Without its `expect`, the command no longer writes the `expect`'s unknown keys.
+    let mut bare = store.get(&c).unwrap().clone();
+    bare.expect = None;
+    store.update_command(&c, bare).unwrap();
+    store.save_collection("Mine").unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(saved["groups"][0]["commands"][0].get("expect"), None);
+    assert_eq!(saved["groups"][0]["commands"][0]["since"], json!("1.4"));
+
+    // Deleting the command deletes what it carried; the group keeps its own.
+    store.remove_command(&c).unwrap();
+    store.save_collection("Mine").unwrap();
+    let text = fs::read_to_string(&file).unwrap();
     assert!(
-        !text.contains("my notes") && !text.contains("extra"),
+        !text.contains("since") && !text.contains("latin1"),
         "{text}"
+    );
+    assert!(text.contains("colour"), "{text}");
+    // A new command carries nothing.
+    store
+        .add_command("Mine", "H", Command::text("new", "n"))
+        .unwrap();
+    assert!(
+        store
+            .get(&CommandRef::new("Mine", "H", "new"))
+            .unwrap()
+            .carried
+            .is_empty()
     );
 }
 
@@ -1173,18 +1243,14 @@ fn the_bundled_examples_cannot_be_saved() {
 fn small_store() -> CommandStore {
     let mut store = CommandStore::empty();
     store.set_collection(CommandCollection {
-        name: "Mine".into(),
-        source: CollectionSource::User("mine.json".into()),
         groups: vec![
-            CommandGroup {
-                name: "A".into(),
-                commands: vec![Command::text("one", "1"), Command::text("two", "2")],
-            },
-            CommandGroup {
-                name: "B".into(),
-                commands: vec![Command::text("three", "3")],
-            },
+            CommandGroup::new(
+                "A",
+                vec![Command::text("one", "1"), Command::text("two", "2")],
+            ),
+            CommandGroup::new("B", vec![Command::text("three", "3")]),
         ],
+        ..CommandCollection::new("Mine", CollectionSource::User("mine.json".into()))
     });
     store.set_collection(CommandCollection::bundled_examples());
     store
@@ -1439,10 +1505,9 @@ fn menu() -> CommandStore {
         let command = Command::text(name, name).with_description(description);
         match collection.groups.iter_mut().find(|g| g.name == group) {
             Some(g) => g.commands.push(command),
-            None => collection.groups.push(CommandGroup {
-                name: group.into(),
-                commands: vec![command],
-            }),
+            None => collection
+                .groups
+                .push(CommandGroup::new(group, vec![command])),
         }
     }
     store.set_collection(collection);
@@ -1518,10 +1583,10 @@ fn every_word_must_match_and_the_group_and_description_count() {
 fn equal_scores_keep_the_store_order() {
     let mut store = CommandStore::empty();
     let mut collection = CommandCollection::new("C", CollectionSource::User("c.json".into()));
-    collection.groups.push(CommandGroup {
-        name: "G".into(),
-        commands: ["b1", "a1", "c1"].map(|n| Command::text(n, "x")).to_vec(),
-    });
+    collection.groups.push(CommandGroup::new(
+        "G",
+        ["b1", "a1", "c1"].map(|n| Command::text(n, "x")).to_vec(),
+    ));
     store.set_collection(collection);
     assert_eq!(names(&store.filter("1")), ["b1", "a1", "c1"]);
 }

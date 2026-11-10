@@ -781,13 +781,13 @@ mod tests {
             "Bench",
             CollectionSource::User(PathBuf::from("/cfg/commands/bench.json")),
         );
-        collection.groups.push(CommandGroup {
-            name: "Modem".into(),
-            commands: vec![
+        collection.groups.push(CommandGroup::new(
+            "Modem",
+            vec![
                 Command::text("Version", "AT+VER?"),
                 Command::text("Reset", "ATZ"),
             ],
-        });
+        ));
         store.set_collection(collection);
         let name = |text: &str| resolve_command(&store, text).map(|(reference, _)| reference);
         let version = CommandRef::new("Bench", "Modem", "Version");

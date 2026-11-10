@@ -38,14 +38,55 @@ pub struct CommandCollection {
     pub name: String,
     pub source: CollectionSource,
     pub groups: Vec<CommandGroup>,
+    /// What the file held at the top level that this build does not read.
+    pub carried: Carried,
 }
 
 /// A named run of commands inside a collection.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommandGroup {
     pub name: String,
     #[serde(default)]
     pub commands: Vec<Command>,
+    /// What the file held in this group that this build does not read.
+    #[serde(skip)]
+    pub carried: Carried,
+}
+
+impl CommandGroup {
+    /// A group that carries nothing.
+    pub fn new(name: impl Into<String>, commands: Vec<Command>) -> Self {
+        Self {
+            name: name.into(),
+            commands,
+            carried: Carried::default(),
+        }
+    }
+}
+
+/// What a collection file held that this build does not read, kept beside the model so
+/// that saving writes it back: the keys it does not know at the level that holds this
+/// (for a command, also those in its payload and its `expect`). Anything made in the
+/// app carries nothing. Each [`Param`] carries its own.
+///
+/// Edits keep it: [`CommandStore::update_command`](super::CommandStore::update_command)
+/// gives a replacement that carries nothing the old command's, and renames keep it.
+/// Deleting a command or group deletes what it carried.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Carried {
+    /// Unknown keys at this level.
+    pub(crate) keys: Map<String, Value>,
+    /// A command's unknown payload keys.
+    pub(crate) payload: Map<String, Value>,
+    /// A command's unknown `expect` keys, written back while it has an `expect`.
+    pub(crate) expect: Map<String, Value>,
+}
+
+impl Carried {
+    /// Whether there is nothing to write back.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.payload.is_empty() && self.expect.is_empty()
+    }
 }
 
 /// A saved command: a payload, and what to do around sending it.
@@ -81,6 +122,10 @@ pub struct Command {
     /// Values to ask for when the command is sent, in the order to ask.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<Param>,
+    /// What the file held in this command, its payload and its `expect` that this build
+    /// does not read.
+    #[serde(skip)]
+    pub carried: Carried,
 }
 
 impl Command {
@@ -94,6 +139,7 @@ impl Command {
             expect: None,
             keybinding: None,
             params: Vec::new(),
+            carried: Carried::default(),
         }
     }
 
@@ -130,6 +176,22 @@ impl Command {
     pub fn with_param(mut self, param: Param) -> Self {
         self.params.push(param);
         self
+    }
+
+    /// Takes what `old` carried when this command carries nothing itself: for an edit
+    /// or a move that builds the command afresh. A param that carries nothing takes
+    /// what `old`'s param of the same name carried.
+    pub fn keep_carried_from(&mut self, old: &Command) {
+        if self.carried.is_empty() {
+            self.carried = old.carried.clone();
+        }
+        for param in &mut self.params {
+            if param.carried.is_empty()
+                && let Some(was) = old.params.iter().find(|p| p.name == param.name)
+            {
+                param.carried = was.carried.clone();
+            }
+        }
     }
 
     /// The parameters to prompt for, in order.
@@ -336,6 +398,9 @@ pub struct Param {
     pub default: Option<String>,
     #[serde(default)]
     pub kind: ParamKind,
+    /// What the file held in this param that this build does not read.
+    #[serde(skip)]
+    pub carried: Carried,
 }
 
 impl Param {
@@ -345,6 +410,7 @@ impl Param {
             label: None,
             default: None,
             kind,
+            carried: Carried::default(),
         }
     }
 
@@ -443,6 +509,7 @@ impl CommandCollection {
             name: name.into(),
             source,
             groups: Vec::new(),
+            carried: Carried::default(),
         }
     }
 
