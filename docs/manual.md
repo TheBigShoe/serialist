@@ -186,6 +186,31 @@ a device profile that matches the id, or `--baud`) times the speed, or as fast a
 reads at `max`. A `.timing` file that does not parse makes the open fail with a message naming
 the port, rather than play at the wrong pace.
 
+## Exporting decoded frames
+
+While a codec decodes the session, Export to a `.csv` or `.json` file writes the frames the
+session still retains. The format follows the file's extension.
+
+CSV has a header row, then one row per frame. The columns are `time`, `timestamp`,
+`direction`, `kind`, `summary`, one column per field name (in the order the fields first
+appear; a frame without that field leaves it empty), and `raw`, the frame's bytes as hex.
+
+JSON is an object, not a bare array:
+
+```json
+{ "format": "serialist-frames", "version": 1, "frames": [ { "id": 0, "time": "...", "timestamp": "..." } ] }
+```
+
+Each frame object has `id`, `time`, `timestamp`, `direction` (`RX`, `TX` or `--`), `kind`,
+`severity`, `summary`, `fields` (numbers as numbers, bytes as hex, lists as arrays),
+`raw_start`, `raw_end` and `raw` (hex, or `null` once the bytes were evicted). New keys may
+appear in a later version; `version` changes only if a key changes its meaning or goes away.
+
+`time` is for people: it is the Decoded panel's stamp, so it follows the session's timestamp
+mode and `display.timestamp_format` and by default has no date. `timestamp` is for programs:
+the frame's wall-clock time in UTC as RFC 3339 with microseconds, such as
+`2026-11-10T14:03:22.123456Z`, the same whatever the display settings are.
+
 ## Settings
 
 `cmd-,` (`ctrl-,` on Linux and Windows), the Serialist menu's Settings… or the palette
