@@ -66,8 +66,9 @@ impl CommandGroup {
 
 /// What a collection file held that this build does not read, kept beside the model so
 /// that saving writes it back: the keys it does not know at the level that holds this
-/// (for a command, also those in its payload and its `expect`). Anything made in the
-/// app carries nothing. Each [`Param`] carries its own.
+/// (for a command, also those in its payload and its `expect`), and, in a collection or
+/// group, the groups or commands it could not read, verbatim and in their places.
+/// Anything made in the app carries nothing. Each [`Param`] carries its own.
 ///
 /// Edits keep it: [`CommandStore::update_command`](super::CommandStore::update_command)
 /// gives a replacement that carries nothing the old command's, and renames keep it.
@@ -80,13 +81,43 @@ pub struct Carried {
     pub(crate) payload: Map<String, Value>,
     /// A command's unknown `expect` keys, written back while it has an `expect`.
     pub(crate) expect: Map<String, Value>,
+    /// In a collection, the groups it could not read; in a group, the commands. In
+    /// file order.
+    pub(crate) skipped: Vec<Skipped>,
 }
 
 impl Carried {
     /// Whether there is nothing to write back.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.payload.is_empty() && self.expect.is_empty()
+        self.keys.is_empty()
+            && self.payload.is_empty()
+            && self.expect.is_empty()
+            && self.skipped.is_empty()
     }
+
+    /// How many groups (in a collection) or commands (in a group) could not be read.
+    pub fn skipped(&self) -> usize {
+        self.skipped.len()
+    }
+
+    /// Keeps the skipped entries in their places when the readable sibling at `index`
+    /// is removed.
+    pub(crate) fn removed(&mut self, index: usize) {
+        for skipped in &mut self.skipped {
+            if skipped.before > index {
+                skipped.before -= 1;
+            }
+        }
+    }
+}
+
+/// A group or command this build could not read, kept verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Skipped {
+    /// How many readable siblings came before it in the file: it is written back just
+    /// before the readable one at this index, or after the last.
+    pub(crate) before: usize,
+    pub(crate) value: Value,
 }
 
 /// A saved command: a payload, and what to do around sending it.

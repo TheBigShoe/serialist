@@ -714,39 +714,139 @@ fn a_payload_needs_exactly_one_form() {
         (r#"{ "fields": {} }"#, "`fields` belongs"),
         (r#""AT""#, "expected"),
     ] {
-        match parse_err(&wrap(payload)) {
-            CommandsError::Invalid { message, line, .. } => {
-                assert!(message.contains(needle), "{payload}: {message}");
-                // The error points into the file, at the payload or after it.
-                assert!(line >= 2, "{payload}: line {line}");
-            }
-            other => panic!("{payload}: {other:?}"),
-        }
+        // The command is skipped alone, with a warning naming it and saying why.
+        let loaded = parse(&wrap(payload));
+        assert!(loaded.collection.groups[0].commands.is_empty(), "{payload}");
+        assert_eq!(loaded.collection.groups[0].carried.skipped(), 1);
+        let [warning] = loaded.warnings.as_slice() else {
+            panic!("{payload}: {:?}", loaded.warnings);
+        };
+        assert!(warning.contains("`G` \u{203a} `C`"), "{payload}: {warning}");
+        assert!(warning.contains(needle), "{payload}: {warning}");
+        assert!(warning.contains("skipped"), "{payload}: {warning}");
     }
     // A command with no payload at all.
-    let missing = r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C" } ] } ] }"#;
-    match parse_err(missing) {
-        CommandsError::Invalid { message, .. } => assert!(message.contains("payload"), "{message}"),
-        other => panic!("{other:?}"),
-    }
+    let missing = parse(r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C" } ] } ] }"#);
+    assert!(
+        missing.warnings[0].contains("payload"),
+        "{:?}",
+        missing.warnings
+    );
 }
 
 #[test]
 fn a_wrong_shape_is_an_error_not_a_panic() {
+    // At the top level, the whole file fails.
     for text in [
         "[]",
         "5",
         r#"{ "groups": {} }"#,
-        r#"{ "groups": [ { "commands": [] } ] }"#,
-        r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": 5 } } ] } ] }"#,
-        r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": "a" }, "eol": "crcr" } ] } ] }"#,
-        r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": "a" }, "params": [ { "name": "p", "kind": "float" } ] } ] } ] }"#,
+        r#"{ "name": 5, "groups": [] }"#,
     ] {
         assert!(
             matches!(parse_err(text), CommandsError::Invalid { .. }),
             "{text}"
         );
     }
+    // Below it, only the group or command with the wrong shape is skipped.
+    for (text, needle) in [
+        (
+            r#"{ "groups": [ { "commands": [] } ] }"#,
+            "group 1 has no name",
+        ),
+        (r#"{ "groups": [ 5 ] }"#, "group 1 is not an object"),
+        (
+            r#"{ "groups": [ { "name": "G", "commands": {} } ] }"#,
+            "group `G` has `commands` that is not a list",
+        ),
+        (
+            r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": 5 } } ] } ] }"#,
+            "`G` \u{203a} `C`",
+        ),
+        (
+            r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": "a" }, "eol": "crcr" } ] } ] }"#,
+            "crcr",
+        ),
+        (
+            r#"{ "groups": [ { "name": "G", "commands": [ { "name": "C", "payload": { "text": "a" }, "params": [ { "name": "p", "kind": "float" } ] } ] } ] }"#,
+            "float",
+        ),
+        (
+            r#"{ "groups": [ { "name": "G", "commands": [ "AT" ] } ] }"#,
+            "`G` \u{203a} command 1",
+        ),
+    ] {
+        let loaded = parse(text);
+        assert!(loaded.collection.commands().next().is_none(), "{text}");
+        let [warning] = loaded.warnings.as_slice() else {
+            panic!("{text}: {:?}", loaded.warnings);
+        };
+        assert!(warning.contains(needle), "{text}: {warning}");
+        assert!(warning.contains("skipped"), "{text}: {warning}");
+    }
+}
+
+#[test]
+fn one_unreadable_command_does_not_stop_the_rest_and_saves_in_its_place() {
+    let text = r#"{ "name": "Mine", "groups": [
+        "not a group",
+        { "name": "G", "commands": [
+            { "name": "A", "payload": { "text": "a" } },
+            { "name": "New", "payload": { "base64": "AAE=" } },
+            { "name": "B", "payload": { "text": "b" } },
+            { "payload": { "cbor": 1 } }
+        ] },
+        { "name": "H", "commands": [] }
+    ] }"#;
+    let loaded = parse(text);
+    let names: Vec<_> = loaded
+        .collection
+        .commands()
+        .map(|(_, c)| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["A", "B"]);
+    let groups: Vec<_> = loaded
+        .collection
+        .groups
+        .iter()
+        .map(|g| g.name.as_str())
+        .collect();
+    assert_eq!(groups, ["G", "H"]);
+    assert_eq!(loaded.warnings.len(), 3, "{:?}", loaded.warnings);
+    assert!(loaded.warnings[0].starts_with("group 1 is not an object"));
+    assert!(loaded.warnings[1].starts_with("`G` \u{203a} `New`: this version cannot read it"));
+    assert!(loaded.warnings[2].starts_with("`G` \u{203a} command 4"));
+    // Saving writes everything back where it was.
+    let mut collection = loaded.collection;
+    let original: serde_json::Value = serde_json::from_str(text).unwrap();
+    let saved: serde_json::Value = serde_json::from_str(&collection.to_json()).unwrap();
+    assert_eq!(saved, original);
+    // Removing a readable command or group leaves the skipped ones in their places;
+    // adding one puts it after them.
+    let mut store = CommandStore::empty();
+    collection.source = CollectionSource::User("mine.json".into());
+    store.set_collection(collection);
+    store
+        .remove_command(&CommandRef::new("Mine", "G", "A"))
+        .unwrap();
+    store
+        .add_command("Mine", "G", Command::text("C", "c"))
+        .unwrap();
+    store.remove_group("Mine", "H").unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&store.collection("Mine").unwrap().to_json()).unwrap();
+    assert_eq!(
+        saved,
+        json!({ "name": "Mine", "groups": [
+            "not a group",
+            { "name": "G", "commands": [
+                { "name": "New", "payload": { "base64": "AAE=" } },
+                { "name": "B", "payload": { "text": "b" } },
+                { "payload": { "cbor": 1 } },
+                { "name": "C", "payload": { "text": "c" } }
+            ] }
+        ] })
+    );
 }
 
 #[test]
@@ -1005,6 +1105,30 @@ fn a_bad_file_is_a_warning_and_the_rest_still_load() {
     assert!(odd.message.contains("escape"), "{}", odd.message);
     assert!(odd.to_string().contains("odd.json"));
     assert!(store.find("Good", "ok").is_some());
+}
+
+#[test]
+fn a_command_this_build_cannot_read_is_a_warning_naming_file_group_and_command() {
+    let root = TempDir::new("cmd-later");
+    let paths = config(&root);
+    root.write(
+        "config/commands/later.json",
+        r#"{ "name": "Later", "groups": [ { "name": "G", "commands": [
+            { "name": "old", "payload": { "text": "AT" } },
+            { "name": "new", "payload": { "text": "AT" }, "params": [ { "name": "p", "kind": "float" } ] }
+        ] } ] }"#,
+    );
+    let store = CommandStore::load(&paths);
+    // The file loads, without the command it cannot read.
+    assert!(store.find("Later", "old").is_some());
+    assert!(store.find("Later", "new").is_none());
+    let [warning] = store.warnings() else {
+        panic!("{:?}", store.warnings());
+    };
+    let text = warning.to_string();
+    assert!(text.contains("later.json"), "{text}");
+    assert!(text.contains("`G` \u{203a} `new`"), "{text}");
+    assert!(text.contains("float"), "{text}");
 }
 
 #[test]

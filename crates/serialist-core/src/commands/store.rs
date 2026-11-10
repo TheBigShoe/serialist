@@ -431,6 +431,8 @@ impl CommandStore {
             .iter()
             .position(|c| c.name == target.name)
             .ok_or_else(|| no_command(target))?;
+        // The commands this build could not read stay where they were.
+        group.carried.removed(at);
         Ok(group.commands.remove(at))
     }
 
@@ -478,7 +480,7 @@ impl CommandStore {
         Ok(())
     }
 
-    /// Removes a group and the commands in it.
+    /// Removes a group and the commands in it, with the ones this build could not read.
     pub fn remove_group(&mut self, collection: &str, group: &str) -> Result<(), EditError> {
         let target = self.editable(collection)?;
         let at = target
@@ -489,6 +491,7 @@ impl CommandStore {
                 collection: collection.to_owned(),
                 group: group.to_owned(),
             })?;
+        target.carried.removed(at);
         target.groups.remove(at);
         Ok(())
     }
