@@ -582,6 +582,16 @@ impl FrameTime {
     }
 }
 
+impl FrameTime {
+    /// The wall-clock time a frame was completed `at`, as RFC 3339 in UTC with
+    /// microseconds (`2026-11-10T14:03:22.123456Z`). It is the same whatever the timestamp
+    /// mode, format or zone, so programs can read it.
+    pub fn timestamp(&self, at: Instant) -> String {
+        chrono::DateTime::<chrono::Utc>::from(self.clock.epoch.wall_time(at))
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    }
+}
+
 /// `RX`, `TX` or `--`.
 pub fn direction_label(frame: &Frame) -> &'static str {
     match frame.direction {

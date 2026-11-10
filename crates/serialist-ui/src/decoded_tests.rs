@@ -793,7 +793,9 @@ fn decoded_frames_export_to_csv_and_json_as_the_snapshot_has_them(cx: &mut TestA
         notice(cx, &view).is_some_and(|text| text.ends_with("frames to frames.json"))
     });
     let parsed: JsonValue = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
-    let array = parsed.as_array().unwrap();
+    assert_eq!(parsed["format"], "serialist-frames");
+    assert_eq!(parsed["version"], 1);
+    let array = parsed["frames"].as_array().unwrap();
     assert!(
         array.len() >= count,
         "at least what the earlier snapshot had"

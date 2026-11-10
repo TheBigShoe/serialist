@@ -20,15 +20,18 @@
 //! frame the session's frame store retains, from a [`FrameSnapshot`] taken with the job,
 //! with the raw bytes of each read from the store [`Snapshot`] by its stream offsets.
 //!
-//! - **CSV**: a header row, then one row per frame: `time`, `direction`, `kind`,
+//! - **CSV**: a header row, then one row per frame: `time`, `timestamp`, `direction`, `kind`,
 //!   `summary`, one column per field name of the kinds present (in the order the fields
 //!   first appear; a frame without that field leaves it empty), and `raw`, the frame's
 //!   bytes as hex. Cells with commas, quotes or line breaks are quoted.
-//! - **JSON**: an array of objects with `id`, `time`, `direction`, `kind`, `severity`,
-//!   `summary`, `fields` (numbers as numbers, bytes as hex), `raw_start`, `raw_end` and
-//!   `raw` (hex, or `null` once the store has evicted the bytes).
+//! - **JSON**: an object `{ "format": "serialist-frames", "version": 1, "frames": [...] }`
+//!   whose frames are objects with `id`, `time`, `timestamp`, `direction`, `kind`,
+//!   `severity`, `summary`, `fields` (numbers as numbers, bytes as hex), `raw_start`,
+//!   `raw_end` and `raw` (hex, or `null` once the store has evicted the bytes).
 //!
-//! Times are stamped as the Decoded panel stamps them ([`FrameTime`]).
+//! `time` is stamped as the Decoded panel stamps it ([`FrameTime`]), for people.
+//! `timestamp` is the frame's wall-clock time in UTC as RFC 3339 with microseconds,
+//! whatever the display settings, for programs.
 //!
 //! # The screen
 //!
@@ -63,7 +66,7 @@ pub enum ExportFormat {
     Raw,
     /// The decoded frames as CSV.
     Csv,
-    /// The decoded frames as a JSON array.
+    /// The decoded frames as a versioned JSON object.
     Json,
     /// The terminal screen's rows as text (VT mode).
     Screen,
@@ -310,7 +313,7 @@ fn write_frames_csv(
         }
     }
     let mut row = String::new();
-    for header in ["time", "direction", "kind", "summary"]
+    for header in ["time", "timestamp", "direction", "kind", "summary"]
         .into_iter()
         .chain(fields.iter().copied())
         .chain(["raw"])
@@ -323,6 +326,7 @@ fn write_frames_csv(
     for (_, frame) in frames.frames() {
         row.clear();
         csv_cell(&mut row, &time.stamp(frame.at, previous));
+        csv_cell(&mut row, &time.timestamp(frame.at));
         csv_cell(&mut row, direction_label(frame));
         csv_cell(&mut row, &frame.kind);
         csv_cell(&mut row, &frame.summary);
@@ -350,7 +354,7 @@ fn write_frames_json(
     out: &mut dyn Write,
 ) -> io::Result<(u64, usize)> {
     let mut out = Counting { out, bytes: 0 };
-    out.write_all(b"[")?;
+    out.write_all(b"{\n  \"format\": \"serialist-frames\",\n  \"version\": 1,\n  \"frames\": [")?;
     let mut previous = None;
     let mut count = 0;
     for (id, frame) in frames.frames() {
@@ -362,6 +366,7 @@ fn write_frames_json(
         let object = json!({
             "id": id.0,
             "time": time.stamp(frame.at, previous),
+            "timestamp": time.timestamp(frame.at),
             "direction": direction_label(frame),
             "kind": frame.kind.as_str(),
             "severity": frame.severity.name(),
@@ -371,12 +376,12 @@ fn write_frames_json(
             "raw_end": frame.raw.end,
             "raw": frame_raw_hex(raw, frame),
         });
-        out.write_all(if count == 0 { b"\n  " } else { b",\n  " })?;
+        out.write_all(if count == 0 { b"\n    " } else { b",\n    " })?;
         serde_json::to_writer(&mut out, &object).map_err(io::Error::other)?;
         previous = Some(frame.at);
         count += 1;
     }
-    out.write_all(if count == 0 { b"]\n" } else { b"\n]\n" })?;
+    out.write_all(if count == 0 { b"]\n}\n" } else { b"\n  ]\n}\n" })?;
     Ok((out.bytes, count))
 }
 
@@ -535,8 +540,8 @@ mod tests {
         let rows = parse_csv(&fs::read_to_string(&csv).unwrap());
         assert_eq!(rows.len(), 4, "a header and three frames");
         assert_eq!(
-            rows[0][..5],
-            ["time", "direction", "kind", "summary", "text"]
+            rows[0][..6],
+            ["time", "timestamp", "direction", "kind", "summary", "text"]
         );
         let column = |name: &str| rows[0].iter().position(|h| h == name).unwrap();
         assert_eq!(rows[1][column("kind")], "text");
@@ -546,6 +551,14 @@ mod tests {
             "quoted and back"
         );
         assert_eq!(rows[1][column("time")], "+00:00:01.500");
+        let stamp = FrameTime {
+            clock: Clock::fixed(epoch, 0),
+            mode: TimestampMode::Off,
+            format: None,
+        }
+        .timestamp(at);
+        assert_eq!(rows[1][column("timestamp")], stamp);
+        assert!(stamp.ends_with('Z') && stamp.len() == 27, "{stamp}");
         assert_eq!(rows[2][column("kind")], "log");
         assert_eq!(rows[2][column("cmd_id")], "3904");
         assert_eq!(rows[2][column("text")], "", "a log frame has no text");
@@ -559,7 +572,9 @@ mod tests {
             Ok("Exported 3 frames to frames.json".into())
         );
         let parsed: JsonValue = serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
-        let array = parsed.as_array().unwrap();
+        assert_eq!(parsed["format"], "serialist-frames");
+        assert_eq!(parsed["version"], 1);
+        let array = parsed["frames"].as_array().unwrap();
         assert_eq!(array.len(), 3);
         assert_eq!(array[2]["kind"], "response");
         assert_eq!(array[2]["fields"]["cmd_id"], 0x0F15);
@@ -567,7 +582,36 @@ mod tests {
         assert_eq!(array[2]["raw"], "05 5B 05 00 15 0F 00 56 31");
         assert_eq!(array[1]["severity"], "info");
         assert_eq!(array[0]["raw_start"], 0);
+        assert_eq!(array[0]["time"], "+00:00:01.500");
+        assert_eq!(array[0]["timestamp"], stamp);
         assert_eq!(entries(dir.path()), ["frames.csv", "frames.json"]);
+    }
+
+    #[test]
+    fn the_machine_readable_timestamp_ignores_the_display_settings() {
+        use crate::terminal::{Clock, TimestampMode};
+
+        // 2026-09-29 13:02:03.500 UTC.
+        let epoch = Epoch {
+            instant: Instant::now(),
+            wall: std::time::UNIX_EPOCH + Duration::from_millis(1_790_686_923_500),
+        };
+        let at = epoch.instant + Duration::from_micros(1_042_345);
+        let frame = |mode, format: Option<&str>, offset| FrameTime {
+            clock: Clock::fixed(epoch, offset),
+            mode,
+            format: format.map(str::to_owned),
+        };
+        let stamps: Vec<String> = [
+            frame(TimestampMode::Relative, None, 0),
+            frame(TimestampMode::Delta, None, 3600),
+            frame(TimestampMode::Off, Some("%Y"), -4 * 3600),
+            frame(TimestampMode::Absolute, Some("%d/%m %H"), 5 * 3600),
+        ]
+        .iter()
+        .map(|time| time.timestamp(at))
+        .collect();
+        assert!(stamps.iter().all(|s| s == "2026-09-29T13:02:04.542345Z"));
     }
 
     #[test]
