@@ -3,7 +3,10 @@
 > **Status: a proposal, not a decision.** This page lists what Serialist's users depend
 > on and proposes a promise for each. None of the promises is accepted yet; each is for
 > the owner to accept, change or drop before 1.0.0 is tagged. It describes the code at
-> version 0.2.0 (commit `19b4434` and the doc fixes made with this page).
+> version 0.2.0 with the changes made in answer to its first draft, which closed most of
+> what each "Before 1.0" paragraph listed; those paragraphs now say what is left, and the
+> decisions at the end are split into the ones the code now settles and the ones still
+> open.
 
 Version 1.0.0 promises that what a user's files, scripts, plugins and habits rely on keeps
 working through every 1.x release. This page is the inventory of that surface, found in the
@@ -25,20 +28,20 @@ The owner's decisions are collected at the end, most consequential first.
 | Surface | Version marker today | Proposed 1.x promise, in short |
 |---|---|---|
 | Config directory | none | Same place on each OS, same file names |
-| `settings.json` | none | Every 1.0 key and value keeps its meaning; keys are only added |
+| `settings.json` | none | Every 1.0 key and value keeps its meaning; keys and values are only added |
 | `keymap.json`, action names, key contexts | none | Names and contexts kept; default chords may change with notice |
 | Saved-command collections | none | Every 1.0 collection loads with the same meaning |
 | `history.jsonl` | none | Format kept |
-| `state.json` | `"version": 2` | App-private; earlier versions still read, newer ones ignored |
+| `state.json` | `"version": 2` | App-private; earlier versions still read, newer ones left alone |
 | Theme files | Zed schema v0.2.0 (not checked) | Every file 1.0 loads still loads; bundled theme names kept |
-| Lua scripting API | none | Calls, arguments and results kept; additions only |
+| Lua scripting API | `serialist.api` (1) | Calls, arguments and results kept; additions only |
 | Plugin folders | none | Folder name is the codec name; entry file names kept |
-| Lua codec interface | none | A plugin that loads in 1.0 loads and decodes the same |
+| Lua codec interface | `api` in `describe()` (1) | A plugin that loads in 1.0 loads and decodes the same |
 | `plugin.toml` and WIT | `api = "1"`, `wit/v1` | v1 never changes; a v2 sits beside it |
 | `serialist-plugin-sdk` | the workspace version | Undecided: see the section |
 | Command line | none | Flags, port ids and `--script` exit codes kept |
 | Recordings and `.timing` | `serialist-timing 1` | v1 readable by every 1.x |
-| Exports (text, raw, CSV, JSON) | none | Raw byte for byte; CSV and JSON column and key names kept |
+| Exports (text, raw, CSV, JSON) | JSON: `"version": 1`; the rest none | Raw byte for byte; CSV and JSON column and key names kept |
 | Rust crates | the workspace version | Internal: no promise |
 
 ## 1. Where files live
@@ -52,8 +55,11 @@ The directory is `$HOME/.config/serialist` on macOS and Linux and `%APPDATA%\Ser
 Windows (`%USERPROFILE%\AppData\Roaming\Serialist` without `APPDATA`). With no home
 directory the code falls back to `<temp>/serialist-config` and logs a warning.
 `SERIALIST_CONFIG_DIR` overrides the platform rule (an empty value is ignored), and
-`--config-dir` overrides both. Linux does not read `XDG_CONFIG_HOME`, and macOS does not
-use `~/Library/Application Support`.
+`--config-dir` overrides both. On Linux an absolute `XDG_CONFIG_HOME` moves the directory
+to `$XDG_CONFIG_HOME/serialist`, unless that directory does not exist and
+`$HOME/.config/serialist` does, in which case the old one is still used; an unset, empty
+or relative `XDG_CONFIG_HOME` changes nothing. macOS does not use
+`~/Library/Application Support`.
 
 Inside it: `settings.json`, `keymap.json`, `themes/`, `commands/`, `scripts/`, `plugins/`
 (with `plugins/examples/`, which the app writes and which never loads), `history.jsonl`
@@ -72,23 +78,26 @@ and `state.json`. A project adds the nearest `.serialist/settings.json` and
 `project_settings_are_found_by_searching_upward`,
 `project_commands_are_found_by_searching_upward` and
 `commands_and_history_live_in_the_config_directory` (all in
-`crates/serialist-core/src/settings/tests.rs`); `scripts_live_in_the_config_directory`
-and `example_plugins_are_copied_beside_the_plugins_not_into_them` in `paths.rs`. No test
-covers `config::paths_for`, so `--config-dir` winning over `SERIALIST_CONFIG_DIR` is not
-pinned.
+`crates/serialist-core/src/settings/tests.rs`); `scripts_live_in_the_config_directory`,
+`example_plugins_are_copied_beside_the_plugins_not_into_them` and the four
+`XDG_CONFIG_HOME` tests (`linux_uses_an_absolute_xdg_config_home`,
+`linux_keeps_an_existing_home_directory_when_the_xdg_one_is_new`,
+`an_unset_empty_or_relative_xdg_config_home_means_the_home_directory`,
+`xdg_config_home_changes_only_linux_and_never_beats_the_override`) in `paths.rs`;
+`the_flag_wins_over_the_environment_variable` and
+`the_environment_variable_wins_over_the_platform_directory` in
+`crates/serialist-ui/src/config.rs`. The Linux rule is tested by passing the platform in;
+it has not run on a Linux desktop.
 
 **Proposed promise.** Every 1.x build reads its configuration from the same directory on
 each OS, honors `--config-dir` and `SERIALIST_CONFIG_DIR` the same way, and keeps every file
 and folder name listed here with its meaning. New files may be added. Nothing moves unless
 the old location is still read.
 
-**Before 1.0.** Decide whether macOS stays on `~/.config/serialist` and whether Linux
-should honor `XDG_CONFIG_HOME`; either change after 1.0 needs a migration. Add a test for
-`paths_for`. The `--help` text for `--config-dir` (`USAGE` in `crates/serialist/src/cli.rs`)
-names `settings.json`, `keymap.json`, `themes/`, `commands/`, `scripts/` and
-`history.jsonl` but not `plugins/` or `state.json`. A user plugin folder named `examples`
-collides with `plugins/examples/`; the name is reserved in practice and could be reserved
-in the docs.
+**Before 1.0.** Confirm that macOS stays on `~/.config/serialist`; a move after 1.0 needs
+a migration. Done since the first draft: Linux honors `XDG_CONFIG_HOME`, `paths_for` is
+tested, the `--help` text for `--config-dir` names `plugins/` and `state.json`, and
+`docs/plugins.md` reserves the plugin folder name `examples`.
 
 ## 2. `settings.json`
 
@@ -139,23 +148,31 @@ keys and follows every default.
 
 **Newer and older.** A key this build does not know is ignored and reported as a
 `SettingsWarning` ("unknown setting `display.wrapp` is ignored"), shown in the status line.
-A value it does not accept (a new enum value, a number out of range, a wrong type) fails
-the whole layer with `SettingsError::Invalid` naming file, line and column. The app then
-keeps the last settings that loaded, which at startup are the bundled defaults, and shows
-"Settings not applied: …". A headless `--script` run uses the defaults and logs a warning
-(`configured_options` in `crates/serialist/src/headless.rs`). So a file written for a later
-version that adds a key loads in an earlier build with a warning, but one that uses a new
-value for an existing key (a fifth `line_ending`, a third `emulation`) loses every user
-setting in the earlier build. An older file loads in a newer build as long as no key or
-value it uses was removed.
+A value it does not accept (a new enum value, a number out of range, a wrong type) leaves
+out that key alone, with a warning naming the file, line, column, key and reason
+(`SettingsWarningKind::InvalidValue`); the value from the layer below stays in force and
+the rest of the file applies. The loader does this by applying each layer one leaf key at
+a time (`LayerLoad::apply` in `load.rs`). In `devices`, a bad key is left out of its
+profile, and a profile that is not an object or has no readable `match` is left out
+whole; a `devices` that is not a list leaves the lower layer's list. Only a file that is
+not JSON with comments, or whose root is not an object, still fails as a whole with
+`SettingsError::Invalid`; the app then keeps the last settings that loaded and shows
+"Settings not applied: …". A headless `--script` run logs each warning and uses the rest
+of the file (`configured_options` in `crates/serialist/src/headless.rs`). So a file
+written for a later version loads in an earlier build with one warning for each key or
+value the earlier build does not know, and loses only those. An older file loads in a
+newer build as long as no key or value it uses was removed. The Settings screen stays
+strict about what it writes: an edit that would make the loader leave a value out is
+refused and the file is untouched, while a value from a later release already in the file
+does not block edits to other keys (`edit_settings` in `settings_io.rs`).
 
 **Pinned by.** In `crates/serialist-core/src/settings/tests.rs`:
 `bundled_defaults_are_complete_and_as_documented`,
 `a_partial_document_deserializes_with_bundled_defaults`,
 `comments_and_trailing_commas_are_accepted`, `a_non_object_root_is_rejected`,
 `layering_is_defaults_then_user_then_project`, `unknown_keys_are_warnings_not_errors`,
-`out_of_range_values_are_errors_with_positions`,
-`sizes_and_heights_that_do_not_fit_an_f32_are_errors`, `null_unsets_optional_keys`,
+`out_of_range_values_are_warnings_with_positions`,
+`sizes_and_heights_that_do_not_fit_an_f32_are_left_out`, `null_unsets_optional_keys`,
 `a_theme_string_replaces_a_theme_object_and_back`,
 `line_height_has_three_forms_and_zeds_custom_object`,
 `usb_ids_accept_hex_strings_and_integers`, `line_settings_accept_numbers_and_names`,
@@ -164,29 +181,36 @@ value it uses was removed.
 `an_unknown_replay_key_is_reported_and_ignored`,
 `uncommenting_a_template_line_overrides_that_key`. In `settings/inline_tests.rs`:
 `defaults_are_the_documented_values`, `every_key_is_read`,
-`backspace_takes_names_and_byte_values`, `bad_values_are_errors_with_positions`. The app's
-side: `a_broken_settings_file_keeps_the_last_good_settings_and_shows_why`
-(`crates/serialist-ui/src/config_tests.rs`) and
-`a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched`
-(`settings_tests.rs`); the comment-preserving editor by
-`crates/serialist-core/tests/settings_edit.rs`.
+`backspace_takes_names_and_byte_values`, `bad_values_are_warnings_with_positions`. The
+per-key rule has its own file, `settings/layer_tests.rs`: a value from a later release
+for `line_ending` and for `terminal.emulation` keeps every other setting, a bad project
+value falls back to the user's, the `devices` cases, a project's `devices` replacing the
+user's list, and the `parity` letters and `"rtscts"` and `"xonxoff"` spellings. In
+`crates/serialist-core/tests/settings_compat.rs`, the fixture
+`tests/fixtures/settings_v0.2.0.jsonc` sets every key the 0.2.0 release accepted to a
+value other than its default and must load with no warning and every value in place, and
+the property test `one_bad_leaf_costs_only_that_leaf` spoils one of 36 leaves at a time.
+The app's side: `a_broken_settings_file_keeps_the_last_good_settings_and_shows_why`
+(`crates/serialist-ui/src/config_tests.rs`),
+`a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched` and
+`writes_stay_strict_beside_a_value_from_a_later_release` (`settings_tests.rs`), and
+`one_bad_value_leaves_the_rest_of_the_file_in_force` (`headless.rs`); the
+comment-preserving editor by `crates/serialist-core/tests/settings_edit.rs`.
 
-Not pinned: the `parity` letters and the `"rtscts"` and `"xonxoff"` spellings; no test
-keeps a settings file written by 0.1.0 or 0.2.0 as a fixture; nothing tests that a
-project file's `devices` replaces the user's list rather than adding to it.
+Not pinned: the fixture uses the object form of `theme` and one `inline.backspace`
+spelling; the other forms are pinned by the unit tests above, not by a file.
 
 **Proposed promise.** Every key and value a 1.0 settings file can hold, the extra
-spellings above included, keeps its meaning in every 1.x. New keys may be added; a key may
-be deprecated but is still read. An unknown key is a warning, never an error. A changed
+spellings above included, keeps its meaning in every 1.x. New keys and new values for
+existing keys may be added; a key may be deprecated but is still read. An unknown key or
+an unreadable value is a warning that costs only that key, never the file. A changed
 default is named in the changelog.
 
-**Before 1.0.** Decide how a later 1.x value meets an earlier 1.x build. Either change the
-loader so that a value it cannot read rejects that key only (warning, default kept) rather
-than the whole file, or promise that 1.x never adds a value to an existing key and gives
-new behavior a new key instead. Decide whether the extra spellings are promised or removed
-now. Decide whether default values are part of the promise (see the decisions list); since
-the template comments every key out, a changed default reaches every user. Add a fixture
-of a full 0.2.0 settings file to the tests.
+**Before 1.0.** Decide whether default values are part of the promise (see the decisions
+list); since the template comments every key out, a changed default reaches every user.
+Done since the first draft: a value the loader cannot read rejects that key only, the
+extra spellings are pinned by tests (so they are promised unless the owner removes them
+now), and a full 0.2.0 settings file is a fixture.
 
 ## 3. `keymap.json`, action names and key contexts
 
@@ -256,21 +280,20 @@ the tests run on),
 `command_keybindings_send_and_conflicts_are_reported` (`commands_tests.rs`),
 `rebinding_a_key_writes_the_user_keymap_and_the_new_chord_works` (`settings_tests.rs`).
 
-Not pinned: the complete list of action names and contexts. `the_scan_finds_the_ui_actions`
-checks seven names, and `every_platform_default_loads_and_names_only_real_actions` checks
-that the bundled keymaps name real actions, so a rename that also edits the bundled
-keymaps passes every test while breaking users' files. No test binds
-`plugins::InstallExamplePlugin` from a keymap file.
+The complete list is pinned by `the_action_names_and_key_contexts_are_pinned`
+(`crates/serialist-core/src/keymap/tests.rs`), a snapshot of all 64 action names, the
+three with arguments included, and the 11 contexts: a rename or removal has to change a
+committed file. `a_keymap_file_binds_install_example_plugin_with_its_name`
+(`config_tests.rs`) binds `plugins::InstallExamplePlugin` from a keymap file.
 
 **Proposed promise.** Every action name, key context and argument shape listed here
 works in every 1.x. A renamed action keeps answering to its old name. Default chords may
 change in a minor release, named in the changelog; a binding in the user's `keymap.json`
 always wins. gpui-kit's actions are not covered.
 
-**Before 1.0.** Add a test that pins the full list of action names and contexts (a
-snapshot of what `declared_actions` and `declared_contexts` scan). Decide whether
-diagnostic actions such as `terminal::ToggleFrameStats` belong in the promised set. Decide
-whether default chords are promised (see the decisions list).
+**Before 1.0.** Decide whether diagnostic actions such as `terminal::ToggleFrameStats`
+belong in the promised set, and whether default chords are promised (see the decisions
+list). Done since the first draft: the full list of names and contexts is pinned.
 
 ## 4. Saved-command collections
 
@@ -293,38 +316,54 @@ codec's command. `keybinding` and `commands.send` name a command as
 
 **Versioned.** No.
 
-**Newer and older.** A key outside the known lists is reported as a warning and ignored.
-A file that does not parse, or whose values do not fit the model (a `kind` this build does
-not know, a payload with none of the four forms it knows), is skipped whole with a warning,
-and the other collections load. When the Commands panel saves an edit it rewrites the whole
-file as plain JSON from the model, which drops comments and unknown keys
-(`CommandCollection::to_json`). So a collection that a later build wrote with a new key
-loses that key the first time an earlier build edits it, and one that uses a new payload
-form or param kind does not load in the earlier build at all.
+**Newer and older.** A key outside the known lists is reported as a warning and not used.
+A command whose values do not fit the model (a `kind` this build does not know, a payload
+with none of the four forms it knows) is skipped by itself with a warning naming the
+file, the group and the command; so is a group that will not read. Everything else in the
+file loads. Only a file that is not JSON, or whose top level has the wrong shape, is
+skipped whole, and then the other collections still load. When the Commands panel saves
+an edit it rewrites the file as plain JSON from the model and writes back what this build
+did not read (`Carried` in `model.rs`, `CommandCollection::to_json`): the unknown keys at
+every level and each skipped command or group, verbatim and in its place. Comments are
+dropped. So a collection that a later build wrote keeps its newer keys, payload forms and
+param kinds through an edit in an earlier build, which shows and sends only the commands
+it can read.
 
 **Pinned by.** In `crates/serialist-core/src/commands/tests.rs`:
 `the_plans_example_file_parses_field_by_field`, `defaults_for_omitted_keys`,
 `an_expect_can_be_a_frame_predicate`, `a_script_payload_runs_a_script_and_has_no_bytes`,
 `a_payload_needs_exactly_one_form`, `a_wrong_shape_is_an_error_not_a_panic`,
 `unknown_keys_and_problems_become_warnings`, `a_bad_file_is_a_warning_and_the_rest_still_load`,
-`saving_drops_comments_and_unknown_keys`, `the_bundled_examples_load_clean_and_encode`,
+`saving_drops_comments_and_keeps_unknown_keys`,
+`edits_keep_what_a_command_carries_and_deletes_drop_it`,
+`one_unreadable_command_does_not_stop_the_rest_and_saves_in_its_place`,
+`a_command_this_build_cannot_read_is_a_warning_naming_file_group_and_command`,
+`the_bundled_examples_load_clean_and_encode`,
 and the payload tests (`text_escapes`, `hex_payloads_expand_hex16_little_endian_by_default`,
 `hex_payloads_expand_int_as_one_byte`, `hex_and_codec_payloads_send_no_line_ending_unless_told_to`
 and their neighbours). The codec payload and frame predicate in the app:
 `a_codec_command_without_its_plugin_is_not_sent_and_says_what_to_install`
 (`plugin_tests.rs`) and the Decoded panel tests.
 
-Not pinned: no collection written by 0.1.0 or 0.2.0 is kept as a fixture other than the
-bundled examples, which change with the app.
+Two fixtures in `crates/serialist-core/tests/fixtures/commands/` pin the format apart
+from the bundled examples, through `crates/serialist-core/tests/command_collections.rs`:
+`format_1_0.json` uses every key, payload form, escape, placeholder form, param kind and
+`expect` form (`the_1_0_format_loads_without_warnings_and_means_what_it_says`), and
+`from_the_future.json` holds what a later build might write
+(`a_collection_from_a_later_build_loads_what_it_can`,
+`editing_a_collection_from_a_later_build_keeps_the_rest_of_it`, and the property test
+`parse_save_parse_keeps_the_model_and_the_unknown_keys`). The panel's own save path:
+`editing_in_the_panel_keeps_what_this_build_cannot_read` and
+`moving_a_command_in_the_form_keeps_what_it_carried` (`commands_tests.rs`).
 
 **Proposed promise.** Every collection that loads in 1.0 loads with the same meaning in
 every 1.x: the keys, the four payload forms, the escapes, the placeholder syntax, the
 param kinds and the `expect` forms. New keys, payload forms and param kinds may be added.
 
-**Before 1.0.** Decide whether the writer keeps keys it does not know (carry them through
-from the parsed JSON) so an edit in an earlier build does not destroy a later build's data.
-Consider skipping one command with a warning, rather than the whole file, when a command
-uses a payload form or param kind this build does not know.
+**Before 1.0.** Nothing. Done since the first draft: the writer keeps what it does not
+know, and an unreadable command is skipped alone. Two limits remain and are documented in
+the manual: the writer spells out the defaults it fills in (`expect.timeout_ms`, a
+param's `kind`), and a param that is renamed loses its unknown keys.
 
 ## 5. `history.jsonl`
 
@@ -359,13 +398,16 @@ through `state.json.tmp` and a rename.
 **Newer and older.** A file of version 1 or 2 loads; missing optional keys take defaults.
 A file of a version outside 1 to 2, or one that does not parse (including a version-2
 file with a `mode` or `emulation` value this build does not know), is ignored with a log
-line, and the app starts with no tabs. At the next quit the build overwrites it with its
-own version, so a later build's tabs are lost after running an earlier one. A restored
+line, and the app starts with no tabs. At quit a file whose `version` is newer than this
+build writes is left alone, with a logged warning, so a later build's tabs survive a run
+of an earlier one (which then does not save its own tabs); a file of the same or an older
+version, or one that does not parse, is replaced. A restored
 `tcp:` id that does not parse leaves its tab waiting with a Connect button; a `replay:` tab
 always waits, and an option this build does not know makes its Connect fail (section 14).
 
 **Pinned by.** `state_round_trips_through_the_file`, `a_bad_or_foreign_file_is_ignored`,
-`a_version_1_file_still_loads_without_an_emulation`, `saving_needs_the_directory`
+`a_version_1_file_still_loads_without_an_emulation`, `saving_needs_the_directory`,
+`saving_leaves_a_newer_builds_file_alone`, `saving_replaces_an_older_or_corrupt_file`
 (`session_state.rs`); `the_open_tabs_come_back_at_the_next_start`,
 `a_version_1_state_file_reopens_its_tabs_with_the_emulation_the_settings_name`,
 `restore_session_off_starts_with_no_tabs` (`tab_tests.rs`);
@@ -374,12 +416,10 @@ always waits, and an option this build does not know makes its Connect fail (sec
 
 **Proposed promise.** `state.json` is the app's own file, not an interface: nobody is
 expected to edit it or read it. Every 1.x reads the state files of every earlier 1.x (and
-versions 1 and 2), bumps `version` whenever the format changes, and ignores a newer file
-rather than misreading it.
+versions 1 and 2), bumps `version` whenever the format changes, and neither misreads nor
+overwrites a newer file.
 
-**Before 1.0.** Decide whether an earlier build should overwrite a later build's file at
-quit; leaving a newer file alone (or setting it aside) costs a few lines in
-`SessionState::save`'s caller.
+**Before 1.0.** Nothing. Done since the first draft: a newer file is left alone at quit.
 
 ## 7. Theme files
 
@@ -445,10 +485,15 @@ Scripts menu, `scripts::Run`, a saved command's `{ "script" }` payload, a device
 alongside this page. `docs/scripting.md` describes them, and they are part of the proposed
 1.0 surface with the rest of the table.
 
-**Versioned.** No. A script cannot ask which version of the API it runs against.
+**Versioned.** Yes: the global `serialist` holds `serialist.api`, an integer (`SCRIPT_API`
+in `api.rs`, 1 at 1.0) that goes up by one in each release that adds something, and
+`serialist.version`, the app version as a string.
 
-**Newer and older.** A script that calls a function this build lacks fails with Lua's
-"attempt to call a nil value", which ends the run with exit status 1 headless.
+**Newer and older.** A script that needs a later addition checks
+`assert(serialist.api >= 2, "…")` and fails with its own message. One that does not check
+and calls a function this build lacks fails with Lua's "attempt to call a nil value".
+Either ends the run with exit status 1 headless. On a build from before the number
+existed, `serialist` is `nil`.
 
 **Pinned by.** `crates/serialist-script/tests/host.rs` (`print_and_log_arrive_as_output_in_order`,
 `errors_carry_a_traceback_with_the_script_name_and_line`, `the_memory_cap_is_an_error_not_an_abort`,
@@ -456,7 +501,8 @@ alongside this page. `docs/scripting.md` describes them, and they are part of th
 `commands_send_goes_through_the_sender`, `the_sandbox_has_no_os_io_or_escape_hatches`,
 `a_symlink_out_of_the_scripts_directory_is_refused`, `hex_and_bytes_helpers`,
 `waiting_inside_a_coroutine_the_script_made_fails_clearly`,
-`a_script_without_a_session_is_told_so`) and `tests/port.rs`
+`a_script_without_a_session_is_told_so`,
+`scripts_can_check_the_api_they_run_against`) and `tests/port.rs`
 (`version_probe_against_the_at_modem`,
 `an_expect_that_never_matches_times_out_with_nil_and_elapsed`,
 `expect_captures_and_reads_the_stream_in_order`, `read_line_and_read_with_timeouts`,
@@ -475,11 +521,9 @@ New globals, functions and optional arguments may be added. The sandbox does not
 a library scripts have. Lua stays 5.4. Message texts and `port:description()` are not
 promised.
 
-**Before 1.0.** Give scripts a value to check (for example `serialist.version`, or an API
-number) so a script written for a later 1.x can fail clearly on an earlier one. Decide
-whether the three additions in progress land before 1.0. Decide whether the headless
-output forms (`print` tab-joined, `log.*` as `[info] …`) are promised, since tools parse
-stdout.
+**Before 1.0.** Decide whether the headless output forms (`print` tab-joined, `log.*` as
+`[info] …`) are promised, since tools parse stdout. Done since the first draft: scripts
+have `serialist.api` to check, and the three additions are in.
 
 ## 9. Plugin folders
 
@@ -533,13 +577,16 @@ The sandbox has `string`, `table`, `math`, `utf8`, `coroutine`, `os.time`, `os.c
 memory, 20 000 000 instructions per call checked every 10 000, 1 MiB held back, 64 MiB of
 frames per call, 1 MiB for `describe`.
 
-**Versioned.** No. A Lua plugin has no manifest and declares no API number;
-`describe().version` is the plugin's own version. (The plan's "Open questions" answer
-says a plugin's `plugin.toml` declares `api = "1"`; that holds for WebAssembly plugins
-only.)
+**Versioned.** Yes, optionally: `describe()` may return `api`, an integer naming the Lua
+codec interface the plugin was written for; absent means 1. This build provides
+`LUA_CODEC_API` (1, in `lua/mod.rs`), which a plugin reads as `codec.api`.
+`describe().version` is the plugin's own version. A Lua plugin still has no manifest.
 
-**Newer and older.** A plugin that uses something this build lacks fails at load, or the
-call fails and its bytes become a `plugin_error` frame; ingest never stalls.
+**Newer and older.** A plugin whose `api` is higher than the build provides is refused at
+load with a message naming the plugin and both numbers; so is an `api` that is not a
+positive integer. A plugin that declares nothing and uses something this build lacks
+fails at load, or the call fails and its bytes become a `plugin_error` frame; ingest
+never stalls.
 
 **Pinned by.** `crates/serialist-plugins/tests/lua_adapter.rs`
 (`held_back_bytes_are_prepended_and_offsets_stay_global`,
@@ -549,7 +596,8 @@ call fails and its bytes become a `plugin_error` frame; ingest never stalls.
 `the_frame_budget_is_a_limit_like_the_others`, `the_describe_budget_is_a_limit_like_the_others`,
 `encode_maps_results_and_errors`, `the_sandbox_has_no_io_os_or_debug`,
 `a_plugin_that_cannot_load_says_why`, `reload_picks_up_edits_and_keeps_the_old_plugin_on_failure`,
-`reset_forgets_held_bytes_and_state`) and the Rust-against-Lua tests in
+`reset_forgets_held_bytes_and_state`, `a_plugin_declares_the_codec_api_it_was_written_for`,
+`the_host_api_number_is_codec_api`) and the Rust-against-Lua tests in
 `tests/conformance.rs` (`both_describe_the_same_codec`,
 `rust_and_lua_agree_on_any_capture_however_it_is_cut`, `rust_and_lua_encode_any_request_alike`).
 
@@ -557,9 +605,8 @@ call fails and its bytes become a `plugin_error` frame; ingest never stalls.
 1.x: the three functions, the description and frame tables, the field types, the `codec`
 helpers and the sandbox's libraries stay. Limits may be raised, not lowered.
 
-**Before 1.0.** Decide whether Lua plugins declare an API (an `api` key in what
-`describe()` returns, or a `plugin.toml` beside `plugin.lua`). Without one, a later
-incompatible interface cannot tell an old plugin from a new one.
+**Before 1.0.** Nothing. Done since the first draft: `describe()` takes an optional `api`,
+so a later interface can tell an old plugin (no `api`, or 1) from a new one.
 
 ## 11. `plugin.toml` and the WebAssembly interface
 
@@ -657,8 +704,9 @@ prints `serialist: <error>` and the usage to stderr and exits 2. The simulated d
 one exits 2. Environment: `SERIALIST_CONFIG_DIR` and `RUST_LOG`.
 
 `--script` exit statuses: 0 when the main chunk returns, 1 on an error (including a port
-that cannot be opened), 2 when the script was stopped or nothing ran (a bad flag, no
-`--port` or more than one, an unreadable script, an unknown simulated device). Headless,
+that cannot be opened), 2 when nothing ran (a bad flag, no `--port` or more than one, an
+unreadable script, an unknown simulated device), and 130 for a stopped script, which
+nothing in a headless run can cause yet: Ctrl-C ends the process by the signal. Headless,
 stdout carries only the script's `print` and `log.*` lines; notices, prompts, errors and
 the log (at `warn` unless `RUST_LOG` says otherwise) go to stderr. `--terminal-demo`
 opens the milestone 1 terminal element over an in-memory stream: a development tool.
@@ -672,25 +720,31 @@ opens the milestone 1 terminal element over an in-memory stream: a development t
 `the_help_names_every_kind_of_port_id`, `custom_baud_rates_are_accepted`,
 `terminal_demo_flag`, `help_and_version`, `errors_name_the_problem`. In `headless.rs`:
 `a_script_expects_ok_from_virtual_at_and_exits_zero`, `an_error_exits_one_and_names_the_line`
-(which also checks that `Stopped` maps to 2), `the_device_profile_and_baud_set_the_line`,
+(which also checks that `Stopped` maps to 130), `the_device_profile_and_baud_set_the_line`,
 `without_a_port_or_a_readable_script_nothing_runs`. In `wiring.rs`:
-`named_virtual_device_is_listed_with_real_ports_and_opened`.
+`named_virtual_device_is_listed_with_real_ports_and_opened`. The binary itself is run by
+`crates/serialist/tests/cli.rs`: `version_prints_the_name_and_number`,
+`help_prints_the_usage_on_stdout`, `an_unknown_flag_exits_two_with_the_usage_on_stderr`,
+`a_script_that_cannot_run_exits_two` (no port, two ports, an unreadable script, an
+unknown simulated device), `a_script_against_a_simulated_device_prints_only_its_output`
+and `a_script_that_raises_an_error_exits_one_and_says_so_on_stderr`. Those have run on
+macOS only.
 
-Not pinned: everything in `main.rs`, which the coverage run leaves out. No test checks
-that a bad flag or a setup failure exits 2, or the text `--version` prints. No headless
-path stops a script: `run_headless` calls neither `ScriptRun::stop` nor
-`ScriptHost::stop_current`, and there is no signal handler, so exit status 2 for
-"stopped" is unreachable there, and Ctrl-C ends the process by the signal.
+Not pinned: the paths in `main.rs` that open a window. No headless path stops a script:
+`run_headless` calls neither `ScriptRun::stop` nor `ScriptHost::stop_current`, and there
+is no signal handler, so exit status 130 is reserved, not reachable, and Ctrl-C ends the
+process by the signal.
 
 **Proposed promise.** Every flag keeps its name, spelling and meaning in every 1.x; new
 flags may be added. The `--script` exit statuses keep their meanings, and headless stdout
 carries only the script's output. `--terminal-demo` is not covered. The simulated device
 names stay; what the devices send is not promised.
 
-**Before 1.0.** Remove `--terminal-demo` or mark it as unsupported in `--help`. Decide
-whether a usage error should keep sharing status 2 with a stopped script. Add an
-integration test that runs the binary and checks its exit statuses and `--version`
-output.
+**Before 1.0.** Nothing required. Done since the first draft: `--help` marks
+`--terminal-demo` as a development tool outside the promise, a stopped script has its own
+status (130) apart from "nothing ran" (2), and an integration test runs the binary.
+Stopping a headless script cleanly on Ctrl-C would make 130 reachable; it can be added in
+any 1.x.
 
 ## 14. Port ids
 
@@ -744,7 +798,7 @@ UTF-8 text: the header `serialist-timing 1`, then `rx <t> <offset> <len>`,
 **Newer and older.** A different version in the header is an error, and a replay whose
 sidecar does not parse fails to open with a message naming the port. A record kind this
 build does not know is skipped only if it is lowercase ASCII letters and `_` (the rule is
-in `parse_record`, not in the module docs); any other unknown first word is an error. A
+in `parse_record`, and now in the module docs too); any other unknown first word is an error. A
 known record with an extra field is an error (`rx: too many fields`), so version 1 can
 grow only by new record kinds. A capture without a sidecar replays at the port's baud rate
 times the speed.
@@ -763,8 +817,9 @@ and the rest of `crates/serialist-core/tests/replay.rs`;
 file stays received bytes only. A 1.x build writes version 1, or, if it ever writes a
 version 2, still reads version 1.
 
-**Before 1.0.** Put the lowercase rule for unknown record kinds into the module docs.
-Decide whether sent bytes should be recorded; a `tx` kind fits version 1.
+**Before 1.0.** Nothing required. Whether sent bytes should be recorded can wait: a `tx`
+kind fits version 1 and older builds skip it. Done since the first draft: the module docs
+state the rule for unknown record kinds.
 
 ## 16. Exports
 
@@ -776,17 +831,23 @@ the CSV and JSON writers); `write_lines`, `format_timestamp` and `TextOptions` i
 The format follows the file's extension: `.bin` and `.raw` are raw bytes as received (what
 the store still holds), `.txt`, `.log` and `.text` are the lines as displayed, one per line,
 optionally stamped `[<stamp>] ` with no Rx or Tx marker; `.csv` and `.json` are decoded
-frames. VT mode adds the screen's rows as text. CSV columns are `time`, `direction`, `kind`,
-`summary`, one per field name in the order fields first appear, and `raw` (hex). JSON is an
-array of objects with `id`, `time`, `direction`, `kind`, `severity`, `summary`, `fields`
-(numbers as numbers, bytes as hex, lists as arrays), `raw_start`, `raw_end` and `raw` (hex,
-or `null` once evicted). `direction` is `RX`, `TX` or `--`. `time` is the Decoded panel's
-stamp: the session's timestamp mode and `display.timestamp_format`, local time, with
-absolute stamps while the gutter is off. With the defaults that is `%H:%M:%S%.3f`, no date.
+frames. VT mode adds the screen's rows as text. CSV columns are `time`, `timestamp`,
+`direction`, `kind`, `summary`, one per field name in the order fields first appear, and
+`raw` (hex). JSON is an object, `{ "format": "serialist-frames", "version": 1, "frames":
+[ … ] }`, whose frames are objects with `id`, `time`, `timestamp`, `direction`, `kind`,
+`severity`, `summary`, `fields` (numbers as numbers, bytes as hex, lists as arrays),
+`raw_start`, `raw_end` and `raw` (hex, or `null` once evicted). `direction` is `RX`, `TX`
+or `--`. `time` is the Decoded panel's stamp, for people: the session's timestamp mode and
+`display.timestamp_format`, local time, with absolute stamps while the gutter is off;
+with the defaults that is `%H:%M:%S%.3f`, no date. `timestamp` is for programs: the
+frame's wall-clock time as RFC 3339 in UTC with microseconds
+(`2026-11-10T14:03:22.123456Z`), whatever the display settings (`FrameTime::timestamp`).
+Version 0.2.0 wrote the JSON as a bare array with no `timestamp`.
 
-**Versioned.** No.
+**Versioned.** The JSON export, yes: `"version": 1`. The CSV and the others, no.
 
 **Pinned by.** `format_follows_the_extension`, `decoded_frames_export_as_csv_and_json`,
+`the_machine_readable_timestamp_ignores_the_display_settings`,
 `text_export_writes_lines_as_displayed_with_the_chosen_stamps`,
 `raw_export_is_the_stream_byte_for_byte_and_counts_what_was_evicted`,
 `a_failed_export_leaves_no_partial_file_and_keeps_the_old_one` (`export.rs`);
@@ -798,10 +859,9 @@ absolute stamps while the gutter is off. With the defaults that is `%H:%M:%S%.3f
 keep their names and meanings; new CSV columns go after the field columns and new JSON
 keys may be added. Text and screen exports are for people and are not promised.
 
-**Before 1.0.** Give decoded-frame exports a machine-readable time that does not depend
-on display settings (for example an ISO 8601 UTC stamp with the date). Decide whether the
-JSON stays a bare array; turning it into an object with a version later would break every
-reader.
+**Before 1.0.** Nothing, if the owner accepts the one break this made: a reader of
+0.2.0's JSON export must now look under `frames`. Done since the first draft: exports
+carry `timestamp`, and the JSON is a versioned object.
 
 ## 17. The Rust crates
 
@@ -812,19 +872,19 @@ reader.
 
 **Versioned.** Every crate takes the workspace version, 0.2.0.
 
-None is published. Only `airoha-race-wasm` says `publish = false`; the others could be
-packaged, but the workspace dependencies are path-only (`serialist-core = { path =
-"crates/serialist-core" }`), so `cargo publish` refuses every crate that depends on
-another workspace crate, and `serialist-ui` pins the community GPUI snapshot `gpui-pre
-=0.3.7`. No document says any of them is meant for others. `serialist_core::Codec` is the
+None is published, and every workspace package now says `publish = false`, the SDK
+included (its manifest says what would have to change first). The workspace dependencies
+are path-only (`serialist-core = { path = "crates/serialist-core" }`) and `serialist-ui`
+pins the community GPUI snapshot `gpui-pre =0.3.7`. No document says any of them is meant
+for others. `serialist_core::Codec` is the
 in-process codec boundary, but third-party codecs reach it only through the Lua and
 WebAssembly adapters.
 
 **Proposed promise.** The Rust API of every crate except possibly `serialist-plugin-sdk`
 (section 12) is internal and may change in any release.
 
-**Before 1.0.** Add `publish = false` to every crate the promise leaves internal, so an
-accidental publish cannot create an expectation.
+**Before 1.0.** Nothing. Done since the first draft: `publish = false` on every crate, so
+an accidental publish cannot create an expectation.
 
 ## Where the documents and the code differed
 
@@ -841,41 +901,53 @@ Found while writing this page and fixed in their own commits:
 - `docs/scripting.md`'s exit status table left out `--script` with more than one `--port`,
   which exits 2.
 
-Not fixed, because they are not errors in a document this change may edit:
+Left out of the first draft and fixed since:
 
-- The plan's answer to "Should the plugin API be public and versioned" says a plugin's
-  `plugin.toml` declares `api = "1"`; Lua plugins have no `plugin.toml` and no API number
-  (section 10).
-- `docs/scripting.md` and `--help` say `--script` exits 2 "if it is stopped"; the mapping
-  exists (`exit_code`), but no headless path stops a script (section 13).
-- The `--help` text for `--config-dir` leaves out `plugins/` and `state.json` (section 1).
+- The plan's answer to "Should the plugin API be public and versioned" said a plugin's
+  `plugin.toml` declares `api = "1"`; that holds for WebAssembly plugins, and a Lua
+  plugin now declares its number in `describe()` (section 10).
+- `docs/scripting.md` and `--help` said `--script` exits 2 "if it is stopped", which no
+  headless path can do. Both now say 2 means nothing ran and 130 is reserved for a
+  stopped script (section 13).
+- The `--help` text for `--config-dir` left out `plugins/` and `state.json` (section 1).
 
 ## Decisions for the owner
 
-1. **How a later 1.x file meets an earlier 1.x build.** Today one unknown value rejects a
-   whole `settings.json` (the earlier build drops every user setting), one unknown payload
-   form or param kind drops a whole command collection, and an edit in the earlier build
-   deletes keys it does not know. Change the loaders and the collection writer before 1.0,
-   or promise that 1.x only ever adds keys, never values.
-2. **Whether the WebAssembly tier is in 1.0.** The release packages are built without the
+The first draft listed ten. The code now settles seven of them one way; each of those is
+still the owner's to reverse before the tag, and the choice made is stated so it can be.
+
+### Still open
+
+1. **Whether the WebAssembly tier is in 1.0.** The release packages are built without the
    `wasm` feature, so `wit/v1`, `plugin.toml` and the SDK reach only people who build from
-   source. Ship the feature in the packages, or leave the tier out of the promise.
-3. **Which Rust crates are public.** The proposal: none, except possibly
-   `serialist-plugin-sdk`, and `publish = false` on the rest. Publishing the SDK needs the
-   WIT inside the crate and a version line of its own.
-4. **Whether Lua plugins declare an API before 1.0.** Without a declared number, a later
-   incompatible Lua codec interface cannot tell old plugins from new ones.
-5. **What the Lua scripting API is at 1.0.** `codecs.<name>.encode`, timers and
-   `port:on_frame` are in now; what is left is whether scripts get a version value to
-   check.
-6. **Whether defaults are promised.** Default setting values, default key chords and the
+   source. Ship the feature in the packages (the release binary grows from 36.4 MB to
+   50.6 MB, and a signed macOS build needs a JIT entitlement), or leave the tier out of
+   the promise.
+2. **Whether defaults are promised.** Default setting values, default key chords and the
    bundled theme names reach every user who has not overridden them; promise them, or
    promise only file formats and names and announce default changes in the changelog.
-7. **The config directory.** Keep `~/.config/serialist` on macOS and ignore
-   `XDG_CONFIG_HOME` on Linux, or change either now; after 1.0 a move needs a migration.
-8. **Decoded-frame exports.** Add a machine-readable time and settle the JSON's top-level
-   shape before promising the columns and keys.
-9. **The command line's loose ends.** Remove or disown `--terminal-demo`, and decide whether
-   a usage error keeps sharing exit status 2 with a stopped script.
-10. **`state.json` after a downgrade.** Whether an earlier build may overwrite a later
-    build's state file at quit.
+   With it: whether diagnostic actions such as `terminal::ToggleFrameStats` are in the
+   promised set, and whether the headless output forms are.
+3. **Whether `serialist-plugin-sdk` is published.** Every crate is `publish = false` now.
+   Publishing the SDK needs the WIT inside the crate and a version line of its own.
+4. **macOS's config directory.** It stays `~/.config/serialist` unless the owner moves it
+   now; after 1.0 a move needs a migration.
+
+### Settled in the code
+
+5. **How a later 1.x file meets an earlier 1.x build.** The loaders changed, so 1.x may
+   add values as well as keys: an unreadable settings value costs only its key, an
+   unreadable saved command only itself, and saving a collection writes back what the
+   build did not read (sections 2 and 4).
+6. **Lua plugins declare an API.** Optionally, as `api` in `describe()`; absent means 1
+   (section 10).
+7. **Scripts get a version value.** `serialist.api` and `serialist.version` (section 8).
+8. **Linux's config directory.** An absolute `XDG_CONFIG_HOME` is honored, and an
+   existing `~/.config/serialist` is still used while the new directory does not exist
+   (section 1).
+9. **Decoded-frame exports.** A `timestamp` in UTC, and the JSON as a versioned object;
+   this breaks readers of 0.2.0's bare array (section 16).
+10. **The command line's loose ends.** `--terminal-demo` is disowned in `--help`, and a
+    stopped script's status is 130, apart from 2 for "nothing ran" (section 13).
+11. **`state.json` after a downgrade.** An earlier build leaves a later build's file
+    alone at quit (section 6).
