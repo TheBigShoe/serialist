@@ -110,6 +110,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::convert::{Stamp, build_line, same_content};
 use crate::events::{Listener, VtEvent};
+use crate::mouse::{MouseEncoding, MouseMode, MouseReporting};
 use crate::scrollback::Scrollback;
 use crate::snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};
 
@@ -583,7 +584,7 @@ impl VtScreen {
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             app_cursor_keys: mode.contains(TermMode::APP_CURSOR),
             app_keypad: mode.contains(TermMode::APP_KEYPAD),
-            mouse_reporting: mode.intersects(TermMode::MOUSE_MODE),
+            mouse: mouse_reporting(mode),
         };
         let title = self.listener.0.lock().title.clone();
         let title = match (title, prev.and_then(|p| p.title.as_ref())) {
@@ -790,6 +791,31 @@ fn capture(
         }
         _ => Arc::new(line),
     }
+}
+
+/// The mouse reporting `mode` asks for. Alacritty keeps one mouse mode at a time (the
+/// last one set) and one of the two encodings beyond X10.
+fn mouse_reporting(mode: TermMode) -> Option<MouseReporting> {
+    let reporting = if mode.contains(TermMode::MOUSE_MOTION) {
+        MouseMode::Motion
+    } else if mode.contains(TermMode::MOUSE_DRAG) {
+        MouseMode::Drag
+    } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+        MouseMode::Click
+    } else {
+        return None;
+    };
+    let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+        MouseEncoding::Sgr
+    } else if mode.contains(TermMode::UTF8_MOUSE) {
+        MouseEncoding::Utf8
+    } else {
+        MouseEncoding::X10
+    };
+    Some(MouseReporting {
+        mode: reporting,
+        encoding,
+    })
 }
 
 /// Whether two snapshots of one screen show the same thing.

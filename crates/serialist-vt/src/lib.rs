@@ -17,6 +17,8 @@
 //!   from a session, added with [`Ingest::spawn_with`](serialist_core::Ingest::spawn_with)
 //!   next to the store; [`VtHandle`] is the UI's side of it.
 //! - [`vt_key_bytes`] gives the cursor-key bytes that depend on the terminal's mode.
+//! - [`MouseReporting::report`] gives the bytes of a mouse report in the mode and
+//!   encoding the device asked for ([`VtModes::mouse`]).
 //!
 //! # Line ids
 //!
@@ -61,8 +63,8 @@
 //! | [`VtEvent::ColorRequest`] | OSC 4, 10, 11 or 12 with `?` | answers with its theme color |
 //!
 //! OSC 52 clipboard access is disabled: a device on a serial line does not get to read
-//! or write the clipboard. Mouse reporting is tracked in [`VtModes`] but Serialist sends
-//! no mouse reports yet.
+//! or write the clipboard. Mouse reporting is in [`VtModes::mouse`]; the app sends the
+//! reports (see the [`MouseReporting`] docs).
 //!
 //! # Wide characters
 //!
@@ -97,6 +99,7 @@
 mod convert;
 mod events;
 mod keys;
+mod mouse;
 mod screen;
 mod scrollback;
 mod sink;
@@ -105,6 +108,7 @@ mod snapshot;
 pub use convert::cell_width;
 pub use events::{ColorRequest, MAX_EVENTS, VtEvent};
 pub use keys::vt_key_bytes;
+pub use mouse::{MouseAction, MouseButton, MouseEncoding, MouseEvent, MouseMode, MouseReporting};
 pub use screen::{
     DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS, STAGING_ROWS,
     SYNC_TIMEOUT, VtScreen,

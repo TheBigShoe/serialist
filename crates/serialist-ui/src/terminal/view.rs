@@ -15,6 +15,15 @@
 //! lines. Search does not: the screen is redrawn in place, so it searches the log the
 //! session keeps underneath ([`TerminalView::set_log`]), says so in the search bar, and
 //! marks nothing on the screen, whose line ids mean screen rows, not log lines.
+//!
+//! When the device asks for the mouse (`CSI ? 1000 h` and friends) and the terminal is in
+//! inline mode, where its input goes to the device, the mouse on the screen's rows is
+//! reported instead of selecting: presses, releases, moves and the wheel as the device's
+//! mode says, through [`TerminalScreen::report`], in the encoding it asked for
+//! ([`serialist_vt::MouseReporting`]). With Shift held the mouse selects and scrolls as
+//! always, as in other terminals. The view keeps which button the device was told is
+//! down, so it hears each release once, and the cell of the last report, so a move
+//! inside a cell is not sent again.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -24,7 +33,10 @@ use std::time::Duration;
 
 use serialist_core::store::DEFAULT_TIMESTAMP_FORMAT;
 use serialist_core::{LineId, LineSource, SearchMatch, Searcher};
-use serialist_vt::CursorState;
+use serialist_vt::{
+    CursorState, MouseAction, MouseButton as VtMouseButton, MouseEvent as VtMouseEvent,
+    MouseReporting,
+};
 
 use crate::actions::{
     self, CycleTimestamps, DismissSearch, JumpToBottom, PageDown, PageUp, ScrollToTop, Search,
@@ -60,30 +72,67 @@ pub const MAX_MARKS: usize = 256;
 /// How long a blinking cursor stays on, and then off.
 pub const CURSOR_BLINK: Duration = Duration::from_millis(530);
 
+/// Wheel reports sent for one wheel event at most.
+pub const MAX_WHEEL_REPORTS: usize = 10;
+
 /// What the search bar says while it searches the log under a terminal screen.
 pub const LOG_SEARCH_NOTE: &str = "in the raw log";
 
-/// A terminal screen to show (VT mode): how the element asks for it to be resized.
+/// Writes a mouse report to the device.
+pub type SendMouseReport = Rc<dyn Fn(Vec<u8>, &mut App)>;
+
+/// A terminal screen to show (VT mode): how the element asks for it to be resized, and
+/// where the mouse reports the device asked for go.
 #[derive(Clone)]
 pub struct TerminalScreen {
     /// Called after a frame whose element fits a different number of cells than the
     /// screen has, with the columns and rows that fit.
     pub resize: ResizeScreen,
+    /// Called with each mouse report, in inline mode while the device asks for them.
+    pub report: SendMouseReport,
 }
 
-/// A screen snapshot's size and cursor, as the element draws them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A screen snapshot's size, cursor and mouse reporting, as the element uses them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScreenState {
     pub columns: usize,
     pub rows: usize,
     /// `None` while the device hides the cursor.
     pub cursor: Option<CursorState>,
+    /// The id of the screen's top row: rows above it are scrollback.
+    pub first_visible: LineId,
+    /// The mouse reports the device asked for, if any.
+    pub mouse: Option<MouseReporting>,
+}
+
+impl Default for ScreenState {
+    fn default() -> Self {
+        Self {
+            columns: 0,
+            rows: 0,
+            cursor: None,
+            first_visible: LineId::ZERO,
+            mouse: None,
+        }
+    }
 }
 
 struct ScreenView {
     resize: ResizeScreen,
+    report: SendMouseReport,
     requested: Rc<Cell<Option<(usize, usize)>>>,
     state: ScreenState,
+}
+
+/// The mouse as reports have told the device about it.
+#[derive(Clone, Copy, Debug, Default)]
+struct MouseReports {
+    /// The button whose press was reported and whose release was not.
+    pressed: Option<VtMouseButton>,
+    /// The cell of the last report, so a move inside one cell is not reported again.
+    cell: Option<(usize, usize)>,
+    /// Wheel travel not yet reported, in rows.
+    wheel: f32,
 }
 
 /// Where each source stood when the view was paused.
@@ -150,6 +199,8 @@ pub struct TerminalView {
     inline: bool,
     /// The terminal screen the text source is, in VT mode.
     screen: Option<ScreenView>,
+    /// What the device has heard of the mouse, in VT mode with reporting on.
+    mouse: MouseReports,
     /// What search runs over while a screen is shown: the session's log.
     log: Option<Arc<dyn LineSource>>,
     /// `terminal.cursor_blink`.
@@ -248,6 +299,7 @@ impl TerminalView {
             },
             inline: false,
             screen: None,
+            mouse: MouseReports::default(),
             log: None,
             cursor_blink,
             blink_on: true,
@@ -482,8 +534,10 @@ impl TerminalView {
     /// Show the text source as a terminal screen (VT mode), or as lines again (`None`).
     /// Call [`Self::update_screen`] with each snapshot's size and cursor.
     pub fn set_screen(&mut self, screen: Option<TerminalScreen>, cx: &mut Context<Self>) {
+        self.mouse = MouseReports::default();
         self.screen = screen.map(|screen| ScreenView {
             resize: screen.resize,
+            report: screen.report,
             requested: Rc::default(),
             state: ScreenState::default(),
         });
@@ -500,6 +554,9 @@ impl TerminalView {
             return;
         };
         if screen.state != state {
+            if state.mouse.is_none() {
+                self.mouse = MouseReports::default();
+            }
             screen.state = state;
             self.sync_blink(cx);
             cx.notify();
@@ -579,9 +636,99 @@ impl TerminalView {
             columns: screen.state.columns,
             rows: screen.state.rows,
             cursor,
+            first_visible: screen.state.first_visible,
+            mouse: self.mouse_reporting(),
             resize: screen.resize.clone(),
             requested: screen.requested.clone(),
         })
+    }
+
+    /// The mouse reports to send: what the device asked for, in inline mode (where the
+    /// terminal's input goes to the device), in the text view of a screen.
+    pub fn mouse_reporting(&self) -> Option<MouseReporting> {
+        self.screen
+            .as_ref()
+            .filter(|_| self.inline && self.display == DisplayMode::Text)?
+            .state
+            .mouse
+    }
+
+    /// Whether a reported press waits for its release.
+    pub(crate) fn mouse_pressed(&self) -> Option<VtMouseButton> {
+        self.mouse.pressed
+    }
+
+    /// Report `action` at screen cell `cell` (column, row) with Alt and Control as
+    /// `alt` and `control`, if the device asked for it: a press or release changes which
+    /// button is down, a move inside the cell of the last report is not sent again, and a
+    /// release without a reported press is not sent. Returns whether a report went out.
+    pub(crate) fn report_mouse(
+        &mut self,
+        action: MouseAction,
+        cell: (usize, usize),
+        alt: bool,
+        control: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(reporting) = self.mouse_reporting() else {
+            return false;
+        };
+        match action {
+            MouseAction::Press(button) => self.mouse.pressed = Some(button),
+            MouseAction::Release(button) => {
+                if self.mouse.pressed != Some(button) {
+                    return false;
+                }
+                self.mouse.pressed = None;
+            }
+            MouseAction::Move(_) => {
+                if self.mouse.cell == Some(cell) || !reporting.reports(action) {
+                    return false;
+                }
+            }
+            MouseAction::Wheel { .. } => {}
+        }
+        self.mouse.cell = Some(cell);
+        let event = VtMouseEvent {
+            action,
+            column: cell.0,
+            row: cell.1,
+            alt,
+            control,
+        };
+        let Some(bytes) = reporting.report(event) else {
+            return false;
+        };
+        if let Some(screen) = &self.screen {
+            let report = screen.report.clone();
+            report(bytes, cx);
+        }
+        true
+    }
+
+    /// Report the wheel moving `rows` rows (positive towards older text, up) at `cell`:
+    /// one report per whole row, the rest kept for the next turn.
+    pub(crate) fn report_wheel(
+        &mut self,
+        rows: f32,
+        cell: (usize, usize),
+        alt: bool,
+        control: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A change of direction drops what was left of the other one.
+        if self.mouse.wheel * rows < 0.0 {
+            self.mouse.wheel = 0.0;
+        }
+        self.mouse.wheel += rows;
+        let steps = self.mouse.wheel.trunc();
+        self.mouse.wheel -= steps;
+        // A fling can travel a long way; a device needs a few steps, not a screenful.
+        let count = (steps.abs() as usize).min(MAX_WHEEL_REPORTS);
+        let up = steps > 0.0;
+        for _ in 0..count {
+            self.report_mouse(MouseAction::Wheel { up }, cell, alt, control, cx);
+        }
     }
 
     // --- Inline mode and marks ---------------------------------------------------------
@@ -595,6 +742,7 @@ impl TerminalView {
     pub fn set_inline(&mut self, inline: bool, cx: &mut Context<Self>) {
         if self.inline != inline {
             self.inline = inline;
+            self.mouse = MouseReports::default();
             cx.notify();
         }
     }
