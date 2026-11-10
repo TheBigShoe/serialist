@@ -685,6 +685,95 @@ fn editing_saves_the_file_and_the_watcher_brings_it_back(cx: &mut TestAppContext
     assert!(editor.read_with(cx, |e, _| e.error().is_some()));
 }
 
+/// `BENCH` as a later build might write it: a command this build cannot read between
+/// two it can, and keys it does not know.
+const FUTURE_BENCH: &str = r#"{
+  "name": "Bench",
+  "format": 2,
+  "groups": [
+    {
+      "name": "Modem",
+      "commands": [
+        {
+          "name": "Version",
+          "payload": { "text": "AT+VER?", "encoding": "ascii" },
+          "expect": { "pattern": "^OK", "timeout_ms": 2000, "retries": 2 },
+          "colour": "blue"
+        },
+        { "name": "Blob", "payload": { "base64": "AAEC" } },
+        { "name": "Reset", "payload": { "text": "ATZ" } }
+      ]
+    }
+  ]
+}"#;
+
+#[gpui_test]
+fn editing_in_the_panel_keeps_what_this_build_cannot_read(cx: &mut TestAppContext) {
+    let dir = config_dir("commands-future");
+    let file = dir.join("commands").join("bench.json");
+    std::fs::write(&file, FUTURE_BENCH).unwrap();
+    let (world, _) = world();
+    let (window, workspace, _view) = open(cx, &world, &dir, "virtual:at", false);
+    let panel = workspace.read_with(cx, |w, _| w.commands().clone());
+    // The command it cannot read is not listed; the others are.
+    let names = row_names(cx, &workspace);
+    assert!(names.contains(&"Version".to_owned()), "{names:?}");
+    assert!(!names.contains(&"Blob".to_owned()), "{names:?}");
+
+    let version_row = row_of(cx, &workspace, &reference("Modem", "Version"));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.right_click(("command-row", version_row), cx);
+    })
+    .unwrap();
+    let editor = panel
+        .read_with(cx, |p, _| p.editor().cloned())
+        .expect("the editor opened");
+    cx.update_window(window, |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.set_field(Field::Name, "Firmware", window, cx);
+            editor.set_field(Field::ExpectTimeout, "750", window, cx);
+            assert!(editor.save(cx), "{:?}", editor.error());
+        });
+    })
+    .unwrap();
+
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut want: serde_json::Value = serde_json::from_str(FUTURE_BENCH).unwrap();
+    let version = &mut want["groups"][0]["commands"][0];
+    version["name"] = "Firmware".into();
+    version["expect"]["timeout_ms"] = 750.into();
+    assert_eq!(saved, want);
+}
+
+#[test]
+fn moving_a_command_in_the_form_keeps_what_it_carried() {
+    let dir = config_dir("commands-future-move");
+    let file = dir.join("commands").join("bench.json");
+    std::fs::write(&file, FUTURE_BENCH).unwrap();
+    let mut store = CommandStore::empty();
+    let loaded = CommandCollection::load(&file, CollectionSource::User(file.clone())).unwrap();
+    store.set_collection(loaded.collection);
+    // The form builds the command afresh, carrying nothing, in another group.
+    let command = serialist_core::Command::text("Version", "AT+VER?").with_expect("^OK", 2000);
+    crate::commands_panel::write_command(
+        &store,
+        Some(&reference("Modem", "Version")),
+        "Bench",
+        "Other",
+        command,
+    )
+    .unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut want: serde_json::Value = serde_json::from_str(FUTURE_BENCH).unwrap();
+    let groups = want["groups"].as_array_mut().unwrap();
+    let moved = groups[0]["commands"].as_array_mut().unwrap().remove(0);
+    groups.push(serde_json::json!({ "name": "Other", "commands": [moved] }));
+    assert_eq!(saved, want);
+}
+
 #[gpui_test]
 fn command_keybindings_send_and_conflicts_are_reported(cx: &mut TestAppContext) {
     let dir = config_dir("commands-keys");
