@@ -43,18 +43,31 @@
 //! character `n` times) makes eleven bytes add 65535. Every snapshot of the row copies
 //! them too. So the tracker drops a zero-width character once its cell holds
 //! [`MAX_ZERO_WIDTH`] of them.
+//!
+//! # Insert mode
+//!
+//! In insert mode (`CSI 4 h`) Alacritty makes room for every character by moving the cells
+//! from the cursor to the end of the row one to the right, a cell at a time, so a
+//! character costs as much as the row is wide. `CSI 65535 b` then makes eight bytes cost
+//! 65535 times the row: 57 ms on a 1024-column screen, where a device at 115200 baud can
+//! send over a thousand of them a second. When those cells are all equal, as on a blank
+//! row or one the repeat has already filled, moving them changes nothing, so the tracker
+//! has the character written without the move. It looks along the row once and then
+//! remembers where it is, for as long as only characters arrive. What is left costs what
+//! typing into a row of text in insert mode costs: one move of the row for each character
+//! until the text has left it, which a repeat can ask for once a row.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row};
-use alacritty_terminal::index::Line;
+use alacritty_terminal::index::{Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape as VtCursorShape, CursorStyle, Handler, Hyperlink,
-    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode,
-    Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedMode,
+    PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
     cursor_icon::CursorIcon,
 };
 use serialist_core::ansi::incomplete_utf8_suffix;
@@ -287,6 +300,7 @@ impl VtScreen {
                 at: self.last_at,
                 offset: self.offset,
             },
+            equal_from: None,
         };
         f(&mut self.processor, &mut tracker);
     }
@@ -584,14 +598,47 @@ struct Tracker<'a> {
     term: &'a mut Term<Listener>,
     listener: &'a Listener,
     rows: Absorb<'a>,
+    /// Where the cursor is, when the cells from it to the end of its row are known to be
+    /// all equal and no part of a wide character: set by an insert-mode character
+    /// written without moving them, and forgotten on any other call. See the module docs.
+    equal_from: Option<Point>,
 }
 
 impl Tracker<'_> {
+    /// After every call but a character: whatever it did, the row may have changed.
     #[inline(always)]
     fn after(&mut self) {
+        self.equal_from = None;
+        self.absorb_scrolled();
+    }
+
+    #[inline(always)]
+    fn absorb_scrolled(&mut self) {
         if self.term.grid().history_size() != 0 {
             self.rows.absorb(self.term);
         }
+    }
+
+    /// Whether Alacritty's `input` would, for a character `width` cells wide, move the
+    /// cells from the cursor to the end of the row and leave the row as it was: insert
+    /// mode is on, the character goes on this row with room after it (otherwise `input`
+    /// wraps first or moves nothing), and those cells are all equal. Cells of a wide
+    /// character do not count as equal: writing over one changes its neighbour.
+    fn insert_moves_nothing(&self, width: usize) -> bool {
+        if !self.term.mode().contains(TermMode::INSERT) {
+            return false;
+        }
+        let grid = self.term.grid();
+        let point = grid.cursor.point;
+        if grid.cursor.input_needs_wrap || point.column.0 + width >= grid.columns() {
+            return false;
+        }
+        if self.equal_from == Some(point) {
+            return true;
+        }
+        let rest = &grid[point.line][point.column..];
+        let wide = Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+        !rest[0].flags.intersects(wide) && rest.windows(2).all(|pair| pair[0] == pair[1])
     }
 
     /// Whether the cell a zero-width character would join already holds
@@ -700,13 +747,29 @@ impl Handler for Tracker<'_> {
     }
 
     /// A character. A zero-width one joins a cell (see the module docs) unless that cell
-    /// is full, in which case it is dropped.
+    /// is full, in which case it is dropped. In insert mode, one that would move a run of
+    /// equal cells is written without the move (see the module docs).
     fn input(&mut self, c: char) {
-        if c.width() == Some(0) && self.zero_width_full() {
+        let width = c.width();
+        if width == Some(0) && self.zero_width_full() {
             return;
         }
-        Handler::input(&mut *self.term, c);
-        self.after();
+        if width.is_some_and(|width| width > 0 && self.insert_moves_nothing(width)) {
+            // Insert mode is all that makes `input` move the cells. Turning it off marks
+            // the whole screen damaged, which a screen in insert mode is anyway.
+            let insert = Mode::Named(NamedMode::Insert);
+            Handler::unset_mode(&mut *self.term, insert);
+            Handler::input(&mut *self.term, c);
+            Handler::set_mode(&mut *self.term, insert);
+            // The cells after the character were not touched. On the last column the
+            // cursor stays on the character instead, waiting to wrap.
+            let cursor = &self.term.grid().cursor;
+            self.equal_from = (!cursor.input_needs_wrap).then_some(cursor.point);
+        } else {
+            Handler::input(&mut *self.term, c);
+            self.equal_from = None;
+        }
+        self.absorb_scrolled();
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -736,5 +799,109 @@ impl Handler for Tracker<'_> {
         self.rows.scrollback.clear();
         // Alacritty clears its title on a full reset without telling its listener.
         self.listener.0.lock().reset_title();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::event::VoidListener;
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One thing a device sends.
+    #[derive(Clone, Debug)]
+    enum Sent {
+        Text(String),
+        /// `CSI n b`: repeat the last character.
+        Repeat(u16),
+        InsertMode(bool),
+        Wrap(bool),
+        Goto(u8, u8),
+        Control(u8),
+        Color(u8),
+        /// `CSI n` and this final byte: erase in line, and insert, delete or erase cells.
+        Edit(u8, u8),
+        ReverseIndex,
+    }
+
+    impl Sent {
+        fn write(&self, out: &mut Vec<u8>) {
+            match self {
+                Sent::Text(text) => out.extend_from_slice(text.as_bytes()),
+                Sent::Repeat(n) => out.extend_from_slice(format!("\x1b[{n}b").as_bytes()),
+                Sent::InsertMode(on) => {
+                    out.extend_from_slice(if *on { b"\x1b[4h" } else { b"\x1b[4l" })
+                }
+                Sent::Wrap(on) => {
+                    out.extend_from_slice(if *on { b"\x1b[?7h" } else { b"\x1b[?7l" })
+                }
+                Sent::Goto(row, column) => {
+                    out.extend_from_slice(format!("\x1b[{row};{column}H").as_bytes())
+                }
+                Sent::Control(byte) => out.push(*byte),
+                Sent::Color(n) => out.extend_from_slice(format!("\x1b[{n}m").as_bytes()),
+                Sent::Edit(n, last) => {
+                    out.extend_from_slice(format!("\x1b[{n}{}", char::from(*last)).as_bytes())
+                }
+                Sent::ReverseIndex => out.extend_from_slice(b"\x1bM"),
+            }
+        }
+    }
+
+    fn sent() -> impl Strategy<Value = Sent> {
+        prop_oneof![
+            // Narrow and wide characters, and blanks. No combining marks: the screen
+            // caps them and Alacritty does not.
+            4 => "[ab \u{65e5}]{1,6}".prop_map(Sent::Text),
+            4 => (0u16..40).prop_map(Sent::Repeat),
+            3 => any::<bool>().prop_map(Sent::InsertMode),
+            1 => any::<bool>().prop_map(Sent::Wrap),
+            3 => (1u8..6, 1u8..12).prop_map(|(row, column)| Sent::Goto(row, column)),
+            2 => prop_oneof![Just(b'\r'), Just(b'\n'), Just(0x08u8), Just(b'\t')]
+                .prop_map(Sent::Control),
+            2 => prop_oneof![Just(0u8), Just(7), Just(31), Just(44)].prop_map(Sent::Color),
+            2 => (0u8..4, prop_oneof![Just(b'K'), Just(b'@'), Just(b'P'), Just(b'X')])
+                .prop_map(|(n, last)| Sent::Edit(n, last)),
+            1 => Just(Sent::ReverseIndex),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Insert mode without Alacritty's move of equal cells leaves every cell, the
+        /// cursor and the modes as Alacritty alone leaves them.
+        #[test]
+        fn insert_mode_matches_alacritty(
+            columns in 2usize..10,
+            rows in 1usize..5,
+            stream in proptest::collection::vec(sent(), 1..40),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut bytes = Vec::new();
+            for sent in &stream {
+                sent.write(&mut bytes);
+            }
+
+            // The screen in two chunks: what it remembers about a row does not outlive one.
+            let cut = cut.index(bytes.len() + 1);
+            let mut screen = VtScreen::new(columns, rows, 100);
+            screen.feed(&bytes[..cut]);
+            screen.feed(&bytes[cut..]);
+
+            let mut alacritty = Term::new(Config::default(), &Size { columns, rows }, VoidListener);
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
+                .advance(&mut alacritty, &bytes);
+
+            let (ours, theirs) = (screen.term.grid(), alacritty.grid());
+            for row in 0..rows {
+                let line = Line(row as i32);
+                prop_assert_eq!(&ours[line][..], &theirs[line][..], "row {}", row);
+            }
+            prop_assert_eq!(ours.cursor.point, theirs.cursor.point);
+            prop_assert_eq!(ours.cursor.input_needs_wrap, theirs.cursor.input_needs_wrap);
+            prop_assert_eq!(screen.term.mode(), alacritty.mode());
+        }
     }
 }
