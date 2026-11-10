@@ -614,3 +614,86 @@ fn a_resize_and_a_reset_end_an_update() {
     assert!(!screen.sync_pending());
     assert_eq!(screen_text(&screen.snapshot())[0], "");
 }
+
+/// Every `x` a snapshot holds, scrollback and screen.
+fn count_x(screen: &mut VtScreen) -> usize {
+    let snap = screen.snapshot();
+    scrollback_text(&snap)
+        .iter()
+        .chain(&screen_text(&snap))
+        .map(|row| row.matches('x').count())
+        .sum()
+}
+
+#[test]
+fn a_repeat_writes_a_screenful_at_most() {
+    // `CSI n b` repeats the last character n times. Up to a screenful it is exact.
+    let mut screen = VtScreen::new(10, 3, 100);
+    screen.feed(b"ab\x1b[12bc");
+    assert_eq!(screen_text(&screen.snapshot()), ["abbbbbbbbb", "bbbbc", ""]);
+
+    // Past it the rest is dropped: thirty of the 65535, after the one that was typed.
+    let mut screen = VtScreen::new(10, 3, 100);
+    screen.feed(b"x\x1b[65535b");
+    let snap = screen.snapshot();
+    assert_eq!(scrollback_text(&snap), ["xxxxxxxxxx"]);
+    assert_eq!(screen_text(&snap), ["xxxxxxxxxx", "xxxxxxxxxx", "x"]);
+    // Each repeat has its own screenful, and text goes on after it.
+    screen.feed(b"\x1b[65535b\x1b[65535by");
+    let snap = screen.snapshot();
+    assert_eq!(snap.first_visible(), LineId(7));
+    assert_eq!(screen_text(&snap), ["xxxxxxxxxx", "xxxxxxxxxx", "xy"]);
+}
+
+#[test]
+fn a_repeat_is_capped_however_it_is_spelled_and_wherever_it_is_cut() {
+    // Parameters the parser reads as a count of 65535 or so, with what it lets stand
+    // inside a sequence: more parameters, a control character (which it acts on), DEL and
+    // bytes above ASCII (which it skips).
+    let spellings: [&[u8]; 6] = [
+        b"\x1b[65535b",
+        b"\x1b[65535;7b",
+        b"\x1b[99999999b",
+        b"\x1b[655\r35b",
+        b"\x1b[655\x7f35b",
+        b"\x1b[655\xc3\xa935b",
+    ];
+    for spelling in spellings {
+        let stream = [b"x", spelling, b"\r\ny"].concat();
+        let mut whole = VtScreen::new(10, 3, 100);
+        whole.feed_at(&stream, t0());
+        let count = count_x(&mut whole);
+        assert!(
+            (20..=31).contains(&count),
+            "{count} characters from {spelling:?}"
+        );
+        let whole = common::print(&whole.snapshot(), whole.take_events());
+        for cut in 0..=stream.len() {
+            let split = in_pieces(10, 3, &stream, &[cut]);
+            // `in_pieces` keeps 1000 rows of scrollback; nothing here reaches 100.
+            assert_eq!(split.lines, whole.lines, "{spelling:?} cut at {cut}");
+        }
+    }
+}
+
+#[test]
+fn a_repeat_inside_a_synchronized_update_is_capped_too() {
+    let mut screen = VtScreen::new(10, 3, 100);
+    screen.feed(&bytes(&[BEGIN, b"x\x1b[65535b\x1b[65535b", END]));
+    assert_eq!(count_x(&mut screen), 61);
+}
+
+#[test]
+fn the_letter_b_in_text_is_only_a_letter() {
+    // After a digit, a blank, a control character or a bracket a `b` could end a
+    // sequence, and is parsed on its own; it is still the same text.
+    let text = "0b1010 [b] (b) b\tb\r\nbob abba \u{e9}b 3b\x1b[1mb\x1b[0mb\x1b]0;b\x07b";
+    let whole = one_shot(40, 3, text.as_bytes());
+    // The tab goes to column 24.
+    assert_eq!(whole.lines[0].1, "0b1010 [b] (b) b        b");
+    assert_eq!(whole.lines[1].1, "bob abba \u{e9}b 3bbbb");
+    assert_eq!(whole.title.as_deref(), Some("b"));
+    for cut in 0..=text.len() {
+        assert_eq!(in_pieces(40, 3, text.as_bytes(), &[cut]).lines, whole.lines);
+    }
+}

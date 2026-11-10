@@ -11,8 +11,8 @@
 //! cargo test --release -p serialist-vt --test firehose -- --nocapture
 //! ```
 //!
-//! Also here, for the same bound and the same rule: a flood of `CSI 65535 b` in insert
-//! mode, which is a few hundred bytes that once cost seconds.
+//! Also here, under the same rule: floods of `CSI 65535 b`, which are a few hundred bytes
+//! that once cost seconds.
 
 use std::time::{Duration, Instant};
 
@@ -109,16 +109,21 @@ fn a_32_mib_firehose_with_a_snapshot_per_chunk_stays_within_the_bound() {
     within_bound(elapsed);
 }
 
+/// What one `CSI 65535 b` writes on a screen of `cells` cells: the screen caps a repeat
+/// at a screenful.
+fn repeated(cells: usize) -> usize {
+    cells.min(65535)
+}
+
 /// In insert mode Alacritty moves the rest of the row for every character, and
-/// `CSI 65535 b` repeats one 65535 times: on 1024 columns that was 57 ms for eight bytes,
-/// so this stream of 405 bytes took about 3 s in a release build (the nightly `vt_screen`
-/// fuzz run timed out on it). The screen now skips a move that changes nothing, which
-/// leaves about 60 ms.
+/// `CSI 65535 b` repeats one tens of thousands of times: on 1024 columns that was 57 ms
+/// for eight bytes (the nightly `vt_screen` fuzz run timed out on it). The screen now
+/// skips a move that changes nothing, which leaves what the repeat costs in replace mode.
 #[test]
 fn a_repeat_flood_in_insert_mode_costs_no_more_than_in_replace_mode() {
     const COLUMNS: usize = 1024;
     const ROWS: usize = 40;
-    const REPEATS: usize = 50;
+    const REPEATS: usize = 100;
     let mut bytes = b"\x1b[4hx".to_vec();
     for _ in 0..REPEATS {
         bytes.extend_from_slice(b"\x1b[65535b");
@@ -128,10 +133,11 @@ fn a_repeat_flood_in_insert_mode_costs_no_more_than_in_replace_mode() {
     screen.feed(&bytes);
     let snapshot = screen.snapshot();
     let elapsed = started.elapsed();
-    eprintln!("{REPEATS} repeats of 65535 in insert mode: {elapsed:?}");
+    eprintln!("{REPEATS} repeats in insert mode: {elapsed:?}");
 
-    // Every character is there: full rows of it, and the rest on the cursor's row.
-    let written = 1 + REPEATS * 65535;
+    // Every character the cap lets through is there: full rows of it, and the rest on
+    // the cursor's row.
+    let written = 1 + REPEATS * repeated(COLUMNS * ROWS);
     let full_rows = written / COLUMNS;
     assert_eq!(snapshot.first_visible().0 as usize, full_rows + 1 - ROWS);
     let rows = snapshot.screen_text();
@@ -141,8 +147,39 @@ fn a_repeat_flood_in_insert_mode_costs_no_more_than_in_replace_mode() {
     }
     assert_eq!(rows[ROWS - 1].len(), written % COLUMNS);
 
-    // A release build needs about 60 ms and a debug build about ten times that; with the
-    // move, 3 s and 50 s.
+    // A release build needs about 80 ms and a debug build about 1.3 s; with the move,
+    // 3.6 s and a minute.
     let bound = if cfg!(debug_assertions) { 10 } else { 1 };
+    within(elapsed, Duration::from_secs(bound));
+}
+
+/// `CSI 65535 b` on a wide character on a two-column screen scrolled a row into the
+/// scrollback for each of the 65535: 10 ms for eight bytes. Capped at a screenful it
+/// scrolls 1024 rows.
+#[test]
+fn a_repeat_flood_scrolls_a_screenful_each() {
+    const COLUMNS: usize = 2;
+    const ROWS: usize = 1024;
+    const REPEATS: usize = 400;
+    let mut bytes = "\u{65e5}".as_bytes().to_vec();
+    for _ in 0..REPEATS {
+        bytes.extend_from_slice(b"\x1b[65535b");
+    }
+    let mut screen = VtScreen::new(COLUMNS, ROWS, 10_000);
+    let started = Instant::now();
+    screen.feed(&bytes);
+    let snapshot = screen.snapshot();
+    let elapsed = started.elapsed();
+    eprintln!("{REPEATS} repeats that scroll: {elapsed:?}");
+
+    // A wide character fills a row, and the cursor waits on the last one to wrap.
+    let written = 1 + REPEATS * repeated(COLUMNS * ROWS);
+    assert_eq!(snapshot.first_visible().0 as usize, written - ROWS);
+    assert_eq!(snapshot.scrollback_lines(), 10_000);
+    assert!(snapshot.screen_text().iter().all(|row| *row == "\u{65e5}"));
+
+    // A release build needs about 0.2 s and a debug build about 0.8 s; uncapped, a
+    // release build needs 4 s.
+    let bound = if cfg!(debug_assertions) { 15 } else { 2 };
     within(elapsed, Duration::from_secs(bound));
 }

@@ -66,11 +66,13 @@
 //! [`changed_since`](VtSnapshot::changed_since)'s range.
 //!
 //! Speed: the first row to scroll off a fresh Alacritty screen makes it allocate 1000
-//! rows, so a run costs milliseconds before any check does. `CSI 65535 b` makes eight
-//! bytes into 65535 characters, each fed twice here, so an input full of them takes
-//! tenths of a second. In insert mode on a 1024-column screen it took a thousand times
-//! that, and the nightly run timed out (`regress_insert_mode_rep`); the screen now skips
-//! the move of the row that made it so.
+//! rows, so a run costs milliseconds before any check does. `CSI 65535 b` made eight
+//! bytes into 65535 characters, each fed twice here, and three nightly runs timed out on
+//! inputs with a few dozen of them: in insert mode on a 1024-column screen, where each
+//! character moved the rest of its row (`regress_insert_mode_rep`). The screen now skips
+//! that move, and caps a repeat at a screenful of characters, inside a synchronized
+//! update too (`regress_rep_scrolls_rows`, `regress_rep_in_sync`), so the most a repeat
+//! costs here is the 40 960 characters of the 40 by 1024 screen.
 
 use std::time::Instant;
 
