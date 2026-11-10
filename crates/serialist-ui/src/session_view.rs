@@ -86,7 +86,7 @@
 //!
 //! The ingest thread also rings a [`LineBell`](serialist_script::LineBell) through a
 //! [`ScriptLink`](crate::script_bridge::ScriptLink) sink, from the moment the session
-//! opens. Once the workspace calls [`SessionView::attach_scripts`], the view owns a
+//! opens; it is the last sink, so a ring finds the chunk's decoded frames stored too. Once the workspace calls [`SessionView::attach_scripts`], the view owns a
 //! [`SessionScripts`]: a script thread whose `serial.current()` writes through the
 //! session's [`SessionControl`](crate::session_handle::SessionControl) and reads this
 //! store. [`SessionView::run_script`] queues a run (one runs at a time; the others wait
@@ -456,10 +456,11 @@ struct IngestStart {
 }
 
 /// Start an ingest thread taking `events` into `store`, through the view's recording
-/// and script-link sinks, then `extra_sinks`, then the VT slot's sink (which feeds a
-/// terminal screen in VT mode), then a codec slot decoding with `selection` into a new
-/// frame store (from the store's current end, so frames name its stream offsets), and a
-/// task answering its doorbell.
+/// sink, then `extra_sinks`, then the VT slot's sink (which feeds a terminal screen in
+/// VT mode), then a codec slot decoding with `selection` into a new frame store (from the
+/// store's current end, so frames name its stream offsets), then the script link, and a
+/// task answering its doorbell. The script link comes last so that when it rings a
+/// script's bell, the chunk's frames are already in the frame store.
 #[allow(clippy::too_many_arguments)]
 fn start_ingest(
     events: Receiver<SessionEvent>,
@@ -472,11 +473,10 @@ fn start_ingest(
     cx: &mut Context<SessionView>,
 ) -> IngestStart {
     let (doorbell, rings) = async_channel::bounded::<()>(1);
-    let mut sinks: Vec<Box<dyn ChunkSink + Send>> = vec![
-        Box::new(RecordingSink::new(recording.clone())),
-        Box::new(script_link.sink()),
-    ];
+    let mut sinks: Vec<Box<dyn ChunkSink + Send>> =
+        vec![Box::new(RecordingSink::new(recording.clone()))];
     sinks.extend(extra_sinks);
+    let script_sink = script_link.sink();
     // The codec slot is made on the ingest thread, where a codec (a Lua VM) must
     // stay; its frames ring the same doorbell.
     let frame_store = FrameStore::default();
@@ -508,6 +508,7 @@ fn start_ingest(
                 )
                 .starting_at(offset),
             ));
+            sinks.push(Box::new(script_sink));
             sinks
         }),
         Box::new(move || {
