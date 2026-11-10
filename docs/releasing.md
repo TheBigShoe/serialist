@@ -121,27 +121,75 @@ run `xattr -dr com.apple.quarantine /Applications/Serialist.app`. A copy built o
 Mac is not quarantined and opens normally.
 
 **Windows.** SmartScreen shows "Windows protected your PC": More info, then Run anyway.
-
-**Turning on macOS signing and notarization** needs a paid Apple Developer account:
-
-1. Create a "Developer ID Application" certificate and export it as a `.p12`.
-2. Create an app-specific password at appleid.apple.com.
-3. Add the repository secrets listed in the commented block in the `package` job of
-   `release.yml`: `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`,
-   `MACOS_KEYCHAIN_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID` and
-   `APPLE_APP_PASSWORD`.
-4. Uncomment the three marked pieces (import certificate, `CODESIGN_IDENTITY` on the build
-   step, notarize step). `bundle.sh` and `dmg.sh` then sign with the identity, the hardened
-   runtime and a secure timestamp when `CODESIGN_IDENTITY` is set, and
-   `packaging/macos/notarize.sh` submits the `.dmg` with `notarytool --wait` and staples the
-   ticket.
-5. Remove the "unsigned" wording from `README.md`, `packaging/release-notes-install.md` and
-   the header of `release.yml`.
-
-None of the notarization path has been run: it needs credentials.
-
 Windows code signing is not set up. When it is, `cargo wix sign` or `signtool` on the `.msi`
 (and on `serialist.exe` before packaging) is the place to add it.
+
+### Turning on macOS signing and notarization
+
+This needs a paid Apple Developer Program membership. Only its Account Holder can create a
+Developer ID certificate.
+
+1. **Create the certificate** on the Mac you will export it from. Either Xcode, Settings,
+   Accounts, select the team, Manage Certificates, `+`, "Developer ID Application"; or, at
+   developer.apple.com, Account, Certificates, `+`, "Developer ID Application" (the G2
+   Sub-CA), with a certificate signing request made in Keychain Access (Certificate
+   Assistant, Request a Certificate From a Certificate Authority, saved to disk), then
+   double-click the downloaded `.cer`. Either way the certificate and its private key end
+   up in the login keychain. Not "Apple Development" or "Apple Distribution": those do not
+   pass Gatekeeper outside the App Store.
+2. **Find the identity name**: `security find-identity -v -p codesigning` prints it, as
+   `Developer ID Application: <name> (<TEAMID>)`. The ten characters in parentheses are
+   the team ID (also under Membership details at developer.apple.com).
+3. **Export a `.p12`**: Keychain Access, login, My Certificates, expand the Developer ID
+   Application certificate so its key shows, select the certificate, File, Export Items,
+   Personal Information Exchange (`.p12`), with a new password.
+4. **Make an app-specific password** for the Apple ID that owns the membership:
+   account.apple.com, Sign-In and Security, App-Specific Passwords.
+5. **Try it locally** before involving CI:
+
+   ```sh
+   CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAMID>)" just release-macos
+   codesign -dv --verbose=2 target/bundle/Serialist.app  # flags=0x10000(runtime), a Timestamp
+   APPLE_ID=<email> APPLE_TEAM_ID=<TEAMID> APPLE_APP_PASSWORD=<app password> \
+       packaging/macos/notarize.sh dist/Serialist-<version>-macos-arm64.dmg
+   spctl --assess --type open --context context:primary-signature -v dist/Serialist-*.dmg
+   ```
+
+   `spctl` should say `accepted` and `source=Notarized Developer ID`. A rejected submission
+   makes `notarize.sh` print the notary service's log and fail.
+6. **Add the repository secrets** (Settings, Secrets and variables, Actions, or
+   `gh secret set NAME`); the comment above the signing steps in `release.yml` says the
+   same:
+
+   | Secret | Value |
+   | --- | --- |
+   | `MACOS_CERTIFICATE` | the `.p12`, base64: `base64 -i cert.p12 \| gh secret set MACOS_CERTIFICATE` |
+   | `MACOS_CERTIFICATE_PASSWORD` | the `.p12`'s export password |
+   | `MACOS_KEYCHAIN_PASSWORD` | any new random string (it locks a keychain that lives for one job) |
+   | `MACOS_SIGN_IDENTITY` | the identity from step 2, exactly |
+   | `APPLE_ID` | the Apple ID's email |
+   | `APPLE_TEAM_ID` | the team ID from step 2 |
+   | `APPLE_APP_PASSWORD` | the app-specific password from step 4 |
+
+7. **Uncomment the three marked pieces** of the `package` job: "Import the signing
+   certificate", the `env` with `CODESIGN_IDENTITY` on "Build and package", and "Notarize
+   and staple the disk image". With `CODESIGN_IDENTITY` set, `bundle.sh` signs the app with
+   the identity, the hardened runtime (`--options runtime`) and a secure timestamp, and
+   `dmg.sh` signs the `.dmg`; `notarize.sh` submits the `.dmg`, waits for the verdict and
+   staples the ticket to it. Every macOS row does this, the Intel one included.
+8. **Run the workflow by hand** on `main` (artifacts only) and check the macOS log: the
+   imported identity listed by `find-identity`, `bundle.sh` printing
+   `flags=0x10000(runtime)` and a `Timestamp=` line, and `notarize.sh` ending with "The
+   validate action worked!". Open the downloaded `.dmg` on another Mac: it should open with
+   no Gatekeeper warning.
+9. **Remove the "unsigned" wording** about macOS from `README.md`,
+   `packaging/release-notes-install.md`, [Unsigned builds](#unsigned-builds) and the header
+   of `release.yml`.
+
+The app is signed with no entitlements: it generates no code at run time (Lua 5.4 is
+interpreted) and needs none for serial ports outside the App Sandbox. A build with the
+`wasm` feature would need `com.apple.security.cs.allow-jit` (see `bundle.sh`). None of the
+signing or notarization path has been run: it needs the credentials.
 
 ## Changing the icon
 
