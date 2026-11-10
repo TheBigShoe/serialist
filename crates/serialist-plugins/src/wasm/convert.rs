@@ -1,6 +1,7 @@
 //! Values across the component boundary: descriptions and frames coming out, encode
 //! requests going in. Nothing a plugin returns is trusted: spans are checked against
-//! the input, list items against the arena, fields against the declared kinds.
+//! the input and the frame before, list items against the arena, kinds and fields
+//! against what `describe()` declared.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -101,6 +102,18 @@ pub(super) fn frame_span(frame: &wit::Frame, input_len: usize) -> Result<(u64, u
     Ok((start, end))
 }
 
+/// That a frame starting at `start` follows frame `prev` (counting from 1), which ends at
+/// `prev_stop`: frames come in order and do not overlap, though they may touch and may be
+/// empty. For the first frame, `prev` is 0 and `prev_stop` is 0.
+pub(super) fn frame_follows(start: u64, prev: usize, prev_stop: u64) -> Result<(), String> {
+    if start < prev_stop {
+        return Err(format!(
+            "starts at {start}, before frame {prev} ends at {prev_stop}"
+        ));
+    }
+    Ok(())
+}
+
 /// The list items of one frame, each usable once.
 struct Items<'a> {
     items: &'a [wit::Value],
@@ -158,15 +171,18 @@ fn declared(value: Value, ty: FieldType) -> Result<Value, String> {
     }
 }
 
-/// A frame from the plugin, covering stream offsets `raw`. Its fields come out as the
-/// kind declares them (in order, of their types, the required ones present), followed by
-/// any others in the plugin's order.
+/// A frame from the plugin, covering stream offsets `raw`. Its kind must be one
+/// `describe()` lists, and its fields come out as the kind declares them (in order, of
+/// their types, the required ones present), followed by any others in the plugin's order.
 pub(super) fn frame_from_wit(
     frame: &wit::Frame,
     schema: &Schema,
     raw: std::ops::Range<u64>,
     at: Instant,
 ) -> Result<Frame, String> {
+    let Some(declared_fields) = schema.get(&frame.kind) else {
+        return Err(format!("kind `{}` is not one describe() lists", frame.kind));
+    };
     let mut items = Items {
         items: &frame.items,
         used: vec![false; frame.items.len()],
@@ -179,20 +195,17 @@ pub(super) fn frame_from_wit(
         given.push(Some((name.as_str(), value)));
     }
     let mut fields = Vec::with_capacity(given.len());
-    if let Some(declared_fields) = schema.get(&frame.kind) {
-        for (name, ty, optional) in declared_fields {
-            let found = given
-                .iter_mut()
-                .find(|slot| slot.as_ref().is_some_and(|(n, _)| *n == name.as_str()));
-            match found.and_then(Option::take) {
-                Some((_, value)) => {
-                    let value =
-                        declared(value, *ty).map_err(|err| format!("field `{name}` {err}"))?;
-                    fields.push((name.clone(), value));
-                }
-                None if *optional => {}
-                None => return Err(format!("field `{name}` is declared but missing")),
+    for (name, ty, optional) in declared_fields {
+        let found = given
+            .iter_mut()
+            .find(|slot| slot.as_ref().is_some_and(|(n, _)| *n == name.as_str()));
+        match found.and_then(Option::take) {
+            Some((_, value)) => {
+                let value = declared(value, *ty).map_err(|err| format!("field `{name}` {err}"))?;
+                fields.push((name.clone(), value));
             }
+            None if *optional => {}
+            None => return Err(format!("field `{name}` is declared but missing")),
         }
     }
     fields.extend(
@@ -396,6 +409,34 @@ mod tests {
         assert!(err.contains("deep") || err.contains("lists items"), "{err}");
         assert!(frame_span(&wit_frame(vec![], vec![]), 2).is_err());
         assert_eq!(frame_span(&wit_frame(vec![], vec![]), 3), Ok((1, 3)));
+    }
+
+    #[test]
+    fn a_frame_of_a_kind_describe_does_not_list_is_an_error() {
+        let frame = wit::Frame {
+            kind: "nope".into(),
+            ..wit_frame(vec![("a", wit::Value::Uint(1))], vec![])
+        };
+        let err = frame_from_wit(&frame, &kind_schema(), 0..1, Instant::now()).unwrap_err();
+        assert_eq!(err, "kind `nope` is not one describe() lists");
+    }
+
+    #[test]
+    fn frames_may_touch_but_not_overlap_or_go_back() {
+        assert_eq!(frame_follows(0, 0, 0), Ok(()), "the first frame");
+        assert_eq!(frame_follows(4, 1, 4), Ok(()), "touching");
+        assert_eq!(frame_follows(9, 1, 4), Ok(()), "a gap");
+        assert_eq!(frame_follows(4, 2, 4), Ok(()), "empty and touching");
+        assert_eq!(
+            frame_follows(3, 1, 4),
+            Err("starts at 3, before frame 1 ends at 4".to_owned()),
+            "overlapping"
+        );
+        assert_eq!(
+            frame_follows(0, 2, 4),
+            Err("starts at 0, before frame 2 ends at 4".to_owned()),
+            "going back"
+        );
     }
 
     #[test]

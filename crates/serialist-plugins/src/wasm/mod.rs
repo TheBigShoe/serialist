@@ -28,7 +28,10 @@
 //! - `decode` gets whatever it held back last time followed by the new chunk, as the Lua
 //!   tier does, so a plugin never needs to know where chunks were cut. Each frame names
 //!   its bytes by offset and length in that input, and `held` says how many trailing
-//!   bytes to present again next time. The adapter maps both onto stream offsets.
+//!   bytes to present again next time. The adapter maps both onto stream offsets. A
+//!   frame must be of a kind `describe` lists and start at or after the end of the frame
+//!   before it, or it becomes a [`PLUGIN_ERROR_KIND`](crate::PLUGIN_ERROR_KIND) frame
+//!   (over its own bytes for a wrong kind, over the whole call for a frame out of order).
 //! - Frame fields are typed ([`Value`](serialist_core::Value)'s seven types; lists of
 //!   any depth live in the frame's `items` arena). Declared fields come out in declared
 //!   order and must have their declared type (an integer may cross between `int` and
