@@ -227,8 +227,19 @@ change writes one key into the file at once (text fields after a 300 ms pause), 
 your comments and uncommenting the template's line for the key, and the watcher applies it
 like any save. A value nobody set is marked "default"; the arrow beside one you set removes
 it again; one a project's `.serialist/settings.json` sets is read-only there. A value the
-loader would reject is never written and the reason shows under it, and a `settings.json`
+loader cannot read is never written and the reason shows under it, and a `settings.json`
 that does not load shows its error and an Open settings.json button instead.
+
+A value in a settings file that this version cannot read (a wrong type, a number out of
+range, or a value a later version added, such as a new `line_ending`) costs only that key:
+it is ignored, the value from the layer below it applies (the user file under a project's
+`.serialist/settings.json`, the default under the user file), and the rest of the file
+applies as written. The status line names the file, line, column and key, the way it
+names an unknown key, and a `--script` run logs it as a warning. In `devices`, a bad key
+is dropped from its profile and the profile kept; a profile with no readable `match` is
+dropped whole, and the others load. Only a file that is not valid JSON with comments, or
+whose top level is not an object, is not applied at all: the last settings that loaded stay,
+and the status line says "Settings not applied" with the reason.
 
 ## The config directory
 

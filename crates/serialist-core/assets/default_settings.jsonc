@@ -7,6 +7,8 @@
 // Layers, lowest to highest: these defaults, your user settings.json, then a
 // project-local .serialist/settings.json. Objects merge key by key; arrays and
 // scalars from a higher layer replace the lower one. A `null` unsets an optional key.
+// A value a layer sets that this version cannot read is ignored with a warning, and the
+// lower layer's value for that key stays; the rest of the layer still applies.
 {
   // ---- Buffer font: the terminal text ----
 
