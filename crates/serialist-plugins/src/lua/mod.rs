@@ -10,6 +10,7 @@
 //! function M.describe()
 //!   return {
 //!     name = "my-proto", version = "1.0.0", description = "…",
+//!     api = 1,       -- optional: the codec API this plugin was written for
 //!     kinds = {      -- the frames decode produces, fields in display order
 //!       { kind = "packet", description = "…", fields = {
 //!           { name = "id", type = "uint", description = "…" },
@@ -50,6 +51,16 @@
 //!
 //! return M
 //! ```
+//!
+//! **The API number.** `describe()` may return `api`, an integer: the Lua codec interface
+//! the plugin was written for. Absent means `1`, so a plugin written before the number
+//! existed keeps loading. This build provides [`LUA_CODEC_API`] (`1`); a plugin that asks
+//! for a higher one fails to load, with a message naming the plugin, the API it asks for
+//! and the API this build provides, and an `api` that is not a positive integer fails to
+//! load too. The host's number is `codec.api`, so a plugin can adapt. Within 1.x the
+//! interface only gains things and `LUA_CODEC_API` goes up by one in each release that
+//! adds something. (WebAssembly plugins declare theirs in `plugin.toml`.) `api` is a
+//! load-time check, not part of the described codec: [`CodecInfo`] has no such field.
 //!
 //! **Kinds.** A frame's `kind` must be one `describe` lists; a frame of another kind is
 //! a [`PLUGIN_ERROR_KIND`] frame over its bytes. Frames must come in stream order and
@@ -123,6 +134,12 @@ use serialist_core::codec::{
 
 use convert::Schema;
 use vm::Vm;
+
+/// The Lua codec API this build provides, `codec.api` in a plugin. A plugin's `describe()`
+/// may return `api` to say which one it was written for (absent means `1`); one that asks
+/// for more than this fails to load. Within 1.x the interface only gains things, and this
+/// goes up by one in each release that adds something.
+pub const LUA_CODEC_API: i64 = 1;
 
 /// Kind of the frame a Lua codec emits for bytes its plugin failed on.
 pub const PLUGIN_ERROR_KIND: &str = "plugin_error";
@@ -215,6 +232,7 @@ impl Loaded {
         let fail = |message: String| CodecError::Internal(format!("{name}: {message}"));
         let vm = Vm::load(&name, &code, limits).map_err(fail)?;
         let described = vm.call::<LuaValue>(&vm.describe, ()).map_err(fail)?;
+        convert::check_api(&described, LUA_CODEC_API).map_err(fail)?;
         let info = convert::info_from_lua(described, limits.max_describe_bytes).map_err(fail)?;
         let state = vm
             .lua

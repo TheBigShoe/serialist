@@ -218,6 +218,8 @@ fn sandbox(name: &str, limits: &LuaLimits, budget: Arc<Budget>) -> mlua::Result<
         spent,
         LuaValue::NULL,
     ))?;
+    let codec: Table = globals.get("codec")?;
+    codec.set("api", super::LUA_CODEC_API)?;
     Ok((lua, array_mt))
 }
 
