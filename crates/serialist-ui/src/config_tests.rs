@@ -753,6 +753,37 @@ fn keymap_entries_that_cannot_bind_are_reported_and_the_rest_bind(cx: &mut TestA
     assert!(still);
 }
 
+#[gpui_test]
+fn a_keymap_file_binds_install_example_plugin_with_its_name(cx: &mut TestAppContext) {
+    use crate::actions::plugins::InstallExamplePlugin;
+
+    let (_window, _view) = open_terminal(cx);
+    let dir = ConfigDir::new("keymap-install-example").with_keymap(
+        r#"[ { "context": "Workspace",
+               "bindings": {
+                 "alt-i": ["plugins::InstallExamplePlugin", { "name": "airoha-race" }],
+                 "alt-j": ["plugins::InstallExamplePlugin", { "name": "x", "extra": 1 }]
+               } } ]"#,
+    );
+    load(cx, &dir);
+    // The second entry's unknown argument key is refused; the first binds.
+    let problems = config(cx).problems().to_vec();
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].message.contains("alt-j"), "{problems:?}");
+    let bound = cx.update(|cx| {
+        cx.key_bindings()
+            .borrow()
+            .bindings()
+            .filter(|b| b.action().name() == "plugins::InstallExamplePlugin")
+            .filter_map(|b| {
+                let name = b.action().as_any().downcast_ref::<InstallExamplePlugin>()?;
+                Some((b.keystrokes()[0].inner().unparse(), name.name.clone()))
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(bound, [("alt-i".to_owned(), "airoha-race".to_owned())]);
+}
+
 // --- Settings in sessions ----------------------------------------------------------
 
 const EARBUDS: &str = "/dev/cu.usbmodem-EARBUDS";

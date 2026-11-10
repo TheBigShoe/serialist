@@ -33,6 +33,7 @@ vte.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+insta.workspace = true
 proptest.workspace = true
 # A dev-dependency cycle is fine: integration tests and benches link the same
 # serialist-core the simulator does. Unit tests must not use it.
