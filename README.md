@@ -137,7 +137,7 @@ print(port:expect("^OK$", { timeout_ms = 1000 }) and "device is up" or "no answe
 Start one from the Script console or the Scripts menu, from a key binding, from a saved
 command whose payload is `{ "script": "version_probe.lua" }`, from a device profile's
 `on_connect`, or with no window at all: `serialist --port virtual:at --script version_probe.lua`
-exits 0, 1 or 2. Two example scripts ship with the app. The API, the sandbox and the triggers
+exits 0 (it ended well), 1 (an error) or 2 (nothing ran). Two example scripts ship with the app. The API, the sandbox and the triggers
 are in [`docs/scripting.md`](docs/scripting.md).
 
 ## Plugins
