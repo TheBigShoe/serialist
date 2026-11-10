@@ -99,7 +99,7 @@ palette: every action, saved command and script, filtered as you type.
   port.
 - **Settings.** `cmd-,` opens a Settings tab, a front end to `settings.json` and `keymap.json`,
   which stay the source of truth. Everything lives in `~/.config/serialist`
-  (`%APPDATA%\Serialist` on Windows): settings with Zed's key names, Zed-format themes and
+  (`%APPDATA%\Serialist` on Windows, `$XDG_CONFIG_HOME/serialist` on Linux when that is set): settings with Zed's key names, Zed-format themes and
   keymaps, saved commands, scripts and plugins, applied the moment a file is saved.
 
 The rest, from the port settings popover to what a restored `tcp:` tab does at startup, is
