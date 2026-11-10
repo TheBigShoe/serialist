@@ -284,6 +284,36 @@ fn commands_send_goes_through_the_sender() {
 }
 
 #[test]
+fn scripts_can_check_the_api_they_run_against() {
+    let host = plain_host();
+    let finished = run(
+        &host,
+        "api.lua",
+        r#"
+        assert(type(serialist) == "table")
+        assert(type(serialist.version) == "string")
+        assert(math.type(serialist.api) == "integer")
+        print(serialist.version, serialist.api)
+        assert(serialist.api >= 1, "this script needs a newer Serialist")
+        local ok = pcall(function()
+            assert(serialist.api >= 2, "this script needs a newer Serialist")
+        end)
+        assert(not ok)
+        "#,
+    );
+    finished.assert_ok();
+    assert_eq!(
+        finished.output,
+        [format!(
+            "{}\t{}",
+            env!("CARGO_PKG_VERSION"),
+            serialist_script::SCRIPT_API
+        )]
+    );
+    assert_eq!(serialist_script::SCRIPT_API, 1);
+}
+
+#[test]
 fn the_sandbox_has_no_os_io_or_escape_hatches() {
     let dir = TempDir::new();
     dir.write("lib/util.lua", "return { answer = 42 }");
