@@ -26,12 +26,14 @@ use crate::cli::Args;
 use crate::wiring::{self, Backend};
 
 /// The process's exit status for a run that ended with `outcome`: 0 when the script
-/// returned, 1 on an error, 2 if it was stopped.
+/// returned, 1 on an error, 130 if it was stopped. 2 is left for "nothing ran" (a bad
+/// flag, a missing `--port`, an unreadable script), and 130 is what a shell reports for
+/// a process ended by Ctrl-C, so a clean stop on Ctrl-C would report the same.
 pub fn exit_code(outcome: &ScriptOutcome) -> i32 {
     match outcome {
         ScriptOutcome::Ok => 0,
         ScriptOutcome::Error(_) => 1,
-        ScriptOutcome::Stopped => 2,
+        ScriptOutcome::Stopped => 130,
     }
 }
 
@@ -308,7 +310,7 @@ mod tests {
         };
         assert!(message.contains("probe.lua:2: boom"), "{message}");
         assert_eq!(exit_code(&outcome), 1);
-        assert_eq!(exit_code(&ScriptOutcome::Stopped), 2);
+        assert_eq!(exit_code(&ScriptOutcome::Stopped), 130);
     }
 
     #[test]

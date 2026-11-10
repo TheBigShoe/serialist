@@ -20,7 +20,7 @@ a recorded capture opens from the Serial menu or with `--port` too; see [Ports](
 | `--baud <N>` | Baud rate for `--port` and the Connect field, any positive integer (default 115200) |
 | `--virtual [NAME]` | List the simulated devices next to the real ports; with a NAME, also open `virtual:<NAME>` at startup in a tab of its own. Repeatable |
 | `--config-dir <DIR>` | Read and keep the configuration in DIR instead of the user config directory (also `SERIALIST_CONFIG_DIR`) |
-| `--script <PATH>` | Run this Lua script against `--port` with no window, then exit: 0 if it ends well, 1 on an error, 2 if it is stopped |
+| `--script <PATH>` | Run this Lua script against `--port` with no window, then exit: 0 if it ends well, 1 on an error, 2 if nothing ran (a bad flag, no `--port`, an unreadable script); 130 is reserved for a stopped script |
 | `--terminal-demo` | Open only the milestone 1 terminal element, fed by an in-memory stream |
 | `-h`, `--help`, `-V`, `--version` | Print the help or the version |
 
