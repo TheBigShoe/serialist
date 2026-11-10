@@ -97,12 +97,13 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row};
 use alacritty_terminal::index::{Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::color::{COUNT as COLOR_COUNT, Colors};
 use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape as VtCursorShape, CursorStyle, Handler, Hyperlink,
-    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedMode,
-    NamedPrivateMode, PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset,
-    TabulationClearMode, Timeout, cursor_icon::CursorIcon,
+    KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedColor,
+    NamedMode, NamedPrivateMode, PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode,
+    StandardCharset, TabulationClearMode, Timeout, cursor_icon::CursorIcon,
 };
 use serialist_core::ansi::incomplete_utf8_suffix;
 use serialist_core::{Epoch, LineId, StyledLine};
@@ -112,7 +113,7 @@ use crate::convert::{Stamp, build_line, same_content};
 use crate::events::{Listener, VtEvent};
 use crate::mouse::{MouseEncoding, MouseMode, MouseReporting};
 use crate::scrollback::Scrollback;
-use crate::snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};
+use crate::snapshot::{CursorShape, CursorState, DefaultColors, VtModes, VtSnapshot};
 
 /// Rows Alacritty's own history may hold between two looks. The tracker empties it after
 /// every handler call, so this only has to exceed what one call (or one resize) can
@@ -561,6 +562,7 @@ impl VtScreen {
                 self.last_at,
                 self.offset,
                 false,
+                self.term.colors(),
             ));
         }
 
@@ -586,6 +588,13 @@ impl VtScreen {
             app_keypad: mode.contains(TermMode::APP_KEYPAD),
             mouse: mouse_reporting(mode),
         };
+        let colors = self.term.colors();
+        let rgb = |named: NamedColor| colors[named].map(|c| (c.r, c.g, c.b));
+        let colors = DefaultColors {
+            foreground: rgb(NamedColor::Foreground),
+            background: rgb(NamedColor::Background),
+            cursor: rgb(NamedColor::Cursor),
+        };
         let title = self.listener.0.lock().title.clone();
         let title = match (title, prev.and_then(|p| p.title.as_ref())) {
             (Some(now), Some(before)) if **before == *now => Some(Arc::clone(before)),
@@ -597,6 +606,7 @@ impl VtScreen {
             columns,
             cursor,
             modes,
+            colors,
             title,
             generation: self.generation,
             epoch: self.epoch,
@@ -762,6 +772,7 @@ fn capture(
     at: Instant,
     offset: u64,
     complete: bool,
+    colors: &Colors,
 ) -> Arc<StyledLine> {
     let line = build_line(
         row,
@@ -771,6 +782,7 @@ fn capture(
             raw: offset..offset,
             complete,
         },
+        colors,
     );
     let before = prev.and_then(|prev| {
         let first = prev.first_visible().0;
@@ -824,6 +836,7 @@ fn unchanged(a: &VtSnapshot, b: &VtSnapshot) -> bool {
         && a.columns == b.columns
         && a.cursor == b.cursor
         && a.modes == b.modes
+        && a.colors == b.colors
         && a.title == b.title
         && a.visible.len() == b.visible.len()
         && a.visible
@@ -870,6 +883,7 @@ impl Absorb<'_> {
                 self.at,
                 self.offset,
                 true,
+                term.colors(),
             );
             self.scrollback.push(line);
         }
@@ -1021,7 +1035,6 @@ impl Handler for Tracker<'_> {
         set_active_charset(index: CharsetIndex);
         configure_charset(index: CharsetIndex, charset: StandardCharset);
         set_color(index: usize, color: Rgb);
-        dynamic_color_sequence(prefix: String, index: usize, terminator: &str);
         reset_color(index: usize);
         clipboard_store(clipboard: u8, base64: &[u8]);
         clipboard_load(clipboard: u8, terminator: &str);
@@ -1126,8 +1139,30 @@ impl Handler for Tracker<'_> {
         }
     }
 
+    /// OSC 4, 10, 11 or 12 with `?`. A color the device set is answered here, as it is
+    /// drawn; the others are the app's to answer from the theme, as a
+    /// [`VtEvent::ColorRequest`].
+    fn dynamic_color_sequence(&mut self, prefix: String, index: usize, terminator: &str) {
+        if let Some(Some(color)) = (index < COLOR_COUNT).then(|| self.term.colors()[index]) {
+            let answer = format!(
+                "\x1b]{prefix};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}{terminator}",
+                color.r, color.g, color.b
+            );
+            self.listener.0.lock().respond(answer.as_bytes());
+        } else {
+            Handler::dynamic_color_sequence(&mut *self.term, prefix, index, terminator);
+        }
+        self.after();
+    }
+
     fn reset_state(&mut self) {
         Handler::reset_state(&mut *self.term);
+        // Alacritty keeps the colors a device set across a full reset; xterm resets them.
+        for index in 0..COLOR_COUNT {
+            if self.term.colors()[index].is_some() {
+                Handler::reset_color(&mut *self.term, index);
+            }
+        }
         self.after();
         *self.sync = None;
         self.rows.scrollback.clear();

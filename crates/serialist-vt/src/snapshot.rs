@@ -56,6 +56,17 @@ pub struct VtModes {
     pub mouse: Option<MouseReporting>,
 }
 
+/// The default colors the device set (OSC 10, 11 and 12) in place of the theme's, as
+/// red, green and blue; `None` where it set none or reset it (OSC 110, 111, 112, or a
+/// full reset). Palette entries it set (OSC 4) are in the lines' runs already, as
+/// [`Color::Rgb`](serialist_core::Color::Rgb).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DefaultColors {
+    pub foreground: Option<(u8, u8, u8)>,
+    pub background: Option<(u8, u8, u8)>,
+    pub cursor: Option<(u8, u8, u8)>,
+}
+
 /// The screen and scrollback at one moment. Cheap to clone (reference counts) and never
 /// changes, so the UI can hold it while the ingest thread keeps feeding the screen.
 ///
@@ -69,6 +80,7 @@ pub struct VtSnapshot {
     pub(crate) columns: usize,
     pub(crate) cursor: CursorState,
     pub(crate) modes: VtModes,
+    pub(crate) colors: DefaultColors,
     pub(crate) title: Option<Arc<str>>,
     pub(crate) generation: u64,
     pub(crate) epoch: Epoch,
@@ -115,13 +127,20 @@ impl VtSnapshot {
         self.modes
     }
 
+    /// The default colors the device set, which the screen is drawn in instead of the
+    /// theme's.
+    pub fn default_colors(&self) -> DefaultColors {
+        self.colors
+    }
+
     /// The title the device set last, if it set one since the last reset.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 
-    /// Increases with every snapshot whose content (rows, cursor, modes or title) differs
-    /// from the one before, by one or, when the screen took a snapshot of its own in
+    /// Increases with every snapshot whose content (rows, cursor, modes, default colors
+    /// or title) differs from the one before, by one or, when the screen took a snapshot
+    /// of its own in
     /// between (it does when a synchronized update begins), by more. Equal generations
     /// from one screen mean equal snapshots, so the UI can skip everything.
     pub fn generation(&self) -> u64 {
@@ -191,6 +210,7 @@ impl std::fmt::Debug for VtSnapshot {
             )
             .field("cursor", &self.cursor)
             .field("modes", &self.modes)
+            .field("colors", &self.colors)
             .field("title", &self.title)
             .field("screen", &self.screen_text())
             .finish()

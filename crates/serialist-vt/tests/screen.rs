@@ -6,7 +6,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use serialist_core::{LineId, LineSource};
-use serialist_vt::{MAX_ZERO_WIDTH, MouseEncoding, MouseMode, MouseReporting, VtEvent, VtScreen};
+use serialist_vt::{
+    DefaultColors, MAX_ZERO_WIDTH, MouseEncoding, MouseMode, MouseReporting, VtEvent, VtScreen,
+};
 
 use common::{in_pieces, one_shot, screen_text, scrollback_text, t0};
 
@@ -301,6 +303,76 @@ fn modes_the_ui_acts_on() {
     assert!(!cursor.visible);
     assert_eq!(cursor.shape, serialist_vt::CursorShape::Beam);
     assert!(cursor.blinking);
+}
+
+/// The foreground of the first run of row 0.
+fn first_fg(snapshot: &serialist_vt::VtSnapshot) -> serialist_core::Color {
+    snapshot.visible_line(0).unwrap().runs[0].style.fg
+}
+
+#[test]
+fn palette_changes_are_shown_and_reset() {
+    use serialist_core::Color;
+    let mut screen = VtScreen::new(20, 3, 100);
+    screen.feed(b"\x1b[31mred\x1b[0m");
+    assert_eq!(first_fg(&screen.snapshot()), Color::Ansi(1));
+
+    // OSC 4 sets palette entry 1: the red text is drawn in it, rebuilt in place.
+    screen.feed(b"\x1b]4;1;rgb:12/34/56\x07");
+    let snapshot = screen.snapshot();
+    assert_eq!(first_fg(&snapshot), Color::Rgb(0x12, 0x34, 0x56));
+    assert_eq!(snapshot.default_colors(), DefaultColors::default());
+    // OSC 104 resets it.
+    screen.feed(b"\x1b]104;1\x07");
+    assert_eq!(first_fg(&screen.snapshot()), Color::Ansi(1));
+
+    // OSC 10, 11 and 12 set the defaults, which a new snapshot carries though no row
+    // changed; OSC 110 and 111 reset two of them.
+    let before = screen.snapshot().generation();
+    screen.feed(b"\x1b]10;#ffffff\x07\x1b]11;rgb:00/00/80\x07\x1b]12;#ff0000\x07");
+    let snapshot = screen.snapshot();
+    assert!(snapshot.generation() > before);
+    assert_eq!(
+        snapshot.default_colors(),
+        DefaultColors {
+            foreground: Some((0xff, 0xff, 0xff)),
+            background: Some((0, 0, 0x80)),
+            cursor: Some((0xff, 0, 0)),
+        }
+    );
+    assert_eq!(
+        first_fg(&snapshot),
+        Color::Ansi(1),
+        "the text keeps its slot"
+    );
+    screen.feed(b"\x1b]110\x07\x1b]111\x07");
+    assert_eq!(
+        screen.snapshot().default_colors(),
+        DefaultColors {
+            cursor: Some((0xff, 0, 0)),
+            ..DefaultColors::default()
+        }
+    );
+
+    // A full reset clears every color the device set, though Alacritty would keep them.
+    screen.feed(b"\x1b]4;2;rgb:01/02/03\x07\x1bc\x1b[32mgreen");
+    let snapshot = screen.snapshot();
+    assert_eq!(snapshot.default_colors(), DefaultColors::default());
+    assert_eq!(first_fg(&snapshot), Color::Ansi(2));
+}
+
+#[test]
+fn a_query_for_a_color_the_device_set_is_answered_with_it() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    screen.feed(b"\x1b]4;5;rgb:ab/cd/ef\x07\x1b]4;5;?\x07\x1b]11;?\x1b\\");
+    let events = screen.take_events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0],
+        VtEvent::Respond(b"\x1b]4;5;rgb:abab/cdcd/efef\x07".to_vec())
+    );
+    // The theme's background is still the app's to give.
+    assert!(matches!(&events[1], VtEvent::ColorRequest(request) if request.index == 257));
 }
 
 #[test]

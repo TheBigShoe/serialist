@@ -1125,3 +1125,92 @@ fn x10_reports_and_shift_keeps_the_selection(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(heard.lock().is_empty(), "{:?}", heard.lock());
 }
+
+/// Sets palette entry 1 and the default background and cursor colors, writes a red
+/// cell, and resets the background when it receives `r`.
+struct Recolor;
+
+impl SimDevice for Recolor {
+    fn name(&self) -> &str {
+        "recolor"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        out.send(b"\x1b]4;1;rgb:10/20/30\x07\x1b]11;rgb:00/00/80\x07\x1b]12;#00ff00\x07");
+        out.send(b"\x1b[41m \x1b[0mok");
+    }
+
+    fn on_receive(&mut self, bytes: &[u8], out: &mut dyn DeviceOutput) {
+        if bytes == b"r" {
+            out.send(b"\x1b]111\x07reset");
+        }
+    }
+}
+
+#[gpui_test]
+fn the_devices_colors_are_drawn_and_reset(cx: &mut TestAppContext) {
+    let dir = vt_config("vt-recolor");
+    let world = SimWorld::empty();
+    world.add_virtual("recolor", "Recolor", LinkConfig::unpaced(), || {
+        Box::new(Recolor)
+    });
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:recolor", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    wait_for_screen(cx, &view, "the text", |snap| snap.screen_text()[0] == " ok");
+    settle_size(cx, window, &view);
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    let (bounds, metrics, theme) = terminal.read_with(cx, |t, _| {
+        (
+            t.scroll_handle().state().bounds,
+            t.cell_metrics().unwrap(),
+            t.palette().clone(),
+        )
+    });
+    let color = |r: u32, g: u32, b: u32| Hsla::from(rgb((r << 16) | (g << 8) | b));
+    // The quads of `color` inside the terminal, as (left edge, width).
+    let quads_of = |cx: &mut TestAppContext, color: Hsla| -> Vec<(Pixels, Pixels)> {
+        let (_, quads) = painted(cx, window);
+        quads
+            .into_iter()
+            .filter(|(c, x, _)| *c == color && *x >= bounds.left())
+            .map(|(_, x, width)| (x, width))
+            .collect()
+    };
+
+    // The background fills the terminal, the red cell is the device's red, and the
+    // cursor after "ok" is the device's cursor color.
+    let navy = color(0, 0, 0x80);
+    let filled = quads_of(cx, navy);
+    assert!(
+        filled
+            .iter()
+            .any(|(x, width)| *x == bounds.left() && *width == bounds.size.width),
+        "{filled:?}"
+    );
+    let red = quads_of(cx, color(0x10, 0x20, 0x30));
+    assert_eq!(red.len(), 1, "{red:?}");
+    assert!((red[0].0 - (bounds.left() + PADDING_LEFT)).abs() < px(0.5));
+    assert!(
+        quads_of(cx, theme.indexed(1)).is_empty(),
+        "not the theme's red"
+    );
+    let cursor = quads_of(cx, color(0, 0xff, 0));
+    assert_eq!(cursor.len(), 1, "{cursor:?}");
+    let cursor_x = bounds.left() + PADDING_LEFT + metrics.cell_width * 3.;
+    assert!((cursor[0].0 - cursor_x).abs() < px(0.5));
+
+    // OSC 111: the theme's background again.
+    press(cx, window, "r");
+    wait_for_screen(cx, &view, "the reset", |snap| {
+        snap.default_colors().background.is_none()
+    });
+    frame(cx, window);
+    assert!(quads_of(cx, navy).is_empty());
+    let filled = quads_of(cx, theme.background);
+    assert!(
+        filled
+            .iter()
+            .any(|(x, width)| *x == bounds.left() && *width == bounds.size.width),
+        "{filled:?}"
+    );
+}
