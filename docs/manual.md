@@ -149,7 +149,9 @@ The `replay` setting gives the speed and the end of a replay whose id does not s
 
 `speed` is `"1x"`, `"4x"`, `"0.5x"`, `"max"` or a bare number, and `end` is `"disconnect"` or
 `"hold"`. An id's own `?speed=` and `?end=` win, and a change reaches the next replay that
-opens, not one already playing. The Settings screen has no control for it; edit `settings.json`.
+opens, not one already playing. The Settings screen sets both under Session, Replay: Speed
+lists the speeds the replay toolbar offers (a speed it does not list, written in
+`settings.json`, shows as the list's text), and At the end is Disconnect or Hold.
 
 Restored tabs: with `restore_session` on, a `tcp:` tab connects again at the next start, as a
 serial tab does when its device is plugged in (if the endpoint does not answer, the tab says why
@@ -182,7 +184,8 @@ the port, rather than play at the wrong pace.
 opens the Settings screen in a tab beside the sessions: Appearance (theme mode, the light
 and dark themes, the UI font), Terminal font (family, size, weight, line height, ligatures,
 fallbacks, and the `terminal.*` overrides), Display, Session (default baud, line ending,
-echo, restore, and inline mode's Backspace, escape chord and paste pacing), Devices (the
+echo, restore, the replay speed and end, and inline mode's Backspace, escape chord and paste
+pacing), Devices (the
 device profiles: add, edit with the port settings form, remove, drag to reorder), Keymap
 (every binding in effect, yours marked, with the saved commands' keys listed as "command" rows,
 with Rebind… on a selected row) and Plugins. It is
