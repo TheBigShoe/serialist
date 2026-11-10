@@ -17,6 +17,8 @@
 //!   past the first that matches; on a timeout the position stays put.
 //! - `discard()` skips everything received so far.
 //! - `on_line(fn)` does not touch the position: it sees every line from the call on.
+//! - `on_frame([filter,] fn)` reads the session's decoded frames instead, from the call
+//!   on; see [`crate::frame`].
 //!
 //! Only received lines count: echoes of what was sent and app notices are skipped, as
 //! for saved commands' matchers. A line counts once it is complete (ended by a line
@@ -37,6 +39,7 @@ use serialist_core::{ControlLine, SerialConfig};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::callback::{CallbackHandle, Slot};
 use crate::hex::decode_hex;
 use crate::race::{Either, race};
 use crate::services::ScriptSession;
@@ -431,6 +434,46 @@ impl Port {
         LineHandle(sub)
     }
 
+    /// `port:on_frame(fn)` or `port:on_frame(filter, fn)`.
+    fn on_frame(&self, first: Value, second: Value) -> mlua::Result<CallbackHandle> {
+        self.state.check_open("on_frame")?;
+        let (filter, callback) = match (first, second) {
+            (Value::Function(callback), Value::Nil) => (None, callback),
+            (Value::Table(filter), Value::Function(callback)) => {
+                let filter = crate::codecs::object(&filter, 0)
+                    .map_err(|err| runtime_error(format!("port:on_frame: filter: {err}")))?;
+                (Some(filter), callback)
+            }
+            (first, second) => {
+                return Err(runtime_error(format!(
+                    "port:on_frame: give a function, or a filter table and a function, \
+                     got {} and {}",
+                    first.type_name(),
+                    second.type_name()
+                )));
+            }
+        };
+        let session = &self.state.session;
+        let Some(frames) = session.frames() else {
+            return Err(runtime_error(format!(
+                "port:on_frame: {} decodes no frames here (no codec runs on it)",
+                self.state.name()
+            )));
+        };
+        let slot = Slot::claim(&self.ctx, "port:on_frame")?;
+        let start = frames.snapshot().end();
+        tokio::task::spawn_local(crate::frame::on_frame_task(
+            Rc::clone(&self.ctx),
+            Arc::clone(session),
+            frames,
+            callback,
+            filter,
+            Rc::clone(&slot),
+            start,
+        ));
+        Ok(CallbackHandle(slot))
+    }
+
     fn set(&self, options: &Table) -> mlua::Result<()> {
         self.state.check_open("set")?;
         let mut dtr = None;
@@ -560,6 +603,9 @@ impl UserData for Port {
         methods.add_method("on_line", |_, this, callback: Function| {
             this.state.check_open("on_line")?;
             Ok(this.on_line(callback))
+        });
+        methods.add_method("on_frame", |_, this, (first, second): (Value, Value)| {
+            this.on_frame(first, second)
         });
         methods.add_method("discard", |_, this, ()| {
             this.state.check_open("discard")?;

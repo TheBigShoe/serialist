@@ -55,7 +55,10 @@ pub struct ExamplePlugin {
 ///
 /// The directory is `~/.config/serialist` on macOS and Linux (Zed uses `~/.config/zed`
 /// on macOS too, so a Zed user finds it where they expect) and `%APPDATA%\Serialist` on
-/// Windows. `SERIALIST_CONFIG_DIR` overrides both.
+/// Windows. On Linux an absolute `XDG_CONFIG_HOME` moves it to
+/// `$XDG_CONFIG_HOME/serialist`, unless that directory does not exist and
+/// `~/.config/serialist` does (so nobody's settings disappear). `SERIALIST_CONFIG_DIR`
+/// overrides all of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigPaths {
     /// The config directory.
@@ -99,8 +102,19 @@ impl ConfigPaths {
             return Self::new(dir);
         }
         let dir = match platform {
-            Platform::MacOs | Platform::Linux => {
-                lookup("HOME").map(|home| PathBuf::from(home).join(".config").join("serialist"))
+            Platform::MacOs => lookup("HOME").map(|home| home_config_dir(&home)),
+            Platform::Linux => {
+                let home = lookup("HOME").map(|home| home_config_dir(&home));
+                // Only an absolute XDG_CONFIG_HOME counts, as the spec says.
+                let xdg = lookup("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .filter(|base| base.is_absolute())
+                    .map(|base| base.join("serialist"));
+                match (xdg, home) {
+                    (Some(xdg), Some(home)) if !xdg.exists() && home.exists() => Some(home),
+                    (Some(xdg), _) => Some(xdg),
+                    (None, home) => home,
+                }
             }
             Platform::Windows => lookup("APPDATA")
                 .map(PathBuf::from)
@@ -324,6 +338,11 @@ impl ConfigPaths {
     }
 }
 
+/// `~/.config/serialist` for the home directory `home`.
+fn home_config_dir(home: &OsString) -> PathBuf {
+    PathBuf::from(home).join(".config").join("serialist")
+}
+
 /// A keymap file that is valid and changes nothing: the header explains the format, and
 /// the bundled defaults for `platform` follow with every line commented out, so a section
 /// can be uncommented and edited to override it. The array brackets stay live.
@@ -392,6 +411,92 @@ pub fn settings_template() -> String {
 mod tests {
     use super::*;
     use crate::test_util::TempDir;
+
+    /// An environment of `pairs`.
+    fn env_of(pairs: &[(&str, OsString)]) -> impl Fn(&str) -> Option<OsString> + use<> {
+        let pairs: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.clone()))
+            .collect();
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn linux_uses_an_absolute_xdg_config_home() {
+        let root = TempDir::new("xdg");
+        let xdg = root.path().join("xdg");
+        let home = root.path().join("home");
+        let env = env_of(&[
+            ("HOME", home.clone().into()),
+            ("XDG_CONFIG_HOME", xdg.clone().into()),
+        ]);
+        // Neither exists: the XDG directory is the one to create.
+        let paths = ConfigPaths::from_environment(Platform::Linux, &env);
+        assert_eq!(paths.dir, xdg.join("serialist"));
+        // Both exist: XDG wins.
+        std::fs::create_dir_all(xdg.join("serialist")).unwrap();
+        std::fs::create_dir_all(home.join(".config").join("serialist")).unwrap();
+        let paths = ConfigPaths::from_environment(Platform::Linux, &env);
+        assert_eq!(paths.dir, xdg.join("serialist"));
+    }
+
+    #[test]
+    fn linux_keeps_an_existing_home_directory_when_the_xdg_one_is_new() {
+        let root = TempDir::new("xdg-old");
+        let xdg = root.path().join("xdg");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".config").join("serialist")).unwrap();
+        let env = env_of(&[
+            ("HOME", home.clone().into()),
+            ("XDG_CONFIG_HOME", xdg.into()),
+        ]);
+        let paths = ConfigPaths::from_environment(Platform::Linux, &env);
+        assert_eq!(paths.dir, home.join(".config").join("serialist"));
+    }
+
+    #[test]
+    fn an_unset_empty_or_relative_xdg_config_home_means_the_home_directory() {
+        for xdg in [None, Some(""), Some("relative/config")] {
+            let mut pairs = vec![("HOME", OsString::from("/home/me"))];
+            if let Some(xdg) = xdg {
+                pairs.push(("XDG_CONFIG_HOME", xdg.into()));
+            }
+            let paths = ConfigPaths::from_environment(Platform::Linux, &env_of(&pairs));
+            assert_eq!(
+                paths.dir,
+                Path::new("/home/me/.config/serialist"),
+                "{xdg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xdg_config_home_changes_only_linux_and_never_beats_the_override() {
+        let xdg = std::env::temp_dir().join("xdg-elsewhere");
+        let pairs = [
+            ("HOME", OsString::from("/home/me")),
+            ("XDG_CONFIG_HOME", xdg.clone().into()),
+        ];
+        let paths = ConfigPaths::from_environment(Platform::MacOs, &env_of(&pairs));
+        assert_eq!(paths.dir, Path::new("/home/me/.config/serialist"));
+        let paths = ConfigPaths::from_environment(
+            Platform::Windows,
+            &env_of(&[
+                ("APPDATA", OsString::from("C:\\Users\\me\\AppData\\Roaming")),
+                ("XDG_CONFIG_HOME", xdg.clone().into()),
+            ]),
+        );
+        assert!(paths.dir.ends_with("Serialist"), "{:?}", paths.dir);
+        let mut with_override = pairs.to_vec();
+        with_override.push((CONFIG_DIR_ENV, OsString::from("/override")));
+        let paths = ConfigPaths::from_environment(Platform::Linux, &env_of(&with_override));
+        assert_eq!(paths.dir, Path::new("/override"));
+    }
 
     #[test]
     fn scripts_live_in_the_config_directory() {

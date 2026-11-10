@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serialist_core::{Epoch, LineId, LineSource, StyledLine};
 
 use crate::convert::same_content;
+use crate::mouse::MouseReporting;
 use crate::scrollback::ScrollbackView;
 
 /// How the cursor is drawn.
@@ -27,7 +28,8 @@ pub struct CursorState {
     /// The row the cursor is on, a visible row of the snapshot.
     pub line: LineId,
     /// The cursor's cell column, 0-based. After a wide character this is one more than
-    /// its character index in the line's text (see the crate docs on wide characters).
+    /// its character index in the line's text: count cells with
+    /// [`cell_width`](crate::cell_width) (see the crate docs on wide characters).
     pub column: usize,
     pub shape: CursorShape,
     /// `false` when the device hid it (`CSI ? 25 l`, or a hidden cursor style).
@@ -48,9 +50,21 @@ pub struct VtModes {
     pub app_cursor_keys: bool,
     /// The keypad is in application mode (DECKPAM, `ESC =`).
     pub app_keypad: bool,
-    /// The device asked for mouse reports (any of `CSI ? 1000/1002/1003 h`). Serialist
-    /// does not send mouse reports yet; this is here so the UI can tell the user.
-    pub mouse_reporting: bool,
+    /// The mouse reports the device asked for (`CSI ? 1000/1002/1003 h`) and how to
+    /// write them (`CSI ? 1005/1006 h`), or `None`. See
+    /// [`MouseReporting::report`](crate::MouseReporting::report).
+    pub mouse: Option<MouseReporting>,
+}
+
+/// The default colors the device set (OSC 10, 11 and 12) in place of the theme's, as
+/// red, green and blue; `None` where it set none or reset it (OSC 110, 111, 112, or a
+/// full reset). Palette entries it set (OSC 4) are in the lines' runs already, as
+/// [`Color::Rgb`](serialist_core::Color::Rgb).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DefaultColors {
+    pub foreground: Option<(u8, u8, u8)>,
+    pub background: Option<(u8, u8, u8)>,
+    pub cursor: Option<(u8, u8, u8)>,
 }
 
 /// The screen and scrollback at one moment. Cheap to clone (reference counts) and never
@@ -66,6 +80,7 @@ pub struct VtSnapshot {
     pub(crate) columns: usize,
     pub(crate) cursor: CursorState,
     pub(crate) modes: VtModes,
+    pub(crate) colors: DefaultColors,
     pub(crate) title: Option<Arc<str>>,
     pub(crate) generation: u64,
     pub(crate) epoch: Epoch,
@@ -112,13 +127,20 @@ impl VtSnapshot {
         self.modes
     }
 
+    /// The default colors the device set, which the screen is drawn in instead of the
+    /// theme's.
+    pub fn default_colors(&self) -> DefaultColors {
+        self.colors
+    }
+
     /// The title the device set last, if it set one since the last reset.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 
-    /// Increases with every snapshot whose content (rows, cursor, modes or title) differs
-    /// from the one before, by one or, when the screen took a snapshot of its own in
+    /// Increases with every snapshot whose content (rows, cursor, modes, default colors
+    /// or title) differs from the one before, by one or, when the screen took a snapshot
+    /// of its own in
     /// between (it does when a synchronized update begins), by more. Equal generations
     /// from one screen mean equal snapshots, so the UI can skip everything.
     pub fn generation(&self) -> u64 {
@@ -188,6 +210,7 @@ impl std::fmt::Debug for VtSnapshot {
             )
             .field("cursor", &self.cursor)
             .field("modes", &self.modes)
+            .field("colors", &self.colors)
             .field("title", &self.title)
             .field("screen", &self.screen_text())
             .finish()

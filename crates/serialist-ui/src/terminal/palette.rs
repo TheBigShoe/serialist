@@ -13,6 +13,7 @@
 //! RGB color the application set) when it is resolved.
 
 use serialist_core::{Color, Direction, Style, StyleFlags};
+use serialist_vt::DefaultColors;
 
 use crate::prelude::*;
 
@@ -268,6 +269,23 @@ fn from_bytes(r: u8, g: u8, b: u8) -> Hsla {
 }
 
 impl TerminalPalette {
+    /// This palette with the default colors a terminal screen's device set (OSC 10, 11
+    /// and 12) in place of the theme's. Bold default text takes the device's foreground
+    /// too: the theme's bright one was chosen for the theme's background.
+    pub fn with_screen_colors(&self, colors: DefaultColors) -> Self {
+        let set = |color: Option<(u8, u8, u8)>, theme: Hsla| {
+            color.map_or(theme, |(r, g, b)| from_bytes(r, g, b))
+        };
+        let foreground = set(colors.foreground, self.foreground);
+        Self {
+            foreground,
+            bright_foreground: set(colors.foreground, self.bright_foreground),
+            background: set(colors.background, self.background),
+            cursor: set(colors.cursor, self.cursor),
+            ..*self
+        }
+    }
+
     /// The color of an ANSI or indexed color number, 0..=255: the sixteen theme colors,
     /// then the 6x6x6 cube, then 24 greys.
     pub fn indexed(&self, index: u8) -> Hsla {

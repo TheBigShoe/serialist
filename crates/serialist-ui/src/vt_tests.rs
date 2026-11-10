@@ -20,7 +20,7 @@ use crate::inline::Mode;
 use crate::prelude::*;
 use crate::session_options::{DisplayDefaults, SessionOptions};
 use crate::session_view::{BELL_FLASH, FRAME, SessionView};
-use crate::terminal::element::PADDING_LEFT;
+use crate::terminal::element::{CellMetrics, PADDING_LEFT};
 use crate::test_support::{
     ENGINE_WAIT, TestDir, allow_engine_threads, displayed, fake_session, open_test_window,
     open_test_window_sized, resize_window, run_until, wait_connected,
@@ -746,4 +746,471 @@ fn search_reads_the_log_under_the_screen_and_says_so(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+/// Writes wide characters, an underlined `X` after them and a red cell after that, and
+/// leaves the cursor after the red cell.
+struct Wide;
+
+impl SimDevice for Wide {
+    fn name(&self) -> &str {
+        "wide"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        // 日 and 本 in cells 0 to 3, X in cell 4, the red blank in cell 5.
+        out.send("日本\x1b[4mX\x1b[24m\x1b[41m \x1b[0m".as_bytes());
+    }
+
+    fn on_receive(&mut self, _: &[u8], _: &mut dyn DeviceOutput) {}
+}
+
+fn dispatch(cx: &mut TestAppContext, window: AnyWindowHandle, event: PlatformInput) {
+    cx.update_window(window, |_, window, cx| {
+        window.dispatch_event(event, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// The left edges and widths of the underlines and the solid quads painted last, in
+/// logical pixels.
+type Painted = (Vec<(Pixels, Pixels)>, Vec<(Hsla, Pixels, Pixels)>);
+
+fn painted(cx: &mut TestAppContext, window: AnyWindowHandle) -> Painted {
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let scale = window.scale_factor();
+        let left = |b: Bounds<ScaledPixels>| px(b.origin.x.0 / scale);
+        let width = |b: Bounds<ScaledPixels>| px(b.size.width.0 / scale);
+        let underlines = window
+            .painted_underlines()
+            .iter()
+            .map(|u| (left(u.bounds), width(u.bounds)))
+            .collect();
+        let quads = window
+            .painted_quads()
+            .iter()
+            .filter_map(|q| Some((q.background.as_solid()?, left(q.bounds), width(q.bounds))))
+            .collect();
+        (underlines, quads)
+    })
+    .unwrap()
+}
+
+#[gpui_test]
+fn wide_characters_are_drawn_selected_and_copied_in_their_cells(cx: &mut TestAppContext) {
+    let dir = vt_config("vt-wide");
+    let world = SimWorld::empty();
+    world.add_virtual("wide", "Wide", LinkConfig::unpaced(), || Box::new(Wide));
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:wide", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    let snapshot = wait_for_screen(cx, &view, "the text", |snap| {
+        snap.screen_text()[0] == "日本X "
+    });
+    assert_eq!(snapshot.cursor().unwrap().column, 6, "a cell column");
+    settle_size(cx, window, &view);
+
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    let (bounds, metrics, palette) = terminal.read_with(cx, |t, _| {
+        (
+            t.scroll_handle().state().bounds,
+            t.cell_metrics().unwrap(),
+            t.palette().clone(),
+        )
+    });
+    let x_of = |cell: f32| bounds.left() + PADDING_LEFT + metrics.cell_width * cell;
+    let near = |a: Pixels, b: Pixels| (a - b).abs() < px(0.5);
+    // The quads of `color` inside the terminal (the toolbar uses the cursor's color too).
+    let of_color = |quads: &[(Hsla, Pixels, Pixels)], color: Hsla| -> Vec<(Pixels, Pixels)> {
+        quads
+            .iter()
+            .filter(|(c, x, _)| *c == color && *x >= bounds.left())
+            .map(|(_, x, width)| (*x, *width))
+            .collect()
+    };
+
+    // The X is drawn in cell 4, after the two wide characters, and the red background
+    // and the cursor are in cells 5 and 6.
+    let (underlines, quads) = painted(cx, window);
+    assert_eq!(underlines.len(), 1, "{underlines:?}");
+    assert!(near(underlines[0].0, x_of(4.)), "{underlines:?}");
+    let reds = of_color(&quads, palette.indexed(1));
+    assert_eq!(reds.len(), 1, "{quads:?}");
+    assert!(near(reds[0].0, x_of(5.)) && near(reds[0].1, metrics.cell_width));
+    let cursors = of_color(&quads, palette.cursor);
+    assert_eq!(cursors.len(), 1, "{quads:?}");
+    assert!(near(cursors[0].0, x_of(6.)), "{cursors:?}");
+
+    // A drag from the second half of 日 to the middle of X selects 本 and X: the caret
+    // goes in front of a wide character it lands in. The selection is painted over their
+    // three cells, and copy gives each character once.
+    let y = bounds.top() + metrics.row_height * 0.5;
+    let (from, to) = (point(x_of(1.6), y), point(x_of(4.6), y));
+    let modifiers = Modifiers::default();
+    let down = MouseDownEvent {
+        button: MouseButton::Left,
+        position: from,
+        modifiers,
+        click_count: 1,
+        first_mouse: false,
+    };
+    dispatch(cx, window, down.to_platform_input());
+    let drag = MouseMoveEvent {
+        position: to,
+        pressed_button: Some(MouseButton::Left),
+        modifiers,
+    };
+    dispatch(cx, window, drag.to_platform_input());
+    let up = MouseUpEvent {
+        button: MouseButton::Left,
+        position: to,
+        modifiers,
+        click_count: 1,
+    };
+    dispatch(cx, window, up.to_platform_input());
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("本X".into())
+    );
+    let (_, quads) = painted(cx, window);
+    let selected = of_color(&quads, palette.selection);
+    assert_eq!(selected.len(), 1, "{quads:?}");
+    assert!(
+        near(selected[0].0, x_of(2.)) && near(selected[0].1, metrics.cell_width * 3.),
+        "{selected:?}"
+    );
+}
+
+/// Sends `modes` on connect (mouse reporting), then a word, and keeps what it receives.
+struct MouseDevice {
+    modes: &'static [u8],
+    heard: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SimDevice for MouseDevice {
+    fn name(&self) -> &str {
+        "mouse"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        out.send(self.modes);
+        out.send(b"menu");
+    }
+
+    fn on_receive(&mut self, bytes: &[u8], _: &mut dyn DeviceOutput) {
+        self.heard.lock().extend_from_slice(bytes);
+    }
+}
+
+/// A session in VT mode on a device that turned on the mouse, in inline mode, with the
+/// screen sized.
+struct MouseSession {
+    /// Holds the settings for as long as the test runs.
+    _dir: TestDir,
+    window: AnyWindowHandle,
+    view: Entity<SessionView>,
+    /// What the device hears.
+    heard: Arc<Mutex<Vec<u8>>>,
+    bounds: Bounds<Pixels>,
+    metrics: CellMetrics,
+}
+
+impl MouseSession {
+    /// The middle of screen cell (column, row).
+    fn cell(&self, column: usize, row: usize) -> Point<Pixels> {
+        point(
+            self.bounds.left() + PADDING_LEFT + self.metrics.cell_width * (column as f32 + 0.5),
+            self.bounds.top() + self.metrics.row_height * (row as f32 + 0.5),
+        )
+    }
+}
+
+/// [`MouseSession`] on a device that sends `modes` when it connects.
+fn open_mouse(cx: &mut TestAppContext, name: &str, modes: &'static [u8]) -> MouseSession {
+    let dir = vt_config(name);
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&heard);
+    let world = SimWorld::empty();
+    world.add_virtual("mouse", "Mouse", LinkConfig::unpaced(), move || {
+        Box::new(MouseDevice {
+            modes,
+            heard: Arc::clone(&log),
+        })
+    });
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:mouse", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    wait_for_screen(cx, &view, "the word", |snap| {
+        snap.screen_text()[0] == "menu" && snap.modes().mouse.is_some()
+    });
+    settle_size(cx, window, &view);
+    let (bounds, metrics) = view.read_with(cx, |v, cx| {
+        let terminal = v.terminal().read(cx);
+        (
+            terminal.scroll_handle().state().bounds,
+            terminal.cell_metrics().unwrap(),
+        )
+    });
+    MouseSession {
+        _dir: dir,
+        window,
+        view,
+        heard,
+        bounds,
+        metrics,
+    }
+}
+
+fn mouse_down(at: Point<Pixels>, button: MouseButton, modifiers: Modifiers) -> PlatformInput {
+    MouseDownEvent {
+        button,
+        position: at,
+        modifiers,
+        click_count: 1,
+        first_mouse: false,
+    }
+    .to_platform_input()
+}
+
+fn mouse_up(at: Point<Pixels>, button: MouseButton, modifiers: Modifiers) -> PlatformInput {
+    MouseUpEvent {
+        button,
+        position: at,
+        modifiers,
+        click_count: 1,
+    }
+    .to_platform_input()
+}
+
+fn mouse_move(at: Point<Pixels>, button: Option<MouseButton>) -> PlatformInput {
+    MouseMoveEvent {
+        position: at,
+        pressed_button: button,
+        modifiers: Modifiers::default(),
+    }
+    .to_platform_input()
+}
+
+fn wheel(at: Point<Pixels>, lines: f32) -> PlatformInput {
+    ScrollWheelEvent {
+        position: at,
+        delta: ScrollDelta::Lines(point(0., lines)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    }
+    .to_platform_input()
+}
+
+/// What the device heard, as text, after the reports reach it.
+fn heard_text(cx: &mut TestAppContext, heard: &Arc<Mutex<Vec<u8>>>, len: usize) -> String {
+    wait_heard(cx, heard, "the reports", |heard| heard.len() >= len);
+    // Anything more would have come with what was waited for.
+    cx.run_until_parked();
+    String::from_utf8_lossy(&heard.lock().split_off(0)).into_owned()
+}
+
+#[gpui_test]
+fn a_click_a_drag_and_the_wheel_are_reported_in_sgr(cx: &mut TestAppContext) {
+    // Button-event tracking (drags) and SGR.
+    let session = open_mouse(cx, "vt-mouse-sgr", b"\x1b[?1002h\x1b[?1006h");
+    let (window, view, heard) = (session.window, &session.view, &session.heard);
+    let cell = |column, row| session.cell(column, row);
+    let none = Modifiers::default();
+
+    // A click on cell (3, 1): its press and release.
+    dispatch(cx, window, mouse_down(cell(3, 1), MouseButton::Left, none));
+    dispatch(cx, window, mouse_up(cell(3, 1), MouseButton::Left, none));
+    let click = "\x1b[<0;4;2M\x1b[<0;4;2m";
+    assert_eq!(heard_text(cx, heard, click.len()), click);
+    assert!(
+        view.read_with(cx, |v, cx| v.terminal().read(cx).selection().is_none()),
+        "a reported click selects nothing"
+    );
+
+    // A drag: moves within a cell are sent once, and the release is where it ended.
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, none));
+    dispatch(cx, window, mouse_move(cell(0, 0), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_move(cell(2, 0), Some(MouseButton::Left)));
+    let mut inside = cell(2, 0);
+    inside.x += px(1.);
+    dispatch(cx, window, mouse_move(inside, Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_move(cell(2, 3), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_up(cell(2, 3), MouseButton::Left, none));
+    let drag = "\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<32;3;4M\x1b[<0;3;4m";
+    assert_eq!(heard_text(cx, heard, drag.len()), drag);
+
+    // Moves with no button down are not asked for in this mode; a right click is.
+    dispatch(cx, window, mouse_move(cell(5, 5), None));
+    dispatch(cx, window, mouse_down(cell(5, 5), MouseButton::Right, none));
+    dispatch(cx, window, mouse_up(cell(5, 5), MouseButton::Right, none));
+    let right = "\x1b[<2;6;6M\x1b[<2;6;6m";
+    assert_eq!(heard_text(cx, heard, right.len()), right);
+
+    // The wheel: a report per row, up and down, and the screen does not scroll.
+    dispatch(cx, window, wheel(cell(1, 2), 2.));
+    dispatch(cx, window, wheel(cell(1, 2), -1.));
+    let turns = "\x1b[<64;2;3M\x1b[<64;2;3M\x1b[<65;2;3M";
+    assert_eq!(heard_text(cx, heard, turns.len()), turns);
+}
+
+#[gpui_test]
+fn x10_reports_and_shift_keeps_the_selection(cx: &mut TestAppContext) {
+    // Any-event tracking, in the X10 form.
+    let session = open_mouse(cx, "vt-mouse-x10", b"\x1b[?1003h");
+    let (window, view, heard) = (session.window, &session.view, &session.heard);
+    let cell = |column, row| session.cell(column, row);
+    let none = Modifiers::default();
+
+    // A move with no button, then a click with Control: the release says only that a
+    // button came up.
+    dispatch(cx, window, mouse_move(cell(1, 0), None));
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    dispatch(
+        cx,
+        window,
+        mouse_down(cell(1, 0), MouseButton::Left, control),
+    );
+    dispatch(cx, window, mouse_up(cell(1, 0), MouseButton::Left, control));
+    let expected = [
+        b"\x1b[M\x43\x22\x21".as_slice(),
+        b"\x1b[M\x30\x22\x21",
+        b"\x1b[M\x33\x22\x21",
+    ]
+    .concat();
+    wait_heard(cx, heard, "the reports", |heard| {
+        heard.len() >= expected.len()
+    });
+    cx.run_until_parked();
+    assert_eq!(heard.lock().split_off(0), expected);
+
+    // With Shift the mouse is Serialist's: a drag selects (from the middle of a cell the caret is after it) and the
+    // device hears nothing.
+    let shift = Modifiers {
+        shift: true,
+        ..none
+    };
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, shift));
+    dispatch(
+        cx,
+        window,
+        MouseMoveEvent {
+            position: cell(3, 0),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: shift,
+        }
+        .to_platform_input(),
+    );
+    dispatch(cx, window, mouse_up(cell(3, 0), MouseButton::Left, shift));
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("enu".into())
+    );
+
+    // In command mode the terminal's input is not the device's: a click selects.
+    press(cx, window, keys::TOGGLE_INLINE);
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, none));
+    dispatch(cx, window, mouse_move(cell(2, 0), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_up(cell(2, 0), MouseButton::Left, none));
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("en".into())
+    );
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(20));
+    cx.run_until_parked();
+    assert!(heard.lock().is_empty(), "{:?}", heard.lock());
+}
+
+/// Sets palette entry 1 and the default background and cursor colors, writes a red
+/// cell, and resets the background when it receives `r`.
+struct Recolor;
+
+impl SimDevice for Recolor {
+    fn name(&self) -> &str {
+        "recolor"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        out.send(b"\x1b]4;1;rgb:10/20/30\x07\x1b]11;rgb:00/00/80\x07\x1b]12;#00ff00\x07");
+        out.send(b"\x1b[41m \x1b[0mok");
+    }
+
+    fn on_receive(&mut self, bytes: &[u8], out: &mut dyn DeviceOutput) {
+        if bytes == b"r" {
+            out.send(b"\x1b]111\x07reset");
+        }
+    }
+}
+
+#[gpui_test]
+fn the_devices_colors_are_drawn_and_reset(cx: &mut TestAppContext) {
+    let dir = vt_config("vt-recolor");
+    let world = SimWorld::empty();
+    world.add_virtual("recolor", "Recolor", LinkConfig::unpaced(), || {
+        Box::new(Recolor)
+    });
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:recolor", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    wait_for_screen(cx, &view, "the text", |snap| snap.screen_text()[0] == " ok");
+    settle_size(cx, window, &view);
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    let (bounds, metrics, theme) = terminal.read_with(cx, |t, _| {
+        (
+            t.scroll_handle().state().bounds,
+            t.cell_metrics().unwrap(),
+            t.palette().clone(),
+        )
+    });
+    let color = |r: u32, g: u32, b: u32| Hsla::from(rgb((r << 16) | (g << 8) | b));
+    // The quads of `color` inside the terminal, as (left edge, width).
+    let quads_of = |cx: &mut TestAppContext, color: Hsla| -> Vec<(Pixels, Pixels)> {
+        let (_, quads) = painted(cx, window);
+        quads
+            .into_iter()
+            .filter(|(c, x, _)| *c == color && *x >= bounds.left())
+            .map(|(_, x, width)| (x, width))
+            .collect()
+    };
+
+    // The background fills the terminal, the red cell is the device's red, and the
+    // cursor after "ok" is the device's cursor color.
+    let navy = color(0, 0, 0x80);
+    let filled = quads_of(cx, navy);
+    assert!(
+        filled
+            .iter()
+            .any(|(x, width)| *x == bounds.left() && *width == bounds.size.width),
+        "{filled:?}"
+    );
+    let red = quads_of(cx, color(0x10, 0x20, 0x30));
+    assert_eq!(red.len(), 1, "{red:?}");
+    assert!((red[0].0 - (bounds.left() + PADDING_LEFT)).abs() < px(0.5));
+    assert!(
+        quads_of(cx, theme.indexed(1)).is_empty(),
+        "not the theme's red"
+    );
+    let cursor = quads_of(cx, color(0, 0xff, 0));
+    assert_eq!(cursor.len(), 1, "{cursor:?}");
+    let cursor_x = bounds.left() + PADDING_LEFT + metrics.cell_width * 3.;
+    assert!((cursor[0].0 - cursor_x).abs() < px(0.5));
+
+    // OSC 111: the theme's background again.
+    press(cx, window, "r");
+    wait_for_screen(cx, &view, "the reset", |snap| {
+        snap.default_colors().background.is_none()
+    });
+    frame(cx, window);
+    assert!(quads_of(cx, navy).is_empty());
+    let filled = quads_of(cx, theme.background);
+    assert!(
+        filled
+            .iter()
+            .any(|(x, width)| *x == bounds.left() && *width == bounds.size.width),
+        "{filled:?}"
+    );
 }

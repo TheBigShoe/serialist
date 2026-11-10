@@ -40,7 +40,8 @@ callback (`serialist --virtual firehose` gives it something to count).
 ## Where scripts live
 
 - Scripts are `*.lua` files under `scripts/` in the config directory (`~/.config/serialist`
-  on macOS and Linux, `%APPDATA%\Serialist` on Windows, or the `--config-dir` directory).
+  on macOS and Linux, `%APPDATA%\Serialist` on Windows, or the `--config-dir` directory;
+  on Linux `$XDG_CONFIG_HOME/serialist` when that is set).
   The Script console lists them at any depth up to eight folders, skipping hidden files and
   folders and symlinked folders. The folder is watched, so the list follows your edits.
 - The Scripts menu's Open Scripts Folder creates the folder and, if it holds no `*.lua`
@@ -90,11 +91,13 @@ days).
 | `port:read_line(opts)` | `{timeout_ms}` | next received line (text only), or `nil, "timeout" \| "closed"` | yes |
 | `port:expect(pattern, opts)` | regex (Rust syntax, smart case), `{timeout_ms}` | `captures, elapsed_ms` (`captures[1]` the match, `[2..]` groups, `false` for a group that did not take part, `.line` the whole line), or `nil, elapsed_ms, "timeout" \| "closed"` | yes |
 | `port:on_line(fn)` | `fn(line)` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs for each later line, may wait |
+| `port:on_frame(filter, fn)` | optional `filter` (`{ kind = ..., <field> = ... }`), `fn(frame)` | handle with `cancel()`, `active()`, and `<close>` support; error if the session decodes nothing | no; `fn` runs for each later decoded frame `filter` matches, may wait |
 | `port:discard()` | | nothing: skips everything unread | no |
 | `port:set{dtr=, rts=, baud=}` | booleans, positive integer | nothing | no (queued) |
 | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
 | `port:description()`, `port:id()` | | strings | no |
 | `sleep(ms)` | milliseconds | nothing | yes |
+| `timer.after(ms, fn)`, `timer.every(ms, fn)` | milliseconds (`every`: 1 or more), `fn()` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs once after `ms`, or every `ms`, may wait |
 | `print(...)` | values | one `ScriptEvent::Output`, tab-joined | no |
 | `log.debug/info/warn/error(...)` | values | `ScriptUi::log` and an `Output` line `"[info] ..."`, space-joined | no |
 | `ui.prompt(label, default)` | strings | the answer, or `nil` if dismissed; sends `ScriptEvent::Prompt` first | yes |
@@ -103,9 +106,24 @@ days).
 | `hex.encode(bytes, sep)` | string or byte table, separator (default `" "`) | `"05 5A 00"` | no |
 | `hex.decode(text)` | hex text | byte string; error if malformed | no |
 | `bytes.from_table(t)`, `bytes.to_table(s)` | byte table / string | string / byte table | no |
+| `codecs.<name>.encode(fields)` | a saved command's codec `fields`, as a table (`command` picks the codec's command) | the command's bytes; error if the codec refuses the fields | no |
+| `serialist.version`, `serialist.api` | | the app version (a string such as `"1.0.0"`) and the API number (an integer, `1` at 1.0) | no |
 | `require(name)`, `dofile(path)` | `"lib.util"` / `"lib/util.lua"` in the scripts directory | the module's value / the file's results | yes (worker thread) |
 
 `string.pack` and `string.unpack` are there for binary frames.
+
+**Versions.** Within 1.x the API only gains things, and `serialist.api` goes up by one in
+each release that adds something. A script that needs a later addition starts with
+
+```lua
+assert(serialist.api >= 2, "this script needs a newer Serialist")
+```
+
+On a build older than the one that added `serialist`, the global is `nil`, so a script
+that must fail with the message there too writes
+`assert(serialist and serialist.api >= 2, "this script needs a newer Serialist")`.
+`serialist.version` is the app version, for logging; check `serialist.api` to decide
+what to call.
 
 **Reading is a stream.** Each port object has one read position that `read`,
 `read_line` and `expect` consume from, like a socket, so nothing is lost between
@@ -125,8 +143,55 @@ feed ends it or another line starts after it.
 commands: `port:expect([[^VAL=(\d+)]])`. Only received lines count, never echoes of
 what was sent or app notices.
 
-**Ending.** A run ends when its main chunk returns; `on_line` handlers still active
-then are cancelled. An error in an `on_line` callback ends the run with that error.
+**Timers.** `timer.after(ms, fn)` calls `fn()` once, `ms` from now; `timer.every(ms,
+fn)` calls it every `ms`. Like `on_line` callbacks, they run while the script waits
+(`sleep`, `expect`, a prompt), one call at a time, never inside another wait's own
+code; a callback may wait itself, and an error in one ends the run. A call is never
+queued: when one runs past the next tick, that tick is skipped and the timer is next due
+one interval after the call returns. `active()` is false once an `after` has fired or
+either was cancelled. A run may have 1024 timers and `on_frame` handlers active at once
+(`Limits::max_callbacks`); one more raises an error until one is cancelled or fires for
+the last time.
+
+```lua
+local port = serial.current()
+local keepalive <close> = timer.every(500, function() port:write("AT\r\n") end)
+local ready = port:expect("^READY$", { timeout_ms = 10000 })
+```
+
+**Frames.** `port:on_frame(fn)` calls `fn(frame)` for each frame the session's codec
+decodes from the call on, and `port:on_frame(filter, fn)` for those `filter` matches,
+read the way a saved command's frame predicate is: `kind` names the frame's kind and
+every other key a field with an equal value, an integer field matching a number or hex
+text (`cmd_id = 0x0F15` or `"0x0F15"`), a bytes field hex text or a table of byte
+values. `frame` is a table: `kind`, `severity` (`"info"`, `"warning"` or `"error"`),
+`summary`, `fields` (by name; integers as integers, bytes as byte strings, lists as
+tables) and `bytes`, the frame's bytes from the scrollback (`nil` once they have been
+evicted). Handlers run like `on_line` callbacks and timers, one call at a time, and an
+error in one ends the run. Nothing is queued: frames wait in the session's frame store,
+which keeps the newest 100 000 within 64 MiB, so a handler that falls further behind
+than that skips the frames evicted meanwhile. A handler counts toward the run's 1024
+timers and frame handlers. In the window a tab's session decodes with the codec its
+toolbar or device profile picks; a handler made before a codec is picked starts
+receiving frames when one is, and a frame a codec could not be made for arrives as kind
+`codec_error`. A session that decodes nothing at all (headless without a profile
+`plugin`, or a port from `serial.open`) raises an error instead.
+
+```lua
+local port = serial.current()
+local race = assert(codecs["airoha-race"])
+local reply
+local h <close> = port:on_frame({ kind = "response", cmd_id = 0x0F15 }, function(frame)
+  reply = frame
+end)
+port:write(race.encode{ cmd_id = 0x0F15 })
+for _ = 1, 100 do if reply then break end sleep(10) end
+log.info("version", reply and reply.fields.payload:sub(2))
+```
+
+**Ending.** A run ends when its main chunk returns; `on_line` and `on_frame` handlers
+and timers still active then are cancelled. An error in any of their callbacks ends the
+run with that error.
 
 In the table, `ScriptEvent::Output` is one line of script output (a line in the Script
 console, or on stdout when headless), `ScriptEvent::Prompt` is a prompt asking for an
@@ -144,11 +209,32 @@ A few details of the app's side of `commands.send(name, params)`:
 - Headless, there are no saved commands: the call raises "saved commands are not available
   in this host".
 
+**Codecs.** `codecs.<name>` is the installed codec plugin of that name (the plugin's
+folder under `plugins/`), or `nil` when none is installed, so `if codecs.race then`
+tests for one; a name with a hyphen is spelled `codecs["airoha-race"]`. Its
+`encode(fields)` builds the bytes a saved command's `{ "codec": …, "fields": { … } }`
+payload would, from the same fields: a `command` key picks one of the codec's commands
+(the first without it), integers may be numbers or hex text (`0x0F15` or `"0x0F15"`),
+and bytes are hex text (`"05 5A"`) or a table of byte values. A sequence becomes a list
+(an empty table too), any other table an object. It adds no line ending; send the bytes
+with `port:write`:
+
+```lua
+local race = assert(codecs["airoha-race"], "install the Airoha RACE plugin")
+port:write(race.encode{ cmd_id = 0x0F15 })
+```
+
+A field the codec refuses (missing, unknown, out of range, not UTF-8 text) raises an
+error naming the codec and the field, which `pcall` catches. The codec is made on the
+script thread the first time a run encodes with it and kept for the run; a plugin
+reloaded meanwhile is used from its next call, and one that panics is made again.
+`codecs.<name>.encode` only encodes: it never touches a session's decoding.
+
 `ui.notify(text)` prints `notice: <text>` in the Script console and shows a notice; headless
 it goes to stderr as `notice: <text>`.
 
-The plan (`docs/plan.md`) lists `port:on_frame`, timers and `codecs.<name>.encode` in the
-scripting API. The table above has none of them.
+Everything the plan (`docs/plan.md`) lists for the scripting API is in the table above:
+`port:on_frame`, timers and `codecs.<name>.encode` included.
 
 ## Sandbox and limits
 
@@ -164,9 +250,9 @@ scripting API. The table above has none of them.
   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
   run, but every later wait fails the same way and the executor drops the script at
   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-- Waiting calls work in the main body, required modules and `on_line` callbacks, not
-  inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
-  (they fail with a message saying so).
+- Waiting calls work in the main body, required modules, and `on_line`, `on_frame` and
+  timer callbacks, not inside coroutines the script creates with `coroutine.create` or
+  `coroutine.wrap` (they fail with a message saying so).
 
 ## Headless runs with `--script`
 
@@ -198,6 +284,12 @@ How the API behaves without the app around it:
   scripts get no `serial.open`: it returns `nil` and a message, and a script uses
   `serial.current()`, which works on a `tcp:` or `replay:` tab as on any port.)
 - `commands.send` raises an error (no saved commands).
+- `codecs.<name>` sees the plugins installed in the config directory's `plugins/`, read
+  once when the run starts; a plugin that does not load is reported on stderr.
+- The port decodes with the plugin its device profile names (`plugin`), so
+  `port:on_frame` works on it; without one, or with a plugin that is not installed (a
+  warning on stderr), `port:on_frame` raises an error. Ports from `serial.open` never
+  decode.
 - `require` and `dofile` read from the script file's own folder.
 
 ### Exit codes
@@ -205,5 +297,6 @@ How the API behaves without the app around it:
 | Code | Meaning |
 |---|---|
 | 0 | The script's main chunk returned. (`--help` and `--version` also exit 0.) |
-| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line` callback, or the port could not be opened. |
-| 2 | The script was stopped, or nothing ran: a bad flag, `--script` without `--port`, a script file that cannot be read, or a `--virtual` device that does not exist. |
+| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line`, `on_frame` or timer callback, or the port could not be opened. |
+| 2 | Nothing ran: a bad flag, `--script` without `--port` or with more than one, a script file that cannot be read, or a `--virtual` device that does not exist. |
+| 130 | Reserved for a stopped script (what a shell reports for a process ended by Ctrl-C). Nothing in a headless run stops a script today, and Ctrl-C ends the process by the signal. |

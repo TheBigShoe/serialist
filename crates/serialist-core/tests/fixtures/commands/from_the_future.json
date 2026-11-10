@@ -1,0 +1,55 @@
+{
+  "name": "Future bench",
+  "format": 2,
+  "sync": { "remote": "https://example.invalid/bench", "every_s": 60 },
+  "groups": [
+    {
+      "name": "Modem",
+      "icon": "antenna",
+      "collapsed": true,
+      "commands": [
+        {
+          "name": "Version",
+          "description": "Ask for the firmware version",
+          "payload": { "text": "AT+VER?", "encoding": "ascii" },
+          "eol": "crlf",
+          "expect": { "pattern": "^OK", "timeout_ms": 1000, "retries": 2 },
+          "keybinding": "cmd-1",
+          "params": [
+            { "name": "id", "label": "Id", "default": "7", "kind": "int", "range": [0, 255] }
+          ],
+          "colour": "blue",
+          "history": { "sent": 12 }
+        },
+        {
+          "name": "Base64 blob",
+          "payload": { "base64": "AAEC" },
+          "keybinding": "cmd-2"
+        },
+        {
+          "name": "Float",
+          "payload": { "text": "AT+GAIN={{x}}" },
+          "params": [ { "name": "x", "kind": "float", "precision": 2 } ]
+        },
+        {
+          "name": "Reset",
+          "payload": { "hex": "00 01" },
+          "since": "1.3"
+        }
+      ]
+    },
+    "a group written as a string by a later build",
+    {
+      "name": "Later",
+      "commands": [
+        { "payload": { "cbor": { "op": 1 } } },
+        {
+          "name": "Frame",
+          "payload": { "codec": "airoha-race", "fields": { "command": "race_version" }, "compressed": false },
+          "expect": { "frame": { "kind": "response" }, "timeout_ms": 500, "decoder": "v2" }
+        }
+      ],
+      "order": "manual"
+    }
+  ]
+}

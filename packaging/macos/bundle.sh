@@ -10,6 +10,12 @@
 # downloaded copy as unidentified. Set CODESIGN_IDENTITY to a "Developer ID Application:
 # ..." identity to sign for distribution; that also turns on the hardened runtime and a
 # secure timestamp, which notarization requires (see notarize.sh).
+#
+# The hardened runtime is signed with no entitlements. Serialist generates no code at run
+# time (Lua 5.4 is an interpreter) and loads no library of another team, and serial ports
+# need no entitlement outside the App Sandbox, which it does not use. A build with the
+# `wasm` feature (off in releases) runs wasmtime's compiler, and would need an entitlements
+# file with com.apple.security.cs.allow-jit passed through --entitlements.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,4 +58,6 @@ fi
 codesign "${sign_args[@]}" "$app"
 
 codesign --verify --strict --verbose=2 "$app" >&2
+# The identity, team, flags (runtime) and timestamp the log should show for a release.
+codesign --display --verbose=2 "$app" >&2
 log "built $app"

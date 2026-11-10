@@ -754,6 +754,51 @@ impl EncodeRequest {
     }
 }
 
+/// Whether `frame` is what `predicate` asks for: its `kind` key names the frame's kind,
+/// and every other key a field of the frame with an equal value (see [`loose_eq`]).
+///
+/// This is the frame predicate of a saved command's expected reply, and the filter of a
+/// script's `port:on_frame`, so both read it the same way.
+pub fn frame_matches(predicate: &Map<String, JsonValue>, frame: &Frame) -> bool {
+    predicate.iter().all(|(key, expected)| {
+        if key == "kind" {
+            return expected.as_str() == Some(frame.kind.as_str());
+        }
+        frame
+            .field(key)
+            .is_some_and(|actual| loose_eq(expected, actual))
+    })
+}
+
+/// A predicate's JSON value against a frame's field, compared the way a codec reads its
+/// request fields: an integer field matches a JSON integer or hex digits (`"0x0F15"` or
+/// `"0F15"`), a bytes field matches hex text or a list of bytes, a string matches the
+/// same string, a bool the same bool.
+pub fn loose_eq(expected: &JsonValue, actual: &Value) -> bool {
+    match (expected, actual) {
+        (JsonValue::Bool(e), Value::Bool(a)) => e == a,
+        (JsonValue::Number(e), Value::UInt(a)) => e.as_u64() == Some(*a),
+        (JsonValue::Number(e), Value::Int(a)) => e.as_i64() == Some(*a),
+        (JsonValue::Number(e), Value::Float(a)) => e.as_f64() == Some(*a),
+        (JsonValue::String(e), Value::UInt(a)) => parse_hex_uint(e.trim()) == Some(*a),
+        (JsonValue::String(e), Value::Int(a)) => {
+            parse_hex_uint(e.trim()).and_then(|n| i64::try_from(n).ok()) == Some(*a)
+        }
+        (JsonValue::String(e), Value::Str(a)) => e == a,
+        (JsonValue::String(e), Value::Bytes(a)) => decode_hex(e).is_ok_and(|bytes| bytes == *a),
+        (JsonValue::Array(e), Value::Bytes(a)) => {
+            e.len() == a.len()
+                && e.iter()
+                    .zip(a)
+                    .all(|(e, a)| e.as_u64() == Some(u64::from(*a)))
+        }
+        (JsonValue::Array(e), Value::List(a)) => {
+            e.len() == a.len() && e.iter().zip(a).all(|(e, a)| loose_eq(e, a))
+        }
+        _ => false,
+    }
+}
+
 /// A JSON integer, or hex digits with an optional `0x` prefix.
 fn json_uint(value: &JsonValue) -> Result<u64, String> {
     match value {
@@ -942,6 +987,29 @@ mod tests {
             EncodeRequest::from_payload(&fields, "race"),
             Err(CodecError::BadField { field, .. }) if field == "command"
         ));
+    }
+
+    #[test]
+    fn predicates_compare_the_way_codecs_read_fields() {
+        let frame = Frame::new("response", 0..10, Instant::now())
+            .with_field("cmd_id", 0x0F15u64)
+            .with_field("payload", vec![0x00u8, 0x41])
+            .with_field("text", "hi");
+        let matches = |predicate: JsonValue| {
+            let JsonValue::Object(predicate) = predicate else {
+                panic!("an object");
+            };
+            frame_matches(&predicate, &frame)
+        };
+        assert!(matches(json!({ "kind": "response", "cmd_id": "0x0F15" })));
+        assert!(matches(json!({ "cmd_id": "0f15" })));
+        assert!(matches(json!({ "cmd_id": 3861 })));
+        assert!(matches(json!({ "payload": "00 41", "text": "hi" })));
+        assert!(matches(json!({ "payload": [0, 65] })));
+        assert!(matches(json!({})));
+        assert!(!matches(json!({ "kind": "log" })));
+        assert!(!matches(json!({ "cmd_id": "0x0F40" })));
+        assert!(!matches(json!({ "missing": 1 })));
     }
 
     struct Nothing;

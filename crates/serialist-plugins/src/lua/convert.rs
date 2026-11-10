@@ -199,6 +199,40 @@ fn fields_info(table: &Table, what: &str, budget: &mut Budget) -> Result<Vec<Fie
     })
 }
 
+/// Checks the `api` a plugin's `describe()` asks for against what the host `provides`.
+/// Absent means 1. Runs before the rest of `describe()` is read, so a plugin written for
+/// a later interface is refused for that, not for whatever it changed.
+pub(super) fn check_api(described: &LuaValue, provides: i64) -> Result<(), String> {
+    let LuaValue::Table(table) = described else {
+        return Ok(()); // `info_from_lua` says what is wrong
+    };
+    let api = table.get::<LuaValue>("api").map_err(lua_err)?;
+    if matches!(api, LuaValue::Nil) {
+        return Ok(());
+    }
+    let Some(wanted) = integer(&api).filter(|n| *n >= 1) else {
+        let shown = match &api {
+            LuaValue::Integer(n) => n.to_string(),
+            LuaValue::Number(x) => x.to_string(),
+            other => other.type_name().to_owned(),
+        };
+        return Err(format!(
+            "describe().api must be a positive integer, not {shown}"
+        ));
+    };
+    if wanted > provides {
+        let name = match table.get::<LuaValue>("name") {
+            Ok(LuaValue::String(s)) => s.to_string_lossy(),
+            _ => "this plugin".to_owned(),
+        };
+        return Err(format!(
+            "plugin \"{name}\" needs Lua codec API {wanted}, but this build provides API \
+             {provides}; update Serialist or use an older version of the plugin"
+        ));
+    }
+    Ok(())
+}
+
 /// What `describe()` returned, as a [`CodecInfo`] that may take `max_bytes` as [`Budget`]
 /// counts them.
 pub(super) fn info_from_lua(value: LuaValue, max_bytes: usize) -> Result<CodecInfo, String> {

@@ -46,12 +46,15 @@ jobs:
     # Cold release builds are long: gpui-pre, wgpu and gpui-kit compile from scratch with
     # thin LTO. The cache below shortens warm runs.
     timeout-minutes: 90
+    # A row marked `extra` may fail without failing the run: the draft is made from the
+    # rows that passed, as long as the packages of the three required rows are there (see
+    # the `release` job).
+    continue-on-error: ${{ matrix.extra == true }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macos-latest is Apple Silicon, so the .dmg is arm64. An Intel build needs an
-          # Intel runner (macos-15-intel or macos-26-intel) and another matrix row.
+          # macos-latest is Apple Silicon, so the .dmg is arm64.
           - name: macos
             os: macos-latest
           # ubuntu-22.04 rather than ubuntu-latest: a binary links against the glibc of the
@@ -61,6 +64,16 @@ jobs:
             os: ubuntu-22.04
           - name: windows
             os: windows-latest
+          # Each package is named by the architecture of the runner that built it
+          # (packaging/lib.sh, host_arch), so these rows add files and never replace the
+          # ones above: Serialist-<version>-macos-x86_64.dmg, and
+          # serialist-<version>-linux-aarch64.tar.gz with serialist_<version>-1_arm64.deb.
+          - name: macos-x86_64
+            os: macos-15-intel
+            extra: true
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            extra: true
     defaults:
       run:
         # Git Bash on Windows; packaging/package.sh is a bash script.
@@ -82,6 +95,12 @@ jobs:
       # arguments rustup installs the toolchain and components pinned in that file.
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install --profile minimal --no-self-update
+
+      # Info.plist says macOS 11 or later. That is rustc's default deployment target on
+      # Apple Silicon; on Intel the default is older, so the Intel build is told.
+      - name: Target macOS 11 on Intel
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       # Same policy as ci.yml, adapted: only main saves the cache (here, by a manual run on
       # main), and a tag run restores the newest one from main and never saves. `key` keeps
@@ -132,21 +151,27 @@ jobs:
 
       # ---------------------------------------------------------------------------------
       # macOS signing and notarization: OFF. To turn it on you need a paid Apple Developer
-      # account and a "Developer ID Application" certificate exported as a .p12. Add these
-      # repository secrets (Settings > Secrets and variables > Actions):
+      # account and a "Developer ID Application" certificate exported, with its private key,
+      # as a .p12. docs/releasing.md has the steps. Add these repository secrets (Settings >
+      # Secrets and variables > Actions, or `gh secret set NAME`):
       #
       #   MACOS_CERTIFICATE           the .p12, base64-encoded: base64 -i cert.p12 | pbcopy
       #   MACOS_CERTIFICATE_PASSWORD  the password set when exporting the .p12
       #   MACOS_KEYCHAIN_PASSWORD     any random string; protects a throwaway keychain
-      #   MACOS_SIGN_IDENTITY         e.g. Developer ID Application: John Gunn (ABCDE12345)
-      #   APPLE_ID                    the Apple ID that owns the developer account
-      #   APPLE_TEAM_ID               the 10-character team ID
-      #   APPLE_APP_PASSWORD          an app-specific password from appleid.apple.com
+      #   MACOS_SIGN_IDENTITY         the identity exactly as `security find-identity -v -p
+      #                               codesigning` prints it, e.g.
+      #                               Developer ID Application: John Gunn (ABCDE12345)
+      #   APPLE_ID                    the Apple ID (email) that owns the developer account
+      #   APPLE_TEAM_ID               the 10-character team ID (developer.apple.com,
+      #                               Account, Membership details)
+      #   APPLE_APP_PASSWORD          an app-specific password for that Apple ID
+      #                               (account.apple.com, Sign-In and Security)
       #
       # Then (1) uncomment "Import the signing certificate" here, (2) uncomment the `env`
       # block on "Build and package" below, so that bundle.sh and dmg.sh sign with the
-      # identity and the hardened runtime, and (3) uncomment "Notarize" after it. Update
-      # README.md, the release notes and this file's header, which say the build is unsigned.
+      # identity, the hardened runtime and a secure timestamp, and (3) uncomment "Notarize"
+      # after it. Update README.md, the release notes and this file's header, which say the
+      # build is unsigned.
       #
       # - name: Import the signing certificate
       #   if: runner.os == 'macOS'
@@ -155,16 +180,25 @@ jobs:
       #     MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
       #     MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
       #   run: |
+      #     keychain="$RUNNER_TEMP/signing.keychain-db"
       #     echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-      #     security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
-      #     security set-keychain-settings -lut 21600 build.keychain
-      #     security default-keychain -s build.keychain
-      #     security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" build.keychain
-      #     security import "$RUNNER_TEMP/certificate.p12" -k build.keychain \
+      #     security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
+      #     security set-keychain-settings -lut 21600 "$keychain"
+      #     security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
+      #     security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -f pkcs12 \
       #       -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+      #     # The Developer ID intermediate, so codesign can build the chain even when the
+      #     # .p12 holds only the leaf certificate.
+      #     curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+      #       https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+      #     security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
+      #     # Let codesign use the key without a prompt, which would hang a headless runner.
       #     security set-key-partition-list -S apple-tool:,apple:,codesign: \
-      #       -s -k "$MACOS_KEYCHAIN_PASSWORD" build.keychain
+      #       -s -k "$MACOS_KEYCHAIN_PASSWORD" "$keychain"
+      #     # codesign looks for the identity in the user's keychain search list.
+      #     security list-keychains -d user -s "$keychain" login.keychain
       #     rm "$RUNNER_TEMP/certificate.p12"
+      #     security find-identity -v -p codesigning "$keychain"
       # ---------------------------------------------------------------------------------
 
       # Builds the release binary, checks that it starts and reports the workspace version,
@@ -192,7 +226,9 @@ jobs:
   release:
     name: draft release
     needs: package
-    if: github.ref_type == 'tag' || inputs.draft_release
+    # Not only on success: an `extra` row's failure must not stop the draft. The check
+    # below stops it when a required package is missing instead.
+    if: ${{ !cancelled() && (github.ref_type == 'tag' || inputs.draft_release) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -206,6 +242,22 @@ jobs:
           path: dist
           pattern: packages-*
           merge-multiple: true
+
+      # The packages of the three required rows. Without one of them there is no draft,
+      # as before the extra rows existed; an extra row's package is simply absent.
+      - name: Check the required packages are here
+        working-directory: dist
+        run: |
+          missing=0
+          for pattern in 'Serialist-*-macos-arm64.dmg' 'serialist-*-linux-x86_64.tar.gz' \
+              'serialist_*_amd64.deb' 'Serialist-*-windows-x86_64.msi'; do
+            if ! compgen -G "$pattern" >/dev/null; then
+              echo "::error::no $pattern in the packages: its package job failed"
+              missing=1
+            fi
+          done
+          ls -l
+          [ "$missing" = 0 ]
 
       - name: Checksums
         working-directory: dist

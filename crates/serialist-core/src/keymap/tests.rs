@@ -395,6 +395,36 @@ fn the_scan_finds_the_ui_actions() {
     );
 }
 
+/// The complete list of action names and key contexts a user's `keymap.json` can name.
+///
+/// A removed or renamed line is a breaking change to users' keymaps: their entries for it
+/// would be skipped. Keep the old name answering, or do not make the change. An added
+/// line is fine: accept the new snapshot.
+#[test]
+fn the_action_names_and_key_contexts_are_pinned() {
+    // `declared_actions` reads the `actions!` lists; the actions that take arguments are
+    // structs with `#[action(namespace = ..)]`, which the scan above does not see.
+    let source = std::fs::read_to_string(ACTIONS_RS).unwrap();
+    let with_arguments =
+        Regex::new(r"#\[action\(namespace = (\w+)\)\](?:\s*#\[[^\n]*\])*\s*pub struct (\w+)")
+            .unwrap();
+    let mut actions = declared_actions();
+    actions.extend(
+        with_arguments
+            .captures_iter(&source)
+            .map(|c| format!("{}::{}", &c[1], &c[2])),
+    );
+    let mut listing = String::from("actions:\n");
+    for action in actions {
+        listing.push_str(&format!("  {action}\n"));
+    }
+    listing.push_str("contexts:\n");
+    for context in declared_contexts() {
+        listing.push_str(&format!("  {context}\n"));
+    }
+    insta::assert_snapshot!(listing);
+}
+
 #[test]
 fn every_platform_default_loads_and_names_only_real_actions() {
     let actions = declared_actions();

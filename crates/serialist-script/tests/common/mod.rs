@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod race;
+
 use std::collections::VecDeque;
 use std::future;
 use std::io::{self, Write};

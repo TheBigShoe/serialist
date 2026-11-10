@@ -7,7 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serialist_core::{
-    ControlLine, DeviceMatch, ParamValues, PortId, SerialConfig, SessionClosed, StoreReader,
+    CodecFactory, CodecRegistry, ControlLine, DeviceMatch, FrameStoreReader, ParamValues, PortId,
+    SerialConfig, SessionClosed, StoreReader,
 };
 
 use crate::bell::LineBell;
@@ -57,10 +58,39 @@ pub trait ScriptSession: Send + Sync {
     /// Rung after each received chunk is stored; closed when no more can arrive.
     fn bell(&self) -> LineBell;
 
+    /// The frames the session's codec decodes, for `port:on_frame`, or `None` for a
+    /// session that never decodes (`port:on_frame` then raises an error). A session
+    /// whose codec can be chosen later (the app's) returns its store at once, empty
+    /// until a codec runs.
+    ///
+    /// The bell must ring after a chunk's frames are in this store, not only after the
+    /// chunk's lines: put the codec's sink before the bell's among the ingest sinks. The
+    /// default is `None`.
+    fn frames(&self) -> Option<FrameStoreReader> {
+        None
+    }
+
     /// Close the session. Called only for ports a script opened with `serial.open`,
     /// when the script calls `port:close()` or ends, on a thread that may block (a
     /// worker, or the script thread between runs). The default does nothing.
     fn close(&self) {}
+}
+
+/// The codecs `codecs.<name>.encode` reaches: the plugins the host has installed.
+///
+/// Looked up on the script thread each time a script names a codec, so a host whose
+/// plugins reload (the app) hands out the current factory; it must not block. A run keeps
+/// one codec per name made from that factory, on the script thread, and makes a fresh one
+/// when the factory changes.
+pub trait CodecSource: Send + Sync {
+    /// The factory of the codec called `name`, if one is installed.
+    fn codec(&self, name: &str) -> Option<Arc<dyn CodecFactory>>;
+}
+
+impl CodecSource for CodecRegistry {
+    fn codec(&self, name: &str) -> Option<Arc<dyn CodecFactory>> {
+        self.get(name)
+    }
 }
 
 /// Severity of a `log.*` call.

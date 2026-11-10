@@ -13,7 +13,16 @@ builds](#unsigned-builds)).
 | Linux (x86_64) | `serialist-<version>-linux-x86_64.tar.gz` | `packaging/linux/tarball.sh` |
 | Linux (x86_64) | `serialist_<version>-1_amd64.deb` | cargo-deb, from `[package.metadata.deb]` in `crates/serialist/Cargo.toml` |
 | Windows (x86_64) | `Serialist-<version>-windows-x86_64.msi` | cargo-wix, from `packaging/windows/main.wxs` and `[package.metadata.wix]` |
+| macOS (Intel), extra | `Serialist-<version>-macos-x86_64.dmg` | as for Apple Silicon, on `macos-15-intel` |
+| Linux (arm64), extra | `serialist-<version>-linux-aarch64.tar.gz` and `serialist_<version>-1_arm64.deb` | as for x86_64, on `ubuntu-22.04-arm` |
 | all | `SHA256SUMS` | the `release` job |
+
+The first four packages are required: the draft is made only when all of them are built.
+The rows marked extra are `extra: true` in the workflow's matrix: a failure there shows as a
+failed job, but the run does not fail and the draft is made without that package. Every
+file name carries the architecture of the runner that built it (`host_arch` in
+`packaging/lib.sh`; cargo-deb uses Debian's names), so an extra row never replaces a
+required package, and `SHA256SUMS` and the upload take whatever files are there.
 
 Every package carries `THIRD_PARTY_LICENSES.md`, the copyright and MIT license text of the
 bundled Fadetouched theme (a license condition: the notice must travel with the program, and
@@ -52,10 +61,12 @@ install prefix (`bin/`, `share/`) and has an `install.sh` that copies it to `~/.
 
    The tag must equal `v` plus the version in `Cargo.toml`. The workflow checks this first
    and fails fast if you tagged before bumping.
-5. **Watch the workflow** (Actions, Release). Three `package` jobs run in parallel, each
+5. **Watch the workflow** (Actions, Release). Five `package` jobs run in parallel, each
    building the release binary (the first run is slow: GPUI compiles from scratch), running
-   `--version` on it, and packaging. When all three pass, the `draft release` job downloads
-   their artifacts, adds `SHA256SUMS` and creates the draft.
+   `--version` on it, and packaging. When they are done, the `draft release` job downloads
+   their artifacts, checks that the four required packages are there, adds `SHA256SUMS` and
+   creates the draft. If an extra job failed, its package is missing from the draft: re-run
+   it, or say in the notes that it is missing.
 6. **Try the drafts.** Download each package on its OS and start it. On macOS use the steps
    under [Unsigned builds](#unsigned-builds). Check that the app icon shows and the app opens
    a window. Read the notes.
@@ -71,8 +82,8 @@ commit, delete the draft release and the tag (`git push --delete origin vX.Y.Z`,
 Run it by hand: Actions, Release, Run workflow. That builds and packages on all three
 systems and keeps the results as workflow artifacts for 14 days. Tick `draft_release` to
 also create the draft. GitHub only offers a manual run for a workflow file that exists on
-the default branch, so do this once after merging the packaging work and before the first
-real tag.
+the default branch, so a change to `release.yml` or `packaging/` is tried this way after it
+merges and before the next tag.
 
 ## Building packages locally
 
@@ -110,27 +121,75 @@ run `xattr -dr com.apple.quarantine /Applications/Serialist.app`. A copy built o
 Mac is not quarantined and opens normally.
 
 **Windows.** SmartScreen shows "Windows protected your PC": More info, then Run anyway.
-
-**Turning on macOS signing and notarization** needs a paid Apple Developer account:
-
-1. Create a "Developer ID Application" certificate and export it as a `.p12`.
-2. Create an app-specific password at appleid.apple.com.
-3. Add the repository secrets listed in the commented block in the `package` job of
-   `release.yml`: `MACOS_CERTIFICATE`, `MACOS_CERTIFICATE_PASSWORD`,
-   `MACOS_KEYCHAIN_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID` and
-   `APPLE_APP_PASSWORD`.
-4. Uncomment the three marked pieces (import certificate, `CODESIGN_IDENTITY` on the build
-   step, notarize step). `bundle.sh` and `dmg.sh` then sign with the identity, the hardened
-   runtime and a secure timestamp when `CODESIGN_IDENTITY` is set, and
-   `packaging/macos/notarize.sh` submits the `.dmg` with `notarytool --wait` and staples the
-   ticket.
-5. Remove the "unsigned" wording from `README.md`, `packaging/release-notes-install.md` and
-   the header of `release.yml`.
-
-None of the notarization path has been run: it needs credentials.
-
 Windows code signing is not set up. When it is, `cargo wix sign` or `signtool` on the `.msi`
 (and on `serialist.exe` before packaging) is the place to add it.
+
+### Turning on macOS signing and notarization
+
+This needs a paid Apple Developer Program membership. Only its Account Holder can create a
+Developer ID certificate.
+
+1. **Create the certificate** on the Mac you will export it from. Either Xcode, Settings,
+   Accounts, select the team, Manage Certificates, `+`, "Developer ID Application"; or, at
+   developer.apple.com, Account, Certificates, `+`, "Developer ID Application" (the G2
+   Sub-CA), with a certificate signing request made in Keychain Access (Certificate
+   Assistant, Request a Certificate From a Certificate Authority, saved to disk), then
+   double-click the downloaded `.cer`. Either way the certificate and its private key end
+   up in the login keychain. Not "Apple Development" or "Apple Distribution": those do not
+   pass Gatekeeper outside the App Store.
+2. **Find the identity name**: `security find-identity -v -p codesigning` prints it, as
+   `Developer ID Application: <name> (<TEAMID>)`. The ten characters in parentheses are
+   the team ID (also under Membership details at developer.apple.com).
+3. **Export a `.p12`**: Keychain Access, login, My Certificates, expand the Developer ID
+   Application certificate so its key shows, select the certificate, File, Export Items,
+   Personal Information Exchange (`.p12`), with a new password.
+4. **Make an app-specific password** for the Apple ID that owns the membership:
+   account.apple.com, Sign-In and Security, App-Specific Passwords.
+5. **Try it locally** before involving CI:
+
+   ```sh
+   CODESIGN_IDENTITY="Developer ID Application: <name> (<TEAMID>)" just release-macos
+   codesign -dv --verbose=2 target/bundle/Serialist.app  # flags=0x10000(runtime), a Timestamp
+   APPLE_ID=<email> APPLE_TEAM_ID=<TEAMID> APPLE_APP_PASSWORD=<app password> \
+       packaging/macos/notarize.sh dist/Serialist-<version>-macos-arm64.dmg
+   spctl --assess --type open --context context:primary-signature -v dist/Serialist-*.dmg
+   ```
+
+   `spctl` should say `accepted` and `source=Notarized Developer ID`. A rejected submission
+   makes `notarize.sh` print the notary service's log and fail.
+6. **Add the repository secrets** (Settings, Secrets and variables, Actions, or
+   `gh secret set NAME`); the comment above the signing steps in `release.yml` says the
+   same:
+
+   | Secret | Value |
+   | --- | --- |
+   | `MACOS_CERTIFICATE` | the `.p12`, base64: `base64 -i cert.p12 \| gh secret set MACOS_CERTIFICATE` |
+   | `MACOS_CERTIFICATE_PASSWORD` | the `.p12`'s export password |
+   | `MACOS_KEYCHAIN_PASSWORD` | any new random string (it locks a keychain that lives for one job) |
+   | `MACOS_SIGN_IDENTITY` | the identity from step 2, exactly |
+   | `APPLE_ID` | the Apple ID's email |
+   | `APPLE_TEAM_ID` | the team ID from step 2 |
+   | `APPLE_APP_PASSWORD` | the app-specific password from step 4 |
+
+7. **Uncomment the three marked pieces** of the `package` job: "Import the signing
+   certificate", the `env` with `CODESIGN_IDENTITY` on "Build and package", and "Notarize
+   and staple the disk image". With `CODESIGN_IDENTITY` set, `bundle.sh` signs the app with
+   the identity, the hardened runtime (`--options runtime`) and a secure timestamp, and
+   `dmg.sh` signs the `.dmg`; `notarize.sh` submits the `.dmg`, waits for the verdict and
+   staples the ticket to it. Every macOS row does this, the Intel one included.
+8. **Run the workflow by hand** on `main` (artifacts only) and check the macOS log: the
+   imported identity listed by `find-identity`, `bundle.sh` printing
+   `flags=0x10000(runtime)` and a `Timestamp=` line, and `notarize.sh` ending with "The
+   validate action worked!". Open the downloaded `.dmg` on another Mac: it should open with
+   no Gatekeeper warning.
+9. **Remove the "unsigned" wording** about macOS from `README.md`,
+   `packaging/release-notes-install.md`, [Unsigned builds](#unsigned-builds) and the header
+   of `release.yml`.
+
+The app is signed with no entitlements: it generates no code at run time (Lua 5.4 is
+interpreted) and needs none for serial ports outside the App Sandbox. A build with the
+`wasm` feature would need `com.apple.security.cs.allow-jit` (see `bundle.sh`). None of the
+signing or notarization path has been run: it needs the credentials.
 
 ## Changing the icon
 
@@ -151,22 +210,66 @@ considered; neither is used by the build.
 
 On Windows, `crates/serialist/build.rs` embeds `serialist.ico` in `serialist.exe` as icon
 resource 1 (the id GPUI's Windows backend loads), by writing a `.res` file and passing it to
-the MSVC linker. It does nothing on other targets.
+the MSVC linker. The same file holds the version resource that Explorer's Details tab
+shows: file and product version from the package version (a pre-release is flagged as
+one), product name, description, company and copyright as `main.wxs` and `Info.plist.in`
+spell them, and the original file name. The bytes come from
+`crates/serialist/build/windows_res.rs`, which `crates/serialist/tests/windows_res.rs` also
+includes, so `cargo test` checks the layout on every platform, and checks that the strings
+still match the other two packages. It does nothing on other targets.
 
 ## Known gaps
 
-- **macOS is arm64 only.** `macos-latest` is Apple Silicon. For an Intel build add a matrix
-  row on an Intel runner (`macos-15-intel`, `macos-26-intel`).
+- **The macOS Intel and Linux arm64 rows have never run.** They were added without a run
+  (nothing here can start the workflow). On the first manual run, check that: both jobs
+  start at all (`macos-15-intel` and `ubuntu-22.04-arm` are GitHub-hosted labels, and the
+  arm one is free only for public repositories); the Intel log says `packaging serialist
+  <version> for macos-x86_64` and `otool -l target/release/serialist` on the binary
+  (or `vtool -show-build`) reports `minos 11.0` (the workflow sets
+  `MACOSX_DEPLOYMENT_TARGET` for it); the arm64 log says `for linux-aarch64` and
+  `dpkg-deb --info` prints `Architecture: arm64`; the `draft release` job lists all seven
+  files and `SHA256SUMS` has a line for each; and, with `draft_release` ticked, an extra row
+  made to fail still leaves a draft with the four required packages. Then open the Intel
+  `.dmg` on an Intel Mac and the arm64 `.deb` on an arm64 Linux desktop (a Raspberry Pi 5
+  with a Vulkan driver, or an arm64 VM). Once both have passed a few releases, drop
+  `extra: true` and add their patterns to the check in the `release` job.
+- **Windows on ARM is not built.** A `windows-11-arm` row is not added, for three reasons
+  that nothing here can settle. The dependency tree has `ring` (through the HTTP client),
+  which needs `clang` to build for `aarch64-pc-windows-msvc`, and nothing shows that image
+  has it on `PATH`. The workflow relies on the image for `rustup`, WiX Toolset 3.14 and
+  Chocolatey (the WiX fallback), and none of them is confirmed there. And cargo-wix 0.3.9
+  must pass `-arch arm64` to WiX for an ARM64 `.msi`; `main.wxs` already picks the 64-bit
+  Program Files folder for `arm64`, but the pairing has not been built. Windows 11 on ARM
+  runs the x86_64 `.msi` under emulation, which is the answer until then (also untried).
 - **The Linux glibc floor** is that of the build runner (`ubuntu-22.04`, glibc 2.35). The
   tarball and `.deb` link the host's shared libraries: the `.deb` depends on what
   `dpkg-shlibdeps` finds plus `libvulkan1` (loaded at run time); a tarball user installs the
   libraries named in the README.
-- **Linux window icon.** Wayland compositors match a window to `serialist.desktop` by its
-  app id, and the app does not set one yet. Setting `app_id: Some("serialist".into())` in the
-  main window's options would make the taskbar icon show. The `.desktop` file already has
-  `StartupWMClass=serialist`.
-- **No version resource on Windows.** `serialist.exe` has an icon but no VERSIONINFO, so
-  Explorer's Details tab is empty.
-- **Windows on ARM and Linux arm64** are not built.
-- **First run.** The macOS steps have been run. The Linux and Windows jobs were written on a
-  Mac and have not run; expect to fix small things on the first manual run.
+- **Linux window icon, untried on a desktop.** A desktop finds a window's icon and name
+  through its `.desktop` entry: on Wayland it matches the window's app id against the
+  entry's file name (`serialist` for `serialist.desktop`), on X11 the window's `WM_CLASS`
+  against `StartupWMClass`. GPUI sends the main window's `app_id` as the Wayland app id
+  and writes it as both halves of `WM_CLASS` on X11, so the app id is `serialist`
+  (`open_main_window` in `crates/serialist-ui/src/workspace.rs`), the file installed by the
+  `.deb` and the tarball is `serialist.desktop`, and the entry says
+  `StartupWMClass=serialist`. Keep the three equal. Nobody has yet looked at the taskbar
+  of a GNOME or KDE session, on Wayland or X11, with an installed package.
+- **The Windows version resource has not been seen.** `serialist.exe` now carries a
+  `VS_VERSIONINFO` (see [Changing the icon](#changing-the-icon)), and its bytes are tested
+  against Microsoft's documented layout, but it was written on a Mac: no MSVC link has
+  taken it yet, and nobody has opened Properties, Details on the result. The next Windows
+  job of the release workflow links it; check the Details tab of the installed
+  `serialist.exe`.
+- **Linux and Windows packages are built but not tried.** The workflow has run three times
+  (a manual run on `main` on 2026-09-30, then the `v0.1.0` and `v0.2.0` tags), and every
+  job passed on all three systems: each built the release binary, ran `--version` on its
+  runner and packaged it, and the two tag runs attached the `.dmg`, the `.tar.gz`, the
+  `.deb`, the `.msi` and `SHA256SUMS` to the release. That proves the Linux and Windows
+  binaries start far enough to print their version, not that they open a window. GitHub
+  counts no download of the Linux or Windows files of either release, so nothing shows that
+  the `.deb` or the tarball has been installed on a Linux desktop or the `.msi` on Windows.
+  Step 6 of [Cutting a release](#cutting-a-release) is the first time that happens.
+- **WiX warns about the Start menu shortcut.** Light reports ICE69 for `main.wxs`: the
+  shortcut's component refers to `serialist.exe`, which belongs to another component of the
+  same feature. The warning does not fail the build, and within one feature the reference
+  holds; nobody has yet seen the shortcut on an installed copy.

@@ -99,7 +99,7 @@ palette: every action, saved command and script, filtered as you type.
   port.
 - **Settings.** `cmd-,` opens a Settings tab, a front end to `settings.json` and `keymap.json`,
   which stay the source of truth. Everything lives in `~/.config/serialist`
-  (`%APPDATA%\Serialist` on Windows): settings with Zed's key names, Zed-format themes and
+  (`%APPDATA%\Serialist` on Windows, `$XDG_CONFIG_HOME/serialist` on Linux when that is set): settings with Zed's key names, Zed-format themes and
   keymaps, saved commands, scripts and plugins, applied the moment a file is saved.
 
 The rest, from the port settings popover to what a restored `tcp:` tab does at startup, is
@@ -137,7 +137,7 @@ print(port:expect("^OK$", { timeout_ms = 1000 }) and "device is up" or "no answe
 Start one from the Script console or the Scripts menu, from a key binding, from a saved
 command whose payload is `{ "script": "version_probe.lua" }`, from a device profile's
 `on_connect`, or with no window at all: `serialist --port virtual:at --script version_probe.lua`
-exits 0, 1 or 2. Two example scripts ship with the app. The API, the sandbox and the triggers
+exits 0 (it ended well), 1 (an error) or 2 (nothing ran). Two example scripts ship with the app. The API, the sandbox and the triggers
 are in [`docs/scripting.md`](docs/scripting.md).
 
 ## Plugins
@@ -165,8 +165,10 @@ is in [`docs/plugins.md`](docs/plugins.md).
 
 Release builds are attached to
 [GitHub Releases](https://github.com/TheBigShoe/serialist/releases): a `.dmg` for macOS
-(Apple Silicon), a `.tar.gz` and a `.deb` for Linux (x86_64), and an `.msi` for Windows
-(x86_64). `SHA256SUMS` lists the checksums. **None of them are code-signed yet**, so each
+(Apple Silicon, `arm64`, and Intel, `x86_64`), a `.tar.gz` and a `.deb` for Linux (x86_64,
+and arm64: the `aarch64` tarball and the `arm64` `.deb`), and an `.msi` for Windows
+(x86_64). The Intel `.dmg` and the Linux arm64 packages are new and may be missing from a
+release whose build of them failed. `SHA256SUMS` lists the checksums. **None of them are code-signed yet**, so each
 OS warns on first launch:
 
 - **macOS.** Open the `.dmg` and drag Serialist to Applications. The app is signed ad hoc

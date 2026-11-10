@@ -6,7 +6,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{Command, CommandRef, CommandStore, PortId, SettingsEditor, ThemeMode};
+use serialist_core::{
+    Command, CommandRef, CommandStore, PortId, ReplayEnd, ReplaySettings, ReplaySpeed,
+    SettingsEditor, ThemeMode,
+};
 use serialist_sim::{EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::keys;
@@ -271,6 +274,86 @@ fn ligatures_theme_and_default_write_and_remove_their_keys(cx: &mut TestAppConte
 }
 
 #[gpui_test]
+fn replay_speed_and_end_write_their_keys_and_reach_the_config(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-replay");
+    start(cx, &paths);
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Session);
+    let picked = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            v.picker(Pick::ReplaySpeed)
+                .read(cx)
+                .selected_value()
+                .cloned()
+        })
+    };
+    assert_eq!(picked(cx).as_deref(), Some("1x"));
+
+    // "Hold" in the segmented control.
+    cx.update_window(window, |_, window, cx| {
+        window.click("settings-replay-end-1", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        file_value(&paths.settings, "/replay/end"),
+        Some(json!("hold"))
+    );
+
+    update_view(cx, window, &view, |v, window, cx| {
+        v.set_replay_speed(ReplaySpeed::Max, window, cx);
+    });
+    assert_eq!(
+        file_value(&paths.settings, "/replay/speed"),
+        Some(json!("max"))
+    );
+    let text = std::fs::read_to_string(&paths.settings).unwrap();
+    assert!(
+        text.contains("\"1x\" plays at the recorded pace"),
+        "the comment above the speed stays"
+    );
+    run_until(cx, "the replay settings in the config", |cx| {
+        cx.update(|cx| {
+            let replay = cx.global::<Config>().settings().replay;
+            replay.speed == ReplaySpeed::Max && replay.end == ReplayEnd::Hold
+        })
+    });
+    run_until(cx, "the list to show max", |cx| {
+        picked(cx).as_deref() == Some("max")
+    });
+
+    // A speed the list does not offer selects nothing; picking one replaces it.
+    SettingsEditor::set_in_file(&paths.settings, "/replay/speed", "3x").unwrap();
+    run_until(cx, "the screen to read 3x", |cx| {
+        view.read_with(cx, |v, _| {
+            v.settings().replay.speed == ReplaySpeed::times(3.0).unwrap()
+        })
+    });
+    assert_eq!(picked(cx), None);
+    update_view(cx, window, &view, |v, window, cx| {
+        v.set_replay_speed(ReplaySpeed::times(0.5).unwrap(), window, cx);
+    });
+    assert_eq!(
+        file_value(&paths.settings, "/replay/speed"),
+        Some(json!("0.5x"))
+    );
+
+    // "Default" takes the keys out again.
+    for pointer in ["/replay/speed", "/replay/end"] {
+        update_view(cx, window, &view, |v, window, cx| {
+            v.reset(pointer, window, cx)
+        });
+        assert_eq!(file_value(&paths.settings, pointer), None);
+    }
+    assert_eq!(
+        view.read_with(cx, |v, _| v.settings().replay),
+        ReplaySettings::default()
+    );
+}
+
+#[gpui_test]
 fn a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched(cx: &mut TestAppContext) {
     let world = SimWorld::empty();
     let (window, workspace) = open_workspace(cx, &world, None);
@@ -318,6 +401,51 @@ fn a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched(cx: &mut 
     assert_eq!(
         file_value(&paths.settings, "/inline/escape_chord"),
         Some(json!("ctrl-alt-x"))
+    );
+}
+
+/// The loader leaves a value it cannot read out with a warning, but the Settings
+/// screen's writes stay strict: a bad value is never written. A value already in the file
+/// that this build cannot read (one from a later release) does not block other keys.
+#[test]
+fn writes_stay_strict_beside_a_value_from_a_later_release() {
+    let dir = TestDir::new("settings-strict-writes");
+    let paths = ConfigPaths::new(dir.path());
+    std::fs::write(&paths.settings, "{\n  \"line_ending\": \"crcrlf\"\n}\n").unwrap();
+    let read = || std::fs::read_to_string(&paths.settings).unwrap();
+
+    settings_io::write_setting(&paths, "/display/wrap", Some(json!(true))).unwrap();
+    assert_eq!(
+        file_value(&paths.settings, "/display/wrap"),
+        Some(json!(true))
+    );
+
+    for (pointer, value, reason) in [
+        ("/display/hex_bytes_per_row", json!(0), "1 to 256"),
+        ("/line_ending", json!("lfcr"), "unknown variant `lfcr`"),
+        ("/display", json!(5), "invalid type"),
+        (
+            "/devices/0",
+            json!({ "match": {}, "parity": "sometimes" }),
+            "parity must be",
+        ),
+        ("/devices/0", json!({ "baud": 9600 }), "no `match`"),
+    ] {
+        let before = read();
+        let error = settings_io::write_setting(&paths, pointer, Some(value)).unwrap_err();
+        assert!(
+            error.contains(reason) && error.contains("settings.json:"),
+            "{pointer}: {error}"
+        );
+        assert_eq!(read(), before, "{pointer}: the file is untouched");
+    }
+
+    // Putting a value this build reads over the later release's one is a write like any
+    // other.
+    settings_io::write_setting(&paths, "/line_ending", Some(json!("lf"))).unwrap();
+    assert_eq!(
+        file_value(&paths.settings, "/line_ending"),
+        Some(json!("lf"))
     );
 }
 

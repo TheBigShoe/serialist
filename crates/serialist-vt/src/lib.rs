@@ -17,6 +17,8 @@
 //!   from a session, added with [`Ingest::spawn_with`](serialist_core::Ingest::spawn_with)
 //!   next to the store; [`VtHandle`] is the UI's side of it.
 //! - [`vt_key_bytes`] gives the cursor-key bytes that depend on the terminal's mode.
+//! - [`MouseReporting::report`] gives the bytes of a mouse report in the mode and
+//!   encoding the device asked for ([`VtModes::mouse`]).
 //!
 //! # Line ids
 //!
@@ -58,21 +60,41 @@
 //! | [`VtEvent::ResetTitle`] | the title was cleared, or a full reset | shows its default |
 //! | [`VtEvent::Bell`] | BEL | rings or flashes |
 //! | [`VtEvent::Respond`] | a query: DA (`CSI c`, `CSI > c`), DSR (`CSI 5 n`, `CSI 6 n`), `CSI 18 t`, DECRQM | writes the bytes to the device |
-//! | [`VtEvent::ColorRequest`] | OSC 4, 10, 11 or 12 with `?` | answers with its theme color |
+//! | [`VtEvent::ColorRequest`] | OSC 4, 10, 11 or 12 with `?`, for a color the device did not set | answers with its theme color |
 //!
 //! OSC 52 clipboard access is disabled: a device on a serial line does not get to read
-//! or write the clipboard. Mouse reporting is tracked in [`VtModes`] but Serialist sends
-//! no mouse reports yet.
+//! or write the clipboard. Mouse reporting is in [`VtModes::mouse`]; the app sends the
+//! reports (see the [`MouseReporting`] docs).
+//!
+//! # Wide characters
+//!
+//! Alacritty measures character widths, and a wide character (CJK, most emoji) takes two
+//! cells. A line's text has it once (the spacer cell is skipped), and a combining mark
+//! follows its base character and takes no cell. [`cell_width`] says how many cells each
+//! character of a line's text takes, and they add up to the columns the device put the
+//! characters in; half of a wide character whose other half was deleted shows as a blank.
+//! The terminal element lays a screen line out by it: each character is drawn in its
+//! cell, selection and hit testing count cells, and the text, which is what copy gives,
+//! has each character once. [`CursorState::column`] is a cell.
+//!
+//! # Colors the device sets
+//!
+//! Colors reach the element as theme slots ([`Color::Ansi`](serialist_core::Color::Ansi)
+//! and friends) unless the device changed them. A palette entry it set with OSC 4 is in
+//! the runs as that color ([`Color::Rgb`](serialist_core::Color::Rgb)); the default
+//! foreground, background and cursor colors it set with OSC 10, 11 and 12 stay
+//! [`Color::Default`](serialist_core::Color::Default) in the runs and come with the
+//! snapshot ([`VtSnapshot::default_colors`]), which the element draws the screen in.
+//! OSC 104, 110, 111 and 112 and a full reset put the theme's back. A query for a color
+//! the device set is answered on the ingest thread with it; one for a theme color is a
+//! [`VtEvent::ColorRequest`] as before.
 //!
 //! # Known limitations
 //!
-//! - **Wide characters.** Alacritty measures character widths, and a wide character
-//!   takes two cells. The line text has it once (the spacer cell is skipped), but the
-//!   terminal element draws one character per column, so the rest of that row is drawn
-//!   one column left per wide character before it. Combining marks stay with their base
-//!   character and take no column, which the element gets right.
-//! - **Palette changes** (OSC 4, 10, 11) are accepted but not shown: colors reach the
-//!   element as theme slots ([`Color::Ansi`](serialist_core::Color::Ansi) and friends).
+//! - **Recolored scrollback.** A row takes the palette in force when it is captured: a
+//!   palette change redraws the screen, but rows already in the scrollback keep the
+//!   colors they scrolled off in. (The default colors apply to all of it.) Bold text in a
+//!   palette entry the device set is not brightened.
 //! - **Clearing the screen keeps it**: `CSI 2 J` on the primary screen scrolls what was
 //!   on it into the scrollback before blanking (Alacritty's behavior, like VTE's), so
 //!   the rows stay readable above. `clear` on Linux also sends `CSI 3 J`, which then
@@ -91,16 +113,19 @@
 mod convert;
 mod events;
 mod keys;
+mod mouse;
 mod screen;
 mod scrollback;
 mod sink;
 mod snapshot;
 
+pub use convert::cell_width;
 pub use events::{ColorRequest, MAX_EVENTS, VtEvent};
 pub use keys::vt_key_bytes;
+pub use mouse::{MouseAction, MouseButton, MouseEncoding, MouseEvent, MouseMode, MouseReporting};
 pub use screen::{
     DEFAULT_SCROLLBACK, MAX_COLUMNS, MAX_ROWS, MAX_ZERO_WIDTH, MIN_COLUMNS, MIN_ROWS, STAGING_ROWS,
     SYNC_TIMEOUT, VtScreen,
 };
 pub use sink::{VtHandle, VtSink};
-pub use snapshot::{CursorShape, CursorState, VtModes, VtSnapshot};
+pub use snapshot::{CursorShape, CursorState, DefaultColors, VtModes, VtSnapshot};

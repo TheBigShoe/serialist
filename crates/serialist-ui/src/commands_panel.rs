@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 
 use serialist_core::commands::DEFAULT_EXPECT_TIMEOUT_MS;
-use serialist_core::{Command, CommandRef, CommandStore, Expect, LineEnding, Payload};
+use serialist_core::{Carried, Command, CommandRef, CommandStore, Expect, LineEnding, Payload};
 
 use crate::actions::commands::{
     EditSelected, NewCollection, NewCommand, SelectNext, SelectPrevious, SendSelected,
@@ -1209,6 +1209,8 @@ impl CommandEditor {
             expect,
             keybinding,
             params: self.params.clone(),
+            // The store gives it what the command it replaces carried.
+            carried: Carried::default(),
         };
         if let Some(problem) = command.problems().into_iter().next() {
             return Err(problem);
@@ -1269,7 +1271,10 @@ pub fn write_command(
             store.update_command(target, command).map_err(text)?
         }
         Some(target) => {
-            store.remove_command(target).map_err(text)?;
+            // A move keeps what the command carried from its file.
+            let mut command = command;
+            let removed = store.remove_command(target).map_err(text)?;
+            command.keep_carried_from(&removed);
             let added = store
                 .add_command(collection, group, command)
                 .map_err(text)?;
@@ -1402,13 +1407,13 @@ mod tests {
         let mut store = CommandStore::empty();
         let mut mine =
             CommandCollection::new("Mine", CollectionSource::User("/tmp/mine.json".into()));
-        mine.groups.push(serialist_core::CommandGroup {
-            name: "Modem".into(),
-            commands: vec![
+        mine.groups.push(serialist_core::CommandGroup::new(
+            "Modem",
+            vec![
                 Command::text("Version", "AT+VER?").with_keybinding("cmd-1"),
                 Command::text("Reset", "ATZ").with_description("Restart the modem"),
             ],
-        });
+        ));
         store.set_collection(mine);
         store.set_collection(CommandCollection::bundled_examples());
         store

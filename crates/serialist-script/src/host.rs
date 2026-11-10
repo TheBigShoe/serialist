@@ -16,7 +16,7 @@ use serialist_core::PortSource;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
-use crate::services::{CommandSender, PortOpener, ScriptSession, ScriptUi};
+use crate::services::{CodecSource, CommandSender, PortOpener, ScriptSession, ScriptUi};
 
 /// Name of the thread every script of a host runs on.
 pub const SCRIPT_THREAD_NAME: &str = "serialist-script";
@@ -37,11 +37,18 @@ pub struct Limits {
     /// How many VM instructions run between checks of the stop flag. Smaller stops a
     /// busy loop sooner and costs more; 10 000 is well under a millisecond.
     pub instruction_check_every: u32,
+    /// How many timers and frame handlers (`timer.after`, `timer.every`,
+    /// `port:on_frame`) one run may have active at once; starting one more raises an
+    /// error. Each is a task on the script thread, outside the VM's memory cap, so this
+    /// is what keeps a script that starts them in a loop from growing the heap without
+    /// bound.
+    pub max_callbacks: usize,
 }
 
 impl Limits {
     pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_INSTRUCTION_CHECK_EVERY: u32 = 10_000;
+    pub const DEFAULT_MAX_CALLBACKS: usize = 1024;
 }
 
 impl Default for Limits {
@@ -49,6 +56,7 @@ impl Default for Limits {
         Self {
             memory_bytes: Self::DEFAULT_MEMORY_BYTES,
             instruction_check_every: Self::DEFAULT_INSTRUCTION_CHECK_EVERY,
+            max_callbacks: Self::DEFAULT_MAX_CALLBACKS,
         }
     }
 }
@@ -66,13 +74,15 @@ pub struct HostServices {
     pub opener: Option<Arc<dyn PortOpener>>,
     /// Backs `serial.ports()` and `serial.open{ match = ... }`.
     pub ports: Option<Arc<dyn PortSource>>,
+    /// Backs `codecs.<name>.encode`. `None` leaves `codecs` empty.
+    pub codecs: Option<Arc<dyn CodecSource>>,
     /// The only directory `require` and `dofile` read from. `None` disables both.
     pub scripts_dir: Option<PathBuf>,
     pub limits: Limits,
 }
 
 impl HostServices {
-    /// Only a UI: no session, commands, opener, port list or scripts directory.
+    /// Only a UI: no session, commands, opener, port list, codecs or scripts directory.
     pub fn new(ui: Arc<dyn ScriptUi>) -> Self {
         Self {
             session: None,
@@ -80,6 +90,7 @@ impl HostServices {
             commands: None,
             opener: None,
             ports: None,
+            codecs: None,
             scripts_dir: None,
             limits: Limits::default(),
         }
@@ -93,6 +104,7 @@ impl fmt::Debug for HostServices {
             .field("commands", &self.commands.is_some())
             .field("opener", &self.opener.is_some())
             .field("ports", &self.ports.is_some())
+            .field("codecs", &self.codecs.is_some())
             .field("scripts_dir", &self.scripts_dir)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
@@ -169,7 +181,7 @@ pub enum ScriptOutcome {
     /// The main chunk returned.
     Ok,
     /// A syntax error, an uncaught runtime error (message and Lua traceback), a memory
-    /// error, or an error in an `on_line` callback.
+    /// error, or an error in an `on_line`, `on_frame` or timer callback.
     Error(String),
     /// [`ScriptRun::stop`] (or dropping the host) ended it.
     Stopped,

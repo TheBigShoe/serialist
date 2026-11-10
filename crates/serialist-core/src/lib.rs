@@ -48,7 +48,7 @@ pub use codec::{
     FieldInfo, FieldType, FnCodecFactory, Frame, FrameKindInfo, Severity, SmolStr, Value,
 };
 pub use commands::{
-    CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
+    Carried, CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
     CommandWarning, DEFAULT_EXPECT_TIMEOUT_MS, EditError, Expect, Param, ParamKind, ParamValues,
     Payload, PayloadError,
 };
@@ -75,7 +75,8 @@ pub use settings::{
     BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView, Emulation,
     FontFeatures, FontSpec, InlineSettings, KeyChange, KeymapEditor, LineEnding, LineHeight,
     Platform, ReplaySettings, Settings, SettingsEditor, SettingsError, SettingsWarning,
-    TerminalSettings, ThemeMode, ThemeSelection, TimestampMode, UsbId, load_settings,
+    SettingsWarningKind, TerminalSettings, ThemeMode, ThemeSelection, TimestampMode, UsbId,
+    load_settings,
 };
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,

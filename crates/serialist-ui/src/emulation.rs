@@ -45,7 +45,8 @@
 //! points it at the new session). A session with no control handle (a test double) gets
 //! its answers queued as [`VtEvent::Respond`] instead, which the view writes on its next
 //! wake. Color queries (OSC 4, 10, 11, 12) are answered by the view from the terminal
-//! palette ([`palette_rgb`]): only it knows the theme.
+//! palette ([`palette_rgb`]): only it knows the theme. A color the device set is
+//! answered by the screen itself.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

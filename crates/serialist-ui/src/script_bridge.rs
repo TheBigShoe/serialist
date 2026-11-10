@@ -10,8 +10,9 @@
 //!
 //! - [`GuiScriptSession`] writes through the session's [`SessionControl`] (the writer
 //!   thread's queue) and reads the session's store, woken by the [`LineBell`] that the
-//!   ingest thread rings through [`ScriptLink`], one of its sinks. No byte of a script's
-//!   reads or writes crosses the main thread.
+//!   ingest thread rings through [`ScriptLink`], its last sink, after the codec slot has
+//!   stored the chunk's frames, which `port:on_frame` reads from the session's frame
+//!   store. No byte of a script's reads or writes crosses the main thread.
 //! - [`GuiScriptUi`] and [`GuiCommands`] only send a [`UiRequest`] down a channel. The
 //!   session view drains it, with the run's own [`ScriptEvent`]s, once a frame while a
 //!   script is active ([`SessionScripts::poll`]), on the main thread. A prompt's answer
@@ -36,13 +37,14 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 use serialist_core::{
-    ChunkSink, Command, CommandRef, CommandStore, ControlLine, LineEnding, ParamValues, PortId,
-    PortSource, SerialConfig, SessionClosed, StoreReader,
+    ChunkSink, CodecFactory, CodecRegistry, Command, CommandRef, CommandStore, ControlLine,
+    FrameStoreReader, LineEnding, ParamValues, PortId, PortSource, SerialConfig, SessionClosed,
+    StoreReader,
 };
 use serialist_script::{
-    BellSink, CommandError, CommandSender, HostServices, Limits, LineBell, LogLevel, PromptFuture,
-    RunId, ScriptEvent, ScriptHost, ScriptOutcome, ScriptRun, ScriptSession, ScriptSource,
-    ScriptUi,
+    BellSink, CodecSource, CommandError, CommandSender, HostServices, Limits, LineBell, LogLevel,
+    PromptFuture, RunId, ScriptEvent, ScriptHost, ScriptOutcome, ScriptRun, ScriptSession,
+    ScriptSource, ScriptUi,
 };
 
 use crate::session_handle::SessionControl;
@@ -110,6 +112,8 @@ pub struct GuiScriptSession {
     /// `None` for a session scripts cannot write to; every write then fails as closed.
     pub control: Option<Arc<dyn SessionControl>>,
     pub reader: StoreReader,
+    /// The session's decoded frames, for `port:on_frame`: empty until a codec runs.
+    pub frames: Option<FrameStoreReader>,
     pub link: ScriptLinkParts,
 }
 
@@ -166,6 +170,10 @@ impl ScriptSession for GuiScriptSession {
 
     fn bell(&self) -> LineBell {
         self.link.bell.clone()
+    }
+
+    fn frames(&self) -> Option<FrameStoreReader> {
+        self.frames.clone()
     }
 }
 
@@ -260,6 +268,38 @@ impl CommandsSnapshot {
     }
 }
 
+/// The installed codecs as a script sees them: the configuration's registry, swapped in
+/// by the workspace on every reload, so `codecs.<name>` follows the plugins folder while a
+/// script runs. Cheap to clone; every clone sees the swap.
+#[derive(Clone, Default)]
+pub struct CodecsSnapshot(Arc<RwLock<Arc<CodecRegistry>>>);
+
+impl fmt::Debug for CodecsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CodecsSnapshot").field(&*self.get()).finish()
+    }
+}
+
+impl CodecsSnapshot {
+    pub fn new(registry: Arc<CodecRegistry>) -> Self {
+        Self(Arc::new(RwLock::new(registry)))
+    }
+
+    pub fn set(&self, registry: Arc<CodecRegistry>) {
+        *self.0.write() = registry;
+    }
+
+    pub fn get(&self) -> Arc<CodecRegistry> {
+        Arc::clone(&self.0.read())
+    }
+}
+
+impl CodecSource for CodecsSnapshot {
+    fn codec(&self, name: &str) -> Option<Arc<dyn CodecFactory>> {
+        self.get().get(name)
+    }
+}
+
 /// The saved command `name` names: `collection/group/name`, `collection/name`, or a
 /// bare name, which is the first command called that (exactly, else ignoring case) in
 /// the order the Commands panel lists them.
@@ -330,6 +370,8 @@ pub struct ScriptEnv {
     /// Where `require` and `dofile` read from.
     pub scripts_dir: Option<PathBuf>,
     pub commands: CommandsSnapshot,
+    /// Backs `codecs.<name>.encode`.
+    pub codecs: CodecsSnapshot,
 }
 
 impl fmt::Debug for ScriptEnv {
@@ -468,6 +510,7 @@ impl SessionScripts {
             // The first UI version opens no ports for scripts: `serial.open` says so.
             opener: None,
             ports: env.ports,
+            codecs: Some(Arc::new(env.codecs)),
             scripts_dir: env.scripts_dir,
             limits: Limits::default(),
         };
@@ -738,13 +781,13 @@ mod tests {
             "Bench",
             CollectionSource::User(PathBuf::from("/cfg/commands/bench.json")),
         );
-        collection.groups.push(CommandGroup {
-            name: "Modem".into(),
-            commands: vec![
+        collection.groups.push(CommandGroup::new(
+            "Modem",
+            vec![
                 Command::text("Version", "AT+VER?"),
                 Command::text("Reset", "ATZ"),
             ],
-        });
+        ));
         store.set_collection(collection);
         let name = |text: &str| resolve_command(&store, text).map(|(reference, _)| reference);
         let version = CommandRef::new("Bench", "Modem", "Version");

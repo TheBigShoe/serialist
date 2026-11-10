@@ -23,14 +23,18 @@ Options:
                       Ports named with --port and --virtual open in the order
                       given, the first one in front; with none, the tabs open at
                       the last quit reopen (the restore_session setting)
-  --config-dir <DIR>  Read settings.json, keymap.json, themes/, commands/ and
-                      scripts/, and keep history.jsonl, in DIR instead of the user
-                      config directory (also SERIALIST_CONFIG_DIR)
+  --config-dir <DIR>  Read settings.json, keymap.json, themes/, commands/,
+                      scripts/ and plugins/, and keep history.jsonl and
+                      state.json, in DIR instead of the user config directory
+                      (also SERIALIST_CONFIG_DIR; the flag wins)
   --script <PATH>     Run this Lua script against --port with no window, then
-                      exit: 0 if it ends well, 1 on an error, 2 if it is stopped.
-                      --baud and a matching device profile set the line
-  --terminal-demo     Open only the milestone 1 terminal element, fed by an
-                      in-memory stream (200 000 lines, 2 000 more a second)
+                      exit: 0 if it ends well, 1 on an error, 2 if nothing ran
+                      (a bad flag, no --port, an unreadable script). Ctrl-C ends
+                      the process by the signal; 130 is reserved for a stopped
+                      script. --baud and a matching device profile set the line
+  --terminal-demo     A development tool, not covered by the compatibility
+                      promise: open only the milestone 1 terminal element, fed
+                      by an in-memory stream (200 000 lines, 2 000 more a second)
   -h, --help          Print this help
   -V, --version       Print the version
 

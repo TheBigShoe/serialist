@@ -12,6 +12,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 use tokio::task::LocalSet;
 
+use crate::codecs::CodecCache;
 use crate::host::{HostServices, Job, RunControl, RunId, ScriptEvent, ScriptOutcome};
 use crate::port::PortState;
 use crate::race::{Either, race};
@@ -76,7 +77,7 @@ pub(crate) struct RunCtx {
     events: Sender<ScriptEvent>,
     pub(crate) services: HostServices,
     prompts: Cell<u64>,
-    /// The first error from an `on_line` callback; it ends the run.
+    /// The first error from an `on_line`, `on_frame` or timer callback; it ends the run.
     failure: RefCell<Option<LuaError>>,
     failed: Notify,
     /// Ports the script opened; closed when it ends.
@@ -85,6 +86,10 @@ pub(crate) struct RunCtx {
     pub(crate) current: Option<Rc<PortState>>,
     /// Coroutines the script created itself, as weak keys.
     user_threads: RefCell<Option<Table>>,
+    /// The codecs `codecs.<name>.encode` made, kept for the run.
+    pub(crate) codecs: RefCell<CodecCache>,
+    /// Timers and frame handlers active, against [`Limits::max_callbacks`](crate::Limits).
+    pub(crate) callbacks: Cell<usize>,
 }
 
 impl RunCtx {
@@ -105,6 +110,8 @@ impl RunCtx {
             owned: RefCell::new(Vec::new()),
             current,
             user_threads: RefCell::new(None),
+            codecs: RefCell::new(CodecCache::default()),
+            callbacks: Cell::new(0),
         }
     }
 
@@ -156,7 +163,7 @@ impl RunCtx {
             return Err(runtime_error(format!(
                 "{what} cannot wait inside a coroutine the script created \
                  (coroutine.create or coroutine.wrap); call it from the script body, \
-                 a required module or an on_line callback"
+                 a required module, or an on_line, on_frame or timer callback"
             )));
         }
         Ok(())

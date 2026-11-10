@@ -86,7 +86,8 @@
 //!
 //! The ingest thread also rings a [`LineBell`](serialist_script::LineBell) through a
 //! [`ScriptLink`](crate::script_bridge::ScriptLink) sink, from the moment the session
-//! opens. Once the workspace calls [`SessionView::attach_scripts`], the view owns a
+//! opens; it is the last sink, so a ring finds the chunk's decoded frames stored too.
+//! Once the workspace calls [`SessionView::attach_scripts`], the view owns a
 //! [`SessionScripts`]: a script thread whose `serial.current()` writes through the
 //! session's [`SessionControl`](crate::session_handle::SessionControl) and reads this
 //! store. [`SessionView::run_script`] queues a run (one runs at a time; the others wait
@@ -456,10 +457,11 @@ struct IngestStart {
 }
 
 /// Start an ingest thread taking `events` into `store`, through the view's recording
-/// and script-link sinks, then `extra_sinks`, then the VT slot's sink (which feeds a
-/// terminal screen in VT mode), then a codec slot decoding with `selection` into a new
-/// frame store (from the store's current end, so frames name its stream offsets), and a
-/// task answering its doorbell.
+/// sink, then `extra_sinks`, then the VT slot's sink (which feeds a terminal screen in
+/// VT mode), then a codec slot decoding with `selection` into a new frame store (from the
+/// store's current end, so frames name its stream offsets), then the script link, and a
+/// task answering its doorbell. The script link comes last so that when it rings a
+/// script's bell, the chunk's frames are already in the frame store.
 #[allow(clippy::too_many_arguments)]
 fn start_ingest(
     events: Receiver<SessionEvent>,
@@ -472,11 +474,10 @@ fn start_ingest(
     cx: &mut Context<SessionView>,
 ) -> IngestStart {
     let (doorbell, rings) = async_channel::bounded::<()>(1);
-    let mut sinks: Vec<Box<dyn ChunkSink + Send>> = vec![
-        Box::new(RecordingSink::new(recording.clone())),
-        Box::new(script_link.sink()),
-    ];
+    let mut sinks: Vec<Box<dyn ChunkSink + Send>> =
+        vec![Box::new(RecordingSink::new(recording.clone()))];
     sinks.extend(extra_sinks);
+    let script_sink = script_link.sink();
     // The codec slot is made on the ingest thread, where a codec (a Lua VM) must
     // stay; its frames ring the same doorbell.
     let frame_store = FrameStore::default();
@@ -508,6 +509,7 @@ fn start_ingest(
                 )
                 .starting_at(offset),
             ));
+            sinks.push(Box::new(script_sink));
             sinks
         }),
         Box::new(move || {
@@ -1660,16 +1662,25 @@ impl SessionView {
             columns: snapshot.columns(),
             rows: snapshot.viewport_rows(),
             cursor: snapshot.cursor().filter(|cursor| cursor.visible),
+            first_visible: snapshot.first_visible(),
+            mouse: snapshot.modes().mouse,
+            colors: snapshot.default_colors(),
         })
     }
 
     /// Put the screen on the terminal: its snapshot as the text source, the log to
-    /// search, and the hook the element resizes it through.
+    /// search, the hook the element resizes it through, and where mouse reports go.
     fn show_screen(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
+        let reporter = view.clone();
         let screen = TerminalScreen {
             resize: std::rc::Rc::new(move |columns, rows, cx: &mut App| {
                 view.update(cx, |view, cx| view.resize_screen(columns, rows, cx))
+                    .ok();
+            }),
+            report: std::rc::Rc::new(move |bytes, cx: &mut App| {
+                reporter
+                    .update(cx, |view, _| view.send_mouse_report(bytes))
                     .ok();
             }),
         };
@@ -2383,6 +2394,7 @@ impl SessionView {
             serial: self.serial.clone(),
             control: self.session.as_ref().and_then(|session| session.control()),
             reader: ingest.reader(),
+            frames: Some(self.frames.clone()),
             link: self.script_link.clone(),
         };
         self.script_env = Some(env.clone());
@@ -2759,6 +2771,17 @@ impl SessionView {
         }
         if session.write(key.bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
+        }
+    }
+
+    /// Write a mouse report the screen's device asked for (VT mode). Never echoed: it is
+    /// not something typed.
+    pub fn send_mouse_report(&mut self, bytes: Vec<u8>) {
+        let Some((session, _)) = self.live() else {
+            return;
+        };
+        if session.write(bytes).is_err() {
+            tracing::debug!(port = %self.port, "the session closed before a mouse report");
         }
     }
 

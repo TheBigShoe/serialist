@@ -30,6 +30,13 @@
 //! [`ScreenInputs::resize`]. The request runs after the frame (`App::defer`, since
 //! nothing can be notified mid-draw), once per size, so a window being dragged costs at
 //! most one resize a frame.
+//!
+//! A screen line's characters are not all one cell: a wide character takes two and a
+//! combining mark none. A line with such characters gets a [`CellMap`]: its pieces are
+//! drawn from the cells they start in, and backgrounds, selection, search matches, hit
+//! testing and the cursor go through the map (see [`cells`](super::cells)). A line of
+//! one-cell characters, which is every line in monitor mode, has no map and is laid out
+//! as before.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,11 +49,14 @@ use std::time::Instant;
 use std::cell::Cell;
 
 use serialist_core::{Direction, LineId, LineSource, SearchMatch, Style, StyledLine};
-use serialist_vt::{CursorShape, CursorState};
+use serialist_vt::{
+    CursorShape, CursorState, MouseAction, MouseButton as VtMouseButton, MouseReporting,
+};
 
 use crate::config::Config;
 use crate::prelude::*;
 use crate::terminal::cache::Lru;
+use crate::terminal::cells::{CellMap, cell_of};
 use crate::terminal::layout::{self, OneRowEach, RowCounter, Span, Viewport, wrap_rows};
 use crate::terminal::palette::{ResolvedStyle, TerminalPalette};
 use crate::terminal::scroll::TerminalScrollHandle;
@@ -106,6 +116,8 @@ struct EntryKey {
     content: u64,
     /// Wrap width in cells, 0 when unwrapped.
     columns: usize,
+    /// Laid out as a terminal screen's line, in the cells of its characters.
+    screen: bool,
 }
 
 impl EntryKey {
@@ -117,20 +129,43 @@ impl EntryKey {
         Self {
             content: hasher.finish(),
             columns,
+            screen: false,
         }
+    }
+
+    fn on_screen(self, screen: bool) -> Self {
+        Self { screen, ..self }
     }
 }
 
 /// One wrap row of a shaped line.
 #[derive(Clone, Debug)]
 struct ShapedRow {
+    /// The row, or on a screen line with a wide character, its first piece.
     shaped: ShapedLine,
-    /// Column of the row's first cell within the line.
+    /// The pieces after the first, each with the cell it starts in (see
+    /// [`shape_entry`]). Empty for a row that is one piece.
+    pieces: Vec<(usize, ShapedLine)>,
+    /// Column (character) of the row's first character within the line.
     start: usize,
-    /// Cells in the row.
+    /// Characters in the row.
     len: usize,
-    /// Run backgrounds, in columns relative to the row.
+    /// Run backgrounds, in cells relative to the row.
     backgrounds: Vec<(Range<usize>, Hsla)>,
+    /// The cells of the line's characters, for a screen line whose characters are not
+    /// each one cell. Such a line is never wrapped: it is the row.
+    cells: Option<Arc<CellMap>>,
+}
+
+impl ShapedRow {
+    /// How far the row's text reaches from its left edge.
+    fn width(&self, cell_width: Pixels) -> Pixels {
+        self.pieces
+            .last()
+            .map_or(self.shaped.width(), |(cell, piece)| {
+                cell_width * *cell as f32 + piece.width()
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -297,15 +332,18 @@ pub struct Highlights {
 }
 
 /// One visual row for hit testing.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct HitRow {
     pub line: LineId,
     /// Top of the row relative to the element's top.
     pub y: f32,
+    /// The row's first character and how many it has, in columns (characters).
     pub start: usize,
     pub len: usize,
     /// The line's last wrap row.
     pub last: bool,
+    /// Where the characters sit when they are not one cell each (a screen line).
+    pub cells: Option<Arc<CellMap>>,
 }
 
 /// Where the last frame put things, for turning pointer positions into columns.
@@ -334,13 +372,22 @@ impl HitMap {
         let last = self.rows.last()?;
         let y = f32::from(position.y - self.bounds.top());
         let x = f32::from(position.x - self.column_origin).max(0.0) / self.cell_width;
+        // `x` counts cells; a row with a cell map turns them into characters.
         let caret_in = |row: &HitRow| {
-            let column = (x.round() as usize).min(row.len);
-            SelectionPoint::new(row.line, row.start + column)
+            let cell = x.round() as usize;
+            let column = match &row.cells {
+                Some(cells) => cells.caret_at(cell),
+                None => cell,
+            };
+            SelectionPoint::new(row.line, row.start + column.min(row.len))
         };
         let cell_in = |row: &HitRow| {
-            let column = (x.floor() as usize).min(row.len.saturating_sub(1));
-            SelectionPoint::new(row.line, row.start + column)
+            let cell = x.floor() as usize;
+            let column = match &row.cells {
+                Some(cells) => cells.char_at(cell),
+                None => cell,
+            };
+            SelectionPoint::new(row.line, row.start + column.min(row.len.saturating_sub(1)))
         };
         if y < first.y {
             let caret = SelectionPoint::new(first.line, first.start);
@@ -366,6 +413,40 @@ impl HitMap {
     }
 }
 
+impl HitMap {
+    /// The screen cell (column, row) under `position`, for a mouse report: on the
+    /// screen's rows (ids from `first_visible`, `columns` by `rows`), clamped to them
+    /// when the pointer is past an edge. `None` over the scrollback.
+    pub fn screen_cell(
+        &self,
+        position: Point<Pixels>,
+        first_visible: LineId,
+        columns: usize,
+        rows: usize,
+    ) -> Option<(usize, usize)> {
+        let y = f32::from(position.y - self.bounds.top());
+        let row = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.y <= y)
+            .or(self.rows.first())?;
+        let screen_row = row.line.0.checked_sub(first_visible.0)? as usize;
+        let x = f32::from(position.x - self.column_origin).max(0.0) / self.cell_width;
+        let column = (x.floor() as usize).min(columns.saturating_sub(1));
+        Some((column, screen_row.min(rows.saturating_sub(1))))
+    }
+}
+
+fn vt_button(button: MouseButton) -> Option<VtMouseButton> {
+    match button {
+        MouseButton::Left => Some(VtMouseButton::Left),
+        MouseButton::Middle => Some(VtMouseButton::Middle),
+        MouseButton::Right => Some(VtMouseButton::Right),
+        _ => None,
+    }
+}
+
 /// Asks for a terminal screen of `columns` by `rows` cells.
 pub type ResizeScreen = Rc<dyn Fn(usize, usize, &mut App)>;
 
@@ -377,6 +458,10 @@ pub struct ScreenInputs {
     pub rows: usize,
     /// The cursor to draw: `None` while the device hides it, or a blink has it off.
     pub cursor: Option<CursorState>,
+    /// The id of the screen's top row.
+    pub first_visible: LineId,
+    /// The mouse reports to send instead of selecting, if any (see the view's docs).
+    pub mouse: Option<MouseReporting>,
     /// Asked, after the frame, for the screen to be `columns` by `rows` when that is what
     /// fits the element and not the screen's size.
     pub resize: ResizeScreen,
@@ -515,6 +600,8 @@ struct ShapeStyle<'a> {
     font_size: Pixels,
     cell_width: Pixels,
     palette: &'a TerminalPalette,
+    /// The lines are a terminal screen's: characters take the cells the screen gave them.
+    screen: bool,
 }
 
 fn text_run(font: &Font, len: usize, style: &ResolvedStyle) -> TextRun {
@@ -542,7 +629,78 @@ fn text_run(font: &Font, len: usize, style: &ResolvedStyle) -> TextRun {
     }
 }
 
+/// The text runs of `runs` that fall in `bytes`, cut to it.
+fn text_runs_in(
+    runs: &[(Range<usize>, ResolvedStyle)],
+    bytes: &Range<usize>,
+    font: &Font,
+) -> Vec<TextRun> {
+    runs.iter()
+        .filter_map(|(range, resolved_style)| {
+            let start = range.start.max(bytes.start);
+            let end = range.end.min(bytes.end);
+            (start < end).then(|| text_run(font, end - start, resolved_style))
+        })
+        .collect()
+}
+
+/// `text[bytes]` shaped on the cell grid: one cell per glyph, marks on their base.
+fn shape_cells(
+    text: &str,
+    bytes: Range<usize>,
+    runs: &[(Range<usize>, ResolvedStyle)],
+    style: &ShapeStyle<'_>,
+    window: &Window,
+) -> ShapedLine {
+    if bytes.is_empty() {
+        return ShapedLine::default();
+    }
+    let text_runs = text_runs_in(runs, &bytes, style.font);
+    window.text_system().shape_line(
+        SharedString::from(text[bytes].to_owned()),
+        style.font_size,
+        &text_runs,
+        Some(style.cell_width),
+    )
+}
+
+/// The character of a screen line that begins in cell `cell`, with the zero-width
+/// characters on it, and the cells it takes. `None` past the text, and on the second
+/// cell of a wide character.
+fn character_in_cell(text: &str, cell: usize) -> Option<(String, usize)> {
+    let mut at = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let width = serialist_vt::cell_width(c);
+        if width == 0 {
+            continue;
+        }
+        if at == cell {
+            let mut found = c.to_string();
+            while let Some(&mark) = chars.peek() {
+                if serialist_vt::cell_width(mark) != 0 {
+                    break;
+                }
+                found.push(mark);
+                chars.next();
+            }
+            return Some((found, width));
+        }
+        at += width;
+        if at > cell {
+            return None;
+        }
+    }
+    None
+}
+
 /// Shape a line into its wrap rows (one row when `columns` is 0).
+///
+/// The text system puts each glyph one cell after the one before (`force_width`), which
+/// is right for any line whose characters are one cell each. A screen line with a wide
+/// character is cut after each wide character (and the marks on it) into pieces, each
+/// shaped alone and drawn from the cell its first character is in, so the character
+/// after a wide one starts two cells after it.
 fn shape_entry(
     line: &StyledLine,
     key: EntryKey,
@@ -557,6 +715,12 @@ fn shape_entry(
     let column_of = |byte: usize| starts.partition_point(|&start| start < byte);
 
     let runs = resolved_runs(line, style.palette);
+    let cells = if key.screen && key.columns == 0 {
+        CellMap::of(text, serialist_vt::cell_width).map(Arc::new)
+    } else {
+        None
+    };
+    let map = cells.as_deref();
 
     let per_row = if key.columns == 0 {
         chars.max(1)
@@ -569,37 +733,56 @@ fn shape_entry(
         let first_col = row * per_row;
         let last_col = (first_col + per_row).min(chars);
         let bytes = starts[first_col.min(chars)]..starts[last_col];
-        let mut text_runs = Vec::new();
+        let first_cell = cell_of(map, first_col);
         let mut backgrounds = Vec::new();
         for (range, resolved_style) in &runs {
             let start = range.start.max(bytes.start);
             let end = range.end.min(bytes.end);
-            if start >= end {
-                continue;
-            }
-            text_runs.push(text_run(style.font, end - start, resolved_style));
-            if let Some(background) = resolved_style.background {
+            if start < end
+                && let Some(background) = resolved_style.background
+            {
                 backgrounds.push((
-                    column_of(start) - first_col..column_of(end) - first_col,
+                    cell_of(map, column_of(start)) - first_cell
+                        ..cell_of(map, column_of(end)) - first_cell,
                     background,
                 ));
             }
         }
-        let shaped = if bytes.is_empty() {
-            ShapedLine::default()
-        } else {
-            window.text_system().shape_line(
-                SharedString::from(text[bytes].to_owned()),
-                style.font_size,
-                &text_runs,
-                Some(style.cell_width),
-            )
+        let (shaped, pieces) = match map {
+            // Cut after every wide character, before the next character with a cell.
+            Some(map) => {
+                let mut cuts = vec![0];
+                let mut after_wide = false;
+                for (column, c) in text.chars().enumerate() {
+                    let width = serialist_vt::cell_width(c);
+                    if width > 0 {
+                        if after_wide {
+                            cuts.push(column);
+                        }
+                        after_wide = width > 1;
+                    }
+                }
+                let mut pieces: Vec<(usize, ShapedLine)> = cuts
+                    .iter()
+                    .zip(cuts.iter().skip(1).chain([&chars]))
+                    .map(|(&from, &to)| {
+                        let shaped =
+                            shape_cells(text, starts[from]..starts[to], &runs, style, window);
+                        (map.cell_of(from), shaped)
+                    })
+                    .collect();
+                let (_, first) = pieces.remove(0);
+                (first, pieces)
+            }
+            None => (shape_cells(text, bytes, &runs, style, window), Vec::new()),
         };
         rows.push(ShapedRow {
             shaped,
+            pieces,
             start: first_col,
             len: last_col.saturating_sub(first_col),
             backgrounds,
+            cells: cells.clone(),
         });
     }
     ShapedEntry { key, rows }
@@ -757,6 +940,7 @@ impl Element for TerminalElement {
             font_size: inputs.font_size,
             cell_width,
             palette: &inputs.palette,
+            screen: screen.is_some(),
         };
         let mut sample = FrameSample::default();
         let mut placed: Vec<(usize, ShapedRow)> = Vec::with_capacity(visible.len());
@@ -769,7 +953,7 @@ impl Element for TerminalElement {
                 next += 1;
             }
             if let Some(line) = frame.lines.get(&id) {
-                let key = EntryKey::of(line, columns);
+                let key = EntryKey::of(line, columns).on_screen(shape_style.screen);
                 if cache.lines.peek(&id).is_some_and(|entry| entry.key == key) {
                     sample.cache_hits += 1;
                 } else {
@@ -780,7 +964,7 @@ impl Element for TerminalElement {
                 let entry = cache.lines.get(&id).expect("just checked or inserted");
                 for (visible_ix, row) in visible.iter().enumerate().take(next).skip(ix) {
                     if let Some(shaped) = entry.rows.get(row.row as usize) {
-                        widest = widest.max(shaped.shaped.width());
+                        widest = widest.max(shaped.width(cell_width));
                         placed.push((visible_ix, shaped.clone()));
                     }
                 }
@@ -815,20 +999,23 @@ impl Element for TerminalElement {
         for (visible_ix, shaped) in &placed {
             let row = visible[*visible_ix];
             let y = bounds.top() + px(row.y);
+            // Cells relative to the row, and columns (characters) of the line.
+            let cell_bounds = |from: usize, to: usize| {
+                Bounds::from_corners(point(x_of(from), y), point(x_of(to), y + row_height))
+            };
+            let map = shaped.cells.as_deref();
+            let first_cell = cell_of(map, shaped.start);
             let row_bounds = |from: usize, to: usize| {
-                Bounds::from_corners(
-                    point(x_of(from - shaped.start), y),
-                    point(x_of(to - shaped.start), y + row_height),
+                cell_bounds(
+                    cell_of(map, from) - first_cell,
+                    cell_of(map, to) - first_cell,
                 )
             };
             let row_end = shaped.start + shaped.len;
             let last = row.row + 1 == row.line_rows;
 
-            for (columns, color) in &shaped.backgrounds {
-                rects.push((
-                    row_bounds(shaped.start + columns.start, shaped.start + columns.end),
-                    *color,
-                ));
+            for (cells, color) in &shaped.backgrounds {
+                rects.push((cell_bounds(cells.start, cells.end), *color));
             }
 
             let text = frame.lines.get(&row.line).map(|l| l.text.as_str());
@@ -873,12 +1060,19 @@ impl Element for TerminalElement {
                 origin: point(column_origin, y),
                 shaped: shaped.shaped.clone(),
             });
+            for (cell, piece) in &shaped.pieces {
+                rows.push(PaintRow {
+                    origin: point(x_of(*cell), y),
+                    shaped: piece.clone(),
+                });
+            }
             hit_rows.push(HitRow {
                 line: row.line,
                 y: row.y,
                 start: shaped.start,
                 len: shaped.len,
                 last,
+                cells: shaped.cells.clone(),
             });
         }
 
@@ -929,8 +1123,15 @@ impl Element for TerminalElement {
         if let Some(state) = screen.and_then(|screen| screen.cursor)
             && let Some(row) = visible.iter().find(|row| row.line == state.line)
         {
+            // The cursor's column is a cell. The character in it, with its marks, and
+            // its cells: a block on a wide character covers both.
+            let under = frame
+                .lines
+                .get(&state.line)
+                .and_then(|line| character_in_cell(&line.text, state.column));
+            let wide = under.as_ref().map_or(1, |(_, cells)| *cells).max(1);
             let origin = point(x_of(state.column), bounds.top() + px(row.y));
-            let cell = Bounds::new(origin, size(cell_width, row_height));
+            let cell = Bounds::new(origin, size(cell_width * wide as f32, row_height));
             let color = palette.cursor;
             let focused = inputs.focus.is_focused(window);
             match state.shape {
@@ -942,7 +1143,7 @@ impl Element for TerminalElement {
                 CursorShape::Underline => cursor.push(fill(
                     Bounds::new(
                         point(origin.x, origin.y + row_height - CURSOR_THICKNESS),
-                        size(cell_width, CURSOR_THICKNESS),
+                        size(cell.size.width, CURSOR_THICKNESS),
                     ),
                     color,
                 )),
@@ -952,13 +1153,10 @@ impl Element for TerminalElement {
                 )),
                 CursorShape::Block => {
                     cursor.push(fill(cell, color));
-                    let under = frame
-                        .lines
-                        .get(&state.line)
-                        .and_then(|line| line.text.chars().nth(state.column))
-                        .filter(|c| !c.is_whitespace());
-                    if let Some(c) = under {
-                        let text = c.to_string();
+                    let under = under
+                        .map(|(text, _)| text)
+                        .filter(|text| !text.starts_with(char::is_whitespace));
+                    if let Some(text) = under {
                         let run = TextRun {
                             len: text.len(),
                             font: inputs.font.clone(),
@@ -1090,17 +1288,47 @@ impl TerminalElement {
     ) {
         let row_height = layout.row_height;
         let wrap = self.inputs.wrap && self.inputs.screen.is_none();
+        // The screen cell under a position, while the device takes the mouse: Shift
+        // keeps it for selection and scrolling.
+        let reporting = self.inputs.screen.as_ref().and_then(|screen| {
+            screen.mouse?;
+            Some((screen.first_visible, screen.columns, screen.rows))
+        });
+        let cell_at = {
+            let hit_map = layout.hit_map.clone();
+            move |position: Point<Pixels>, modifiers: &Modifiers| {
+                let (first_visible, columns, rows) = reporting?;
+                if modifiers.shift {
+                    return None;
+                }
+                hit_map.screen_cell(position, first_visible, columns, rows)
+            }
+        };
 
         window.on_mouse_event({
             let view = self.inputs.view.clone();
             let hitbox = layout.hitbox.clone();
             let hit_map = layout.hit_map.clone();
             let focus = self.inputs.focus.clone();
+            let cell_at = cell_at.clone();
             move |event: &MouseDownEvent, phase, window, cx| {
-                if !phase.bubble()
-                    || event.button != MouseButton::Left
-                    || !hitbox.is_hovered(window)
+                if !phase.bubble() || !hitbox.is_hovered(window) {
+                    return;
+                }
+                // A press the device asked to hear about goes to it, any button.
+                if let Some(cell) = cell_at(event.position, &event.modifiers)
+                    && let Some(button) = vt_button(event.button)
                 {
+                    window.focus(&focus, cx);
+                    window.capture_pointer(hitbox.id);
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_mouse(MouseAction::Press(button), cell, alt, control, cx)
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.button != MouseButton::Left {
                     return;
                 }
                 window.focus(&focus, cx);
@@ -1118,10 +1346,40 @@ impl TerminalElement {
             let view = self.inputs.view.clone();
             let hit_map = layout.hit_map.clone();
             let scroll = self.inputs.scroll.clone();
-            move |event: &MouseMoveEvent, phase, _window, cx| {
-                if !phase.bubble()
-                    || event.pressed_button != Some(MouseButton::Left)
-                    || !view.read(cx).is_selecting()
+            let hitbox = layout.hitbox.clone();
+            let cell_at = cell_at.clone();
+            let hit_map_for_cells = layout.hit_map.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                // A move the device asked to hear about: with the button it was told is
+                // down (anywhere, clamped to the screen), or with none over the screen.
+                if !view.read(cx).is_selecting()
+                    && let Some((first_visible, columns, rows)) = reporting
+                {
+                    let pressed = view.read(cx).mouse_pressed();
+                    let cell = match pressed {
+                        Some(_) => hit_map_for_cells.screen_cell(
+                            event.position,
+                            first_visible,
+                            columns,
+                            rows,
+                        ),
+                        None if hitbox.is_hovered(window) => {
+                            cell_at(event.position, &event.modifiers)
+                        }
+                        None => None,
+                    };
+                    if let Some(cell) = cell {
+                        let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                        view.update(cx, |view, cx| {
+                            view.report_mouse(MouseAction::Move(pressed), cell, alt, control, cx)
+                        });
+                    }
+                    return;
+                }
+                if event.pressed_button != Some(MouseButton::Left) || !view.read(cx).is_selecting()
                 {
                     return;
                 }
@@ -1141,11 +1399,26 @@ impl TerminalElement {
 
         window.on_mouse_event({
             let view = self.inputs.view.clone();
+            let hit_map = layout.hit_map.clone();
             move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase.bubble()
-                    && event.button == MouseButton::Left
-                    && view.read(cx).is_selecting()
+                if !phase.bubble() {
+                    return;
+                }
+                // The release of a reported press, wherever the pointer is now.
+                if let Some((first_visible, columns, rows)) = reporting
+                    && let Some(button) = vt_button(event.button)
+                    && view.read(cx).mouse_pressed() == Some(button)
                 {
+                    let cell = hit_map
+                        .screen_cell(event.position, first_visible, columns, rows)
+                        .unwrap_or((0, 0));
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_mouse(MouseAction::Release(button), cell, alt, control, cx)
+                    });
+                    return;
+                }
+                if event.button == MouseButton::Left && view.read(cx).is_selecting() {
                     view.update(cx, |view, cx| view.mouse_up(cx));
                 }
             }
@@ -1160,6 +1433,16 @@ impl TerminalElement {
                     return;
                 }
                 let delta = event.delta.pixel_delta(row_height);
+                // The wheel the device asked for: whole rows of it, as wheel reports.
+                if let Some(cell) = cell_at(event.position, &event.modifiers) {
+                    let rows = f32::from(delta.y) / f32::from(row_height);
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_wheel(rows, cell, alt, control, cx)
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 let (mut dx, mut dy) = (f32::from(delta.x), f32::from(delta.y));
                 // A plain wheel with shift held scrolls sideways.
                 if event.modifiers.shift && dx == 0.0 {
@@ -1330,6 +1613,7 @@ mod tests {
                     start: 0,
                     len: 30,
                     last: true,
+                    cells: None,
                 },
                 HitRow {
                     line: LineId(8),
@@ -1337,6 +1621,7 @@ mod tests {
                     start: 0,
                     len: 30,
                     last: false,
+                    cells: None,
                 },
                 HitRow {
                     line: LineId(8),
@@ -1344,6 +1629,7 @@ mod tests {
                     start: 30,
                     len: 4,
                     last: true,
+                    cells: None,
                 },
             ],
         };
@@ -1363,5 +1649,48 @@ mod tests {
         assert_eq!(at(0.0, 120.0).caret, SelectionPoint::new(LineId(8), 0));
         assert_eq!(at(50.0, 0.0).caret, SelectionPoint::new(LineId(7), 0));
         assert_eq!(at(50.0, 500.0).caret, SelectionPoint::new(LineId(8), 34));
+    }
+
+    #[test]
+    fn hit_testing_a_screen_line_counts_cells() {
+        // `a日b`: the wide character in cells 1 and 2, `b` in cell 3.
+        let text = "a日b";
+        let map = HitMap {
+            bounds: Bounds::new(point(px(0.), px(0.)), size(px(400.), px(20.))),
+            column_origin: px(0.),
+            cell_width: 10.0,
+            row_height: 20.0,
+            rows: vec![HitRow {
+                line: LineId(0),
+                y: 0.0,
+                start: 0,
+                len: 3,
+                last: true,
+                cells: CellMap::of(text, serialist_vt::cell_width).map(Arc::new),
+            }],
+        };
+        let at = |x: f32| map.hit(point(px(x), px(5.))).unwrap();
+        let column = |point: SelectionPoint| point.column;
+        // Either half of the wide character is it; the cell after it is `b`.
+        assert_eq!(column(at(15.0).cell), 1);
+        assert_eq!(column(at(25.0).cell), 1);
+        assert_eq!(column(at(35.0).cell), 2);
+        // Carets: before the wide character, after it, after `b`.
+        assert_eq!(column(at(9.0).caret), 1);
+        assert_eq!(column(at(31.0).caret), 2);
+        assert_eq!(column(at(41.0).caret), 3);
+        assert_eq!(column(at(99.0).caret), 3, "past the end");
+    }
+
+    #[test]
+    fn the_character_in_a_cell() {
+        let text = "a日e\u{301}\u{1f600}";
+        let found = |cell| character_in_cell(text, cell);
+        assert_eq!(found(0), Some(("a".to_string(), 1)));
+        assert_eq!(found(1), Some(("日".to_string(), 2)));
+        assert_eq!(found(2), None, "the second half of a wide character");
+        assert_eq!(found(3), Some(("e\u{301}".to_string(), 1)));
+        assert_eq!(found(4), Some(("\u{1f600}".to_string(), 2)));
+        assert_eq!(found(6), None, "past the text");
     }
 }

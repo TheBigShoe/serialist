@@ -32,6 +32,7 @@
 //! bindings; a bad theme file is skipped. Each problem is logged and shown in the status
 //! line through [`Config::notice`] until the next load that succeeds.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ use std::time::Duration;
 
 use crossbeam_channel::RecvTimeoutError;
 use serialist_core::config_watch::{ConfigEvent, ConfigWatcher};
-use serialist_core::settings::ConfigPaths;
+use serialist_core::settings::{ConfigPaths, Platform};
 use serialist_core::{
     Appearance, CommandCollection, CommandStore, FontSpec, Keymap, PortInfo, Rgba as CoreRgba,
     SerialConfig, Settings, SettingsError, Theme as ZedTheme, ThemeRegistry, load_keymap,
@@ -720,13 +721,27 @@ pub fn set_appearance(appearance: WindowAppearance, cx: &mut App) {
 /// platform directory. A project `.serialist/settings.json` above the working
 /// directory joins it.
 pub fn paths_for(config_dir: Option<PathBuf>) -> ConfigPaths {
-    let paths = match config_dir {
-        Some(dir) => ConfigPaths::new(dir),
-        None => ConfigPaths::default_for_platform(),
-    };
+    let paths = config_dir_for(config_dir, Platform::current(), &|name| {
+        std::env::var_os(name)
+    });
     match std::env::current_dir() {
         Ok(cwd) => paths.with_project_from(&cwd),
         Err(_) => paths,
+    }
+}
+
+/// The config directory before the project settings join it, with the platform and the
+/// environment passed in so the rule is testable without touching the process's:
+/// `config_dir` (the `--config-dir` flag) wins over `SERIALIST_CONFIG_DIR`, which wins
+/// over the platform directory.
+fn config_dir_for(
+    config_dir: Option<PathBuf>,
+    platform: Platform,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> ConfigPaths {
+    match config_dir {
+        Some(dir) => ConfigPaths::new(dir),
+        None => ConfigPaths::from_environment(platform, env),
     }
 }
 
@@ -813,4 +828,34 @@ pub fn start(paths: ConfigPaths, cx: &mut App) {
     tracing::info!(dir = %paths.dir.display(), "loading configuration");
     install(Config::load(paths.clone(), dark), cx);
     watch(&paths, cx);
+}
+
+#[cfg(test)]
+mod paths_tests {
+    use super::*;
+
+    fn env(name: &str) -> Option<OsString> {
+        match name {
+            "SERIALIST_CONFIG_DIR" => Some("/from/env".into()),
+            "HOME" => Some("/home/me".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_flag_wins_over_the_environment_variable() {
+        let paths = config_dir_for(Some("/from/flag".into()), Platform::Linux, &env);
+        assert_eq!(paths.dir, Path::new("/from/flag"));
+        assert_eq!(paths.settings, Path::new("/from/flag/settings.json"));
+    }
+
+    #[test]
+    fn the_environment_variable_wins_over_the_platform_directory() {
+        let paths = config_dir_for(None, Platform::Linux, &env);
+        assert_eq!(paths.dir, Path::new("/from/env"));
+        let paths = config_dir_for(None, Platform::MacOs, &|name| {
+            (name == "HOME").then(|| "/Users/me".into())
+        });
+        assert_eq!(paths.dir, Path::new("/Users/me/.config/serialist"));
+    }
 }

@@ -51,6 +51,7 @@ function M.describe()
   return {
     name = "airoha-race",
     version = "1.0.0",
+    api = 1,
     description = "Airoha RACE: 0x05-framed commands, responses, indications and logs, with the text between frames",
     kinds = {
       frame_kind("command", "A command to the device (type 0x5A)"),

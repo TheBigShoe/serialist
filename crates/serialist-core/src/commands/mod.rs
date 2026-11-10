@@ -35,7 +35,8 @@
 //! }
 //! ```
 //!
-//! Reading accepts comments and trailing commas. Writing does not preserve them: see
+//! Reading accepts comments and trailing commas. Writing does not preserve them, but
+//! does write back what this build does not read ([`Carried`]): see
 //! [`CommandCollection::to_json`]. The payload forms, escapes and placeholders are in
 //! [`Command::encode`]'s module docs ([`payload`]), and the reply a command waits for
 //! goes through [`MatcherHandle::expect`](crate::MatcherHandle::expect).
@@ -57,7 +58,7 @@ pub(crate) use file::write_atomic;
 pub use file::{CommandWarning, CommandsError, LoadedCollection};
 pub use filter::{FuzzyMatch, fuzzy_match};
 pub use model::{
-    CollectionSource, Command, CommandCollection, CommandGroup, CommandRef,
+    Carried, CollectionSource, Command, CommandCollection, CommandGroup, CommandRef,
     DEFAULT_EXPECT_TIMEOUT_MS, Expect, Param, ParamKind, Payload,
 };
 pub use payload::{ParamValues, PayloadError};

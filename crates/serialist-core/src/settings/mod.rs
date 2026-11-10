@@ -9,9 +9,12 @@
 //! 3. a project-local `.serialist/settings.json`.
 //!
 //! Objects merge key by key, arrays and scalars replace, and `null` unsets an optional
-//! key, so a user file may hold a single key. Unknown keys are ignored and reported as
-//! [`SettingsWarning`]s on [`Settings::warnings`]; a wrong type or bad syntax is a
-//! [`SettingsError`] naming the file, line and column.
+//! key, so a user file may hold a single key. Unknown keys are ignored, and a value this
+//! build cannot read (a wrong type, a number out of range, an enum value from a later
+//! release) leaves only its own key out, so the layer below keeps that key; both are
+//! reported as [`SettingsWarning`]s on [`Settings::warnings`] naming the file, line and
+//! column. Bad syntax, or a root that is not an object, is a [`SettingsError`] for the
+//! whole file.
 
 mod de;
 mod defaults;
@@ -27,6 +30,8 @@ mod types;
 #[cfg(test)]
 mod inline_tests;
 #[cfg(test)]
+mod layer_tests;
+#[cfg(test)]
 mod tests;
 
 pub use defaults::DEFAULT_SETTINGS_JSONC;
@@ -37,7 +42,8 @@ pub use inline::{
 };
 pub use keymap_edit::KeymapEditor;
 pub use load::{
-    SettingsError, SettingsLayer, SettingsWarning, load_settings, load_settings_from_layers,
+    SettingsError, SettingsLayer, SettingsWarning, SettingsWarningKind, load_settings,
+    load_settings_from_layers,
 };
 pub use paths::{
     CONFIG_DIR_ENV, ConfigPaths, ExamplePlugin, Platform, keymap_template, settings_template,

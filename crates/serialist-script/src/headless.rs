@@ -9,15 +9,17 @@ use std::thread;
 use parking_lot::Mutex;
 use serialist_core::LinkState;
 use serialist_core::{
-    ControlLine, Ingest, IngestHandle, PortId, PortSource, SerialConfig, Session, SessionClosed,
-    SessionConfig, Store, StoreReader, TransportError, TransportFactory,
+    ChunkSink, CodecFactory, CodecSink, ControlLine, FrameStore, FrameStoreReader, Ingest,
+    IngestHandle, PortId, PortSource, SerialConfig, Session, SessionClosed, SessionConfig, Store,
+    StoreReader, TransportError, TransportFactory,
 };
 use tokio::sync::oneshot;
 
 use crate::bell::LineBell;
 use crate::host::{HostServices, ScriptEvent, ScriptHost, ScriptOutcome, ScriptSource};
 use crate::services::{
-    LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture, ScriptSession, ScriptUi,
+    CodecSource, LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture, ScriptSession,
+    ScriptUi,
 };
 
 /// A [`Session`] with its own ingest thread and store, for scripts that run without the
@@ -28,6 +30,7 @@ pub struct HeadlessSession {
     ingest: Mutex<Option<IngestHandle>>,
     reader: StoreReader,
     bell: LineBell,
+    frames: Option<FrameStoreReader>,
 }
 
 impl fmt::Debug for HeadlessSession {
@@ -41,17 +44,40 @@ impl fmt::Debug for HeadlessSession {
 
 impl HeadlessSession {
     /// Open `port` through `factory` and start its ingest thread, with the bell's sink.
+    /// It decodes nothing.
     pub fn open(
         factory: &dyn TransportFactory,
         port: PortId,
         serial: SerialConfig,
     ) -> Result<Self, TransportError> {
+        Self::open_decoding(factory, port, serial, None)
+    }
+
+    /// [`open`](Self::open), decoding received bytes with a codec `codec` makes on the
+    /// ingest thread, into a frame store `port:on_frame` reads. The codec's sink runs
+    /// before the bell's, so a ring finds the chunk's frames stored.
+    pub fn open_decoding(
+        factory: &dyn TransportFactory,
+        port: PortId,
+        serial: SerialConfig,
+        codec: Option<Arc<dyn CodecFactory>>,
+    ) -> Result<Self, TransportError> {
         let session = Session::open(factory, SessionConfig::new(port.clone(), serial))?;
         let bell = LineBell::new();
-        let ingest = Ingest::spawn(
+        let bell_sink = bell.sink();
+        let frame_store = codec.as_ref().map(|_| FrameStore::default());
+        let frames = frame_store.as_ref().map(FrameStore::reader);
+        let ingest = Ingest::spawn_with(
             session.events(),
             Store::default(),
-            vec![Box::new(bell.sink())],
+            Box::new(move || {
+                let mut sinks: Vec<Box<dyn ChunkSink>> = Vec::new();
+                if let (Some(codec), Some(store)) = (codec, frame_store) {
+                    sinks.push(Box::new(CodecSink::from_factory(codec, store, None)));
+                }
+                sinks.push(Box::new(bell_sink));
+                sinks
+            }),
             Box::new(|| {}),
         );
         // The script may ask for the description at once; give the ingest thread a
@@ -69,6 +95,7 @@ impl HeadlessSession {
             session: Mutex::new(Some(session)),
             ingest: Mutex::new(Some(ingest)),
             bell,
+            frames,
         })
     }
 
@@ -140,6 +167,10 @@ impl ScriptSession for HeadlessSession {
 
     fn bell(&self) -> LineBell {
         self.bell.clone()
+    }
+
+    fn frames(&self) -> Option<FrameStoreReader> {
+        self.frames.clone()
     }
 
     fn close(&self) {
@@ -315,13 +346,36 @@ impl ScriptUi for StdioUi {
     }
 }
 
+/// The codecs a headless run offers its script.
+#[derive(Clone, Default)]
+pub struct HeadlessCodecs {
+    /// Backs `codecs.<name>.encode`: the plugins installed in the config directory.
+    pub source: Option<Arc<dyn CodecSource>>,
+    /// Decodes the run's own port, for `port:on_frame`: the codec the device profile
+    /// names. `None` decodes nothing.
+    pub decode: Option<Arc<dyn CodecFactory>>,
+}
+
+impl fmt::Debug for HeadlessCodecs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeadlessCodecs")
+            .field("source", &self.source.is_some())
+            .field(
+                "decode",
+                &self.decode.as_ref().map(|codec| codec.info().name),
+            )
+            .finish()
+    }
+}
+
 /// Run one script against `port` with no app around it, for `--script`: open a
 /// [`HeadlessSession`], run the script on a [`ScriptHost`] with that session as
 /// `serial.current()`, hand every output line to [`ScriptUi::output`], then close the
 /// port (letting queued writes out) and return the outcome.
 ///
 /// `serial.open` works through `factory`, by `port` only. `require` and `dofile` read
-/// from the script file's directory, if the script came from a file.
+/// from the script file's directory, if the script came from a file. No codec is
+/// installed; [`run_headless_with`] takes some.
 pub fn run_headless(
     port: PortId,
     config: SerialConfig,
@@ -329,7 +383,22 @@ pub fn run_headless(
     script: ScriptSource,
     ui: Arc<dyn ScriptUi>,
 ) -> ScriptOutcome {
-    let session = match HeadlessSession::open(factory.as_ref(), port.clone(), config) {
+    run_headless_with(port, config, factory, script, ui, HeadlessCodecs::default())
+}
+
+/// [`run_headless`] with `codecs` for `codecs.<name>.encode`, and the port decoded with
+/// `codecs.decode` for `port:on_frame`.
+pub fn run_headless_with(
+    port: PortId,
+    config: SerialConfig,
+    factory: Arc<dyn TransportFactory>,
+    script: ScriptSource,
+    ui: Arc<dyn ScriptUi>,
+    codecs: HeadlessCodecs,
+) -> ScriptOutcome {
+    let opened =
+        HeadlessSession::open_decoding(factory.as_ref(), port.clone(), config, codecs.decode);
+    let session = match opened {
         Ok(session) => Arc::new(session),
         Err(err) => return ScriptOutcome::Error(format!("could not open {port}: {err}")),
     };
@@ -337,6 +406,7 @@ pub fn run_headless(
     services.session = Some(Arc::clone(&session) as Arc<dyn ScriptSession>);
     services.opener = Some(Arc::new(HeadlessOpener::new(factory)));
     services.scripts_dir = script.path.as_deref().map(script_dir);
+    services.codecs = codecs.source;
     let host = ScriptHost::new(services);
     let run = host.run(script);
     let events = run.events();

@@ -149,7 +149,9 @@ use crate::param_prompt::{ParamPrompt, ParamPromptEvent};
 use crate::plugin_files;
 use crate::port_settings::PortSettings;
 use crate::prelude::*;
-use crate::script_bridge::{CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, inline_source};
+use crate::script_bridge::{
+    CodecsSnapshot, CommandsSnapshot, ConsoleKind, ConsoleLine, ScriptEnv, inline_source,
+};
 use crate::script_console::{ScriptConsole, ScriptConsoleEvent};
 use crate::script_files::{display_name, resolve_script};
 use crate::session_handle::{CoreSessionOpener, SessionHandle, SessionOpener};
@@ -205,7 +207,11 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
         }),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(640.), px(400.))),
-        app_id: Some("dev.serialist.Serialist".into()),
+        // On Linux this is the Wayland app id and both halves of the X11 WM_CLASS. Desktops
+        // match a window to its `.desktop` entry by them (the app id against the file's
+        // name, WM_CLASS against `StartupWMClass`), so it must stay equal to the
+        // `serialist.desktop` that packaging/linux installs. Other platforms ignore it.
+        app_id: Some("serialist".into()),
         ..Default::default()
     };
     let (_, workspace) = kit_open_window(window_options, cx, |window, cx| {
@@ -421,6 +427,7 @@ pub struct Workspace {
     console: Entity<ScriptConsole>,
     /// The saved commands scripts send by name, kept current on every reload.
     script_commands: CommandsSnapshot,
+    script_codecs: CodecsSnapshot,
     /// The compose history every session shares, kept in `history.jsonl`.
     history: Entity<PersistentHistory>,
     /// The parameter dialog, while it is open.
@@ -533,6 +540,11 @@ impl Workspace {
                 ScriptConsoleEvent::RunInline(code) => this.run_inline(code, window, cx),
                 ScriptConsoleEvent::Stop => this.stop_script(cx),
             });
+        let script_codecs = CodecsSnapshot::new(
+            cx.try_global::<Config>()
+                .map(|config| config.codec_registry().clone())
+                .unwrap_or_default(),
+        );
         let script_commands = CommandsSnapshot::new(
             cx.try_global::<Config>()
                 .map(|config| config.commands().clone())
@@ -587,6 +599,7 @@ impl Workspace {
             decoded,
             console,
             script_commands,
+            script_codecs,
             history,
             param_prompt: None,
             param_target: None,
@@ -676,6 +689,7 @@ impl Workspace {
     fn config_changed(&mut self, cx: &mut Context<Self>) {
         if let Some(config) = cx.try_global::<Config>() {
             self.script_commands.set(config.commands().clone());
+            self.script_codecs.set(config.codec_registry().clone());
         }
         self.apply_replay_defaults(cx);
         let sessions: Vec<(Entity<SessionView>, PortInfo)> = self
@@ -1993,7 +2007,7 @@ impl Workspace {
     // --- Scripts ---------------------------------------------------------------------
 
     /// What a new session's scripts get: the port list, the scripts folder for
-    /// `require`, and the saved commands.
+    /// `require`, the saved commands and the installed codecs.
     fn script_env(&self, cx: &App) -> ScriptEnv {
         ScriptEnv {
             ports: Some(self.port_source.clone()),
@@ -2001,6 +2015,7 @@ impl Workspace {
                 .try_global::<Config>()
                 .map(|config| config.paths().scripts_dir()),
             commands: self.script_commands.clone(),
+            codecs: self.script_codecs.clone(),
         }
     }
 

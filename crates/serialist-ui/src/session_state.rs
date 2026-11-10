@@ -32,7 +32,8 @@
 //!
 //! A file that does not parse, or of a version this build does not know (none, or newer
 //! than [`STATE_VERSION`]), is ignored (and logged): the app starts with no tabs, as it
-//! would without one.
+//! would without one. A file of a newer version is also left alone when saving, so an
+//! earlier build does not overwrite what a later one wrote.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -158,12 +159,34 @@ impl SessionState {
 
     /// Write the state to `path`: a temporary file next to it, renamed over it. The
     /// directory must exist; the state is not worth creating a config directory for.
+    ///
+    /// A file already there with a `version` newer than [`STATE_VERSION`] was written by
+    /// a later build; it is left alone (and logged), so running an earlier build does
+    /// not cost the later one its tabs.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(version) = newer_version_on_disk(path) {
+            tracing::warn!(
+                path = %path.display(),
+                version,
+                "not saving the session state: the file is of a newer version than this build writes"
+            );
+            return Ok(());
+        }
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         let temp = path.with_extension("json.tmp");
         std::fs::write(&temp, text + "\n")?;
         std::fs::rename(&temp, path)
     }
+}
+
+/// The `version` of the file at `path`, if it parses as JSON and names one newer than
+/// this build writes. Anything else (no file, unreadable, not JSON, no version, an equal
+/// or older one) is `None`.
+fn newer_version_on_disk(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let version = value.get("version")?.as_u64()?;
+    (version > u64::from(STATE_VERSION)).then_some(version)
 }
 
 #[cfg(test)]
@@ -292,6 +315,32 @@ mod tests {
         assert_eq!(state.tabs[1].codec.as_deref(), Some("airoha-race"));
         assert!(state.tabs.iter().all(|tab| tab.emulation.is_none()));
         assert!(state.docks.is_some());
+    }
+
+    #[test]
+    fn saving_leaves_a_newer_builds_file_alone() {
+        let dir = TestDir::new("session-state-newer");
+        let path = dir.join("state.json");
+        let newer = "{ \"version\": 3,\n  \"tabs\": [], \"future\": true }\n";
+        std::fs::write(&path, newer).unwrap();
+        SessionState::default().save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        assert!(!dir.join("state.json.tmp").exists());
+    }
+
+    #[test]
+    fn saving_replaces_an_older_or_corrupt_file() {
+        let dir = TestDir::new("session-state-older");
+        let path = dir.join("state.json");
+        for old in [r#"{ "version": 1, "tabs": [] }"#, "{ not json", ""] {
+            std::fs::write(&path, old).unwrap();
+            SessionState::default().save(&path).unwrap();
+            assert_eq!(
+                SessionState::load(&path),
+                Some(SessionState::default()),
+                "{old:?}"
+            );
+        }
     }
 
     #[test]

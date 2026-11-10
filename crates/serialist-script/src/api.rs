@@ -1,6 +1,6 @@
 //! The global Lua API: `serial`, `sleep`, `print`, `log`, `ui`, `commands`, `hex`,
-//! `bytes`, and the sandboxed `require` and `dofile`. Port methods live in
-//! [`crate::port`].
+//! `bytes`, `timer`, and the sandboxed `require` and `dofile`. Port methods live in
+//! [`crate::port`], `codecs` in [`crate::codecs`].
 
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -15,17 +15,33 @@ use crate::port::{Port, PortState, bytes_arg, duration_ms};
 use crate::services::{LogLevel, OpenRequest};
 use crate::vm::{RunCtx, runtime_error};
 
+/// The scripting API number, `serialist.api` in Lua. The API only gains things within
+/// 1.x, and this goes up by one in each release that adds something, so a script that
+/// needs a later addition can check `serialist.api >= n` and fail clearly.
+pub const SCRIPT_API: i64 = 1;
+
+/// `serialist`: the app version (`version`) and the API number (`api`).
+fn serialist_table(lua: &Lua) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("version", env!("CARGO_PKG_VERSION"))?;
+    table.set("api", SCRIPT_API)?;
+    Ok(table)
+}
+
 pub(crate) fn install(lua: &Lua, ctx: &Rc<RunCtx>) -> mlua::Result<()> {
     let globals = lua.globals();
+    globals.set("serialist", serialist_table(lua)?)?;
     let tostring: Function = globals.get("tostring")?;
     globals.set("print", print_fn(lua, ctx, tostring.clone())?)?;
     globals.set("log", log_table(lua, ctx, &tostring)?)?;
     globals.set("sleep", sleep_fn(lua, ctx)?)?;
+    globals.set("timer", crate::timer::timer_table(lua, ctx)?)?;
     globals.set("ui", ui_table(lua, ctx)?)?;
     globals.set("commands", commands_table(lua, ctx, tostring)?)?;
     globals.set("hex", hex_table(lua)?)?;
     globals.set("bytes", bytes_table(lua)?)?;
     globals.set("serial", serial_table(lua, ctx)?)?;
+    globals.set("codecs", crate::codecs::codecs_table(lua, ctx)?)?;
     globals.set("require", require_fn(lua, ctx)?)?;
     globals.set("dofile", dofile_fn(lua, ctx)?)?;
     Ok(())

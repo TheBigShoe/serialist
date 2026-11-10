@@ -19,9 +19,9 @@ a recorded capture opens from the Serial menu or with `--port` too; see [Ports](
 | `--port <ID>` | Open this port at startup in a tab of its own: a path (`/dev/cu.usbserial-1420`, `COM3`), `virtual:<NAME>` for a simulated device, `tcp:<HOST>:<PORT>` for a raw TCP stream or `replay:<FILE>` for a recorded capture (see [Ports](#ports)). Repeatable |
 | `--baud <N>` | Baud rate for `--port` and the Connect field, any positive integer (default 115200) |
 | `--virtual [NAME]` | List the simulated devices next to the real ports; with a NAME, also open `virtual:<NAME>` at startup in a tab of its own. Repeatable |
-| `--config-dir <DIR>` | Read and keep the configuration in DIR instead of the user config directory (also `SERIALIST_CONFIG_DIR`) |
-| `--script <PATH>` | Run this Lua script against `--port` with no window, then exit: 0 if it ends well, 1 on an error, 2 if it is stopped |
-| `--terminal-demo` | Open only the milestone 1 terminal element, fed by an in-memory stream |
+| `--config-dir <DIR>` | Read and keep the configuration in DIR instead of the user config directory (also `SERIALIST_CONFIG_DIR`; the flag wins). It holds `settings.json`, `keymap.json`, `themes/`, `commands/`, `scripts/`, `plugins/`, `history.jsonl` and `state.json` |
+| `--script <PATH>` | Run this Lua script against `--port` with no window, then exit: 0 if it ends well, 1 on an error, 2 if nothing ran (a bad flag, no `--port`, an unreadable script); 130 is reserved for a stopped script |
+| `--terminal-demo` | A development tool, not covered by the compatibility promise: open only the milestone 1 terminal element, fed by an in-memory stream |
 | `-h`, `--help`, `-V`, `--version` | Print the help or the version |
 
 Logging follows `RUST_LOG`, for example `RUST_LOG=serialist=debug`.
@@ -62,7 +62,15 @@ default, and a device profile's `"emulation"` sets it per device. Try it with
 In VT mode the screen is sized to the terminal pane (a device that asks with `CSI 18 t`
 learns the new size), the cursor is drawn where the device puts it, the arrows follow
 the device's cursor key mode, pastes are bracketed when it asks, its window title shows
-on the tab and its bell flashes the status dot. Queries such as device attributes and
+on the tab and its bell flashes the status dot. Wide characters (CJK, most emoji) take
+two cells and combining accents none, as the device counted them, so text after them
+stays in its columns; selecting and copying them gives each character once. When the
+device asks for the mouse (`CSI ? 1000 h`, `1002` or `1003`, in the SGR form with `1006`),
+clicks, drags and the wheel on the screen go to it as mouse reports in inline mode, so a
+menu that takes clicks works; hold Shift to select and scroll as usual. In command mode
+the mouse always selects. Colors the device sets replace the theme's on its screen:
+palette entries (OSC 4) and the default text, background and cursor colors (OSC 10, 11
+and 12), until it resets them (OSC 104, 110, 111, 112, or a full reset). Queries such as device attributes and
 the cursor position are answered at once. The log keeps recording underneath: search
 reads it (the search bar says so), raw and text export and recording are the same as in
 monitor mode, and Export adds the screen's rows as text. Switching to VT mode starts a
@@ -149,7 +157,9 @@ The `replay` setting gives the speed and the end of a replay whose id does not s
 
 `speed` is `"1x"`, `"4x"`, `"0.5x"`, `"max"` or a bare number, and `end` is `"disconnect"` or
 `"hold"`. An id's own `?speed=` and `?end=` win, and a change reaches the next replay that
-opens, not one already playing. The Settings screen has no control for it; edit `settings.json`.
+opens, not one already playing. The Settings screen sets both under Session, Replay: Speed
+lists the speeds the replay toolbar offers (a speed it does not list, written in
+`settings.json`, shows as the list's text), and At the end is Disconnect or Hold.
 
 Restored tabs: with `restore_session` on, a `tcp:` tab connects again at the next start, as a
 serial tab does when its device is plugged in (if the endpoint does not answer, the tab says why
@@ -176,13 +186,39 @@ a device profile that matches the id, or `--baud`) times the speed, or as fast a
 reads at `max`. A `.timing` file that does not parse makes the open fail with a message naming
 the port, rather than play at the wrong pace.
 
+## Exporting decoded frames
+
+While a codec decodes the session, Export to a `.csv` or `.json` file writes the frames the
+session still retains. The format follows the file's extension.
+
+CSV has a header row, then one row per frame. The columns are `time`, `timestamp`,
+`direction`, `kind`, `summary`, one column per field name (in the order the fields first
+appear; a frame without that field leaves it empty), and `raw`, the frame's bytes as hex.
+
+JSON is an object, not a bare array:
+
+```json
+{ "format": "serialist-frames", "version": 1, "frames": [ { "id": 0, "time": "...", "timestamp": "..." } ] }
+```
+
+Each frame object has `id`, `time`, `timestamp`, `direction` (`RX`, `TX` or `--`), `kind`,
+`severity`, `summary`, `fields` (numbers as numbers, bytes as hex, lists as arrays),
+`raw_start`, `raw_end` and `raw` (hex, or `null` once the bytes were evicted). New keys may
+appear in a later version; `version` changes only if a key changes its meaning or goes away.
+
+`time` is for people: it is the Decoded panel's stamp, so it follows the session's timestamp
+mode and `display.timestamp_format` and by default has no date. `timestamp` is for programs:
+the frame's wall-clock time in UTC as RFC 3339 with microseconds, such as
+`2026-11-10T14:03:22.123456Z`, the same whatever the display settings are.
+
 ## Settings
 
 `cmd-,` (`ctrl-,` on Linux and Windows), the Serialist menu's Settings… or the palette
 opens the Settings screen in a tab beside the sessions: Appearance (theme mode, the light
 and dark themes, the UI font), Terminal font (family, size, weight, line height, ligatures,
 fallbacks, and the `terminal.*` overrides), Display, Session (default baud, line ending,
-echo, restore, and inline mode's Backspace, escape chord and paste pacing), Devices (the
+echo, restore, the replay speed and end, and inline mode's Backspace, escape chord and paste
+pacing), Devices (the
 device profiles: add, edit with the port settings form, remove, drag to reorder), Keymap
 (every binding in effect, yours marked, with the saved commands' keys listed as "command" rows,
 with Rebind… on a selected row) and Plugins. It is
@@ -191,14 +227,29 @@ change writes one key into the file at once (text fields after a 300 ms pause), 
 your comments and uncommenting the template's line for the key, and the watcher applies it
 like any save. A value nobody set is marked "default"; the arrow beside one you set removes
 it again; one a project's `.serialist/settings.json` sets is read-only there. A value the
-loader would reject is never written and the reason shows under it, and a `settings.json`
+loader cannot read is never written and the reason shows under it, and a `settings.json`
 that does not load shows its error and an Open settings.json button instead.
+
+A value in a settings file that this version cannot read (a wrong type, a number out of
+range, or a value a later version added, such as a new `line_ending`) costs only that key:
+it is ignored, the value from the layer below it applies (the user file under a project's
+`.serialist/settings.json`, the default under the user file), and the rest of the file
+applies as written. The status line names the file, line, column and key, the way it
+names an unknown key, and a `--script` run logs it as a warning. In `devices`, a bad key
+is dropped from its profile and the profile kept; a profile with no readable `match` is
+dropped whole, and the others load. Only a file that is not valid JSON with comments, or
+whose top level is not an object, is not applied at all: the last settings that loaded stay,
+and the status line says "Settings not applied" with the reason.
 
 ## The config directory
 
 Settings, key bindings, themes, saved commands, scripts, plugins and history live in one
 directory: `~/.config/serialist` on macOS and Linux (where Zed users expect it),
-`%APPDATA%\Serialist` on Windows. `--config-dir` or `SERIALIST_CONFIG_DIR` overrides it.
+`%APPDATA%\Serialist` on Windows. On Linux, when `XDG_CONFIG_HOME` is set to an absolute
+path the directory is `$XDG_CONFIG_HOME/serialist` instead, unless that directory does not
+exist and `~/.config/serialist` does, in which case the old one is kept so no settings
+disappear. `--config-dir` or `SERIALIST_CONFIG_DIR` overrides all of it, and the flag wins
+over the variable.
 The directory is Serialist's own: it never reads Zed's configuration, and only the settings
 key names and the theme file format match Zed's, so a Zed theme file can be copied into
 `themes/` as it is.
@@ -220,6 +271,20 @@ nearest one found searching up from the working directory is used. Defaults for 
 setting, with a comment each, are in
 `crates/serialist-core/assets/default_settings.jsonc`.
 
+A saved-command collection that a later Serialist wrote may hold things this version cannot
+read. A key it does not know is reported as a warning and otherwise left alone. A command it
+cannot read (a payload form or a param `kind` it does not know, a value of the wrong type)
+is left out of the Commands panel with a warning naming the file, the group and the command
+(by name, or by position when it has no readable name), and every other command in the file
+still loads; a group that is not an object, or has no name, is left out the same way. A file
+that is not valid JSON, or whose top level is not `{ "name", "groups": [ … ] }`, is left out
+whole with a warning. Saving a change from the Commands panel rewrites the file as plain
+JSON: your comments and formatting are dropped, and so are a command or group you deleted,
+with everything inside it, but every key this version does not know and every command or
+group it left out is written back as it was, in its place. Keys may come back in a
+different order, and a value the app fills in (an `expect`'s `timeout_ms`, a param's `kind`)
+is written out even where the file left it to the default.
+
 ## Keyboard
 
 These are the bindings the app ships with, read from
@@ -230,6 +295,7 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Where | Action | What it does | macOS | Linux and Windows |
 |---|---|---|---|---|
 | Anywhere | `serialist::Quit` | Quit | `cmd-q` | `ctrl-q` |
+| Workspace | `command_palette::Toggle` | Open the command palette | `cmd-shift-p` | `ctrl-shift-p` |
 | Workspace | `serialist::OpenSettingsUi` | Open the Settings screen in a tab | `cmd-,` | `ctrl-,` |
 | Workspace | `terminal::Clear` | Clear the terminal | `cmd-k` | `ctrl-shift-k` |
 | Workspace | `serial::Disconnect` | Disconnect the port (asking first while it records or runs a script) | `cmd-shift-w` | `ctrl-alt-w` |
@@ -250,6 +316,8 @@ that section has no entry for the action. Linux and Windows use the same binding
 | Commands panel | `commands::SendSelected` | Send the selected command | `enter` | `enter` |
 | Commands panel filter | `commands::SelectPrevious` | Select the previous command | `up` | `up` |
 | Commands panel filter | `commands::SelectNext` | Select the next command | `down` | `down` |
+| Command palette input | `command_palette::SelectPrevious` | Select the previous entry | `up` | `up` |
+| Command palette input | `command_palette::SelectNext` | Select the next entry | `down` | `down` |
 | Compose bar input | `compose::HistoryPrevious` | Previous compose-bar history entry | `up` | `up` |
 | Compose bar input | `compose::HistoryNext` | Next compose-bar history entry | `down` | `down` |
 | Compose bar | `compose::CycleLineEnding` | Cycle the line ending (None, CR, LF, CRLF) | `cmd-e` | `ctrl-shift-e` |

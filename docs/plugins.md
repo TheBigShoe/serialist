@@ -22,7 +22,8 @@ plugin. The app registers a plugin under its folder's name, so `plugins/airoha-r
 the codec `airoha-race` and a copy in `plugins/airoha-race-lua/` is listed beside it.
 (The library function `serialist_plugins::load_plugins` registers under the name
 `describe` returns instead.) `plugins/examples/` is not a plugin: it holds copies of the
-bundled examples. WebAssembly folders load only in a build with the `wasm` feature
+bundled examples, and the folder name `examples` is reserved (the app writes its example
+plugins there, and a folder of that name never loads as a plugin, whatever it contains). WebAssembly folders load only in a build with the `wasm` feature
 (`cargo build -p serialist --features wasm`); otherwise the folder is reported as needing it.
 
 `serialist-plugins` also has the RACE codec in Rust (`AirohaRace`) and a line codec
@@ -114,6 +115,7 @@ local M = {}
 function M.describe()
   return {
     name = "my-proto", version = "1.0.0", description = "…",
+    api = 1,       -- optional: the codec API this plugin was written for
     kinds = {      -- the frames decode produces, fields in display order
       { kind = "packet", description = "…", fields = {
           { name = "id", type = "uint", description = "…" },
@@ -159,7 +161,7 @@ return M
 
 | Key | Required | Meaning |
 |---|---|---|
-| `kind` | yes | A string, normally one of the kinds `describe` lists. |
+| `kind` | yes | One of the kinds `describe` lists. A frame of any other kind becomes a `plugin_error` frame over its bytes. |
 | `pos`, `len` | yes | Where the frame sits in `bytes`: `pos` is 1-based, like `string.sub`, and `len` is a byte count. They must lie inside `bytes`. |
 | `severity` | no | `"info"` (the default), `"warning"` or `"error"`. |
 | `summary` | no | A one-line description for a list or the terminal. |
@@ -170,6 +172,9 @@ return M
   `uint`, a sequence is a `list`. Fields the kind does not declare follow, sorted by name,
   with their types inferred (string `str`, integer `int`, float `float`, boolean `bool`,
   sequence `list`). Lists nest at most 32 deep.
+- **Order.** Frames come in stream order and do not overlap. A frame that starts before
+  the previous one ends is dropped with every frame after it in the call, and one
+  `plugin_error` frame over all of the call's bytes goes ahead of the frames before it.
 - **Held-back bytes.** The second result of `decode` is a suffix of `bytes` (or `nil`) that
   the host prepends to the next chunk, so your plugin sees one contiguous stream and never
   needs to know where chunks were cut. It must be a suffix of what you were given and at
@@ -193,10 +198,21 @@ return M
   runs out of memory or spends its budget does not stall ingest: the bytes it was given
   become one `plugin_error` frame (severity `error`, its `error` field holds the message)
   and the plugin starts over with a fresh `state` and nothing held back. A frame whose
-  `fields` are wrong becomes a `plugin_error` frame for just its own bytes; a frame outside
-  `bytes`, or a result that is not a list of tables, fails the whole call.
+  `fields` are wrong, or whose kind `describe` does not list, becomes a `plugin_error` frame
+  for just its own bytes; a frame outside `bytes`, or a result that is not a list of tables,
+  fails the whole call.
+- **The API number.** `describe()` may return `api`, an integer: the Lua codec interface
+  the plugin was written for. Absent means `1`, so every plugin written before the number
+  existed keeps loading. This build provides API `1`, and a plugin can read it as
+  `codec.api` to adapt. Within 1.x the interface only gains things, and the number goes up
+  by one in each release that adds something. A plugin that asks for a higher one than the
+  build provides is refused at load, with a message naming the plugin, the API it asks for
+  and the API the build provides; so is an `api` that is not a positive integer.
+  (`codec.api` is `nil` on a build older than this one.) WebAssembly plugins declare theirs
+  in `plugin.toml` (`api = "1"`, see below).
 - **Refused at load.** A `plugin.lua` that does not return a table with `describe`,
-  `decode` and `encode` functions, or whose `describe` result is not valid.
+  `decode` and `encode` functions, or whose `describe` result is not valid, or whose `api`
+  is higher than the build provides or not a positive integer.
 - **Reloading.** `LuaCodec::reload` loads the file again into a fresh VM and starts decoding
   over; if the new file fails to load, the old one keeps running. The app reloads a plugin
   when a file in `plugins/` is saved: a session decoding with it switches to the new
@@ -246,8 +262,11 @@ import log: func(level: log-level, message: string);
 `decode` gets whatever it held back last time followed by the new chunk, as the Lua tier
 does, so a plugin never needs to know where chunks were cut. Each frame names its bytes by
 offset and length in that input, and `held` says how many trailing bytes to present again
-next time. Frame fields are typed (`bool`, `int`, `uint`, `float`, `str`, `bytes`, `list`);
-declared fields come out in declared order and must have their declared type (an integer
+next time. As in the Lua tier, a frame of a kind `describe` does not list becomes a
+`plugin_error` frame over its bytes. A frame that starts before the previous one ends is
+dropped with every frame after it in the call, and one `plugin_error` frame over all of
+the call's bytes goes ahead of the frames before it. Frame fields are typed (`bool`,
+`int`, `uint`, `float`, `str`, `bytes`, `list`); declared fields come out in declared order and must have their declared type (an integer
 may cross between `int` and `uint` if it fits), and other fields follow in the plugin's
 order. Requests arrive as typed JSON: numbers as `int` when they fit an `s64`, `uint` when
 they are larger, `float` otherwise.
@@ -266,10 +285,10 @@ to nothing on other targets, so the crate also builds and unit-tests natively.
 crate-type = ["cdylib"]
 
 [dependencies]
-serialist-plugin-sdk = "0.1"
+serialist-plugin-sdk = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-serialist-plugin-sdk = { version = "0.1", features = ["rt"] }
+serialist-plugin-sdk = { version = "0.2", features = ["rt"] }
 ```
 
 Nothing in this repository says the SDK is published to crates.io. From a checkout, point

@@ -6,8 +6,10 @@
 //! are the GUI's: the device profile that matches the port over `default_baud`, with
 //! `--baud` over both. The script runs through
 //! [`run_headless`](serialist_script::run_headless) with standard streams for its
-//! output and prompts; `require` reads from the script's own folder. `main` exits with
-//! [`exit_code`] of the outcome.
+//! output and prompts; `require` reads from the script's own folder. The plugins in the
+//! config directory's `plugins/` load as they do for the window, for
+//! `codecs.<name>.encode`, and the port decodes with the plugin its device profile names
+//! (`plugin`), for `port:on_frame`. `main` exits with [`exit_code`] of the outcome.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,26 +17,30 @@ use std::sync::Arc;
 use anyhow::{Context as _, bail};
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{PortId, PortInfo, PortKind, Settings, load_settings};
-use serialist_script::{ScriptOutcome, ScriptSource, ScriptUi, run_headless};
+use serialist_script::{HeadlessCodecs, ScriptOutcome, ScriptSource, ScriptUi, run_headless_with};
 use serialist_sim::SimWorld;
 use serialist_ui::AppOptions;
+use serialist_ui::codecs::CodecSet;
 
 use crate::cli::Args;
 use crate::wiring::{self, Backend};
 
 /// The process's exit status for a run that ended with `outcome`: 0 when the script
-/// returned, 1 on an error, 2 if it was stopped.
+/// returned, 1 on an error, 130 if it was stopped. 2 is left for "nothing ran" (a bad
+/// flag, a missing `--port`, an unreadable script), and 130 is what a shell reports for
+/// a process ended by Ctrl-C, so a clean stop on Ctrl-C would report the same.
 pub fn exit_code(outcome: &ScriptOutcome) -> i32 {
     match outcome {
         ScriptOutcome::Ok => 0,
         ScriptOutcome::Error(_) => 1,
-        ScriptOutcome::Stopped => 2,
+        ScriptOutcome::Stopped => 130,
     }
 }
 
 /// What a headless run opens its port through: the options for `args` over `real` and
 /// `world` (see [`wiring::build`]) and the settings under `paths`, which are the defaults
-/// when they do not load. The `replay` setting is applied here, so a `replay:` port or a
+/// when a file does not parse; a key whose value this build cannot read is left out with
+/// a logged warning and the rest of the file applies. The `replay` setting is applied here, so a `replay:` port or a
 /// script's `serial.open` plays at the speed and end the settings name (an id's own
 /// `?speed=` and `?end=` still win), as it does in the window.
 pub(crate) fn configured_options(
@@ -45,7 +51,14 @@ pub(crate) fn configured_options(
 ) -> anyhow::Result<(AppOptions, Settings)> {
     let options = wiring::build(args, real, world)?;
     let settings = match load_settings(Some(&paths.settings), paths.project_settings.as_deref()) {
-        Ok(settings) => settings,
+        Ok(settings) => {
+            // An unknown key, or a value this build cannot read: that key alone is left
+            // out and the rest of the file applies, as in the window.
+            for warning in &settings.warnings {
+                tracing::warn!("{warning}");
+            }
+            settings
+        }
         Err(error) => {
             tracing::warn!(%error, "settings not applied; using the defaults");
             Settings::default()
@@ -91,17 +104,39 @@ pub fn run(
             kind: PortKind::Unknown,
             display_name: port.to_string(),
         });
+    let plugin = settings
+        .profile_for(&info)
+        .and_then(|profile| profile.plugin.clone());
     let mut serial = settings.serial_config_for(&info);
     if let Some(baud) = args.baud {
         serial.baud = baud;
     }
+    let (codecs, problems) = CodecSet::load(&paths.plugins_dir());
+    for problem in problems {
+        tracing::warn!("{problem}");
+    }
+    let registry = codecs.registry().clone();
+    let decode = plugin.and_then(|name| {
+        let factory = registry.get(&name);
+        if factory.is_none() {
+            tracing::warn!(
+                "the device profile names the plugin {name}, which is not installed; \
+                 nothing is decoded"
+            );
+        }
+        factory
+    });
     tracing::info!(%port, serial = %serial.summary(), script = %source.name, "running a script");
-    Ok(run_headless(
+    Ok(run_headless_with(
         port,
         serial,
         options.transport_factory,
         source,
         ui,
+        HeadlessCodecs {
+            source: Some(registry),
+            decode,
+        },
     ))
 }
 
@@ -283,7 +318,7 @@ mod tests {
         };
         assert!(message.contains("probe.lua:2: boom"), "{message}");
         assert_eq!(exit_code(&outcome), 1);
-        assert_eq!(exit_code(&ScriptOutcome::Stopped), 2);
+        assert_eq!(exit_code(&ScriptOutcome::Stopped), 130);
     }
 
     #[test]
@@ -302,6 +337,64 @@ mod tests {
         assert_eq!(out, "virtual:at @ 57600 8N1\n", "--baud wins");
         let (_, out) = run_script(&dir, &["--port", "virtual:at", "--baud", "12000000"], code);
         assert_eq!(out, "virtual:at @ 12000000 8N1\n", "the top of the list");
+    }
+
+    /// Install the bundled Airoha RACE Lua plugin into `dir`'s config directory.
+    fn install_race_plugin(dir: &TempDir) {
+        let paths = ConfigPaths::new(dir.0.join("config"));
+        let example = CodecSet::default()
+            .examples_to_install()
+            .into_iter()
+            .find(|example| example.name == "airoha-race")
+            .expect("the bundled RACE example");
+        paths.install_example_plugin(example).unwrap();
+    }
+
+    #[test]
+    fn a_script_encodes_with_an_installed_plugin() {
+        let dir = TempDir::new("encode");
+        let code = "print(codecs['airoha-race'] ~= nil)\n";
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, "false\n", "nothing installed yet");
+
+        install_race_plugin(&dir);
+        let code = "local race = assert(codecs['airoha-race'])\n\
+                    print(hex.encode(race.encode{ cmd_id = '0x0F15' }))\n\
+                    local ok, err = pcall(race.encode, {})\n\
+                    print(tostring(err):match('codecs%[\"airoha%-race\"%]%.encode: [^\\n]*'))\n";
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(
+            out,
+            "05 5A 02 00 15 0F\ncodecs[\"airoha-race\"].encode: missing field `cmd_id`\n"
+        );
+    }
+
+    #[test]
+    fn the_profile_s_plugin_decodes_for_on_frame() {
+        let dir = TempDir::new("frames");
+        let code = "local p = serial.current()\n\
+                    local got\n\
+                    local h <close> = p:on_frame({ kind = 'response' }, function(f) got = f end)\n\
+                    p:write(codecs['airoha-race'].encode{ cmd_id = 0x0F15 })\n\
+                    for _ = 1, 200 do if got then break end sleep(10) end\n\
+                    print(got and string.format('%s 0x%04X', got.kind, got.fields.cmd_id))\n";
+        // Installed but not named by a profile: nothing decodes.
+        install_race_plugin(&dir);
+        let (outcome, _) = run_script(&dir, &["--port", "virtual:race"], code);
+        let ScriptOutcome::Error(message) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains("decodes no frames here"), "{message}");
+
+        dir.write(
+            "config/settings.json",
+            r#"{ "devices": [ { "match": { "path": "virtual:race" }, "plugin": "airoha-race" } ] }"#,
+        );
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, "response 0x0F15\n");
     }
 
     /// What `run` opens its port through, for `settings` in a config directory.
@@ -348,14 +441,44 @@ mod tests {
             }
         );
 
-        // No settings file, and one that does not load, both play at 1x and disconnect.
+        // No settings file, and one that does not parse, both play at 1x and disconnect.
         let dir = TempDir::new("replay-no-settings");
         let (options, _) = configured(&dir, None);
         assert_eq!(replay_defaults(&options), ReplayOptions::default());
-        let dir = TempDir::new("replay-bad-settings");
-        let (options, settings) = configured(&dir, Some(r#"{ "replay": { "speed": "warp" } }"#));
+        let dir = TempDir::new("replay-broken-settings");
+        let (options, settings) = configured(&dir, Some(r#"{ "replay": { "speed": "#));
         assert_eq!(replay_defaults(&options), ReplayOptions::default());
         assert_eq!(settings, Settings::default(), "the defaults stand in");
+    }
+
+    #[test]
+    fn one_bad_value_leaves_the_rest_of_the_file_in_force() {
+        let dir = TempDir::new("one-bad-value");
+        let (options, settings) = configured(
+            &dir,
+            Some(
+                r#"{ "replay": { "speed": "warp", "end": "hold" },
+                     "line_ending": "crcrlf", "default_baud": 9600,
+                     "devices": [ { "match": { "path": "tcp:" }, "parity": "sometimes",
+                                    "baud": 57600 } ] }"#,
+            ),
+        );
+        assert_eq!(
+            replay_defaults(&options),
+            ReplayOptions {
+                speed: ReplayOptions::default().speed,
+                end: ReplayEnd::Hold,
+            },
+            "the speed this build cannot read is left out; the end applies"
+        );
+        assert_eq!(settings.line_ending, Settings::default().line_ending);
+        assert_eq!(settings.default_baud, 9600);
+        assert_eq!(settings.devices.len(), 1);
+        assert_eq!(settings.devices[0].baud, Some(57600));
+        assert_eq!(settings.devices[0].parity, None);
+        let mut keys: Vec<&str> = settings.warnings.iter().map(|w| w.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["devices[0].parity", "line_ending", "replay.speed"]);
     }
 
     #[test]

@@ -56,11 +56,13 @@
 //! | `port:read_line(opts)` | `{timeout_ms}` | next received line (text only), or `nil, "timeout" \| "closed"` | yes |
 //! | `port:expect(pattern, opts)` | regex (Rust syntax, smart case), `{timeout_ms}` | `captures, elapsed_ms` (`captures[1]` the match, `[2..]` groups, `false` for a group that did not take part, `.line` the whole line), or `nil, elapsed_ms, "timeout" \| "closed"` | yes |
 //! | `port:on_line(fn)` | `fn(line)` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs for each later line, may wait |
+//! | `port:on_frame(filter, fn)` | optional `filter` (`{ kind = ..., <field> = ... }`), `fn(frame)` | handle with `cancel()`, `active()`, and `<close>` support; error if the session decodes nothing | no; `fn` runs for each later decoded frame `filter` matches, may wait |
 //! | `port:discard()` | | nothing: skips everything unread | no |
 //! | `port:set{dtr=, rts=, baud=}` | booleans, positive integer | nothing | no (queued) |
 //! | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
 //! | `port:description()`, `port:id()` | | strings | no |
 //! | `sleep(ms)` | milliseconds | nothing | yes |
+//! | `timer.after(ms, fn)`, `timer.every(ms, fn)` | milliseconds (`every`: 1 or more), `fn()` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs once after `ms`, or every `ms`, may wait |
 //! | `print(...)` | values | one [`ScriptEvent::Output`], tab-joined | no |
 //! | `log.debug/info/warn/error(...)` | values | [`ScriptUi::log`] and an `Output` line `"[info] ..."`, space-joined | no |
 //! | `ui.prompt(label, default)` | strings | the answer, or `nil` if dismissed; sends [`ScriptEvent::Prompt`] first | yes |
@@ -69,7 +71,16 @@
 //! | `hex.encode(bytes, sep)` | string or byte table, separator (default `" "`) | `"05 5A 00"` | no |
 //! | `hex.decode(text)` | hex text | byte string; error if malformed | no |
 //! | `bytes.from_table(t)`, `bytes.to_table(s)` | byte table / string | string / byte table | no |
+//! | `codecs.<name>.encode(fields)` | a saved command's codec `fields`, as a table (`command` picks the codec's command) | the command's bytes; error if the codec refuses the fields | no |
+//! | `serialist.version`, `serialist.api` | | the app version (a string such as `"1.0.0"`) and the API number (an integer, `1` at 1.0) | no |
 //! | `require(name)`, `dofile(path)` | `"lib.util"` / `"lib/util.lua"` in the scripts directory | the module's value / the file's results | yes (worker thread) |
+//!
+//! **Versions.** Within 1.x the API only gains things, and `serialist.api`
+//! ([`SCRIPT_API`]) goes up by one in each release that adds something. A script that
+//! needs a later addition starts with
+//! `assert(serialist.api >= 2, "this script needs a newer Serialist")`. On a build older
+//! than the one that added `serialist`, the global is `nil`, so write
+//! `assert(serialist and serialist.api >= 2, ...)` to fail with the message there too.
 //!
 //! `string.pack` and `string.unpack` are there for binary frames.
 //!
@@ -91,8 +102,29 @@
 //! commands: `port:expect([[^VAL=(\d+)]])`. Only received lines count, never echoes of
 //! what was sent or app notices.
 //!
-//! **Ending.** A run ends when its main chunk returns; `on_line` handlers still active
-//! then are cancelled. An error in an `on_line` callback ends the run with that error.
+//! **Codecs.** `codecs.<name>` is the codec [`HostServices::codecs`] has under that
+//! name, or `nil` (`codecs["airoha-race"]` for a name with a hyphen). Its
+//! `encode(fields)` builds what a saved command's `{ "codec": …, "fields": { … } }`
+//! payload would from the same fields (a sequence is a list, an empty table too, any
+//! other table an object), adds no line ending, and raises an error naming the codec and
+//! the field when the codec refuses them. The codec is made on the script thread and kept
+//! for the run; a new factory from the source (a reload) makes a new one.
+//!
+//! **Timers.** `timer.after(ms, fn)` calls `fn()` once, `timer.every(ms, fn)` every
+//! `ms`, while the script waits, one call at a time, as `on_line` callbacks run. A call
+//! is never queued: a tick that falls while the last call still runs is skipped. At most
+//! [`Limits::max_callbacks`] timers and `on_frame` handlers are active at once.
+//!
+//! **Frames.** `port:on_frame([filter,] fn)` calls `fn(frame)` for each frame
+//! [`ScriptSession::frames`] gains from the call on that `filter` matches (read like a
+//! saved command's frame predicate, by `serialist_core::codec::frame_matches`). `frame`
+//! has `kind`, `severity`, `summary`, `fields` and `bytes` (the frame's bytes from the
+//! scrollback, `nil` once evicted). Nothing is queued: a handler that falls behind the
+//! bounded frame store skips what it evicted. A session without frames raises an error.
+//!
+//! **Ending.** A run ends when its main chunk returns; `on_line` and `on_frame` handlers
+//! and timers still active then are cancelled. An error in any of their callbacks ends
+//! the run with that error.
 //!
 //! # Sandbox and limits
 //!
@@ -108,28 +140,35 @@
 //!   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
 //!   run, but every later wait fails the same way and the executor drops the script at
 //!   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-//! - Waiting calls work in the main body, required modules and `on_line` callbacks, not
-//!   inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
-//!   (they fail with a message saying so).
+//! - Waiting calls work in the main body, required modules, and `on_line`, `on_frame`
+//!   and timer callbacks, not inside coroutines the script creates with
+//!   `coroutine.create` or `coroutine.wrap` (they fail with a message saying so).
 
 mod api;
 mod bell;
+mod callback;
+mod codecs;
+mod frame;
 mod headless;
 mod hex;
 mod host;
 mod port;
 mod race;
 mod services;
+mod timer;
 mod vm;
 
+pub use api::SCRIPT_API;
 pub use bell::{BellSink, LineBell};
-pub use headless::{HeadlessOpener, HeadlessSession, StdioUi, run_headless};
+pub use headless::{
+    HeadlessCodecs, HeadlessOpener, HeadlessSession, StdioUi, run_headless, run_headless_with,
+};
 pub use hex::{HexError, decode_hex, encode_hex};
 pub use host::{
     HostServices, Limits, RunId, SCRIPT_THREAD_NAME, SCRIPT_WORKER_THREAD_NAME, ScriptEvent,
     ScriptHost, ScriptOutcome, ScriptRun, ScriptSource,
 };
 pub use services::{
-    CommandError, CommandSender, LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture,
-    ScriptSession, ScriptUi,
+    CodecSource, CommandError, CommandSender, LogLevel, OpenError, OpenRequest, PortOpener,
+    PromptFuture, ScriptSession, ScriptUi,
 };
