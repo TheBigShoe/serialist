@@ -266,10 +266,10 @@ to nothing on other targets, so the crate also builds and unit-tests natively.
 crate-type = ["cdylib"]
 
 [dependencies]
-serialist-plugin-sdk = "0.1"
+serialist-plugin-sdk = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-serialist-plugin-sdk = { version = "0.1", features = ["rt"] }
+serialist-plugin-sdk = { version = "0.2", features = ["rt"] }
 ```
 
 Nothing in this repository says the SDK is published to crates.io. From a checkout, point
