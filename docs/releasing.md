@@ -71,8 +71,8 @@ commit, delete the draft release and the tag (`git push --delete origin vX.Y.Z`,
 Run it by hand: Actions, Release, Run workflow. That builds and packages on all three
 systems and keeps the results as workflow artifacts for 14 days. Tick `draft_release` to
 also create the draft. GitHub only offers a manual run for a workflow file that exists on
-the default branch, so do this once after merging the packaging work and before the first
-real tag.
+the default branch, so a change to `release.yml` or `packaging/` is tried this way after it
+merges and before the next tag.
 
 ## Building packages locally
 
@@ -168,5 +168,16 @@ the MSVC linker. It does nothing on other targets.
 - **No version resource on Windows.** `serialist.exe` has an icon but no VERSIONINFO, so
   Explorer's Details tab is empty.
 - **Windows on ARM and Linux arm64** are not built.
-- **First run.** The macOS steps have been run. The Linux and Windows jobs were written on a
-  Mac and have not run; expect to fix small things on the first manual run.
+- **Linux and Windows packages are built but not tried.** The workflow has run three times
+  (a manual run on `main` on 2026-09-30, then the `v0.1.0` and `v0.2.0` tags), and every
+  job passed on all three systems: each built the release binary, ran `--version` on its
+  runner and packaged it, and the two tag runs attached the `.dmg`, the `.tar.gz`, the
+  `.deb`, the `.msi` and `SHA256SUMS` to the release. That proves the Linux and Windows
+  binaries start far enough to print their version, not that they open a window. GitHub
+  counts no download of the Linux or Windows files of either release, so nothing shows that
+  the `.deb` or the tarball has been installed on a Linux desktop or the `.msi` on Windows.
+  Step 6 of [Cutting a release](#cutting-a-release) is the first time that happens.
+- **WiX warns about the Start menu shortcut.** Light reports ICE69 for `main.wxs`: the
+  shortcut's component refers to `serialist.exe`, which belongs to another component of the
+  same feature. The warning does not fail the build, and within one feature the reference
+  holds; nobody has yet seen the shortcut on an installed copy.
