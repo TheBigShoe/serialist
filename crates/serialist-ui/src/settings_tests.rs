@@ -404,6 +404,51 @@ fn a_bad_value_is_refused_beside_its_control_and_the_file_is_untouched(cx: &mut 
     );
 }
 
+/// The loader leaves a value it cannot read out with a warning, but the Settings
+/// screen's writes stay strict: a bad value is never written. A value already in the file
+/// that this build cannot read (one from a later release) does not block other keys.
+#[test]
+fn writes_stay_strict_beside_a_value_from_a_later_release() {
+    let dir = TestDir::new("settings-strict-writes");
+    let paths = ConfigPaths::new(dir.path());
+    std::fs::write(&paths.settings, "{\n  \"line_ending\": \"crcrlf\"\n}\n").unwrap();
+    let read = || std::fs::read_to_string(&paths.settings).unwrap();
+
+    settings_io::write_setting(&paths, "/display/wrap", Some(json!(true))).unwrap();
+    assert_eq!(
+        file_value(&paths.settings, "/display/wrap"),
+        Some(json!(true))
+    );
+
+    for (pointer, value, reason) in [
+        ("/display/hex_bytes_per_row", json!(0), "1 to 256"),
+        ("/line_ending", json!("lfcr"), "unknown variant `lfcr`"),
+        ("/display", json!(5), "invalid type"),
+        (
+            "/devices/0",
+            json!({ "match": {}, "parity": "sometimes" }),
+            "parity must be",
+        ),
+        ("/devices/0", json!({ "baud": 9600 }), "no `match`"),
+    ] {
+        let before = read();
+        let error = settings_io::write_setting(&paths, pointer, Some(value)).unwrap_err();
+        assert!(
+            error.contains(reason) && error.contains("settings.json:"),
+            "{pointer}: {error}"
+        );
+        assert_eq!(read(), before, "{pointer}: the file is untouched");
+    }
+
+    // Putting a value this build reads over the later release's one is a write like any
+    // other.
+    settings_io::write_setting(&paths, "/line_ending", Some(json!("lf"))).unwrap();
+    assert_eq!(
+        file_value(&paths.settings, "/line_ending"),
+        Some(json!("lf"))
+    );
+}
+
 #[gpui_test]
 fn twelve_mbaud_as_the_default_baud_reaches_the_file_and_the_list(cx: &mut TestAppContext) {
     let world = SimWorld::empty();

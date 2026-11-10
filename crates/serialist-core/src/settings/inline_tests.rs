@@ -8,15 +8,19 @@ fn user_settings(text: &str) -> Settings {
     Settings::from_jsonc(text).unwrap_or_else(|err| panic!("settings failed to load: {err}"))
 }
 
-fn error_of(text: &str) -> SettingsError {
-    Settings::from_jsonc(text).expect_err("settings should be rejected")
-}
-
-fn line_of(err: &SettingsError) -> usize {
-    match err {
-        SettingsError::Invalid { line, .. } => *line,
-        other => panic!("expected an Invalid error, got {other:?}"),
-    }
+/// Loads `text`, which sets one `inline` key to a value this build cannot read, checks
+/// that only that key was left out (every setting is the bundled default), and returns
+/// the warning.
+fn rejected(text: &str) -> SettingsWarning {
+    let mut settings = user_settings(text);
+    let [warning] = settings.warnings.as_slice() else {
+        panic!("{text}: {:?}", settings.warnings);
+    };
+    let warning = warning.clone();
+    assert!(warning.is_invalid_value(), "{text}: {warning}");
+    settings.warnings.clear();
+    assert_eq!(settings, Settings::default(), "{text}");
+    warning
 }
 
 #[test]
@@ -71,9 +75,13 @@ fn every_key_is_read() {
 
 #[test]
 fn backspace_takes_names_and_byte_values() {
-    let backspace = |value: &str| {
-        Settings::from_jsonc(&format!(r#"{{ "inline": {{ "backspace": {value} }} }}"#))
-            .map(|settings| settings.inline.backspace)
+    let text = |value: &str| format!(r#"{{ "inline": {{ "backspace": {value} }} }}"#);
+    let backspace = |value: &str| -> Result<BackspaceKey, SettingsWarning> {
+        let settings = user_settings(&text(value));
+        match settings.warnings.first() {
+            Some(warning) => Err(warning.clone()),
+            None => Ok(settings.inline.backspace),
+        }
     };
     for value in [
         r#""del""#,
@@ -106,25 +114,44 @@ fn backspace_takes_names_and_byte_values() {
         "[]",
     ] {
         assert!(backspace(value).is_err(), "{value} should be rejected");
+        rejected(&text(value));
     }
 }
 
 #[test]
-fn bad_values_are_errors_with_positions() {
-    let err = error_of("{\n  \"inline\": {\n    \"backspace\": \"0x20\"\n  }\n}");
-    assert!(err.to_string().contains("\"del\""), "{err}");
-    assert!(err.to_string().contains("\"bs\""), "{err}");
-    assert_eq!(line_of(&err), 3);
+fn bad_values_are_warnings_with_positions() {
+    let warning = rejected("{\n  \"inline\": {\n    \"backspace\": \"0x20\"\n  }\n}");
+    assert!(warning.to_string().contains("\"del\""), "{warning}");
+    assert!(warning.to_string().contains("\"bs\""), "{warning}");
+    assert_eq!((warning.line, warning.column), (3, 18));
+    assert_eq!(warning.key, "inline.backspace");
 
-    let err = error_of("{\n  \"inline\": { \"escape_chord\": \"ctrl-x ctrl-c\" }\n}");
-    assert!(err.to_string().contains("one keystroke"), "{err}");
-    assert_eq!(line_of(&err), 2);
+    let warning = rejected("{\n  \"inline\": { \"escape_chord\": \"ctrl-x ctrl-c\" }\n}");
+    assert!(warning.to_string().contains("one keystroke"), "{warning}");
+    assert_eq!((warning.line, warning.column), (2, 31));
+    assert_eq!(warning.key, "inline.escape_chord");
 
-    let err = error_of(r#"{ "inline": { "escape_chord": "a" } }"#);
-    assert!(err.to_string().contains("needs ctrl, alt or cmd"), "{err}");
+    let warning = rejected(r#"{ "inline": { "escape_chord": "a" } }"#);
+    assert!(
+        warning.to_string().contains("needs ctrl, alt or cmd"),
+        "{warning}"
+    );
 
-    let err = error_of(r#"{ "inline": { "escape_chord": 5 } }"#);
-    assert!(err.to_string().contains("expected a keystroke"), "{err}");
+    let warning = rejected(r#"{ "inline": { "escape_chord": 5 } }"#);
+    assert!(
+        warning.to_string().contains("expected a keystroke"),
+        "{warning}"
+    );
+
+    // One bad key leaves the object's other keys in force.
+    let settings = user_settings(
+        r#"{ "inline": { "backspace": "bs", "paste_chunk_bytes": 0, "paste_chunk_delay_ms": 30 } }"#,
+    );
+    assert_eq!(settings.inline.backspace, BackspaceKey::Bs);
+    assert_eq!(settings.inline.paste_chunk_bytes, 64);
+    assert_eq!(settings.inline.paste_chunk_delay_ms, 30);
+    let keys: Vec<&str> = settings.warnings.iter().map(|w| w.key.as_str()).collect();
+    assert_eq!(keys, ["inline.paste_chunk_bytes"]);
 
     for bad in [
         r#"{ "inline": { "paste_chunk_bytes": 0 } }"#,
@@ -138,10 +165,7 @@ fn bad_values_are_errors_with_positions() {
         r#"{ "inline": [] }"#,
         r#"{ "inline": "ctrl-]" }"#,
     ] {
-        assert!(
-            Settings::from_jsonc(bad).is_err(),
-            "{bad} should be rejected"
-        );
+        rejected(bad);
     }
     // The limits themselves are fine.
     let edge = user_settings(

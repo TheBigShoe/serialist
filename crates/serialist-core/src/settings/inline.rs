@@ -12,8 +12,9 @@
 //! }
 //! ```
 //!
-//! Every value is checked when the settings load, and a bad one is an error naming the
-//! file, line and column, as for every other key. The escape chord is checked for
+//! Every value is checked when the settings load; a bad one is left out with a warning
+//! naming the file, line and column, as for every other key, and the layer below keeps
+//! that key. The escape chord is checked for
 //! keystroke syntax only (this crate has no window system to ask); the UI turns the
 //! string into a keystroke and falls back to the default if it cannot.
 

@@ -75,7 +75,8 @@ pub use settings::{
     BackspaceKey, ConfigPaths, DeviceMatch, DeviceProfile, DisplaySettings, DisplayView, Emulation,
     FontFeatures, FontSpec, InlineSettings, KeyChange, KeymapEditor, LineEnding, LineHeight,
     Platform, ReplaySettings, Settings, SettingsEditor, SettingsError, SettingsWarning,
-    TerminalSettings, ThemeMode, ThemeSelection, TimestampMode, UsbId, load_settings,
+    SettingsWarningKind, TerminalSettings, ThemeMode, ThemeSelection, TimestampMode, UsbId,
+    load_settings,
 };
 pub use store::{
     AppendReport, HexStyles, HexView, Snapshot, Store, StoreConfig, StoreReader, StoreStats,

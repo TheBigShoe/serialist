@@ -39,7 +39,8 @@ pub fn exit_code(outcome: &ScriptOutcome) -> i32 {
 
 /// What a headless run opens its port through: the options for `args` over `real` and
 /// `world` (see [`wiring::build`]) and the settings under `paths`, which are the defaults
-/// when they do not load. The `replay` setting is applied here, so a `replay:` port or a
+/// when a file does not parse; a key whose value this build cannot read is left out with
+/// a logged warning and the rest of the file applies. The `replay` setting is applied here, so a `replay:` port or a
 /// script's `serial.open` plays at the speed and end the settings name (an id's own
 /// `?speed=` and `?end=` still win), as it does in the window.
 pub(crate) fn configured_options(
@@ -50,7 +51,14 @@ pub(crate) fn configured_options(
 ) -> anyhow::Result<(AppOptions, Settings)> {
     let options = wiring::build(args, real, world)?;
     let settings = match load_settings(Some(&paths.settings), paths.project_settings.as_deref()) {
-        Ok(settings) => settings,
+        Ok(settings) => {
+            // An unknown key, or a value this build cannot read: that key alone is left
+            // out and the rest of the file applies, as in the window.
+            for warning in &settings.warnings {
+                tracing::warn!("{warning}");
+            }
+            settings
+        }
         Err(error) => {
             tracing::warn!(%error, "settings not applied; using the defaults");
             Settings::default()
@@ -433,14 +441,44 @@ mod tests {
             }
         );
 
-        // No settings file, and one that does not load, both play at 1x and disconnect.
+        // No settings file, and one that does not parse, both play at 1x and disconnect.
         let dir = TempDir::new("replay-no-settings");
         let (options, _) = configured(&dir, None);
         assert_eq!(replay_defaults(&options), ReplayOptions::default());
-        let dir = TempDir::new("replay-bad-settings");
-        let (options, settings) = configured(&dir, Some(r#"{ "replay": { "speed": "warp" } }"#));
+        let dir = TempDir::new("replay-broken-settings");
+        let (options, settings) = configured(&dir, Some(r#"{ "replay": { "speed": "#));
         assert_eq!(replay_defaults(&options), ReplayOptions::default());
         assert_eq!(settings, Settings::default(), "the defaults stand in");
+    }
+
+    #[test]
+    fn one_bad_value_leaves_the_rest_of_the_file_in_force() {
+        let dir = TempDir::new("one-bad-value");
+        let (options, settings) = configured(
+            &dir,
+            Some(
+                r#"{ "replay": { "speed": "warp", "end": "hold" },
+                     "line_ending": "crcrlf", "default_baud": 9600,
+                     "devices": [ { "match": { "path": "tcp:" }, "parity": "sometimes",
+                                    "baud": 57600 } ] }"#,
+            ),
+        );
+        assert_eq!(
+            replay_defaults(&options),
+            ReplayOptions {
+                speed: ReplayOptions::default().speed,
+                end: ReplayEnd::Hold,
+            },
+            "the speed this build cannot read is left out; the end applies"
+        );
+        assert_eq!(settings.line_ending, Settings::default().line_ending);
+        assert_eq!(settings.default_baud, 9600);
+        assert_eq!(settings.devices.len(), 1);
+        assert_eq!(settings.devices[0].baud, Some(57600));
+        assert_eq!(settings.devices[0].parity, None);
+        let mut keys: Vec<&str> = settings.warnings.iter().map(|w| w.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["devices[0].parity", "line_ending", "replay.speed"]);
     }
 
     #[test]

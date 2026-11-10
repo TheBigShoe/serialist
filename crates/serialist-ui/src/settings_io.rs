@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use serialist_core::settings::{ConfigPaths, SettingsLayer, load_settings_from_layers};
+use serialist_core::settings::{
+    ConfigPaths, SettingsLayer, SettingsWarning, SettingsWarningKind, load_settings_from_layers,
+};
 use serialist_core::{
     ActionRef, CommandRef, CommandStore, EditError as CommandEditError, Keymap, KeymapEditor,
     Settings, SettingsEditError, SettingsEditor, load_keymap, load_settings,
@@ -123,7 +125,8 @@ pub fn write_setting(
     pointer: &str,
     value: Option<Value>,
 ) -> Result<(), String> {
-    edit_settings(paths, pointer, |editor| match &value {
+    let key = dotted_key(pointer);
+    edit_settings(paths, pointer, Some(&key), |editor| match &value {
         Some(value) => editor.set(pointer, value.clone()),
         None => editor.remove_and_prune(pointer).map(drop),
     })
@@ -134,17 +137,91 @@ pub fn write_setting(
 /// with it along and leaving the rest of the file as it was. Checked and written the way
 /// [`write_setting`] does, with the same messages for a file that does not load.
 pub fn move_setting_element(paths: &ConfigPaths, pointer: &str, to: usize) -> Result<(), String> {
-    edit_settings(paths, pointer, |editor| {
+    edit_settings(paths, pointer, None, |editor| {
         editor.move_element(pointer, to).map(drop)
     })
+}
+
+/// The loader's dotted spelling of a JSON pointer: `/display/wrap` is `display.wrap`,
+/// `/devices/0/baud` is `devices[0].baud`.
+fn dotted_key(pointer: &str) -> String {
+    let mut key = String::new();
+    for token in pointer.split('/').skip(1) {
+        let token = token.replace("~1", "/").replace("~0", "~");
+        if !key.is_empty() && token.parse::<usize>().is_ok() {
+            key.push_str(&format!("[{token}]"));
+        } else {
+            if !key.is_empty() {
+                key.push('.');
+            }
+            key.push_str(&token);
+        }
+    }
+    key
+}
+
+/// The values the loader left out of `file` (the user's file: a project's own problems
+/// are not the edit's).
+fn skipped_values(settings: Settings, file: &Path) -> Vec<SettingsWarning> {
+    settings
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.is_invalid_value() && warning.file == file)
+        .collect()
+}
+
+/// Why an edit is refused, when it is: the loader leaves out the value written at `key`
+/// (or one inside it), or more values than it did before the edit. A value the file
+/// already held that this build cannot read (one from a later release) does not stop
+/// edits to other keys.
+fn refusal(
+    before: &[SettingsWarning],
+    after: &[SettingsWarning],
+    key: Option<&str>,
+) -> Option<String> {
+    let names_key = |warning: &&SettingsWarning| {
+        key.is_some_and(|key| {
+            warning.key == key
+                || warning.key.starts_with(&format!("{key}."))
+                || warning.key.starts_with(&format!("{key}["))
+        })
+    };
+    let warning = after.iter().find(names_key).or_else(|| {
+        if after.len() <= before.len() {
+            return None;
+        }
+        after
+            .iter()
+            .find(|warning| {
+                !before
+                    .iter()
+                    .any(|old| old.key == warning.key && old.message == warning.message)
+            })
+            .or(after.last())
+    })?;
+    let reason = match &warning.kind {
+        SettingsWarningKind::InvalidValue { reason } => reason.as_str(),
+        SettingsWarningKind::UnknownKey => warning.message.as_str(),
+    };
+    Some(format!(
+        "{}:{}:{}: {reason}",
+        warning.file.display(),
+        warning.line,
+        warning.column
+    ))
 }
 
 /// Apply `edit` to the user's `settings.json` in memory, load the result as the app will,
 /// then save it, undoing the save if the file does not load after all. `pointer` names
 /// the key for the log.
+///
+/// The check is stricter than loading: the loader leaves a value it cannot read out with
+/// a warning, but an edit that makes it do so, at `key` or anywhere new, is refused with
+/// the loader's reason and nothing is written.
 fn edit_settings(
     paths: &ConfigPaths,
     pointer: &str,
+    key: Option<&str>,
     edit: impl Fn(&mut SettingsEditor) -> Result<(), SettingsEditError>,
 ) -> Result<(), String> {
     let project = project_layer(paths)?;
@@ -159,7 +236,17 @@ fn edit_settings(
         // Load the edited text as the app will before it reaches the disk.
         let mut layers = vec![SettingsLayer::new(&paths.settings, editor.text())];
         layers.extend(project.clone());
-        load_settings_from_layers(&layers).map_err(|error| error.to_string())?;
+        let loaded = load_settings_from_layers(&layers).map_err(|error| error.to_string())?;
+        let skipped = skipped_values(loaded, &paths.settings);
+        let mut before_layers = vec![SettingsLayer::new(&paths.settings, before.as_str())];
+        before_layers.extend(project.clone());
+        // A file that did not load before the edit counts as leaving nothing out.
+        let skipped_before = load_settings_from_layers(&before_layers)
+            .map(|settings| skipped_values(settings, &paths.settings))
+            .unwrap_or_default();
+        if let Some(reason) = refusal(&skipped_before, &skipped, key) {
+            return Err(reason);
+        }
         match editor.save() {
             Ok(()) => {}
             Err(SettingsEditError::Changed { .. }) if attempt < ATTEMPTS => {
