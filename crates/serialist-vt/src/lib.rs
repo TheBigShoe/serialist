@@ -64,13 +64,19 @@
 //! or write the clipboard. Mouse reporting is tracked in [`VtModes`] but Serialist sends
 //! no mouse reports yet.
 //!
+//! # Wide characters
+//!
+//! Alacritty measures character widths, and a wide character (CJK, most emoji) takes two
+//! cells. A line's text has it once (the spacer cell is skipped), and a combining mark
+//! follows its base character and takes no cell. [`cell_width`] says how many cells each
+//! character of a line's text takes, and they add up to the columns the device put the
+//! characters in; half of a wide character whose other half was deleted shows as a blank.
+//! The terminal element lays a screen line out by it: each character is drawn in its
+//! cell, selection and hit testing count cells, and the text, which is what copy gives,
+//! has each character once. [`CursorState::column`] is a cell.
+//!
 //! # Known limitations
 //!
-//! - **Wide characters.** Alacritty measures character widths, and a wide character
-//!   takes two cells. The line text has it once (the spacer cell is skipped), but the
-//!   terminal element draws one character per column, so the rest of that row is drawn
-//!   one column left per wide character before it. Combining marks stay with their base
-//!   character and take no column, which the element gets right.
 //! - **Palette changes** (OSC 4, 10, 11) are accepted but not shown: colors reach the
 //!   element as theme slots ([`Color::Ansi`](serialist_core::Color::Ansi) and friends).
 //! - **Clearing the screen keeps it**: `CSI 2 J` on the primary screen scrolls what was
@@ -96,6 +102,7 @@ mod scrollback;
 mod sink;
 mod snapshot;
 
+pub use convert::cell_width;
 pub use events::{ColorRequest, MAX_EVENTS, VtEvent};
 pub use keys::vt_key_bytes;
 pub use screen::{

@@ -277,6 +277,15 @@ const SHOTS: &[Shot] = &[
         connect: None,
         drive: vt_capture_menu,
     },
+    // Wide characters in VT mode: CJK, an emoji and a combining accent inside a box.
+    Shot {
+        file: "24-vt-wide-characters.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: None,
+        drive: vt_capture_wide,
+    },
 ];
 
 // --- The shots -----------------------------------------------------------------------
@@ -793,6 +802,57 @@ fn vt_capture_menu(stage: &mut Stage) {
     });
     let expected = vt_menu_screen();
     assert_eq!(&screen[..expected.len()], &expected[..]);
+}
+
+/// A box with CJK text, an emoji and a combining accent inside it, each row's right
+/// border put in column 18 by cursor addressing: drawn in their cells, the borders line
+/// up.
+fn vt_wide_capture() -> Vec<(u64, Vec<u8>)> {
+    let mut text = String::from("\x1b[2J\x1b[2;3H┌─\x1b[13b┐");
+    for (row, content) in [
+        (3, "日本語 テスト"),
+        (4, "emoji \u{1f600} ok"),
+        (5, "e\u{301}cole café"),
+        (6, "ascii text"),
+    ] {
+        text += &format!("\x1b[{row};3H│{content}\x1b[{row};18H│");
+    }
+    text += "\x1b[7;3H└─\x1b[13b┘\x1b[9;3H";
+    vec![
+        (0, b"\x1b[0m".to_vec()),
+        (VT_CAPTURE_START, text.into_bytes()),
+    ]
+}
+
+/// What [`vt_wide_capture`] leaves on the screen's rows 1 to 6.
+const VT_WIDE_SCREEN: [&str; 6] = [
+    "  ┌──────────────┐",
+    "  │日本語 テスト │",
+    "  │emoji \u{1f600} ok   │",
+    "  │e\u{301}cole café    │",
+    "  │ascii text    │",
+    "  └──────────────┘",
+];
+
+/// [`vt_wide_capture`] replayed into a session in VT mode, its rows checked against
+/// [`VT_WIDE_SCREEN`] before the picture.
+fn vt_capture_wide(stage: &mut Stage) {
+    let raw = write_capture(&stage.dir.join("vt-wide.bin"), &vt_wide_capture());
+    let view = stage.open_vt_capture(raw);
+    run_until(&mut stage.cx, "the box", |cx| {
+        view.read_with(cx, |v, _| {
+            v.vt_snapshot()
+                .is_some_and(|snapshot| snapshot.screen_text().get(6) == Some(&VT_WIDE_SCREEN[5]))
+        })
+    });
+    let screen: Vec<String> = view.read_with(&stage.cx, |v, _| {
+        let snapshot = v.vt_snapshot().expect("a screen");
+        snapshot.screen_text()[1..7]
+            .iter()
+            .map(|row| row.to_string())
+            .collect()
+    });
+    assert_eq!(screen, VT_WIDE_SCREEN);
 }
 
 /// A loopback listener that writes a banner to the first client and holds the connection

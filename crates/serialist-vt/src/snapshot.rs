@@ -27,7 +27,8 @@ pub struct CursorState {
     /// The row the cursor is on, a visible row of the snapshot.
     pub line: LineId,
     /// The cursor's cell column, 0-based. After a wide character this is one more than
-    /// its character index in the line's text (see the crate docs on wide characters).
+    /// its character index in the line's text: count cells with
+    /// [`cell_width`](crate::cell_width) (see the crate docs on wide characters).
     pub column: usize,
     pub shape: CursorShape,
     /// `false` when the device hid it (`CSI ? 25 l`, or a hidden cursor style).
