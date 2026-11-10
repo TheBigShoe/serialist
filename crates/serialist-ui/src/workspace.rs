@@ -205,7 +205,11 @@ pub fn open_main_window(options: AppOptions, cx: &mut App) -> Result<Entity<Work
         }),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(640.), px(400.))),
-        app_id: Some("dev.serialist.Serialist".into()),
+        // On Linux this is the Wayland app id and both halves of the X11 WM_CLASS. Desktops
+        // match a window to its `.desktop` entry by them (the app id against the file's
+        // name, WM_CLASS against `StartupWMClass`), so it must stay equal to the
+        // `serialist.desktop` that packaging/linux installs. Other platforms ignore it.
+        app_id: Some("serialist".into()),
         ..Default::default()
     };
     let (_, workspace) = kit_open_window(window_options, cx, |window, cx| {
