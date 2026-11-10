@@ -438,3 +438,39 @@ fn repeating_a_mark_does_not_grow_its_cell() {
         format!("e{}x", "\u{301}".repeat(MAX_ZERO_WIDTH))
     );
 }
+
+#[test]
+fn insert_mode_moves_the_rest_of_the_row_right() {
+    // `CSI 4 h`: a character pushes what is under and after the cursor along, and what
+    // reaches the end of the row falls off.
+    let mut screen = VtScreen::new(8, 2, 10);
+    screen.feed(b"abcdef\x1b[1;2H\x1b[4hXY");
+    assert_eq!(screen_text(&screen.snapshot())[0], "aXYbcdef");
+    screen.feed(b"Z");
+    let snap = screen.snapshot();
+    assert_eq!(screen_text(&snap)[0], "aXYZbcde");
+    assert_eq!(snap.cursor().expect("a cursor").column, 4);
+    // Back in replace mode a character overwrites.
+    screen.feed(b"\x1b[4l12");
+    assert_eq!(screen_text(&screen.snapshot())[0], "aXYZ12de");
+}
+
+#[test]
+fn a_repeat_in_insert_mode_fills_rows_and_pushes_text_off() {
+    // The repeat goes through blank cells (nothing to move), wraps, and then pushes
+    // `tail` off the end of the second row a cell at a time.
+    let mut screen = VtScreen::new(10, 3, 10);
+    screen.feed(b"\x1b[2;4Htail\x1b[1;1H\x1b[4hx\x1b[12b");
+    assert_eq!(
+        screen_text(&screen.snapshot()),
+        ["xxxxxxxxxx", "xxx   tail", ""]
+    );
+    screen.feed(b"\x1b[3b");
+    assert_eq!(
+        screen_text(&screen.snapshot()),
+        ["xxxxxxxxxx", "xxxxxx   t", ""]
+    );
+    // A wide character takes two cells and moves the rest by two.
+    screen.feed(b"\x1b[3;1Hab\x1b[3;1H\xe6\x97\xa5");
+    assert_eq!(screen_text(&screen.snapshot())[2], "\u{65e5}ab");
+}
