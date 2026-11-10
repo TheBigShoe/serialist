@@ -16,7 +16,7 @@ use serialist_core::PortSource;
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 
-use crate::services::{CommandSender, PortOpener, ScriptSession, ScriptUi};
+use crate::services::{CodecSource, CommandSender, PortOpener, ScriptSession, ScriptUi};
 
 /// Name of the thread every script of a host runs on.
 pub const SCRIPT_THREAD_NAME: &str = "serialist-script";
@@ -66,13 +66,15 @@ pub struct HostServices {
     pub opener: Option<Arc<dyn PortOpener>>,
     /// Backs `serial.ports()` and `serial.open{ match = ... }`.
     pub ports: Option<Arc<dyn PortSource>>,
+    /// Backs `codecs.<name>.encode`. `None` leaves `codecs` empty.
+    pub codecs: Option<Arc<dyn CodecSource>>,
     /// The only directory `require` and `dofile` read from. `None` disables both.
     pub scripts_dir: Option<PathBuf>,
     pub limits: Limits,
 }
 
 impl HostServices {
-    /// Only a UI: no session, commands, opener, port list or scripts directory.
+    /// Only a UI: no session, commands, opener, port list, codecs or scripts directory.
     pub fn new(ui: Arc<dyn ScriptUi>) -> Self {
         Self {
             session: None,
@@ -80,6 +82,7 @@ impl HostServices {
             commands: None,
             opener: None,
             ports: None,
+            codecs: None,
             scripts_dir: None,
             limits: Limits::default(),
         }
@@ -93,6 +96,7 @@ impl fmt::Debug for HostServices {
             .field("commands", &self.commands.is_some())
             .field("opener", &self.opener.is_some())
             .field("ports", &self.ports.is_some())
+            .field("codecs", &self.codecs.is_some())
             .field("scripts_dir", &self.scripts_dir)
             .field("limits", &self.limits)
             .finish_non_exhaustive()
