@@ -42,8 +42,8 @@ use serialist_core::settings::{
     ConfigPaths, MAX_PASTE_CHUNK_BYTES, MAX_PASTE_CHUNK_DELAY_MS, validate_chord,
 };
 use serialist_core::{
-    BackspaceKey, DisplayView, Emulation, LineEnding, LineHeight, PortSource, Settings, ThemeMode,
-    ThemeSelection, TimestampMode,
+    BackspaceKey, DisplayView, Emulation, LineEnding, LineHeight, PortSource, ReplayEnd,
+    ReplaySpeed, Settings, ThemeMode, ThemeSelection, TimestampMode,
 };
 
 pub use self::devices::{MatchKey, ProfileEditor, match_summary, profile_json};
@@ -58,6 +58,7 @@ use crate::keystroke_input::{KeystrokeInput, KeystrokeInputEvent};
 use crate::port_settings::STANDARD_BAUDS;
 use crate::prelude::*;
 use crate::settings_io::{self, Origin, SettingsFiles};
+use crate::status::replay_speeds;
 
 /// How long a text field waits after the last keystroke before it writes.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -116,7 +117,7 @@ impl Section {
             Section::Appearance => "Theme and the font of panels, tabs and the status line.",
             Section::TerminalFont => "The font of the scrollback.",
             Section::Display => "How each new session shows what it receives.",
-            Section::Session => "Defaults for opening a port, and inline mode.",
+            Section::Session => "Defaults for opening a port, playing a capture, and inline mode.",
             Section::Devices => {
                 "Per-device profiles. The first profile whose match fits a port applies when it connects."
             }
@@ -464,10 +465,12 @@ pub enum Pick {
     TerminalFamily,
     /// The standard rates, which fill the default baud field.
     Baud,
+    /// `replay.speed`, from the speeds the replay toolbar's menu offers.
+    ReplaySpeed,
 }
 
 impl Pick {
-    const ALL: [Pick; 9] = [
+    const ALL: [Pick; 10] = [
         Pick::LightTheme,
         Pick::DarkTheme,
         Pick::UiWeight,
@@ -477,6 +480,7 @@ impl Pick {
         Pick::BufferFamily,
         Pick::TerminalFamily,
         Pick::Baud,
+        Pick::ReplaySpeed,
     ];
 }
 
@@ -676,6 +680,10 @@ impl SettingsView {
                     (families.clone(), true)
                 }
                 Pick::Baud => (STANDARD_BAUDS.iter().map(u32::to_string).collect(), false),
+                Pick::ReplaySpeed => (
+                    replay_speeds().iter().map(ReplaySpeed::to_string).collect(),
+                    false,
+                ),
             };
             let selected = Self::pick_value(pick, &settings, cx);
             let index = selected
@@ -880,6 +888,7 @@ impl SettingsView {
             Pick::BufferFamily => settings.buffer_font_family.clone(),
             Pick::TerminalFamily => settings.terminal.font_family.clone(),
             Pick::Baud => Some(settings.default_baud.to_string()),
+            Pick::ReplaySpeed => Some(settings.replay.speed.to_string()),
         }
     }
 
@@ -1021,6 +1030,11 @@ impl SettingsView {
             Pick::BufferFamily => self.enter(Field::BufferFontFamily, value, window, cx),
             Pick::TerminalFamily => self.enter(Field::TerminalFontFamily, value, window, cx),
             Pick::Baud => self.enter(Field::DefaultBaud, value, window, cx),
+            Pick::ReplaySpeed => {
+                if let Ok(speed) = value.parse() {
+                    self.set_replay_speed(speed, window, cx);
+                }
+            }
         }
     }
 
@@ -1094,6 +1108,21 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         self.write(pointer, Some(json!(on)), window, cx);
+    }
+
+    /// `replay.speed`, written as the settings file spells it (`"4x"`, `"max"`).
+    pub fn set_replay_speed(
+        &mut self,
+        speed: ReplaySpeed,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.write("/replay/speed", Some(json!(speed.to_string())), window, cx);
+    }
+
+    /// `replay.end`: `"disconnect"` or `"hold"`.
+    pub fn set_replay_end(&mut self, end: ReplayEnd, window: &mut Window, cx: &mut Context<Self>) {
+        self.write("/replay/end", Some(json!(end.to_string())), window, cx);
     }
 
     /// The escape chord, from the recorder or the text field.
@@ -1787,6 +1816,38 @@ impl SettingsView {
                 cx,
             ),
         ];
+        // A speed the list does not offer ("3x" written in settings.json) has no item to
+        // select, so the picker shows it as its placeholder.
+        let speed = settings.replay.speed.to_string();
+        let ends = [ReplayEnd::Disconnect, ReplayEnd::Hold];
+        let replay = vec![
+            self.row(
+                "Speed",
+                "/replay/speed",
+                div()
+                    .w(px(160.))
+                    .child(self.select(Pick::ReplaySpeed, &speed, "/replay/speed")),
+                Some("1x is the recorded pace; max plays as fast as the session reads".to_owned()),
+                cx,
+            ),
+            self.row(
+                "At the end",
+                "/replay/end",
+                self.segmented(
+                    "settings-replay-end",
+                    &["Disconnect", "Hold"],
+                    ends.iter().position(|end| *end == settings.replay.end),
+                    "/replay/end",
+                    move |this, ix, window, cx| this.set_replay_end(ends[ix], window, cx),
+                    cx,
+                ),
+                Some(
+                    "Disconnect ends the session after the last byte; Hold keeps the port open"
+                        .to_owned(),
+                ),
+                cx,
+            ),
+        ];
         let locked_chord = self.locked(Field::EscapeChord.pointer());
         let chord = h_flex()
             .gap_1()
@@ -1846,6 +1907,7 @@ impl SettingsView {
         ];
         vec![
             self.group("Opening a port", port, cx),
+            self.group("Replay", replay, cx),
             self.group("Inline mode", inline, cx),
         ]
     }

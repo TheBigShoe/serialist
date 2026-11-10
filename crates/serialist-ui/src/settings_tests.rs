@@ -6,7 +6,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use serialist_core::settings::ConfigPaths;
-use serialist_core::{Command, CommandRef, CommandStore, PortId, SettingsEditor, ThemeMode};
+use serialist_core::{
+    Command, CommandRef, CommandStore, PortId, ReplayEnd, ReplaySettings, ReplaySpeed,
+    SettingsEditor, ThemeMode,
+};
 use serialist_sim::{EchoDevice, LinkConfig, SimWorld};
 
 use crate::actions::keys;
@@ -268,6 +271,86 @@ fn ligatures_theme_and_default_write_and_remove_their_keys(cx: &mut TestAppConte
         v.reset("/buffer_font_features/calt", window, cx);
     });
     assert_eq!(file_value(&paths.settings, "/buffer_font_features"), None);
+}
+
+#[gpui_test]
+fn replay_speed_and_end_write_their_keys_and_reach_the_config(cx: &mut TestAppContext) {
+    let world = SimWorld::empty();
+    let (window, workspace) = open_workspace(cx, &world, None);
+    let (_dir, paths) = template_dir("settings-replay");
+    start(cx, &paths);
+    let view = open_settings(cx, window, &workspace);
+    show(cx, window, Section::Session);
+    let picked = |cx: &mut TestAppContext| {
+        view.read_with(cx, |v, cx| {
+            v.picker(Pick::ReplaySpeed)
+                .read(cx)
+                .selected_value()
+                .cloned()
+        })
+    };
+    assert_eq!(picked(cx).as_deref(), Some("1x"));
+
+    // "Hold" in the segmented control.
+    cx.update_window(window, |_, window, cx| {
+        window.click("settings-replay-end-1", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        file_value(&paths.settings, "/replay/end"),
+        Some(json!("hold"))
+    );
+
+    update_view(cx, window, &view, |v, window, cx| {
+        v.set_replay_speed(ReplaySpeed::Max, window, cx);
+    });
+    assert_eq!(
+        file_value(&paths.settings, "/replay/speed"),
+        Some(json!("max"))
+    );
+    let text = std::fs::read_to_string(&paths.settings).unwrap();
+    assert!(
+        text.contains("\"1x\" plays at the recorded pace"),
+        "the comment above the speed stays"
+    );
+    run_until(cx, "the replay settings in the config", |cx| {
+        cx.update(|cx| {
+            let replay = cx.global::<Config>().settings().replay;
+            replay.speed == ReplaySpeed::Max && replay.end == ReplayEnd::Hold
+        })
+    });
+    run_until(cx, "the list to show max", |cx| {
+        picked(cx).as_deref() == Some("max")
+    });
+
+    // A speed the list does not offer selects nothing; picking one replaces it.
+    SettingsEditor::set_in_file(&paths.settings, "/replay/speed", "3x").unwrap();
+    run_until(cx, "the screen to read 3x", |cx| {
+        view.read_with(cx, |v, _| {
+            v.settings().replay.speed == ReplaySpeed::times(3.0).unwrap()
+        })
+    });
+    assert_eq!(picked(cx), None);
+    update_view(cx, window, &view, |v, window, cx| {
+        v.set_replay_speed(ReplaySpeed::times(0.5).unwrap(), window, cx);
+    });
+    assert_eq!(
+        file_value(&paths.settings, "/replay/speed"),
+        Some(json!("0.5x"))
+    );
+
+    // "Default" takes the keys out again.
+    for pointer in ["/replay/speed", "/replay/end"] {
+        update_view(cx, window, &view, |v, window, cx| {
+            v.reset(pointer, window, cx)
+        });
+        assert_eq!(file_value(&paths.settings, pointer), None);
+    }
+    assert_eq!(
+        view.read_with(cx, |v, _| v.settings().replay),
+        ReplaySettings::default()
+    );
 }
 
 #[gpui_test]
