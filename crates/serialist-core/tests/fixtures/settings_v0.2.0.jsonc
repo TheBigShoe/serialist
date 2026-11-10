@@ -1,0 +1,101 @@
+// A settings.json as Serialist 0.2.0 accepted it: every key that release read, each
+// set to a value other than its default, in the value forms the defaults file documents
+// (and the extra spellings the loader takes). Later releases must load it unchanged and
+// with no warnings: see tests/settings_compat.rs.
+{
+  "buffer_font_family": "Berkeley Mono",
+  "buffer_font_size": 13.5,
+  "buffer_font_weight": 500,
+  "buffer_font_features": { "calt": false, "ss01": true, "cv01": 7 },
+  "buffer_line_height": 1.45,
+  "buffer_font_fallbacks": ["Symbols Nerd Font Mono", "Noto Emoji"],
+
+  "ui_font_family": "Inter",
+  "ui_font_size": 14,
+  "ui_font_weight": 600,
+  "ui_font_features": { "tnum": true },
+  "ui_font_fallbacks": ["Noto Sans"],
+
+  "terminal": {
+    "font_family": "JetBrains Mono",
+    "font_size": 12,
+    "font_weight": 300,
+    "font_features": { "liga": 0 },
+    "font_fallbacks": ["Menlo"],
+    "line_height": { "custom": 1.5 },
+    "emulation": "vt",
+    "cursor_blink": true,
+  },
+
+  "theme": {
+    "mode": "dark",
+    "light": "Serialist Paper",
+    "dark": "Serialist Ember",
+  },
+
+  "display": {
+    "timestamps": "absolute",
+    "timestamp_format": "%H:%M:%S",
+    "view": "hex_ascii",
+    "hex_bytes_per_row": 32,
+    "show_control_chars": true,
+    "wrap": true,
+    "decoded_inline": false,
+    "hide_framed_bytes": false,
+  },
+
+  "scrollback_budget_bytes": 67108864,
+  "default_baud": 921600,
+  "line_ending": "lf",
+  "local_echo": true,
+  "restore_session": false,
+
+  "replay": { "speed": "4x", "end": "hold" },
+
+  "inline": {
+    "backspace": "bs",
+    "escape_chord": "ctrl-alt-x",
+    "paste_chunk_bytes": 16,
+    "paste_chunk_delay_ms": 25,
+  },
+
+  "devices": [
+    // Names everywhere, and the hex string forms of a USB id.
+    {
+      "name": "Airoha headset",
+      "match": {
+        "vid": "0x0e8d",
+        "pid": "0616",
+        "product": "Airoha",
+        "manufacturer": "Airoha Technology",
+        "serial_number": "AB12",
+      },
+      "baud": 921600,
+      "data_bits": "seven",
+      "parity": "even",
+      "stop_bits": "two",
+      "flow_control": "hardware",
+      "plugin": "airoha-race",
+      "eol": "cr",
+      "on_connect": "airoha/init.lua",
+      "emulation": "monitor",
+    },
+    // Numbers, an integer USB id and a path prefix.
+    {
+      "name": "U-Boot",
+      "match": { "vid": 1027, "pid": 24577, "path": "/dev/cu.usbserial" },
+      "data_bits": 5,
+      "parity": "O",
+      "stop_bits": 1,
+      "flow_control": "xonxoff",
+      "eol": "none",
+      "emulation": "vt",
+    },
+    // The other spellings, and a catch-all match.
+    { "match": {}, "data_bits": "six", "stop_bits": "one", "parity": "m",
+      "flow_control": "rtscts", "eol": "lf" },
+    { "match": { "path": "COM" }, "data_bits": 8, "parity": "space",
+      "flow_control": "software", "eol": "crlf" },
+    { "match": { "path": "/dev/ttyS" }, "parity": "N", "flow_control": "none" },
+  ],
+}
