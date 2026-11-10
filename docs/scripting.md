@@ -103,6 +103,7 @@ days).
 | `hex.encode(bytes, sep)` | string or byte table, separator (default `" "`) | `"05 5A 00"` | no |
 | `hex.decode(text)` | hex text | byte string; error if malformed | no |
 | `bytes.from_table(t)`, `bytes.to_table(s)` | byte table / string | string / byte table | no |
+| `codecs.<name>.encode(fields)` | a saved command's codec `fields`, as a table (`command` picks the codec's command) | the command's bytes; error if the codec refuses the fields | no |
 | `require(name)`, `dofile(path)` | `"lib.util"` / `"lib/util.lua"` in the scripts directory | the module's value / the file's results | yes (worker thread) |
 
 `string.pack` and `string.unpack` are there for binary frames.
@@ -144,11 +145,32 @@ A few details of the app's side of `commands.send(name, params)`:
 - Headless, there are no saved commands: the call raises "saved commands are not available
   in this host".
 
+**Codecs.** `codecs.<name>` is the installed codec plugin of that name (the plugin's
+folder under `plugins/`), or `nil` when none is installed, so `if codecs.race then`
+tests for one; a name with a hyphen is spelled `codecs["airoha-race"]`. Its
+`encode(fields)` builds the bytes a saved command's `{ "codec": …, "fields": { … } }`
+payload would, from the same fields: a `command` key picks one of the codec's commands
+(the first without it), integers may be numbers or hex text (`0x0F15` or `"0x0F15"`),
+and bytes are hex text (`"05 5A"`) or a table of byte values. A sequence becomes a list
+(an empty table too), any other table an object. It adds no line ending; send the bytes
+with `port:write`:
+
+```lua
+local race = assert(codecs["airoha-race"], "install the Airoha RACE plugin")
+port:write(race.encode{ cmd_id = 0x0F15 })
+```
+
+A field the codec refuses (missing, unknown, out of range, not UTF-8 text) raises an
+error naming the codec and the field, which `pcall` catches. The codec is made on the
+script thread the first time a run encodes with it and kept for the run; a plugin
+reloaded meanwhile is used from its next call, and one that panics is made again.
+`codecs.<name>.encode` only encodes: it never touches a session's decoding.
+
 `ui.notify(text)` prints `notice: <text>` in the Script console and shows a notice; headless
 it goes to stderr as `notice: <text>`.
 
-The plan (`docs/plan.md`) lists `port:on_frame`, timers and `codecs.<name>.encode` in the
-scripting API. The table above has none of them.
+The plan (`docs/plan.md`) lists `port:on_frame` and timers in the scripting API. The
+table above has neither.
 
 ## Sandbox and limits
 
@@ -198,6 +220,8 @@ How the API behaves without the app around it:
   scripts get no `serial.open`: it returns `nil` and a message, and a script uses
   `serial.current()`, which works on a `tcp:` or `replay:` tab as on any port.)
 - `commands.send` raises an error (no saved commands).
+- `codecs.<name>` sees the plugins installed in the config directory's `plugins/`, read
+  once when the run starts; a plugin that does not load is reported on stderr.
 - `require` and `dofile` read from the script file's own folder.
 
 ### Exit codes

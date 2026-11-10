@@ -238,6 +238,14 @@ impl CodecSet {
             .collect()
     }
 
+    /// The plugins under `root`, loaded with the app's limits, and what did not load: for
+    /// a headless run, which reads the folder once.
+    pub fn load(root: &Path) -> (Self, Vec<PluginProblem>) {
+        let mut set = Self::default();
+        let problems = set.reload_plugins(root, LuaLimits::default());
+        (set, problems)
+    }
+
     /// Load the plugin folders under `root` again (see the module docs). A folder that
     /// is gone drops its codec; one that does not load keeps its last good version.
     /// Never fails: what went wrong comes back as problems.

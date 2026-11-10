@@ -6,8 +6,9 @@
 //! are the GUI's: the device profile that matches the port over `default_baud`, with
 //! `--baud` over both. The script runs through
 //! [`run_headless`](serialist_script::run_headless) with standard streams for its
-//! output and prompts; `require` reads from the script's own folder. `main` exits with
-//! [`exit_code`] of the outcome.
+//! output and prompts; `require` reads from the script's own folder. The plugins in the
+//! config directory's `plugins/` load as they do for the window, for
+//! `codecs.<name>.encode`. `main` exits with [`exit_code`] of the outcome.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,9 +16,10 @@ use std::sync::Arc;
 use anyhow::{Context as _, bail};
 use serialist_core::settings::ConfigPaths;
 use serialist_core::{PortId, PortInfo, PortKind, Settings, load_settings};
-use serialist_script::{ScriptOutcome, ScriptSource, ScriptUi, run_headless};
+use serialist_script::{HeadlessCodecs, ScriptOutcome, ScriptSource, ScriptUi, run_headless_with};
 use serialist_sim::SimWorld;
 use serialist_ui::AppOptions;
+use serialist_ui::codecs::CodecSet;
 
 use crate::cli::Args;
 use crate::wiring::{self, Backend};
@@ -95,13 +97,21 @@ pub fn run(
     if let Some(baud) = args.baud {
         serial.baud = baud;
     }
+    let (codecs, problems) = CodecSet::load(&paths.plugins_dir());
+    for problem in problems {
+        tracing::warn!("{problem}");
+    }
+    let registry = codecs.registry().clone();
     tracing::info!(%port, serial = %serial.summary(), script = %source.name, "running a script");
-    Ok(run_headless(
+    Ok(run_headless_with(
         port,
         serial,
         options.transport_factory,
         source,
         ui,
+        HeadlessCodecs {
+            source: Some(registry),
+        },
     ))
 }
 
@@ -302,6 +312,38 @@ mod tests {
         assert_eq!(out, "virtual:at @ 57600 8N1\n", "--baud wins");
         let (_, out) = run_script(&dir, &["--port", "virtual:at", "--baud", "12000000"], code);
         assert_eq!(out, "virtual:at @ 12000000 8N1\n", "the top of the list");
+    }
+
+    /// Install the bundled Airoha RACE Lua plugin into `dir`'s config directory.
+    fn install_race_plugin(dir: &TempDir) {
+        let paths = ConfigPaths::new(dir.0.join("config"));
+        let example = CodecSet::default()
+            .examples_to_install()
+            .into_iter()
+            .find(|example| example.name == "airoha-race")
+            .expect("the bundled RACE example");
+        paths.install_example_plugin(example).unwrap();
+    }
+
+    #[test]
+    fn a_script_encodes_with_an_installed_plugin() {
+        let dir = TempDir::new("encode");
+        let code = "print(codecs['airoha-race'] ~= nil)\n";
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, "false\n", "nothing installed yet");
+
+        install_race_plugin(&dir);
+        let code = "local race = assert(codecs['airoha-race'])\n\
+                    print(hex.encode(race.encode{ cmd_id = '0x0F15' }))\n\
+                    local ok, err = pcall(race.encode, {})\n\
+                    print(tostring(err):match('codecs%[\"airoha%-race\"%]%.encode: [^\\n]*'))\n";
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(
+            out,
+            "05 5A 02 00 15 0F\ncodecs[\"airoha-race\"].encode: missing field `cmd_id`\n"
+        );
     }
 
     /// What `run` opens its port through, for `settings` in a config directory.

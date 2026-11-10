@@ -69,6 +69,7 @@
 //! | `hex.encode(bytes, sep)` | string or byte table, separator (default `" "`) | `"05 5A 00"` | no |
 //! | `hex.decode(text)` | hex text | byte string; error if malformed | no |
 //! | `bytes.from_table(t)`, `bytes.to_table(s)` | byte table / string | string / byte table | no |
+//! | `codecs.<name>.encode(fields)` | a saved command's codec `fields`, as a table (`command` picks the codec's command) | the command's bytes; error if the codec refuses the fields | no |
 //! | `require(name)`, `dofile(path)` | `"lib.util"` / `"lib/util.lua"` in the scripts directory | the module's value / the file's results | yes (worker thread) |
 //!
 //! `string.pack` and `string.unpack` are there for binary frames.
@@ -90,6 +91,14 @@
 //! **Patterns are regexes**, not Lua patterns, with the same smart case as saved
 //! commands: `port:expect([[^VAL=(\d+)]])`. Only received lines count, never echoes of
 //! what was sent or app notices.
+//!
+//! **Codecs.** `codecs.<name>` is the codec [`HostServices::codecs`] has under that
+//! name, or `nil` (`codecs["airoha-race"]` for a name with a hyphen). Its
+//! `encode(fields)` builds what a saved command's `{ "codec": …, "fields": { … } }`
+//! payload would from the same fields (a sequence is a list, an empty table too, any
+//! other table an object), adds no line ending, and raises an error naming the codec and
+//! the field when the codec refuses them. The codec is made on the script thread and kept
+//! for the run; a new factory from the source (a reload) makes a new one.
 //!
 //! **Ending.** A run ends when its main chunk returns; `on_line` handlers still active
 //! then are cancelled. An error in an `on_line` callback ends the run with that error.
@@ -114,6 +123,7 @@
 
 mod api;
 mod bell;
+mod codecs;
 mod headless;
 mod hex;
 mod host;
@@ -123,13 +133,15 @@ mod services;
 mod vm;
 
 pub use bell::{BellSink, LineBell};
-pub use headless::{HeadlessOpener, HeadlessSession, StdioUi, run_headless};
+pub use headless::{
+    HeadlessCodecs, HeadlessOpener, HeadlessSession, StdioUi, run_headless, run_headless_with,
+};
 pub use hex::{HexError, decode_hex, encode_hex};
 pub use host::{
     HostServices, Limits, RunId, SCRIPT_THREAD_NAME, SCRIPT_WORKER_THREAD_NAME, ScriptEvent,
     ScriptHost, ScriptOutcome, ScriptRun, ScriptSource,
 };
 pub use services::{
-    CommandError, CommandSender, LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture,
-    ScriptSession, ScriptUi,
+    CodecSource, CommandError, CommandSender, LogLevel, OpenError, OpenRequest, PortOpener,
+    PromptFuture, ScriptSession, ScriptUi,
 };

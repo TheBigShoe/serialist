@@ -17,7 +17,8 @@ use tokio::sync::oneshot;
 use crate::bell::LineBell;
 use crate::host::{HostServices, ScriptEvent, ScriptHost, ScriptOutcome, ScriptSource};
 use crate::services::{
-    LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture, ScriptSession, ScriptUi,
+    CodecSource, LogLevel, OpenError, OpenRequest, PortOpener, PromptFuture, ScriptSession,
+    ScriptUi,
 };
 
 /// A [`Session`] with its own ingest thread and store, for scripts that run without the
@@ -315,19 +316,47 @@ impl ScriptUi for StdioUi {
     }
 }
 
+/// The codecs a headless run offers its script.
+#[derive(Clone, Default)]
+pub struct HeadlessCodecs {
+    /// Backs `codecs.<name>.encode`: the plugins installed in the config directory.
+    pub source: Option<Arc<dyn CodecSource>>,
+}
+
+impl fmt::Debug for HeadlessCodecs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeadlessCodecs")
+            .field("source", &self.source.is_some())
+            .finish()
+    }
+}
+
 /// Run one script against `port` with no app around it, for `--script`: open a
 /// [`HeadlessSession`], run the script on a [`ScriptHost`] with that session as
 /// `serial.current()`, hand every output line to [`ScriptUi::output`], then close the
 /// port (letting queued writes out) and return the outcome.
 ///
 /// `serial.open` works through `factory`, by `port` only. `require` and `dofile` read
-/// from the script file's directory, if the script came from a file.
+/// from the script file's directory, if the script came from a file. No codec is
+/// installed; [`run_headless_with`] takes some.
 pub fn run_headless(
     port: PortId,
     config: SerialConfig,
     factory: Arc<dyn TransportFactory>,
     script: ScriptSource,
     ui: Arc<dyn ScriptUi>,
+) -> ScriptOutcome {
+    run_headless_with(port, config, factory, script, ui, HeadlessCodecs::default())
+}
+
+/// [`run_headless`] with `codecs` for `codecs.<name>.encode`.
+pub fn run_headless_with(
+    port: PortId,
+    config: SerialConfig,
+    factory: Arc<dyn TransportFactory>,
+    script: ScriptSource,
+    ui: Arc<dyn ScriptUi>,
+    codecs: HeadlessCodecs,
 ) -> ScriptOutcome {
     let session = match HeadlessSession::open(factory.as_ref(), port.clone(), config) {
         Ok(session) => Arc::new(session),
@@ -337,6 +366,7 @@ pub fn run_headless(
     services.session = Some(Arc::clone(&session) as Arc<dyn ScriptSession>);
     services.opener = Some(Arc::new(HeadlessOpener::new(factory)));
     services.scripts_dir = script.path.as_deref().map(script_dir);
+    services.codecs = codecs.source;
     let host = ScriptHost::new(services);
     let run = host.run(script);
     let events = run.events();

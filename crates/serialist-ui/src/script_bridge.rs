@@ -36,13 +36,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 use serialist_core::{
-    ChunkSink, Command, CommandRef, CommandStore, ControlLine, LineEnding, ParamValues, PortId,
-    PortSource, SerialConfig, SessionClosed, StoreReader,
+    ChunkSink, CodecFactory, CodecRegistry, Command, CommandRef, CommandStore, ControlLine,
+    LineEnding, ParamValues, PortId, PortSource, SerialConfig, SessionClosed, StoreReader,
 };
 use serialist_script::{
-    BellSink, CommandError, CommandSender, HostServices, Limits, LineBell, LogLevel, PromptFuture,
-    RunId, ScriptEvent, ScriptHost, ScriptOutcome, ScriptRun, ScriptSession, ScriptSource,
-    ScriptUi,
+    BellSink, CodecSource, CommandError, CommandSender, HostServices, Limits, LineBell, LogLevel,
+    PromptFuture, RunId, ScriptEvent, ScriptHost, ScriptOutcome, ScriptRun, ScriptSession,
+    ScriptSource, ScriptUi,
 };
 
 use crate::session_handle::SessionControl;
@@ -260,6 +260,38 @@ impl CommandsSnapshot {
     }
 }
 
+/// The installed codecs as a script sees them: the configuration's registry, swapped in
+/// by the workspace on every reload, so `codecs.<name>` follows the plugins folder while a
+/// script runs. Cheap to clone; every clone sees the swap.
+#[derive(Clone, Default)]
+pub struct CodecsSnapshot(Arc<RwLock<Arc<CodecRegistry>>>);
+
+impl fmt::Debug for CodecsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CodecsSnapshot").field(&*self.get()).finish()
+    }
+}
+
+impl CodecsSnapshot {
+    pub fn new(registry: Arc<CodecRegistry>) -> Self {
+        Self(Arc::new(RwLock::new(registry)))
+    }
+
+    pub fn set(&self, registry: Arc<CodecRegistry>) {
+        *self.0.write() = registry;
+    }
+
+    pub fn get(&self) -> Arc<CodecRegistry> {
+        Arc::clone(&self.0.read())
+    }
+}
+
+impl CodecSource for CodecsSnapshot {
+    fn codec(&self, name: &str) -> Option<Arc<dyn CodecFactory>> {
+        self.get().get(name)
+    }
+}
+
 /// The saved command `name` names: `collection/group/name`, `collection/name`, or a
 /// bare name, which is the first command called that (exactly, else ignoring case) in
 /// the order the Commands panel lists them.
@@ -330,6 +362,8 @@ pub struct ScriptEnv {
     /// Where `require` and `dofile` read from.
     pub scripts_dir: Option<PathBuf>,
     pub commands: CommandsSnapshot,
+    /// Backs `codecs.<name>.encode`.
+    pub codecs: CodecsSnapshot,
 }
 
 impl fmt::Debug for ScriptEnv {
@@ -468,6 +502,7 @@ impl SessionScripts {
             // The first UI version opens no ports for scripts: `serial.open` says so.
             opener: None,
             ports: env.ports,
+            codecs: Some(Arc::new(env.codecs)),
             scripts_dir: env.scripts_dir,
             limits: Limits::default(),
         };
