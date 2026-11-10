@@ -40,7 +40,8 @@ callback (`serialist --virtual firehose` gives it something to count).
 ## Where scripts live
 
 - Scripts are `*.lua` files under `scripts/` in the config directory (`~/.config/serialist`
-  on macOS and Linux, `%APPDATA%\Serialist` on Windows, or the `--config-dir` directory).
+  on macOS and Linux, `%APPDATA%\Serialist` on Windows, or the `--config-dir` directory;
+  on Linux `$XDG_CONFIG_HOME/serialist` when that is set).
   The Script console lists them at any depth up to eight folders, skipping hidden files and
   folders and symlinked folders. The folder is watched, so the list follows your edits.
 - The Scripts menu's Open Scripts Folder creates the folder and, if it holds no `*.lua`
