@@ -151,7 +151,13 @@ considered; neither is used by the build.
 
 On Windows, `crates/serialist/build.rs` embeds `serialist.ico` in `serialist.exe` as icon
 resource 1 (the id GPUI's Windows backend loads), by writing a `.res` file and passing it to
-the MSVC linker. It does nothing on other targets.
+the MSVC linker. The same file holds the version resource that Explorer's Details tab
+shows: file and product version from the package version (a pre-release is flagged as
+one), product name, description, company and copyright as `main.wxs` and `Info.plist.in`
+spell them, and the original file name. The bytes come from
+`crates/serialist/build/windows_res.rs`, which `crates/serialist/tests/windows_res.rs` also
+includes, so `cargo test` checks the layout on every platform, and checks that the strings
+still match the other two packages. It does nothing on other targets.
 
 ## Known gaps
 
@@ -170,8 +176,12 @@ the MSVC linker. It does nothing on other targets.
   `.deb` and the tarball is `serialist.desktop`, and the entry says
   `StartupWMClass=serialist`. Keep the three equal. Nobody has yet looked at the taskbar
   of a GNOME or KDE session, on Wayland or X11, with an installed package.
-- **No version resource on Windows.** `serialist.exe` has an icon but no VERSIONINFO, so
-  Explorer's Details tab is empty.
+- **The Windows version resource has not been seen.** `serialist.exe` now carries a
+  `VS_VERSIONINFO` (see [Changing the icon](#changing-the-icon)), and its bytes are tested
+  against Microsoft's documented layout, but it was written on a Mac: no MSVC link has
+  taken it yet, and nobody has opened Properties, Details on the result. The next Windows
+  job of the release workflow links it; check the Details tab of the installed
+  `serialist.exe`.
 - **Windows on ARM and Linux arm64** are not built.
 - **Linux and Windows packages are built but not tried.** The workflow has run three times
   (a manual run on `main` on 2026-09-30, then the `v0.1.0` and `v0.2.0` tags), and every
