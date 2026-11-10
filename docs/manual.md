@@ -260,6 +260,20 @@ nearest one found searching up from the working directory is used. Defaults for 
 setting, with a comment each, are in
 `crates/serialist-core/assets/default_settings.jsonc`.
 
+A saved-command collection that a later Serialist wrote may hold things this version cannot
+read. A key it does not know is reported as a warning and otherwise left alone. A command it
+cannot read (a payload form or a param `kind` it does not know, a value of the wrong type)
+is left out of the Commands panel with a warning naming the file, the group and the command
+(by name, or by position when it has no readable name), and every other command in the file
+still loads; a group that is not an object, or has no name, is left out the same way. A file
+that is not valid JSON, or whose top level is not `{ "name", "groups": [ … ] }`, is left out
+whole with a warning. Saving a change from the Commands panel rewrites the file as plain
+JSON: your comments and formatting are dropped, and so are a command or group you deleted,
+with everything inside it, but every key this version does not know and every command or
+group it left out is written back as it was, in its place. Keys may come back in a
+different order, and a value the app fills in (an `expect`'s `timeout_ms`, a param's `kind`)
+is written out even where the file left it to the default.
+
 ## Keyboard
 
 These are the bindings the app ships with, read from
