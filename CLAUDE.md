@@ -29,4 +29,5 @@ crate layout, testing strategy, milestones). The plan is the source of truth for
 - Logging: `tracing`. No `println!` outside the binary.
 - Tests live next to the code (`#[cfg(test)]`) or in `tests/` for integration; property
   tests use `proptest`; snapshot tests use `insta`.
-- Commit messages: imperative subject under 72 chars, body explains why.
+- Commit messages: subject is `<type>: <what changed>`, imperative, under 72 chars;
+  type is one of `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `style`. Body explains why.
