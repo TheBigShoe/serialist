@@ -61,6 +61,7 @@
 //! | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
 //! | `port:description()`, `port:id()` | | strings | no |
 //! | `sleep(ms)` | milliseconds | nothing | yes |
+//! | `timer.after(ms, fn)`, `timer.every(ms, fn)` | milliseconds (`every`: 1 or more), `fn()` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs once after `ms`, or every `ms`, may wait |
 //! | `print(...)` | values | one [`ScriptEvent::Output`], tab-joined | no |
 //! | `log.debug/info/warn/error(...)` | values | [`ScriptUi::log`] and an `Output` line `"[info] ..."`, space-joined | no |
 //! | `ui.prompt(label, default)` | strings | the answer, or `nil` if dismissed; sends [`ScriptEvent::Prompt`] first | yes |
@@ -100,8 +101,14 @@
 //! the field when the codec refuses them. The codec is made on the script thread and kept
 //! for the run; a new factory from the source (a reload) makes a new one.
 //!
-//! **Ending.** A run ends when its main chunk returns; `on_line` handlers still active
-//! then are cancelled. An error in an `on_line` callback ends the run with that error.
+//! **Timers.** `timer.after(ms, fn)` calls `fn()` once, `timer.every(ms, fn)` every
+//! `ms`, while the script waits, one call at a time, as `on_line` callbacks run. A call
+//! is never queued: a tick that falls while the last call still runs is skipped. At most
+//! [`Limits::max_callbacks`] timers and `on_frame` handlers are active at once.
+//!
+//! **Ending.** A run ends when its main chunk returns; `on_line` handlers and timers
+//! still active then are cancelled. An error in an `on_line` or timer callback ends the
+//! run with that error.
 //!
 //! # Sandbox and limits
 //!
@@ -117,12 +124,13 @@
 //!   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
 //!   run, but every later wait fails the same way and the executor drops the script at
 //!   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-//! - Waiting calls work in the main body, required modules and `on_line` callbacks, not
+//! - Waiting calls work in the main body, required modules, `on_line` and timer callbacks, not
 //!   inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
 //!   (they fail with a message saying so).
 
 mod api;
 mod bell;
+mod callback;
 mod codecs;
 mod headless;
 mod hex;
@@ -130,6 +138,7 @@ mod host;
 mod port;
 mod race;
 mod services;
+mod timer;
 mod vm;
 
 pub use bell::{BellSink, LineBell};

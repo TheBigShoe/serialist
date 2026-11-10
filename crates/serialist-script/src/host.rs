@@ -37,11 +37,18 @@ pub struct Limits {
     /// How many VM instructions run between checks of the stop flag. Smaller stops a
     /// busy loop sooner and costs more; 10 000 is well under a millisecond.
     pub instruction_check_every: u32,
+    /// How many timers and frame handlers (`timer.after`, `timer.every`,
+    /// `port:on_frame`) one run may have active at once; starting one more raises an
+    /// error. Each is a task on the script thread, outside the VM's memory cap, so this
+    /// is what keeps a script that starts them in a loop from growing the heap without
+    /// bound.
+    pub max_callbacks: usize,
 }
 
 impl Limits {
     pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
     pub const DEFAULT_INSTRUCTION_CHECK_EVERY: u32 = 10_000;
+    pub const DEFAULT_MAX_CALLBACKS: usize = 1024;
 }
 
 impl Default for Limits {
@@ -49,6 +56,7 @@ impl Default for Limits {
         Self {
             memory_bytes: Self::DEFAULT_MEMORY_BYTES,
             instruction_check_every: Self::DEFAULT_INSTRUCTION_CHECK_EVERY,
+            max_callbacks: Self::DEFAULT_MAX_CALLBACKS,
         }
     }
 }
@@ -173,7 +181,7 @@ pub enum ScriptOutcome {
     /// The main chunk returned.
     Ok,
     /// A syntax error, an uncaught runtime error (message and Lua traceback), a memory
-    /// error, or an error in an `on_line` callback.
+    /// error, or an error in an `on_line` or timer callback.
     Error(String),
     /// [`ScriptRun::stop`] (or dropping the host) ended it.
     Stopped,

@@ -88,6 +88,8 @@ pub(crate) struct RunCtx {
     user_threads: RefCell<Option<Table>>,
     /// The codecs `codecs.<name>.encode` made, kept for the run.
     pub(crate) codecs: RefCell<CodecCache>,
+    /// Timers and frame handlers active, against [`Limits::max_callbacks`](crate::Limits).
+    pub(crate) callbacks: Cell<usize>,
 }
 
 impl RunCtx {
@@ -109,6 +111,7 @@ impl RunCtx {
             current,
             user_threads: RefCell::new(None),
             codecs: RefCell::new(CodecCache::default()),
+            callbacks: Cell::new(0),
         }
     }
 
