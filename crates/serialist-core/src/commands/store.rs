@@ -265,8 +265,9 @@ impl CommandStore {
     // ---- Saving ----
 
     /// Writes `collection` to its file, atomically (a temp file, then a rename) and
-    /// creating the directory if needed. The file is rewritten as plain JSON: comments
-    /// and unknown keys in it are lost. The bundled collection is refused with
+    /// creating the directory if needed. The file is rewritten as plain JSON (see
+    /// [`CommandCollection::to_json`]): comments in it are lost, and what this build
+    /// does not read is written back. The bundled collection is refused with
     /// [`io::ErrorKind::PermissionDenied`]. This touches only the file; the store's own
     /// copy is not changed (see [`set_collection`](Self::set_collection)).
     pub fn save(&self, collection: &CommandCollection) -> io::Result<()> {
@@ -382,17 +383,16 @@ impl CommandStore {
         let reference = CommandRef::new(collection, group, &command.name);
         match target.groups.iter_mut().find(|g| g.name == group) {
             Some(existing) => existing.commands.push(command),
-            None => target.groups.push(CommandGroup {
-                name: group.to_owned(),
-                commands: vec![command],
-            }),
+            None => target.groups.push(CommandGroup::new(group, vec![command])),
         }
         Ok(reference)
     }
 
     /// Replaces the command `target` names with `command`, in place. The new command may
-    /// have a new name, if no other command in the collection has it. Returns its
-    /// reference.
+    /// have a new name, if no other command in the collection has it. If `command`
+    /// carries nothing, it takes what the old one carried (see
+    /// [`Command::keep_carried_from`]), so an edit made from a form keeps the keys this
+    /// build does not read. Returns its reference.
     pub fn update_command(
         &mut self,
         target: &CommandRef,
@@ -416,6 +416,8 @@ impl CommandStore {
             .find(|c| c.name == target.name)
             .ok_or_else(|| no_command(target))?;
         let reference = CommandRef::new(&target.collection, &target.group, &command.name);
+        let mut command = command;
+        command.keep_carried_from(slot);
         *slot = command;
         Ok(reference)
     }

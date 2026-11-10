@@ -1,10 +1,11 @@
 //! Reading and writing collection files.
 //!
 //! Reading takes JSON with comments and trailing commas, as Zed's files do. Writing
-//! produces plain pretty-printed JSON from the model and preserves nothing else:
-//! comments, key order beyond the model's own, unknown keys and formatting are lost. A
-//! file the app edits is therefore one to keep free of hand-written comments; a file
-//! that is only ever hand-edited is never rewritten.
+//! produces plain pretty-printed JSON from the model, plus everything the file held that
+//! this build does not read ([`Carried`]), so that an edit in an earlier build does not
+//! destroy a later build's data. Comments, formatting and the order of keys beyond the
+//! model's own are lost. A file the app edits is therefore one to keep free of
+//! hand-written comments; a file that is only ever hand-edited is never rewritten.
 
 use std::fs;
 use std::io::{self, Write as _};
@@ -13,9 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsonc_parser::ParseOptions;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use super::model::{CollectionSource, CommandCollection, CommandGroup};
+use super::model::{
+    Carried, CollectionSource, Command, CommandCollection, CommandGroup, Expect, Param, Payload,
+};
+use crate::settings::LineEnding;
 
 /// Why a collection file could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -66,10 +70,78 @@ struct CollectionFile {
     groups: Vec<CommandGroup>,
 }
 
+/// The written form: the model's keys in the model's order, then what it carried.
 #[derive(Serialize)]
 struct CollectionOut<'a> {
     name: &'a str,
-    groups: &'a [CommandGroup],
+    groups: Vec<GroupOut<'a>>,
+    #[serde(flatten)]
+    carried: &'a Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct GroupOut<'a> {
+    name: &'a str,
+    commands: Vec<CommandOut<'a>>,
+    #[serde(flatten)]
+    carried: &'a Map<String, Value>,
+}
+
+/// A [`Command`]'s keys, as its own `Serialize` writes them, with what it carried at
+/// each level.
+#[derive(Serialize)]
+struct CommandOut<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    description: &'a str,
+    payload: WithCarried<'a, Payload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eol: Option<LineEnding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expect: Option<WithCarried<'a, Expect>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keybinding: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    params: Vec<WithCarried<'a, Param>>,
+    #[serde(flatten)]
+    carried: &'a Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct WithCarried<'a, T: Serialize> {
+    #[serde(flatten)]
+    known: &'a T,
+    #[serde(flatten)]
+    carried: &'a Map<String, Value>,
+}
+
+impl<'a> CommandOut<'a> {
+    fn new(command: &'a Command) -> Self {
+        let carried = &command.carried;
+        Self {
+            name: &command.name,
+            description: &command.description,
+            payload: WithCarried {
+                known: &command.payload,
+                carried: &carried.payload,
+            },
+            eol: command.eol,
+            expect: command.expect.as_ref().map(|known| WithCarried {
+                known,
+                carried: &carried.expect,
+            }),
+            keybinding: command.keybinding.as_deref(),
+            params: command
+                .params
+                .iter()
+                .map(|known| WithCarried {
+                    known,
+                    carried: &known.carried.keys,
+                })
+                .collect(),
+            carried: &carried.keys,
+        }
+    }
 }
 
 /// Keys the model reads, by level, so a typo is reported instead of silently dropped.
@@ -126,16 +198,18 @@ impl CommandCollection {
         // Read the typed form straight from the text so an error carries a position.
         let file: CollectionFile = jsonc_parser::parse_to_serde_value(text, &options())
             .map_err(|e| invalid(origin, &e))?;
-        let collection = CommandCollection {
+        let mut collection = CommandCollection {
             name: file
                 .name
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or(fallback),
             source,
             groups: file.groups,
+            carried: Carried::default(),
         };
         let mut warnings = Vec::new();
         unknown_keys(&value, &mut warnings);
+        collection.carry_unknown(&value);
         collection.check(&mut warnings);
         Ok(LoadedCollection {
             collection,
@@ -152,12 +226,48 @@ impl CommandCollection {
         Self::parse(&text, source, path)
     }
 
-    /// The file form: pretty JSON, two-space indent, ending in a newline. Nothing but
-    /// the model is written, so comments and unknown keys in the original are gone.
+    /// Keeps the keys of `root`, the document this collection was read from, that the
+    /// model does not read, so that [`to_json`](Self::to_json) writes them back.
+    fn carry_unknown(&mut self, root: &Value) {
+        self.carried.keys = unknown_of(root, COLLECTION_KEYS);
+        let groups = items(root, "groups");
+        for (group, value) in self.groups.iter_mut().zip(groups) {
+            group.carried.keys = unknown_of(value, GROUP_KEYS);
+            for (command, value) in group.commands.iter_mut().zip(items(value, "commands")) {
+                command.carried = Carried {
+                    keys: unknown_of(value, COMMAND_KEYS),
+                    payload: value
+                        .get("payload")
+                        .map(|payload| unknown_of(payload, PAYLOAD_KEYS))
+                        .unwrap_or_default(),
+                    expect: value
+                        .get("expect")
+                        .map(|expect| unknown_of(expect, EXPECT_KEYS))
+                        .unwrap_or_default(),
+                };
+                for (param, value) in command.params.iter_mut().zip(items(value, "params")) {
+                    param.carried.keys = unknown_of(value, PARAM_KEYS);
+                }
+            }
+        }
+    }
+
+    /// The file form: pretty JSON, two-space indent, ending in a newline. The model's
+    /// keys come first, in its order, then every key the file held that this build does
+    /// not read ([`Carried`]), at the level it was found. Comments are not kept.
     pub fn to_json(&self) -> String {
         let out = CollectionOut {
             name: &self.name,
-            groups: &self.groups,
+            groups: self
+                .groups
+                .iter()
+                .map(|group| GroupOut {
+                    name: &group.name,
+                    commands: group.commands.iter().map(CommandOut::new).collect(),
+                    carried: &group.carried.keys,
+                })
+                .collect(),
+            carried: &self.carried.keys,
         };
         // Serializing plain data cannot fail.
         let mut text = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_owned());
@@ -196,18 +306,13 @@ fn unknown_keys(root: &Value, out: &mut Vec<String>) {
     let mut check = |value: &Value, known: &[&str], path: &str| {
         if let Value::Object(map) = value {
             for key in map.keys().filter(|key| !known.contains(&key.as_str())) {
-                out.push(format!("unknown key `{path}{key}` is ignored"));
+                out.push(format!(
+                    "unknown key `{path}{key}` is not used, and is kept when saving"
+                ));
             }
         }
     };
     check(root, COLLECTION_KEYS, "");
-    let items = |value: &Value, key: &str| -> Vec<Value> {
-        value
-            .get(key)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    };
     for (g, group) in items(root, "groups").iter().enumerate() {
         check(group, GROUP_KEYS, &format!("groups[{g}]."));
         for (c, command) in items(group, "commands").iter().enumerate() {
@@ -223,6 +328,26 @@ fn unknown_keys(root: &Value, out: &mut Vec<String>) {
                 check(param, PARAM_KEYS, &format!("{at}params[{p}]."));
             }
         }
+    }
+}
+
+/// The array under `key` in `value`, or nothing.
+fn items<'a>(value: &'a Value, key: &str) -> &'a [Value] {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The keys of the object `value` that are not in `known`, with their values.
+fn unknown_of(value: &Value, known: &[&str]) -> Map<String, Value> {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| !known.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        _ => Map::new(),
     }
 }
 

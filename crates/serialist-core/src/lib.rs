@@ -48,7 +48,7 @@ pub use codec::{
     FieldInfo, FieldType, FnCodecFactory, Frame, FrameKindInfo, Severity, SmolStr, Value,
 };
 pub use commands::{
-    CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
+    Carried, CollectionSource, Command, CommandCollection, CommandGroup, CommandRef, CommandStore,
     CommandWarning, DEFAULT_EXPECT_TIMEOUT_MS, EditError, Expect, Param, ParamKind, ParamValues,
     Payload, PayloadError,
 };
