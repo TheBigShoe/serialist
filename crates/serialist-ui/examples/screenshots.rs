@@ -44,6 +44,7 @@ use serialist_sim::{
     MenuDevice, SimWorld,
 };
 use serialist_ui::config::{self, Config};
+use serialist_ui::emulation::Emulation;
 use serialist_ui::export::ExportFormat;
 use serialist_ui::prelude::gpui_test::TestWindowExt;
 use serialist_ui::prelude::*;
@@ -265,6 +266,16 @@ const SHOTS: &[Shot] = &[
         world: SimWorld::new,
         connect: None,
         drive: replay_session,
+    },
+    // VT mode drawing from a recorded capture: a boot menu drawn with cursor addressing
+    // inside synchronized updates, with insert mode and repeats.
+    Shot {
+        file: "23-vt-sync-insert-repeat.png",
+        size: WIDE,
+        theme: DARK,
+        world: SimWorld::new,
+        connect: None,
+        drive: vt_capture_menu,
     },
 ];
 
@@ -648,36 +659,140 @@ const BOOT_LOG: &[(u64, &[u8])] = &[
 /// held open after the last byte: a tab titled with the file name, the speed in the
 /// toolbar and the transport's description in the status line.
 fn replay_session(stage: &mut Stage) {
-    let raw = stage.dir.join("boot-log.bin");
-    let bytes: Vec<u8> = BOOT_LOG
+    let chunks: Vec<(u64, Vec<u8>)> = BOOT_LOG
         .iter()
-        .flat_map(|(_, chunk)| chunk.to_vec())
+        .map(|(ms, chunk)| (*ms, chunk.to_vec()))
         .collect();
-    std::fs::write(&raw, bytes).expect("write the capture");
+    let raw = write_capture(&stage.dir.join("boot-log.bin"), &chunks);
+    stage.replay.set_defaults(ReplayOptions {
+        speed: ReplaySpeed::times(4.0).expect("a speed"),
+        end: ReplayEnd::Hold,
+    });
+    let view = stage.open_capture(raw);
+    run_until(&mut stage.cx, "the capture's last line", |cx| {
+        has_rx_line(cx, &view, "bench login: ")
+    });
+}
+
+/// Write `chunks` (each with its arrival in milliseconds) to `raw`, with the timing sidecar
+/// Record writes beside it, so a replay delivers them as those chunks at those times.
+fn write_capture(raw: &Path, chunks: &[(u64, Vec<u8>)]) -> PathBuf {
+    let bytes: Vec<u8> = chunks.iter().flat_map(|(_, chunk)| chunk.clone()).collect();
+    std::fs::write(raw, bytes).expect("write the capture");
     let origin = Instant::now();
-    let mut timing = TimingWriter::create(&timing_path(&raw), origin).expect("create the sidecar");
-    for (ms, chunk) in BOOT_LOG {
+    let mut timing = TimingWriter::create(&timing_path(raw), origin).expect("create the sidecar");
+    for (ms, chunk) in chunks {
         timing
             .rx(origin + Duration::from_millis(*ms), chunk.len())
             .expect("write the sidecar");
     }
     timing.finish().expect("finish the sidecar");
+    raw.to_owned()
+}
 
-    stage.replay.set_defaults(ReplayOptions {
-        speed: ReplaySpeed::times(4.0).expect("a speed"),
-        end: ReplayEnd::Hold,
-    });
-    let workspace = stage.workspace.clone();
-    stage
-        .cx
-        .update_window(stage.window, |_, window, cx| {
-            workspace.update(cx, |w, cx| w.open_capture(raw, window, cx));
+/// When the first chunk of a VT capture arrives: late enough for the shot to have put the
+/// session in VT mode and sized its screen to the pane, since a screen is drawn only from
+/// the bytes that arrive after it is shown.
+const VT_CAPTURE_START: u64 = 1500;
+
+/// A boot menu as a device draws it in VT mode, in two synchronized updates (`CSI ? 2026 h`
+/// to `l`), the second cut into three chunks. The borders are repeats (`CSI n b`), the
+/// item numbers are put in front of the items in insert mode (`CSI 4 h`), and a bar is
+/// drawn in insert mode on a blank row with repeats, where insert mode moves nothing.
+fn vt_menu_capture() -> Vec<(u64, Vec<u8>)> {
+    fn goto(row: usize, column: usize) -> String {
+        format!("\x1b[{row};{column}H")
+    }
+    let mut first = String::from("\x1b[?2026h\x1b[2J\x1b[H");
+    // Top border and the rule under the title: a corner, a line repeated, a corner.
+    first += &format!("{}┌─\x1b[44b┐", goto(2, 3));
+    first += &format!("{}\x1b[1mSerialist boot menu\x1b[0m", goto(3, 5));
+    first += &format!("{}├─\x1b[44b┤", goto(4, 3));
+    // The items without their numbers, then the numbers inserted in front of them.
+    for (row, item) in [
+        (5, "Boot Linux from eMMC"),
+        (6, "Boot Linux over TFTP"),
+        (7, "U-Boot console"),
+    ] {
+        first += &format!("{}{item}", goto(row, 5));
+    }
+    first += "\x1b[4h";
+    for (row, number) in [(5, "1. "), (6, "2. "), (7, "3. ")] {
+        first += &format!("{}{number}", goto(row, 5));
+    }
+    // A bar on a blank row, in insert mode: twenty of each shade, by repeats.
+    first += &format!("{}▓\x1b[19b░\x1b[19b", goto(9, 5));
+    first += "\x1b[4l";
+    // The side borders, after the inserts that would have moved them.
+    for row in [3, 5, 6, 7, 8, 9] {
+        first += &format!("{}│{}│", goto(row, 3), goto(row, 49));
+    }
+    first += &format!("{}└─\x1b[44b┘", goto(10, 3));
+    first += &format!("{}Autoboot in 3 s", goto(12, 3));
+    first += "\x1b[?2026l";
+
+    // The second frame highlights the first item and counts down, in three chunks of one
+    // update.
+    let second = [
+        format!("\x1b[?2026h{}\x1b[7m 1. Boot Linux", goto(5, 4)),
+        " from eMMC \x1b[20b".to_string(),
+        format!("\x1b[0m{}Autoboot in 2 s\x1b[?2026l", goto(12, 3)),
+    ];
+    // Replay paces from the first chunk, so a chunk that draws nothing comes first.
+    let mut chunks = vec![
+        (0, b"\x1b[0m".to_vec()),
+        (VT_CAPTURE_START, first.into_bytes()),
+    ];
+    for (ix, chunk) in second.into_iter().enumerate() {
+        chunks.push((VT_CAPTURE_START + 400 + 40 * ix as u64, chunk.into_bytes()));
+    }
+    chunks
+}
+
+/// What [`vt_menu_capture`] leaves on the screen's first thirteen rows.
+fn vt_menu_screen() -> Vec<String> {
+    let rule = |left: char, right: char| format!("  {left}{}{right}", "─".repeat(45));
+    let row = |text: &str| format!("  │ {text:<44}│");
+    let bar = format!("{}{}", "▓".repeat(20), "░".repeat(20));
+    vec![
+        String::new(),
+        rule('┌', '┐'),
+        row("Serialist boot menu"),
+        rule('├', '┤'),
+        row("1. Boot Linux from eMMC"),
+        row("2. Boot Linux over TFTP"),
+        row("3. U-Boot console"),
+        row(""),
+        row(&bar),
+        rule('└', '┘'),
+        String::new(),
+        "  Autoboot in 2 s".to_string(),
+        String::new(),
+    ]
+}
+
+/// [`vt_menu_capture`] replayed into a session in VT mode, after both updates: the
+/// screen's rows checked against [`vt_menu_screen`] before the picture.
+fn vt_capture_menu(stage: &mut Stage) {
+    let raw = write_capture(&stage.dir.join("vt-menu.bin"), &vt_menu_capture());
+    let view = stage.open_vt_capture(raw);
+    run_until(&mut stage.cx, "the second frame", |cx| {
+        view.read_with(cx, |v, _| {
+            v.vt_snapshot().is_some_and(|snapshot| {
+                snapshot.screen_text().get(11) == Some(&"  Autoboot in 2 s")
+            })
         })
-        .expect("the window is open");
-    let view = stage.session();
-    run_until(&mut stage.cx, "the capture's last line", |cx| {
-        has_rx_line(cx, &view, "bench login: ")
     });
+    let screen: Vec<String> = view.read_with(&stage.cx, |v, _| {
+        let snapshot = v.vt_snapshot().expect("a screen");
+        snapshot
+            .screen_text()
+            .iter()
+            .map(|row| row.to_string())
+            .collect()
+    });
+    let expected = vt_menu_screen();
+    assert_eq!(&screen[..expected.len()], &expected[..]);
 }
 
 /// A loopback listener that writes a banner to the first client and holds the connection
@@ -894,6 +1009,51 @@ impl Stage {
             })
         });
         session_of(&self.cx).expect("a session view")
+    }
+
+    /// "Open capture\u{2026}" on `raw`, and wait for the session to connect.
+    fn open_capture(&mut self, raw: PathBuf) -> Entity<SessionView> {
+        let workspace = self.workspace.clone();
+        self.cx
+            .update_window(self.window, |_, window, cx| {
+                workspace.update(cx, |w, cx| w.open_capture(raw, window, cx));
+            })
+            .expect("the window is open");
+        self.session()
+    }
+
+    /// [`open_capture`](Self::open_capture) at its recorded pace, held open after the last
+    /// byte, in VT mode, with frames drawn until the screen has the size of the pane.
+    /// The capture's first chunk must come later than that (see [`VT_CAPTURE_START`]).
+    fn open_vt_capture(&mut self, raw: PathBuf) -> Entity<SessionView> {
+        self.replay.set_defaults(ReplayOptions {
+            speed: ReplaySpeed::times(1.0).expect("a speed"),
+            end: ReplayEnd::Hold,
+        });
+        let view = self.open_capture(raw);
+        view.update(&mut self.cx, |v, cx| v.set_emulation(Emulation::Vt, cx));
+        let deadline = Instant::now() + ENGINE_WAIT;
+        loop {
+            self.draw().expect("draw a frame");
+            self.cx.run_until_parked();
+            let sized = view.read_with(&self.cx, |v, cx| {
+                let grid = v.terminal().read(cx).grid_size();
+                v.vt_snapshot()
+                    .is_some_and(|s| grid == Some((s.columns(), s.viewport_rows())))
+            });
+            if sized {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the screen was never sized");
+            self.cx.advance_clock(FRAME);
+        }
+        assert!(
+            view.read_with(&self.cx, |v, _| v
+                .vt_snapshot()
+                .is_some_and(|s| s.screen_text().iter().all(|row| row.is_empty()))),
+            "the capture drew before the screen was sized"
+        );
+        view
     }
 
     /// Press `keys` in the window, as a user would.
