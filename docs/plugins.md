@@ -22,7 +22,8 @@ plugin. The app registers a plugin under its folder's name, so `plugins/airoha-r
 the codec `airoha-race` and a copy in `plugins/airoha-race-lua/` is listed beside it.
 (The library function `serialist_plugins::load_plugins` registers under the name
 `describe` returns instead.) `plugins/examples/` is not a plugin: it holds copies of the
-bundled examples. WebAssembly folders load only in a build with the `wasm` feature
+bundled examples, and the folder name `examples` is reserved (the app writes its example
+plugins there, and a folder of that name never loads as a plugin, whatever it contains). WebAssembly folders load only in a build with the `wasm` feature
 (`cargo build -p serialist --features wasm`); otherwise the folder is reported as needing it.
 
 `serialist-plugins` also has the RACE codec in Rust (`AirohaRace`) and a line codec

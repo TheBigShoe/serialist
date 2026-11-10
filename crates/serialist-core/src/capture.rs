@@ -37,8 +37,14 @@
 //! - `connect` and `disconnect` mark a recording that spans a reconnect. A replay uses
 //!   them only as timing; it does not drop the link in the middle.
 //! - A reader skips a record kind it does not know, so version 1 can grow new kinds (a
-//!   `tx` direction, say) without breaking older readers. A different version number in
-//!   the header is an error.
+//!   `tx` direction, say) without breaking older readers. "Does not know" is decided by
+//!   the first word of the line, the kind: a kind made only of lowercase ASCII letters
+//!   and `_` is skipped, whatever follows it; any other unknown first word (an
+//!   uppercase letter, a digit, punctuation) is an error, as is a line that starts with
+//!   a space. A record kind the reader does know is read strictly: a field missing,
+//!   malformed or in excess (`rx 1 0 4 9`) is an error, never skipped. So version 1
+//!   grows only by new record kinds, never by new fields on `rx`, `connect` or
+//!   `disconnect`. A different version number in the header is an error.
 //!
 //! **Append-only and crash-tolerant.** [`TimingWriter`] only appends through a buffer
 //! and never seeks or syncs per record; the recorder flushes it on its own cadence (with
