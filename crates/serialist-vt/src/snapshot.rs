@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serialist_core::{Epoch, LineId, LineSource, StyledLine};
 
 use crate::convert::same_content;
+use crate::mouse::MouseReporting;
 use crate::scrollback::ScrollbackView;
 
 /// How the cursor is drawn.
@@ -49,9 +50,10 @@ pub struct VtModes {
     pub app_cursor_keys: bool,
     /// The keypad is in application mode (DECKPAM, `ESC =`).
     pub app_keypad: bool,
-    /// The device asked for mouse reports (any of `CSI ? 1000/1002/1003 h`). Serialist
-    /// does not send mouse reports yet; this is here so the UI can tell the user.
-    pub mouse_reporting: bool,
+    /// The mouse reports the device asked for (`CSI ? 1000/1002/1003 h`) and how to
+    /// write them (`CSI ? 1005/1006 h`), or `None`. See
+    /// [`MouseReporting::report`](crate::MouseReporting::report).
+    pub mouse: Option<MouseReporting>,
 }
 
 /// The screen and scrollback at one moment. Cheap to clone (reference counts) and never

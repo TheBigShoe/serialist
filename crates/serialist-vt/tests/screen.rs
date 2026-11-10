@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use serialist_core::{LineId, LineSource};
-use serialist_vt::{MAX_ZERO_WIDTH, VtEvent, VtScreen};
+use serialist_vt::{MAX_ZERO_WIDTH, MouseEncoding, MouseMode, MouseReporting, VtEvent, VtScreen};
 
 use common::{in_pieces, one_shot, screen_text, scrollback_text, t0};
 
@@ -283,18 +283,60 @@ fn clipboard_writes_are_refused() {
 fn modes_the_ui_acts_on() {
     let mut screen = VtScreen::new(20, 3, 100);
     let modes = screen.snapshot().modes();
-    assert!(!modes.app_cursor_keys && !modes.bracketed_paste && !modes.mouse_reporting);
+    assert!(!modes.app_cursor_keys && !modes.bracketed_paste && modes.mouse.is_none());
     screen.feed(b"\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b=\x1b[?25l\x1b[5 q");
     let snap = screen.snapshot();
     let modes = snap.modes();
     assert!(modes.app_cursor_keys);
     assert!(modes.bracketed_paste);
-    assert!(modes.mouse_reporting);
+    assert_eq!(
+        modes.mouse,
+        Some(MouseReporting {
+            mode: MouseMode::Click,
+            encoding: MouseEncoding::X10
+        })
+    );
     assert!(modes.app_keypad);
     let cursor = snap.cursor().unwrap();
     assert!(!cursor.visible);
     assert_eq!(cursor.shape, serialist_vt::CursorShape::Beam);
     assert!(cursor.blinking);
+}
+
+#[test]
+fn mouse_modes_and_encodings() {
+    let mut screen = VtScreen::new(20, 3, 100);
+    let mut mouse = |bytes: &[u8]| {
+        screen.feed(bytes);
+        screen.snapshot().modes().mouse
+    };
+    let on = |mode, encoding| Some(MouseReporting { mode, encoding });
+    assert_eq!(
+        mouse(b"\x1b[?1002h"),
+        on(MouseMode::Drag, MouseEncoding::X10)
+    );
+    assert_eq!(
+        mouse(b"\x1b[?1006h"),
+        on(MouseMode::Drag, MouseEncoding::Sgr)
+    );
+    // The last mode set wins, and the encoding stays.
+    assert_eq!(
+        mouse(b"\x1b[?1003h"),
+        on(MouseMode::Motion, MouseEncoding::Sgr)
+    );
+    assert_eq!(
+        mouse(b"\x1b[?1005h"),
+        on(MouseMode::Motion, MouseEncoding::Utf8)
+    );
+    assert_eq!(mouse(b"\x1b[?1003l"), None);
+    // An encoding alone asks for nothing.
+    assert_eq!(mouse(b"\x1b[?1006h"), None);
+    assert_eq!(
+        mouse(b"\x1b[?1000h"),
+        on(MouseMode::Click, MouseEncoding::Sgr)
+    );
+    // A full reset turns it off.
+    assert_eq!(mouse(b"\x1bc"), None);
 }
 
 /// Alacritty 0.26 erases above the cursor (`CSI 1 J`) only when the cursor is below the

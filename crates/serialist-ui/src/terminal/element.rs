@@ -49,7 +49,9 @@ use std::time::Instant;
 use std::cell::Cell;
 
 use serialist_core::{Direction, LineId, LineSource, SearchMatch, Style, StyledLine};
-use serialist_vt::{CursorShape, CursorState};
+use serialist_vt::{
+    CursorShape, CursorState, MouseAction, MouseButton as VtMouseButton, MouseReporting,
+};
 
 use crate::config::Config;
 use crate::prelude::*;
@@ -411,6 +413,40 @@ impl HitMap {
     }
 }
 
+impl HitMap {
+    /// The screen cell (column, row) under `position`, for a mouse report: on the
+    /// screen's rows (ids from `first_visible`, `columns` by `rows`), clamped to them
+    /// when the pointer is past an edge. `None` over the scrollback.
+    pub fn screen_cell(
+        &self,
+        position: Point<Pixels>,
+        first_visible: LineId,
+        columns: usize,
+        rows: usize,
+    ) -> Option<(usize, usize)> {
+        let y = f32::from(position.y - self.bounds.top());
+        let row = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.y <= y)
+            .or(self.rows.first())?;
+        let screen_row = row.line.0.checked_sub(first_visible.0)? as usize;
+        let x = f32::from(position.x - self.column_origin).max(0.0) / self.cell_width;
+        let column = (x.floor() as usize).min(columns.saturating_sub(1));
+        Some((column, screen_row.min(rows.saturating_sub(1))))
+    }
+}
+
+fn vt_button(button: MouseButton) -> Option<VtMouseButton> {
+    match button {
+        MouseButton::Left => Some(VtMouseButton::Left),
+        MouseButton::Middle => Some(VtMouseButton::Middle),
+        MouseButton::Right => Some(VtMouseButton::Right),
+        _ => None,
+    }
+}
+
 /// Asks for a terminal screen of `columns` by `rows` cells.
 pub type ResizeScreen = Rc<dyn Fn(usize, usize, &mut App)>;
 
@@ -422,6 +458,10 @@ pub struct ScreenInputs {
     pub rows: usize,
     /// The cursor to draw: `None` while the device hides it, or a blink has it off.
     pub cursor: Option<CursorState>,
+    /// The id of the screen's top row.
+    pub first_visible: LineId,
+    /// The mouse reports to send instead of selecting, if any (see the view's docs).
+    pub mouse: Option<MouseReporting>,
     /// Asked, after the frame, for the screen to be `columns` by `rows` when that is what
     /// fits the element and not the screen's size.
     pub resize: ResizeScreen,
@@ -1248,17 +1288,47 @@ impl TerminalElement {
     ) {
         let row_height = layout.row_height;
         let wrap = self.inputs.wrap && self.inputs.screen.is_none();
+        // The screen cell under a position, while the device takes the mouse: Shift
+        // keeps it for selection and scrolling.
+        let reporting = self.inputs.screen.as_ref().and_then(|screen| {
+            screen.mouse?;
+            Some((screen.first_visible, screen.columns, screen.rows))
+        });
+        let cell_at = {
+            let hit_map = layout.hit_map.clone();
+            move |position: Point<Pixels>, modifiers: &Modifiers| {
+                let (first_visible, columns, rows) = reporting?;
+                if modifiers.shift {
+                    return None;
+                }
+                hit_map.screen_cell(position, first_visible, columns, rows)
+            }
+        };
 
         window.on_mouse_event({
             let view = self.inputs.view.clone();
             let hitbox = layout.hitbox.clone();
             let hit_map = layout.hit_map.clone();
             let focus = self.inputs.focus.clone();
+            let cell_at = cell_at.clone();
             move |event: &MouseDownEvent, phase, window, cx| {
-                if !phase.bubble()
-                    || event.button != MouseButton::Left
-                    || !hitbox.is_hovered(window)
+                if !phase.bubble() || !hitbox.is_hovered(window) {
+                    return;
+                }
+                // A press the device asked to hear about goes to it, any button.
+                if let Some(cell) = cell_at(event.position, &event.modifiers)
+                    && let Some(button) = vt_button(event.button)
                 {
+                    window.focus(&focus, cx);
+                    window.capture_pointer(hitbox.id);
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_mouse(MouseAction::Press(button), cell, alt, control, cx)
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.button != MouseButton::Left {
                     return;
                 }
                 window.focus(&focus, cx);
@@ -1276,10 +1346,40 @@ impl TerminalElement {
             let view = self.inputs.view.clone();
             let hit_map = layout.hit_map.clone();
             let scroll = self.inputs.scroll.clone();
-            move |event: &MouseMoveEvent, phase, _window, cx| {
-                if !phase.bubble()
-                    || event.pressed_button != Some(MouseButton::Left)
-                    || !view.read(cx).is_selecting()
+            let hitbox = layout.hitbox.clone();
+            let cell_at = cell_at.clone();
+            let hit_map_for_cells = layout.hit_map.clone();
+            move |event: &MouseMoveEvent, phase, window, cx| {
+                if !phase.bubble() {
+                    return;
+                }
+                // A move the device asked to hear about: with the button it was told is
+                // down (anywhere, clamped to the screen), or with none over the screen.
+                if !view.read(cx).is_selecting()
+                    && let Some((first_visible, columns, rows)) = reporting
+                {
+                    let pressed = view.read(cx).mouse_pressed();
+                    let cell = match pressed {
+                        Some(_) => hit_map_for_cells.screen_cell(
+                            event.position,
+                            first_visible,
+                            columns,
+                            rows,
+                        ),
+                        None if hitbox.is_hovered(window) => {
+                            cell_at(event.position, &event.modifiers)
+                        }
+                        None => None,
+                    };
+                    if let Some(cell) = cell {
+                        let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                        view.update(cx, |view, cx| {
+                            view.report_mouse(MouseAction::Move(pressed), cell, alt, control, cx)
+                        });
+                    }
+                    return;
+                }
+                if event.pressed_button != Some(MouseButton::Left) || !view.read(cx).is_selecting()
                 {
                     return;
                 }
@@ -1299,11 +1399,26 @@ impl TerminalElement {
 
         window.on_mouse_event({
             let view = self.inputs.view.clone();
+            let hit_map = layout.hit_map.clone();
             move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase.bubble()
-                    && event.button == MouseButton::Left
-                    && view.read(cx).is_selecting()
+                if !phase.bubble() {
+                    return;
+                }
+                // The release of a reported press, wherever the pointer is now.
+                if let Some((first_visible, columns, rows)) = reporting
+                    && let Some(button) = vt_button(event.button)
+                    && view.read(cx).mouse_pressed() == Some(button)
                 {
+                    let cell = hit_map
+                        .screen_cell(event.position, first_visible, columns, rows)
+                        .unwrap_or((0, 0));
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_mouse(MouseAction::Release(button), cell, alt, control, cx)
+                    });
+                    return;
+                }
+                if event.button == MouseButton::Left && view.read(cx).is_selecting() {
                     view.update(cx, |view, cx| view.mouse_up(cx));
                 }
             }
@@ -1318,6 +1433,16 @@ impl TerminalElement {
                     return;
                 }
                 let delta = event.delta.pixel_delta(row_height);
+                // The wheel the device asked for: whole rows of it, as wheel reports.
+                if let Some(cell) = cell_at(event.position, &event.modifiers) {
+                    let rows = f32::from(delta.y) / f32::from(row_height);
+                    let (alt, control) = (event.modifiers.alt, event.modifiers.control);
+                    view.update(cx, |view, cx| {
+                        view.report_wheel(rows, cell, alt, control, cx)
+                    });
+                    cx.stop_propagation();
+                    return;
+                }
                 let (mut dx, mut dy) = (f32::from(delta.x), f32::from(delta.y));
                 // A plain wheel with shift held scrolls sideways.
                 if event.modifiers.shift && dx == 0.0 {

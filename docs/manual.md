@@ -64,7 +64,11 @@ learns the new size), the cursor is drawn where the device puts it, the arrows f
 the device's cursor key mode, pastes are bracketed when it asks, its window title shows
 on the tab and its bell flashes the status dot. Wide characters (CJK, most emoji) take
 two cells and combining accents none, as the device counted them, so text after them
-stays in its columns; selecting and copying them gives each character once. Queries such as device attributes and
+stays in its columns; selecting and copying them gives each character once. When the
+device asks for the mouse (`CSI ? 1000 h`, `1002` or `1003`, in the SGR form with `1006`),
+clicks, drags and the wheel on the screen go to it as mouse reports in inline mode, so a
+menu that takes clicks works; hold Shift to select and scroll as usual. In command mode
+the mouse always selects. Queries such as device attributes and
 the cursor position are answered at once. The log keeps recording underneath: search
 reads it (the search bar says so), raw and text export and recording are the same as in
 monitor mode, and Export adds the screen's rows as text. Switching to VT mode starts a

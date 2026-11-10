@@ -1662,16 +1662,24 @@ impl SessionView {
             columns: snapshot.columns(),
             rows: snapshot.viewport_rows(),
             cursor: snapshot.cursor().filter(|cursor| cursor.visible),
+            first_visible: snapshot.first_visible(),
+            mouse: snapshot.modes().mouse,
         })
     }
 
     /// Put the screen on the terminal: its snapshot as the text source, the log to
-    /// search, and the hook the element resizes it through.
+    /// search, the hook the element resizes it through, and where mouse reports go.
     fn show_screen(&mut self, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
+        let reporter = view.clone();
         let screen = TerminalScreen {
             resize: std::rc::Rc::new(move |columns, rows, cx: &mut App| {
                 view.update(cx, |view, cx| view.resize_screen(columns, rows, cx))
+                    .ok();
+            }),
+            report: std::rc::Rc::new(move |bytes, cx: &mut App| {
+                reporter
+                    .update(cx, |view, _| view.send_mouse_report(bytes))
                     .ok();
             }),
         };
@@ -2762,6 +2770,17 @@ impl SessionView {
         }
         if session.write(key.bytes).is_err() {
             let _ = ingest.append_local("Not sent: the session closed", Direction::Notice);
+        }
+    }
+
+    /// Write a mouse report the screen's device asked for (VT mode). Never echoed: it is
+    /// not something typed.
+    pub fn send_mouse_report(&mut self, bytes: Vec<u8>) {
+        let Some((session, _)) = self.live() else {
+            return;
+        };
+        if session.write(bytes).is_err() {
+            tracing::debug!(port = %self.port, "the session closed before a mouse report");
         }
     }
 

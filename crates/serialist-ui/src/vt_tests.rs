@@ -20,7 +20,7 @@ use crate::inline::Mode;
 use crate::prelude::*;
 use crate::session_options::{DisplayDefaults, SessionOptions};
 use crate::session_view::{BELL_FLASH, FRAME, SessionView};
-use crate::terminal::element::PADDING_LEFT;
+use crate::terminal::element::{CellMetrics, PADDING_LEFT};
 use crate::test_support::{
     ENGINE_WAIT, TestDir, allow_engine_threads, displayed, fake_session, open_test_window,
     open_test_window_sized, resize_window, run_until, wait_connected,
@@ -881,4 +881,247 @@ fn wide_characters_are_drawn_selected_and_copied_in_their_cells(cx: &mut TestApp
         near(selected[0].0, x_of(2.)) && near(selected[0].1, metrics.cell_width * 3.),
         "{selected:?}"
     );
+}
+
+/// Sends `modes` on connect (mouse reporting), then a word, and keeps what it receives.
+struct MouseDevice {
+    modes: &'static [u8],
+    heard: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SimDevice for MouseDevice {
+    fn name(&self) -> &str {
+        "mouse"
+    }
+
+    fn on_connect(&mut self, out: &mut dyn DeviceOutput) {
+        out.send(self.modes);
+        out.send(b"menu");
+    }
+
+    fn on_receive(&mut self, bytes: &[u8], _: &mut dyn DeviceOutput) {
+        self.heard.lock().extend_from_slice(bytes);
+    }
+}
+
+/// A session in VT mode on a device that turned on the mouse, in inline mode, with the
+/// screen sized.
+struct MouseSession {
+    /// Holds the settings for as long as the test runs.
+    _dir: TestDir,
+    window: AnyWindowHandle,
+    view: Entity<SessionView>,
+    /// What the device hears.
+    heard: Arc<Mutex<Vec<u8>>>,
+    bounds: Bounds<Pixels>,
+    metrics: CellMetrics,
+}
+
+impl MouseSession {
+    /// The middle of screen cell (column, row).
+    fn cell(&self, column: usize, row: usize) -> Point<Pixels> {
+        point(
+            self.bounds.left() + PADDING_LEFT + self.metrics.cell_width * (column as f32 + 0.5),
+            self.bounds.top() + self.metrics.row_height * (row as f32 + 0.5),
+        )
+    }
+}
+
+/// [`MouseSession`] on a device that sends `modes` when it connects.
+fn open_mouse(cx: &mut TestAppContext, name: &str, modes: &'static [u8]) -> MouseSession {
+    let dir = vt_config(name);
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&heard);
+    let world = SimWorld::empty();
+    world.add_virtual("mouse", "Mouse", LinkConfig::unpaced(), move || {
+        Box::new(MouseDevice {
+            modes,
+            heard: Arc::clone(&log),
+        })
+    });
+    let (window, _workspace, view) = open(cx, &world, &dir, "virtual:mouse", (1280., 800.));
+    press(cx, window, keys::TOGGLE_INLINE);
+    wait_for_screen(cx, &view, "the word", |snap| {
+        snap.screen_text()[0] == "menu" && snap.modes().mouse.is_some()
+    });
+    settle_size(cx, window, &view);
+    let (bounds, metrics) = view.read_with(cx, |v, cx| {
+        let terminal = v.terminal().read(cx);
+        (
+            terminal.scroll_handle().state().bounds,
+            terminal.cell_metrics().unwrap(),
+        )
+    });
+    MouseSession {
+        _dir: dir,
+        window,
+        view,
+        heard,
+        bounds,
+        metrics,
+    }
+}
+
+fn mouse_down(at: Point<Pixels>, button: MouseButton, modifiers: Modifiers) -> PlatformInput {
+    MouseDownEvent {
+        button,
+        position: at,
+        modifiers,
+        click_count: 1,
+        first_mouse: false,
+    }
+    .to_platform_input()
+}
+
+fn mouse_up(at: Point<Pixels>, button: MouseButton, modifiers: Modifiers) -> PlatformInput {
+    MouseUpEvent {
+        button,
+        position: at,
+        modifiers,
+        click_count: 1,
+    }
+    .to_platform_input()
+}
+
+fn mouse_move(at: Point<Pixels>, button: Option<MouseButton>) -> PlatformInput {
+    MouseMoveEvent {
+        position: at,
+        pressed_button: button,
+        modifiers: Modifiers::default(),
+    }
+    .to_platform_input()
+}
+
+fn wheel(at: Point<Pixels>, lines: f32) -> PlatformInput {
+    ScrollWheelEvent {
+        position: at,
+        delta: ScrollDelta::Lines(point(0., lines)),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    }
+    .to_platform_input()
+}
+
+/// What the device heard, as text, after the reports reach it.
+fn heard_text(cx: &mut TestAppContext, heard: &Arc<Mutex<Vec<u8>>>, len: usize) -> String {
+    wait_heard(cx, heard, "the reports", |heard| heard.len() >= len);
+    // Anything more would have come with what was waited for.
+    cx.run_until_parked();
+    String::from_utf8_lossy(&heard.lock().split_off(0)).into_owned()
+}
+
+#[gpui_test]
+fn a_click_a_drag_and_the_wheel_are_reported_in_sgr(cx: &mut TestAppContext) {
+    // Button-event tracking (drags) and SGR.
+    let session = open_mouse(cx, "vt-mouse-sgr", b"\x1b[?1002h\x1b[?1006h");
+    let (window, view, heard) = (session.window, &session.view, &session.heard);
+    let cell = |column, row| session.cell(column, row);
+    let none = Modifiers::default();
+
+    // A click on cell (3, 1): its press and release.
+    dispatch(cx, window, mouse_down(cell(3, 1), MouseButton::Left, none));
+    dispatch(cx, window, mouse_up(cell(3, 1), MouseButton::Left, none));
+    let click = "\x1b[<0;4;2M\x1b[<0;4;2m";
+    assert_eq!(heard_text(cx, heard, click.len()), click);
+    assert!(
+        view.read_with(cx, |v, cx| v.terminal().read(cx).selection().is_none()),
+        "a reported click selects nothing"
+    );
+
+    // A drag: moves within a cell are sent once, and the release is where it ended.
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, none));
+    dispatch(cx, window, mouse_move(cell(0, 0), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_move(cell(2, 0), Some(MouseButton::Left)));
+    let mut inside = cell(2, 0);
+    inside.x += px(1.);
+    dispatch(cx, window, mouse_move(inside, Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_move(cell(2, 3), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_up(cell(2, 3), MouseButton::Left, none));
+    let drag = "\x1b[<0;1;1M\x1b[<32;3;1M\x1b[<32;3;4M\x1b[<0;3;4m";
+    assert_eq!(heard_text(cx, heard, drag.len()), drag);
+
+    // Moves with no button down are not asked for in this mode; a right click is.
+    dispatch(cx, window, mouse_move(cell(5, 5), None));
+    dispatch(cx, window, mouse_down(cell(5, 5), MouseButton::Right, none));
+    dispatch(cx, window, mouse_up(cell(5, 5), MouseButton::Right, none));
+    let right = "\x1b[<2;6;6M\x1b[<2;6;6m";
+    assert_eq!(heard_text(cx, heard, right.len()), right);
+
+    // The wheel: a report per row, up and down, and the screen does not scroll.
+    dispatch(cx, window, wheel(cell(1, 2), 2.));
+    dispatch(cx, window, wheel(cell(1, 2), -1.));
+    let turns = "\x1b[<64;2;3M\x1b[<64;2;3M\x1b[<65;2;3M";
+    assert_eq!(heard_text(cx, heard, turns.len()), turns);
+}
+
+#[gpui_test]
+fn x10_reports_and_shift_keeps_the_selection(cx: &mut TestAppContext) {
+    // Any-event tracking, in the X10 form.
+    let session = open_mouse(cx, "vt-mouse-x10", b"\x1b[?1003h");
+    let (window, view, heard) = (session.window, &session.view, &session.heard);
+    let cell = |column, row| session.cell(column, row);
+    let none = Modifiers::default();
+
+    // A move with no button, then a click with Control: the release says only that a
+    // button came up.
+    dispatch(cx, window, mouse_move(cell(1, 0), None));
+    let control = Modifiers {
+        control: true,
+        ..none
+    };
+    dispatch(
+        cx,
+        window,
+        mouse_down(cell(1, 0), MouseButton::Left, control),
+    );
+    dispatch(cx, window, mouse_up(cell(1, 0), MouseButton::Left, control));
+    let expected = [
+        b"\x1b[M\x43\x22\x21".as_slice(),
+        b"\x1b[M\x30\x22\x21",
+        b"\x1b[M\x33\x22\x21",
+    ]
+    .concat();
+    wait_heard(cx, heard, "the reports", |heard| {
+        heard.len() >= expected.len()
+    });
+    cx.run_until_parked();
+    assert_eq!(heard.lock().split_off(0), expected);
+
+    // With Shift the mouse is Serialist's: a drag selects (from the middle of a cell the caret is after it) and the
+    // device hears nothing.
+    let shift = Modifiers {
+        shift: true,
+        ..none
+    };
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, shift));
+    dispatch(
+        cx,
+        window,
+        MouseMoveEvent {
+            position: cell(3, 0),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: shift,
+        }
+        .to_platform_input(),
+    );
+    dispatch(cx, window, mouse_up(cell(3, 0), MouseButton::Left, shift));
+    let terminal = view.read_with(cx, |v, _| v.terminal().clone());
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("enu".into())
+    );
+
+    // In command mode the terminal's input is not the device's: a click selects.
+    press(cx, window, keys::TOGGLE_INLINE);
+    dispatch(cx, window, mouse_down(cell(0, 0), MouseButton::Left, none));
+    dispatch(cx, window, mouse_move(cell(2, 0), Some(MouseButton::Left)));
+    dispatch(cx, window, mouse_up(cell(2, 0), MouseButton::Left, none));
+    assert_eq!(
+        terminal.read_with(cx, |t, _| t.selection_text()),
+        Some("en".into())
+    );
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(20));
+    cx.run_until_parked();
+    assert!(heard.lock().is_empty(), "{:?}", heard.lock());
 }
