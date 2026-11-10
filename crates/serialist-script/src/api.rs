@@ -1,5 +1,5 @@
 //! The global Lua API: `serial`, `sleep`, `print`, `log`, `ui`, `commands`, `hex`,
-//! `bytes`, and the sandboxed `require` and `dofile`. Port methods live in
+//! `bytes`, `timer`, and the sandboxed `require` and `dofile`. Port methods live in
 //! [`crate::port`], `codecs` in [`crate::codecs`].
 
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +21,7 @@ pub(crate) fn install(lua: &Lua, ctx: &Rc<RunCtx>) -> mlua::Result<()> {
     globals.set("print", print_fn(lua, ctx, tostring.clone())?)?;
     globals.set("log", log_table(lua, ctx, &tostring)?)?;
     globals.set("sleep", sleep_fn(lua, ctx)?)?;
+    globals.set("timer", crate::timer::timer_table(lua, ctx)?)?;
     globals.set("ui", ui_table(lua, ctx)?)?;
     globals.set("commands", commands_table(lua, ctx, tostring)?)?;
     globals.set("hex", hex_table(lua)?)?;

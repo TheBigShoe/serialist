@@ -95,6 +95,7 @@ days).
 | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
 | `port:description()`, `port:id()` | | strings | no |
 | `sleep(ms)` | milliseconds | nothing | yes |
+| `timer.after(ms, fn)`, `timer.every(ms, fn)` | milliseconds (`every`: 1 or more), `fn()` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs once after `ms`, or every `ms`, may wait |
 | `print(...)` | values | one `ScriptEvent::Output`, tab-joined | no |
 | `log.debug/info/warn/error(...)` | values | `ScriptUi::log` and an `Output` line `"[info] ..."`, space-joined | no |
 | `ui.prompt(label, default)` | strings | the answer, or `nil` if dismissed; sends `ScriptEvent::Prompt` first | yes |
@@ -126,8 +127,25 @@ feed ends it or another line starts after it.
 commands: `port:expect([[^VAL=(\d+)]])`. Only received lines count, never echoes of
 what was sent or app notices.
 
-**Ending.** A run ends when its main chunk returns; `on_line` handlers still active
-then are cancelled. An error in an `on_line` callback ends the run with that error.
+**Timers.** `timer.after(ms, fn)` calls `fn()` once, `ms` from now; `timer.every(ms,
+fn)` calls it every `ms`. Like `on_line` callbacks, they run while the script waits
+(`sleep`, `expect`, a prompt), one call at a time, never inside another wait's own
+code; a callback may wait itself, and an error in one ends the run. A call is never
+queued: when one runs past the next tick, that tick is skipped and the timer is next due
+one interval after the call returns. `active()` is false once an `after` has fired or
+either was cancelled. A run may have 1024 timers and `on_frame` handlers active at once
+(`Limits::max_callbacks`); one more raises an error until one is cancelled or fires for
+the last time.
+
+```lua
+local port = serial.current()
+local keepalive <close> = timer.every(500, function() port:write("AT\r\n") end)
+local ready = port:expect("^READY$", { timeout_ms = 10000 })
+```
+
+**Ending.** A run ends when its main chunk returns; `on_line` handlers and timers still
+active then are cancelled. An error in an `on_line` or timer callback ends the run with
+that error.
 
 In the table, `ScriptEvent::Output` is one line of script output (a line in the Script
 console, or on stdout when headless), `ScriptEvent::Prompt` is a prompt asking for an
@@ -169,8 +187,8 @@ reloaded meanwhile is used from its next call, and one that panics is made again
 `ui.notify(text)` prints `notice: <text>` in the Script console and shows a notice; headless
 it goes to stderr as `notice: <text>`.
 
-The plan (`docs/plan.md`) lists `port:on_frame` and timers in the scripting API. The
-table above has neither.
+The plan (`docs/plan.md`) lists `port:on_frame` in the scripting API. The table above
+does not have it.
 
 ## Sandbox and limits
 
@@ -186,7 +204,7 @@ table above has neither.
   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
   run, but every later wait fails the same way and the executor drops the script at
   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-- Waiting calls work in the main body, required modules and `on_line` callbacks, not
+- Waiting calls work in the main body, required modules, `on_line` and timer callbacks, not
   inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
   (they fail with a message saying so).
 
@@ -229,5 +247,5 @@ How the API behaves without the app around it:
 | Code | Meaning |
 |---|---|
 | 0 | The script's main chunk returned. (`--help` and `--version` also exit 0.) |
-| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line` callback, or the port could not be opened. |
+| 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line` or timer callback, or the port could not be opened. |
 | 2 | The script was stopped, or nothing ran: a bad flag, `--script` without `--port` or with more than one, a script file that cannot be read, or a `--virtual` device that does not exist. |
