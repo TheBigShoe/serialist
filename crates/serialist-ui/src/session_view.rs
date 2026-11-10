@@ -86,7 +86,8 @@
 //!
 //! The ingest thread also rings a [`LineBell`](serialist_script::LineBell) through a
 //! [`ScriptLink`](crate::script_bridge::ScriptLink) sink, from the moment the session
-//! opens; it is the last sink, so a ring finds the chunk's decoded frames stored too. Once the workspace calls [`SessionView::attach_scripts`], the view owns a
+//! opens; it is the last sink, so a ring finds the chunk's decoded frames stored too.
+//! Once the workspace calls [`SessionView::attach_scripts`], the view owns a
 //! [`SessionScripts`]: a script thread whose `serial.current()` writes through the
 //! session's [`SessionControl`](crate::session_handle::SessionControl) and reads this
 //! store. [`SessionView::run_script`] queues a run (one runs at a time; the others wait
