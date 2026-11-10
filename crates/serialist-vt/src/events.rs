@@ -92,6 +92,11 @@ impl EventState {
         self.events.push_back(event);
     }
 
+    /// An answer to the device that the screen gives itself.
+    pub fn respond(&mut self, bytes: &[u8]) {
+        self.push(VtEvent::Respond(bytes.to_vec()));
+    }
+
     /// A reset that Alacritty does not report: its full reset clears the title silently.
     pub fn reset_title(&mut self) {
         if self.title.take().is_some() {

@@ -15,19 +15,18 @@
 //! - the whole run feeds the bytes before the resize as one chunk, resizes, and feeds the
 //!   rest as one chunk, so both runs resize at the same byte offset.
 //!
-//! Both runs call `end_sync` before the comparison, and before the resize. `feed_at` reads
-//! the clock to time out a synchronized update (`CSI ? 2026 h` with no end), so an update
-//! left open must not decide the result. The split run takes no snapshot while an update
-//! is open, so its checks never spend the 150 ms; only a machine that stalls that long
-//! inside one chunk's parse could still time an update out, and that input replays
-//! without the stall.
+//! Both runs call `end_sync` before the comparison: a synchronized update
+//! (`CSI ? 2026 h` with no end) holds the snapshot at what the screen showed when it
+//! began, and which snapshot that is depends on the chunks. What the screen holds
+//! underneath does not: it parses an update's bytes as they arrive, and every chunk here
+//! arrives at one `Instant`, so no update times out. The split run takes its snapshots
+//! through open updates too, and each must pass every check below as the screen it
+//! shows.
 //!
-//! The resize is the one thing besides the comparison that would see an open update:
-//! vte 0.15.0 does not keep one independent of chunking when a begin that is not byte for
-//! byte `ESC [ ? 2026 h` (say `ESC [ ? 2026 ; 1 h`) follows an end in the same chunk. That
-//! chunk ignores the begin, while a chunk that starts with it opens an update and holds
-//! the rest back until the update ends or times out. Ending the update first makes the
-//! screens agree again (`regress_sync_begin_variant_at_resize`).
+//! (vte 0.15.0 used to hold an update's bytes back itself, and found the end and the
+//! next begin by searching for their exact bytes, so a begin spelled `ESC [ ? 2026 ; 1 h`
+//! opened an update or not depending on the chunks. The screen has done the holding
+//! itself since: `regress_sync_begin_variant_at_resize`.)
 //!
 //! What must be equal: every line from `first_line()` to `end()` (id, text, runs and
 //! `complete`; the times and raw offsets belong to the chunk a row was captured in), the
@@ -58,8 +57,9 @@
 //!   title the snapshot shows is the one the events last set, when none were dropped.
 //!
 //! And between two snapshots of the split run, which are the stable-id promises:
-//! the generation goes up by one when the snapshot's content changed, and equal
-//! generations mean equal content (the reverse is not promised: erasing an empty
+//! the generation goes up when the snapshot's content changed (by more than one when the
+//! screen took a snapshot of its own in between, as it does where an update begins), and
+//! equal generations mean equal content (the reverse is not promised: erasing an empty
 //! scrollback with `CSI 3 J` takes a new generation for the same content); ids never go
 //! backwards; scrollback rows that stay retained read back unchanged; and every row
 //! whose text or runs differ from the earlier snapshot's is inside
@@ -309,19 +309,17 @@ fn drive(setup: &Setup, steps: &[Step], stream_len: usize, watch: bool) -> Obser
         match *step {
             Step::Feed(bytes) => screen.feed_at(bytes, setup.at),
             Step::Resize => {
-                screen.end_sync();
                 screen.resize(dims.rows, dims.columns);
                 dims = dims.swapped();
                 assert!(dims.matches(&screen), "the resized size, {dims:?}");
             }
         }
-        // Not while an update is open: see the module docs.
-        if watch && !screen.sync_pending() && (i % stride == 0 || matches!(step, Step::Resize)) {
+        if watch && (i % stride == 0 || matches!(step, Step::Resize)) {
             previous = Some(look(&mut screen, dims, setup, previous.as_ref()));
         }
     }
 
-    // `feed_at` times an update out by the clock; an end that does not is not the clock's.
+    // An open update holds an earlier snapshot: see the module docs.
     screen.end_sync();
     assert!(!screen.sync_pending(), "end_sync left an update open");
     assert!(!screen.end_sync(), "end_sync found a second update to end");
@@ -522,17 +520,14 @@ fn check_step(previous: &Seen, current: &Seen) {
         now.first_visible()
     );
 
-    // A snapshot whose content differs has the next generation, and equal generations mean
+    // A snapshot whose content differs has a later generation, and equal generations mean
     // equal content. The reverse is not promised: the scrollback is compared by identity,
     // so erasing an empty one (`CSI 3 J`) takes a new generation for the same content.
     let unchanged = previous.first_difference(current).is_none();
     let (then, next) = (before.generation(), now.generation());
+    assert!(next >= then, "generation {then} then {next}");
     assert!(
-        next == then || next == then + 1,
-        "generation {then} then {next}"
-    );
-    assert!(
-        unchanged || next == then + 1,
+        unchanged || next > then,
         "generation {then} then {next}, with the content changed"
     );
 

@@ -44,6 +44,24 @@
 //! them too. So the tracker drops a zero-width character once its cell holds
 //! [`MAX_ZERO_WIDTH`] of them.
 //!
+//! # Synchronized updates
+//!
+//! A device brackets a redraw with `CSI ? 2026 h` and `CSI ? 2026 l` so that it shows in
+//! one piece. vte would do this by holding the bytes back, up to 2 MiB of them, and
+//! parsing them all in one call when the update ends. The screen does it instead, and
+//! holds back the view: vte is given a timeout that never holds anything
+//! ([`NoHold`]), bytes are parsed as they arrive, and while an update is open
+//! [`VtScreen::snapshot`] returns the snapshot before it. That snapshot is taken when the
+//! update begins, so what arrived ahead of the begin in the same chunk shows at once, and
+//! a device sending one update after another shows each when the next begins. It is
+//! taken at most once per chunk: a device does not get a snapshot for every eight
+//! bytes.
+//!
+//! An update ends at its `CSI ? 2026 l`, on a full reset, on a resize, or
+//! [`SYNC_TIMEOUT`] after it began; a second begin inside it does not extend it. Answers
+//! to the device's queries and its other events are not held: a device that asks inside
+//! an update gets its answer when it asks.
+//!
 //! # Insert mode
 //!
 //! In insert mode (`CSI 4 h`) Alacritty makes room for every character by moving the cells
@@ -58,7 +76,7 @@
 //! until the text has left it, which a repeat can ask for once a row.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::{Dimensions, Grid, GridCell, Row};
 use alacritty_terminal::index::{Line, Point};
@@ -67,8 +85,8 @@ use alacritty_terminal::term::{Config, Osc52, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape as VtCursorShape, CursorStyle, Handler, Hyperlink,
     KeyboardModes, KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedMode,
-    PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
-    cursor_icon::CursorIcon,
+    NamedPrivateMode, PrivateMode, Processor, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset,
+    TabulationClearMode, Timeout, cursor_icon::CursorIcon,
 };
 use serialist_core::ansi::incomplete_utf8_suffix;
 use serialist_core::{Epoch, LineId, StyledLine};
@@ -103,6 +121,29 @@ pub const MAX_ZERO_WIDTH: usize = 30;
 /// The largest buffer kept for joining a held-back character to the next chunk.
 const KEEP_JOINED: usize = 64 * 1024;
 
+/// How long a synchronized update (`CSI ? 2026 h`) holds the view back when the device
+/// does not end it: what vte and Alacritty allow.
+pub const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
+const SYNC_UPDATE: PrivateMode = PrivateMode::Named(NamedPrivateMode::SyncUpdate);
+
+/// The timeout vte keeps for a synchronized update, as one that is never pending: vte
+/// then holds no bytes back and parses every chunk as it comes. It still tells the
+/// handler when an update begins and ends, which is all the screen needs (see the module
+/// docs).
+#[derive(Default)]
+struct NoHold;
+
+impl Timeout for NoHold {
+    fn set_timeout(&mut self, _duration: Duration) {}
+
+    fn clear_timeout(&mut self) {}
+
+    fn pending_timeout(&self) -> bool {
+        false
+    }
+}
+
 struct Size {
     columns: usize,
     rows: usize,
@@ -135,12 +176,14 @@ fn clamp_size(columns: usize, rows: usize) -> Size {
 pub struct VtScreen {
     term: Term<Listener>,
     listener: Listener,
-    processor: Processor,
+    processor: Processor<NoHold>,
     scrollback: Scrollback,
     /// The snapshot handed out last: rows are reused from it when unchanged.
     last: Option<VtSnapshot>,
     /// Something may have changed since `last`.
     dirty: bool,
+    /// When the open synchronized update times out; `None` when none is open.
+    sync: Option<Instant>,
     generation: u64,
     epoch: Epoch,
     /// Bytes fed so far: the stream offset of the next byte.
@@ -153,6 +196,9 @@ pub struct VtScreen {
     held_len: usize,
     /// Reused to join held bytes to the next chunk.
     joined: Vec<u8>,
+    /// The last byte parsed, which says whether the next could end an escape sequence
+    /// (see [`begins_update`]).
+    last_byte: u8,
 }
 
 impl Default for VtScreen {
@@ -196,6 +242,7 @@ impl VtScreen {
             scrollback: Scrollback::new(scrollback_lines),
             last: None,
             dirty: true,
+            sync: None,
             generation: 0,
             epoch,
             offset: 0,
@@ -203,6 +250,7 @@ impl VtScreen {
             held: [0; 3],
             held_len: 0,
             joined: Vec::new(),
+            last_byte: 0,
         }
     }
 
@@ -235,13 +283,14 @@ impl VtScreen {
     }
 
     /// Feed received bytes that arrived at `at` (the session's chunk time). Rows the
-    /// chunk changes get `at` as their `received_at`.
+    /// chunk changes get `at` as their `received_at`, and a synchronized update it begins
+    /// times out [`SYNC_TIMEOUT`] after `at`.
     pub fn feed_at(&mut self, bytes: &[u8], at: Instant) {
         if bytes.is_empty() {
             return;
         }
         self.last_at = at;
-        self.flush_sync(Instant::now());
+        self.flush_sync(at);
         if self.held_len == 0 {
             self.advance_whole_characters(bytes);
         } else {
@@ -265,32 +314,56 @@ impl VtScreen {
         let keep = incomplete_utf8_suffix(bytes);
         let (whole, tail) = bytes.split_at(bytes.len() - keep);
         if !whole.is_empty() {
-            self.with_tracker(|processor, tracker| processor.advance(tracker, whole));
+            self.parse(whole);
         }
         self.held[..keep].copy_from_slice(tail);
         self.held_len = keep;
     }
 
-    /// End a synchronized update (`CSI ? 2026 h`) the device began more than 150 ms
-    /// before `now` and never ended, applying what it buffered. Feeding does this on its
-    /// own; call it when no bytes arrive (the sink does, on idle) so a device that stops
-    /// mid-update does not freeze the screen. Returns whether an update was ended.
+    /// Parse `bytes`, which end on a character boundary. Where a synchronized update
+    /// begins, the parsing stops for a snapshot of the screen as it is, the one shown
+    /// while the update is open: the first time in these bytes only (see the module docs).
+    fn parse(&mut self, bytes: &[u8]) {
+        let mut start = 0;
+        let mut captured = false;
+        let mut prev = self.last_byte;
+        for (i, &byte) in bytes.iter().enumerate() {
+            if !captured && begins_update(prev, byte) {
+                if self.advance(&bytes[start..=i]) {
+                    self.refresh();
+                    captured = true;
+                }
+                start = i + 1;
+            }
+            prev = byte;
+        }
+        self.advance(&bytes[start..]);
+        self.last_byte = prev;
+    }
+
+    /// Hand `bytes` to the parser. Returns whether they began a synchronized update and
+    /// did nothing after that.
+    fn advance(&mut self, bytes: &[u8]) -> bool {
+        self.with_tracker(|processor, tracker| processor.advance(tracker, bytes))
+    }
+
+    /// End a synchronized update (`CSI ? 2026 h`) that the device began [`SYNC_TIMEOUT`]
+    /// or more before `now` and never ended, so the screen shows what has arrived since.
+    /// Feeding does this on its own; call it when no bytes arrive (the sink does, on
+    /// idle) so a device that stops mid-update does not freeze the screen. Returns
+    /// whether an update was ended.
     pub fn flush_sync(&mut self, now: Instant) -> bool {
-        let expired = self
-            .processor
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| now >= deadline);
+        let expired = self.sync.is_some_and(|deadline| now >= deadline);
         if expired {
-            self.with_tracker(|processor, tracker| processor.stop_sync(tracker));
-            self.dirty = true;
+            self.end_sync();
         }
         expired
     }
 
     /// Run `f` with the parser and a tracker over this screen, stamping rows with the
-    /// time of the last chunk.
-    fn with_tracker(&mut self, f: impl FnOnce(&mut Processor, &mut Tracker<'_>)) {
+    /// time of the last chunk. Returns whether the last thing `f` had the tracker do was
+    /// begin a synchronized update.
+    fn with_tracker(&mut self, f: impl FnOnce(&mut Processor<NoHold>, &mut Tracker<'_>)) -> bool {
         let mut tracker = Tracker {
             term: &mut self.term,
             listener: &self.listener,
@@ -301,24 +374,26 @@ impl VtScreen {
                 offset: self.offset,
             },
             equal_from: None,
+            sync: &mut self.sync,
+            begun: false,
         };
         f(&mut self.processor, &mut tracker);
+        tracker.begun
     }
 
-    /// Whether a synchronized update is holding bytes back.
+    /// Whether a synchronized update is open, holding the view back.
     pub fn sync_pending(&self) -> bool {
-        self.processor.sync_timeout().sync_timeout().is_some()
+        self.sync.is_some()
     }
 
-    /// End a synchronized update now, timed out or not, applying what it buffered (the
-    /// link is gone, say). Returns whether one was open.
+    /// End a synchronized update now, timed out or not, so the screen shows what has
+    /// arrived (the link is gone, say). Returns whether one was open.
     pub fn end_sync(&mut self) -> bool {
-        if !self.sync_pending() {
-            return false;
+        let open = self.sync.take().is_some();
+        if open {
+            self.dirty = true;
         }
-        self.with_tracker(|processor, tracker| processor.stop_sync(tracker));
-        self.dirty = true;
-        true
+        open
     }
 
     /// Resize the screen to `columns` by `rows` (clamped as in [`new`](Self::new)).
@@ -326,12 +401,14 @@ impl VtScreen {
     /// Alacritty keeps the cursor row on screen: shrinking pushes rows off the top into
     /// the scrollback, and a narrower primary screen rewraps its rows. Growing adds blank
     /// rows at the bottom; rows are not pulled back out of the scrollback, whose lines
-    /// and ids never change.
+    /// and ids never change. A synchronized update left open ends: the snapshot it
+    /// holds is of the old size.
     pub fn resize(&mut self, columns: usize, rows: usize) {
         let size = clamp_size(columns, rows);
         if size.columns == self.columns() && size.rows == self.rows() {
             return;
         }
+        self.sync = None;
         self.term.resize(size);
         // Rows the resize pushed off the primary screen. On the alternate screen they
         // wait in the primary's history until it is back.
@@ -350,6 +427,7 @@ impl VtScreen {
     pub fn reset(&mut self) {
         self.processor = Processor::new();
         self.held_len = 0;
+        self.last_byte = 0;
         self.with_tracker(|_, tracker| tracker.reset_state());
         self.dirty = true;
     }
@@ -378,15 +456,22 @@ impl VtScreen {
         responses
     }
 
-    /// The screen and scrollback now. Cheap when nothing changed (the same snapshot
-    /// again), and otherwise proportional to the rows that changed: rows Alacritty did
-    /// not damage are shared with the previous snapshot.
+    /// The screen and scrollback now, or as they were when the synchronized update that
+    /// is open began. Cheap when nothing changed (the same snapshot again), and otherwise
+    /// proportional to the rows that changed: rows Alacritty did not damage are shared
+    /// with the previous snapshot.
     pub fn snapshot(&mut self) -> VtSnapshot {
-        if !self.dirty
-            && let Some(last) = &self.last
+        if let Some(last) = &self.last
+            && (self.sync.is_some() || !self.dirty)
         {
             return last.clone();
         }
+        self.refresh()
+    }
+
+    /// The screen and scrollback now, open update or not, as the snapshot to hand out
+    /// from here on.
+    fn refresh(&mut self) -> VtSnapshot {
         self.dirty = false;
         let snapshot = self.build();
         if let Some(last) = &self.last
@@ -486,6 +571,14 @@ impl VtScreen {
             epoch: self.epoch,
         }
     }
+}
+
+/// Whether `byte` after `prev` could be the end of the sequence that begins a
+/// synchronized update, `CSI ? 2026 h`: an `h` after a digit. Stopping at one that is
+/// not costs a call; a begin spelled so that this misses it (a control character before
+/// the `h`, say) only goes without its snapshot, and holds the one before.
+fn begins_update(prev: u8, byte: u8) -> bool {
+    byte == b'h' && prev.is_ascii_digit()
 }
 
 /// `row` as the line with id `id`, sharing the previous snapshot's line when that one
@@ -602,6 +695,10 @@ struct Tracker<'a> {
     /// all equal and no part of a wide character: set by an insert-mode character
     /// written without moving them, and forgotten on any other call. See the module docs.
     equal_from: Option<Point>,
+    /// The screen's open synchronized update: when it times out.
+    sync: &'a mut Option<Instant>,
+    /// A synchronized update began and nothing has been done since.
+    begun: bool,
 }
 
 impl Tracker<'_> {
@@ -609,6 +706,7 @@ impl Tracker<'_> {
     #[inline(always)]
     fn after(&mut self) {
         self.equal_from = None;
+        self.begun = false;
         self.absorb_scrolled();
     }
 
@@ -717,9 +815,6 @@ impl Handler for Tracker<'_> {
         set_mode(mode: Mode);
         unset_mode(mode: Mode);
         report_mode(mode: Mode);
-        set_private_mode(mode: PrivateMode);
-        unset_private_mode(mode: PrivateMode);
-        report_private_mode(mode: PrivateMode);
         set_scrolling_region(top: usize, bottom: Option<usize>);
         set_keypad_application_mode();
         unset_keypad_application_mode();
@@ -750,6 +845,7 @@ impl Handler for Tracker<'_> {
     /// is full, in which case it is dropped. In insert mode, one that would move a run of
     /// equal cells is written without the move (see the module docs).
     fn input(&mut self, c: char) {
+        self.begun = false;
         let width = c.width();
         if width == Some(0) && self.zero_width_full() {
             return;
@@ -770,6 +866,37 @@ impl Handler for Tracker<'_> {
             self.equal_from = None;
         }
         self.absorb_scrolled();
+    }
+
+    /// `CSI ? Pm h`. Mode 2026 begins a synchronized update, unless one is open: a
+    /// second begin does not extend the first.
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        Handler::set_private_mode(&mut *self.term, mode);
+        self.after();
+        if mode == SYNC_UPDATE && self.sync.is_none() {
+            *self.sync = Some(self.rows.at + SYNC_TIMEOUT);
+            self.begun = true;
+        }
+    }
+
+    /// `CSI ? Pm l`. Mode 2026 ends the synchronized update.
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        Handler::unset_private_mode(&mut *self.term, mode);
+        self.after();
+        if mode == SYNC_UPDATE {
+            *self.sync = None;
+        }
+    }
+
+    /// `CSI ? Ps $ p`. Alacritty reports mode 2026 as reset, since with vte holding the
+    /// bytes it never saw the question inside an update. Here it can.
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        if mode == SYNC_UPDATE && self.sync.is_some() {
+            self.listener.0.lock().respond(b"\x1b[?2026;1$y");
+        } else {
+            Handler::report_private_mode(&mut *self.term, mode);
+        }
+        self.after();
     }
 
     fn clear_screen(&mut self, mode: ClearMode) {
@@ -796,6 +923,7 @@ impl Handler for Tracker<'_> {
     fn reset_state(&mut self) {
         Handler::reset_state(&mut *self.term);
         self.after();
+        *self.sync = None;
         self.rows.scrollback.clear();
         // Alacritty clears its title on a full reset without telling its listener.
         self.listener.0.lock().reset_title();
@@ -891,7 +1019,7 @@ mod tests {
             screen.feed(&bytes[cut..]);
 
             let mut alacritty = Term::new(Config::default(), &Size { columns, rows }, VoidListener);
-            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
+            Processor::<NoHold>::new()
                 .advance(&mut alacritty, &bytes);
 
             let (ours, theirs) = (screen.term.grid(), alacritty.grid());
