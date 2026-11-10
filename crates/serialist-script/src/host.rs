@@ -181,7 +181,7 @@ pub enum ScriptOutcome {
     /// The main chunk returned.
     Ok,
     /// A syntax error, an uncaught runtime error (message and Lua traceback), a memory
-    /// error, or an error in an `on_line` or timer callback.
+    /// error, or an error in an `on_line`, `on_frame` or timer callback.
     Error(String),
     /// [`ScriptRun::stop`] (or dropping the host) ended it.
     Stopped,

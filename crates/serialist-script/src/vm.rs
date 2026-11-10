@@ -77,7 +77,7 @@ pub(crate) struct RunCtx {
     events: Sender<ScriptEvent>,
     pub(crate) services: HostServices,
     prompts: Cell<u64>,
-    /// The first error from an `on_line` callback; it ends the run.
+    /// The first error from an `on_line`, `on_frame` or timer callback; it ends the run.
     failure: RefCell<Option<LuaError>>,
     failed: Notify,
     /// Ports the script opened; closed when it ends.
@@ -163,7 +163,7 @@ impl RunCtx {
             return Err(runtime_error(format!(
                 "{what} cannot wait inside a coroutine the script created \
                  (coroutine.create or coroutine.wrap); call it from the script body, \
-                 a required module or an on_line callback"
+                 a required module, or an on_line, on_frame or timer callback"
             )));
         }
         Ok(())

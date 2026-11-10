@@ -2384,6 +2384,7 @@ impl SessionView {
             serial: self.serial.clone(),
             control: self.session.as_ref().and_then(|session| session.control()),
             reader: ingest.reader(),
+            frames: Some(self.frames.clone()),
             link: self.script_link.clone(),
         };
         self.script_env = Some(env.clone());

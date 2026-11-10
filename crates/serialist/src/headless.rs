@@ -8,7 +8,8 @@
 //! [`run_headless`](serialist_script::run_headless) with standard streams for its
 //! output and prompts; `require` reads from the script's own folder. The plugins in the
 //! config directory's `plugins/` load as they do for the window, for
-//! `codecs.<name>.encode`. `main` exits with [`exit_code`] of the outcome.
+//! `codecs.<name>.encode`, and the port decodes with the plugin its device profile names
+//! (`plugin`), for `port:on_frame`. `main` exits with [`exit_code`] of the outcome.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -93,6 +94,9 @@ pub fn run(
             kind: PortKind::Unknown,
             display_name: port.to_string(),
         });
+    let plugin = settings
+        .profile_for(&info)
+        .and_then(|profile| profile.plugin.clone());
     let mut serial = settings.serial_config_for(&info);
     if let Some(baud) = args.baud {
         serial.baud = baud;
@@ -102,6 +106,16 @@ pub fn run(
         tracing::warn!("{problem}");
     }
     let registry = codecs.registry().clone();
+    let decode = plugin.and_then(|name| {
+        let factory = registry.get(&name);
+        if factory.is_none() {
+            tracing::warn!(
+                "the device profile names the plugin {name}, which is not installed; \
+                 nothing is decoded"
+            );
+        }
+        factory
+    });
     tracing::info!(%port, serial = %serial.summary(), script = %source.name, "running a script");
     Ok(run_headless_with(
         port,
@@ -111,6 +125,7 @@ pub fn run(
         ui,
         HeadlessCodecs {
             source: Some(registry),
+            decode,
         },
     ))
 }
@@ -344,6 +359,32 @@ mod tests {
             out,
             "05 5A 02 00 15 0F\ncodecs[\"airoha-race\"].encode: missing field `cmd_id`\n"
         );
+    }
+
+    #[test]
+    fn the_profile_s_plugin_decodes_for_on_frame() {
+        let dir = TempDir::new("frames");
+        let code = "local p = serial.current()\n\
+                    local got\n\
+                    local h <close> = p:on_frame({ kind = 'response' }, function(f) got = f end)\n\
+                    p:write(codecs['airoha-race'].encode{ cmd_id = 0x0F15 })\n\
+                    for _ = 1, 200 do if got then break end sleep(10) end\n\
+                    print(got and string.format('%s 0x%04X', got.kind, got.fields.cmd_id))\n";
+        // Installed but not named by a profile: nothing decodes.
+        install_race_plugin(&dir);
+        let (outcome, _) = run_script(&dir, &["--port", "virtual:race"], code);
+        let ScriptOutcome::Error(message) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(message.contains("decodes no frames here"), "{message}");
+
+        dir.write(
+            "config/settings.json",
+            r#"{ "devices": [ { "match": { "path": "virtual:race" }, "plugin": "airoha-race" } ] }"#,
+        );
+        let (outcome, out) = run_script(&dir, &["--port", "virtual:race"], code);
+        assert_eq!(outcome, ScriptOutcome::Ok, "{out}");
+        assert_eq!(out, "response 0x0F15\n");
     }
 
     /// What `run` opens its port through, for `settings` in a config directory.

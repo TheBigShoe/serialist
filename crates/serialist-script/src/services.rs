@@ -7,8 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serialist_core::{
-    CodecFactory, CodecRegistry, ControlLine, DeviceMatch, ParamValues, PortId, SerialConfig,
-    SessionClosed, StoreReader,
+    CodecFactory, CodecRegistry, ControlLine, DeviceMatch, FrameStoreReader, ParamValues, PortId,
+    SerialConfig, SessionClosed, StoreReader,
 };
 
 use crate::bell::LineBell;
@@ -57,6 +57,18 @@ pub trait ScriptSession: Send + Sync {
 
     /// Rung after each received chunk is stored; closed when no more can arrive.
     fn bell(&self) -> LineBell;
+
+    /// The frames the session's codec decodes, for `port:on_frame`, or `None` for a
+    /// session that never decodes (`port:on_frame` then raises an error). A session
+    /// whose codec can be chosen later (the app's) returns its store at once, empty
+    /// until a codec runs.
+    ///
+    /// The bell must ring after a chunk's frames are in this store, not only after the
+    /// chunk's lines: put the codec's sink before the bell's among the ingest sinks. The
+    /// default is `None`.
+    fn frames(&self) -> Option<FrameStoreReader> {
+        None
+    }
 
     /// Close the session. Called only for ports a script opened with `serial.open`,
     /// when the script calls `port:close()` or ends, on a thread that may block (a

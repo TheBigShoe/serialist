@@ -56,6 +56,7 @@
 //! | `port:read_line(opts)` | `{timeout_ms}` | next received line (text only), or `nil, "timeout" \| "closed"` | yes |
 //! | `port:expect(pattern, opts)` | regex (Rust syntax, smart case), `{timeout_ms}` | `captures, elapsed_ms` (`captures[1]` the match, `[2..]` groups, `false` for a group that did not take part, `.line` the whole line), or `nil, elapsed_ms, "timeout" \| "closed"` | yes |
 //! | `port:on_line(fn)` | `fn(line)` | handle with `cancel()`, `active()`, and `<close>` support | no; `fn` runs for each later line, may wait |
+//! | `port:on_frame(filter, fn)` | optional `filter` (`{ kind = ..., <field> = ... }`), `fn(frame)` | handle with `cancel()`, `active()`, and `<close>` support; error if the session decodes nothing | no; `fn` runs for each later decoded frame `filter` matches, may wait |
 //! | `port:discard()` | | nothing: skips everything unread | no |
 //! | `port:set{dtr=, rts=, baud=}` | booleans, positive integer | nothing | no (queued) |
 //! | `port:close()` | | nothing; closes ports from `serial.open`, only detaches `serial.current()` | yes (worker thread) |
@@ -106,9 +107,16 @@
 //! is never queued: a tick that falls while the last call still runs is skipped. At most
 //! [`Limits::max_callbacks`] timers and `on_frame` handlers are active at once.
 //!
-//! **Ending.** A run ends when its main chunk returns; `on_line` handlers and timers
-//! still active then are cancelled. An error in an `on_line` or timer callback ends the
-//! run with that error.
+//! **Frames.** `port:on_frame([filter,] fn)` calls `fn(frame)` for each frame
+//! [`ScriptSession::frames`] gains from the call on that `filter` matches (read like a
+//! saved command's frame predicate, by `serialist_core::codec::frame_matches`). `frame`
+//! has `kind`, `severity`, `summary`, `fields` and `bytes` (the frame's bytes from the
+//! scrollback, `nil` once evicted). Nothing is queued: a handler that falls behind the
+//! bounded frame store skips what it evicted. A session without frames raises an error.
+//!
+//! **Ending.** A run ends when its main chunk returns; `on_line` and `on_frame` handlers
+//! and timers still active then are cancelled. An error in any of their callbacks ends
+//! the run with that error.
 //!
 //! # Sandbox and limits
 //!
@@ -124,14 +132,15 @@
 //!   stops too. A pending wait raises `script stopped` at once, so `<close>` handlers
 //!   run, but every later wait fails the same way and the executor drops the script at
 //!   its next suspension. `pcall`, `xpcall` and `coroutine.resume` cannot swallow a stop.
-//! - Waiting calls work in the main body, required modules, `on_line` and timer callbacks, not
-//!   inside coroutines the script creates with `coroutine.create` or `coroutine.wrap`
-//!   (they fail with a message saying so).
+//! - Waiting calls work in the main body, required modules, and `on_line`, `on_frame`
+//!   and timer callbacks, not inside coroutines the script creates with
+//!   `coroutine.create` or `coroutine.wrap` (they fail with a message saying so).
 
 mod api;
 mod bell;
 mod callback;
 mod codecs;
+mod frame;
 mod headless;
 mod hex;
 mod host;

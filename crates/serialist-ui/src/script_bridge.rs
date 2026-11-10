@@ -10,8 +10,9 @@
 //!
 //! - [`GuiScriptSession`] writes through the session's [`SessionControl`] (the writer
 //!   thread's queue) and reads the session's store, woken by the [`LineBell`] that the
-//!   ingest thread rings through [`ScriptLink`], one of its sinks. No byte of a script's
-//!   reads or writes crosses the main thread.
+//!   ingest thread rings through [`ScriptLink`], its last sink, after the codec slot has
+//!   stored the chunk's frames, which `port:on_frame` reads from the session's frame
+//!   store. No byte of a script's reads or writes crosses the main thread.
 //! - [`GuiScriptUi`] and [`GuiCommands`] only send a [`UiRequest`] down a channel. The
 //!   session view drains it, with the run's own [`ScriptEvent`]s, once a frame while a
 //!   script is active ([`SessionScripts::poll`]), on the main thread. A prompt's answer
@@ -37,7 +38,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::{Mutex, RwLock};
 use serialist_core::{
     ChunkSink, CodecFactory, CodecRegistry, Command, CommandRef, CommandStore, ControlLine,
-    LineEnding, ParamValues, PortId, PortSource, SerialConfig, SessionClosed, StoreReader,
+    FrameStoreReader, LineEnding, ParamValues, PortId, PortSource, SerialConfig, SessionClosed,
+    StoreReader,
 };
 use serialist_script::{
     BellSink, CodecSource, CommandError, CommandSender, HostServices, Limits, LineBell, LogLevel,
@@ -110,6 +112,8 @@ pub struct GuiScriptSession {
     /// `None` for a session scripts cannot write to; every write then fails as closed.
     pub control: Option<Arc<dyn SessionControl>>,
     pub reader: StoreReader,
+    /// The session's decoded frames, for `port:on_frame`: empty until a codec runs.
+    pub frames: Option<FrameStoreReader>,
     pub link: ScriptLinkParts,
 }
 
@@ -166,6 +170,10 @@ impl ScriptSession for GuiScriptSession {
 
     fn bell(&self) -> LineBell {
         self.link.bell.clone()
+    }
+
+    fn frames(&self) -> Option<FrameStoreReader> {
+        self.frames.clone()
     }
 }
 
