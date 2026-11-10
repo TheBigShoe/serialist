@@ -53,14 +53,29 @@
 //! ([`NoHold`]), bytes are parsed as they arrive, and while an update is open
 //! [`VtScreen::snapshot`] returns the snapshot before it. That snapshot is taken when the
 //! update begins, so what arrived ahead of the begin in the same chunk shows at once, and
-//! a device sending one update after another shows each when the next begins. It is
-//! taken at most once per chunk: a device does not get a snapshot for every eight
-//! bytes.
+//! a device sending one update after another shows each when the next begins. For that
+//! the parsing stops after an `h` that may end the begin ([`Stops`]), and if an
+//! update did begin the snapshot is taken there, at most once per chunk: a device does
+//! not get a snapshot for every eight bytes.
 //!
 //! An update ends at its `CSI ? 2026 l`, on a full reset, on a resize, or
 //! [`SYNC_TIMEOUT`] after it began; a second begin inside it does not extend it. Answers
 //! to the device's queries and its other events are not held: a device that asks inside
 //! an update gets its answer when it asks.
+//!
+//! # Repeats
+//!
+//! `CSI n b` repeats the last character `n` times, up to 65535: eight bytes for about a
+//! millisecond of parsing, or ten when each character scrolls a row off a narrow screen,
+//! which is more than a link delivers them in. vte does the repeating, as that many
+//! calls for one character, so the tracker cannot tell a repeat from text by what it is
+//! asked to do. It can by when: a repeat runs while the `b` that ends its sequence is
+//! parsed. So the screen looks for each `b` that may end one ([`Stops`]) and parses
+//! it in a call of its own, in which the tracker takes one screenful of characters, rows
+//! times columns, and drops the rest. Past a screenful a repeat only scrolls rows of the same
+//! character by. (This is why the screen and not vte holds a synchronized update: vte
+//! would parse a held repeat in one call with everything around it.) A screen of 65535
+//! cells or more caps nothing.
 //!
 //! # Insert mode
 //!
@@ -75,6 +90,7 @@
 //! typing into a row of text in insert mode costs: one move of the row for each character
 //! until the text has left it, which a repeat can ask for once a row.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -196,9 +212,6 @@ pub struct VtScreen {
     held_len: usize,
     /// Reused to join held bytes to the next chunk.
     joined: Vec<u8>,
-    /// The last byte parsed, which says whether the next could end an escape sequence
-    /// (see [`begins_update`]).
-    last_byte: u8,
 }
 
 impl Default for VtScreen {
@@ -250,7 +263,6 @@ impl VtScreen {
             held: [0; 3],
             held_len: 0,
             joined: Vec::new(),
-            last_byte: 0,
         }
     }
 
@@ -320,31 +332,44 @@ impl VtScreen {
         self.held_len = keep;
     }
 
-    /// Parse `bytes`, which end on a character boundary. Where a synchronized update
-    /// begins, the parsing stops for a snapshot of the screen as it is, the one shown
-    /// while the update is open: the first time in these bytes only (see the module docs).
+    /// Parse `bytes`, which end on a character boundary, in pieces (see the module docs
+    /// and [`Stops`]):
+    ///
+    /// - A `b` that may end a repeat is parsed alone, with a screenful of characters
+    ///   allowed.
+    /// - After an `h` that may begin a synchronized update the parsing stops; if one did
+    ///   begin, for a snapshot of the screen as it is, the one shown while the update is
+    ///   open. The first time in these bytes only.
     fn parse(&mut self, bytes: &[u8]) {
         let mut start = 0;
         let mut captured = false;
-        let mut prev = self.last_byte;
-        for (i, &byte) in bytes.iter().enumerate() {
-            if !captured && begins_update(prev, byte) {
-                if self.advance(&bytes[start..=i]) {
+        for stop in Stops::new(bytes) {
+            if bytes[stop] == b'b' {
+                self.advance(&bytes[start..stop], None);
+                let screenful = self.rows() * self.columns();
+                self.advance(&bytes[stop..=stop], Some(screenful));
+                start = stop + 1;
+            } else if !captured {
+                if self.advance(&bytes[start..=stop], None) {
                     self.refresh();
                     captured = true;
                 }
-                start = i + 1;
+                start = stop + 1;
             }
-            prev = byte;
         }
-        self.advance(&bytes[start..]);
-        self.last_byte = prev;
+        self.advance(&bytes[start..], None);
     }
 
-    /// Hand `bytes` to the parser. Returns whether they began a synchronized update and
-    /// did nothing after that.
-    fn advance(&mut self, bytes: &[u8]) -> bool {
-        self.with_tracker(|processor, tracker| processor.advance(tracker, bytes))
+    /// Hand `bytes` to the parser, which may write `characters` characters at most, if
+    /// that is given. Returns whether the last thing they did was begin a synchronized
+    /// update.
+    fn advance(&mut self, bytes: &[u8], characters: Option<usize>) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        self.with_tracker(characters, |processor, tracker| {
+            processor.advance(tracker, bytes)
+        })
     }
 
     /// End a synchronized update (`CSI ? 2026 h`) that the device began [`SYNC_TIMEOUT`]
@@ -361,9 +386,14 @@ impl VtScreen {
     }
 
     /// Run `f` with the parser and a tracker over this screen, stamping rows with the
-    /// time of the last chunk. Returns whether the last thing `f` had the tracker do was
-    /// begin a synchronized update.
-    fn with_tracker(&mut self, f: impl FnOnce(&mut Processor<NoHold>, &mut Tracker<'_>)) -> bool {
+    /// time of the last chunk; the tracker takes `characters` characters, if that is
+    /// given, and drops any more. Returns whether the last mode `f` had the tracker set
+    /// began a synchronized update.
+    fn with_tracker(
+        &mut self,
+        characters: Option<usize>,
+        f: impl FnOnce(&mut Processor<NoHold>, &mut Tracker<'_>),
+    ) -> bool {
         let mut tracker = Tracker {
             term: &mut self.term,
             listener: &self.listener,
@@ -376,6 +406,7 @@ impl VtScreen {
             equal_from: None,
             sync: &mut self.sync,
             begun: false,
+            characters,
         };
         f(&mut self.processor, &mut tracker);
         tracker.begun
@@ -427,8 +458,7 @@ impl VtScreen {
     pub fn reset(&mut self) {
         self.processor = Processor::new();
         self.held_len = 0;
-        self.last_byte = 0;
-        self.with_tracker(|_, tracker| tracker.reset_state());
+        self.with_tracker(None, |_, tracker| tracker.reset_state());
         self.dirty = true;
     }
 
@@ -573,12 +603,152 @@ impl VtScreen {
     }
 }
 
-/// Whether `byte` after `prev` could be the end of the sequence that begins a
-/// synchronized update, `CSI ? 2026 h`: an `h` after a digit. Stopping at one that is
-/// not costs a call; a begin spelled so that this misses it (a control character before
-/// the `h`, say) only goes without its snapshot, and holds the one before.
-fn begins_update(prev: u8, byte: u8) -> bool {
-    byte == b'h' && prev.is_ascii_digit()
+const ESC: u8 = 0x1b;
+
+/// How many bytes [`Stops`] looks through at once.
+const BLOCK: usize = 32;
+
+/// The bytes of a chunk that may be the `b` ending a repeat (`CSI n b`) or the `h` ending
+/// the begin of a synchronized update (`CSI ? 2026 h`), by their offsets in order, going
+/// by the bytes before each in the chunk. It errs only towards yes: every such `b` and
+/// `h` is found, wherever the chunk begins and ends, and so are a few that are text or
+/// end some other sequence, which costs a call and changes nothing.
+///
+/// vte acts on a sequence when its final byte comes, and it reads that byte as the final
+/// one of a CSI sequence only in a state that ESC and then `[` put it in and that any
+/// byte from `@` to `~` takes it out of. From that:
+///
+/// - The byte before the final one ([`may_precede`]). A repeat has no intermediate bytes
+///   (blank to `/`) and no private marker (`<` to `?`), and the begin of an update has
+///   its `?` before a parameter. So that byte is the `[`, part of a parameter (a digit,
+///   `:` or `;`), or one vte passes over inside a sequence: a control character, DEL, or
+///   a byte above ASCII. Most of what a device sends has no such pair in it, and is
+///   passed over a block at a time in a loop that is all comparisons.
+/// - The bytes before that ([`may_end_csi`]): none from `@` to `~` back to a `[`, and
+///   from there none from blank to `~` back to an ESC. Where the chunk begins first, the
+///   answer is yes.
+/// - So a sequence whose ESC came in an earlier chunk ends by the second byte from `@`
+///   to `~` of this one. From there to this chunk's first ESC nothing is looked at, which
+///   for text with no ESC in it is nearly all of it.
+struct Stops<'a> {
+    bytes: &'a [u8],
+    /// The next byte to look at.
+    at: usize,
+    /// From `skip.start` nothing can be a stop before `skip.end`.
+    skip: Range<usize>,
+    /// Up to here the bytes are in a block that holds a pair, and are gone through one by
+    /// one.
+    slow: usize,
+}
+
+impl<'a> Stops<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        let finals = |&(_, byte): &(usize, &u8)| (b'@'..=b'~').contains(byte);
+        let second = bytes.iter().enumerate().filter(finals).nth(1);
+        let head = second.map_or(bytes.len(), |(at, _)| at + 1);
+        Self {
+            bytes,
+            at: 0,
+            skip: head..find_escape(bytes).unwrap_or(bytes.len()),
+            slow: 0,
+        }
+    }
+}
+
+impl Iterator for Stops<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let bytes = self.bytes;
+        while self.at < bytes.len() {
+            if self.skip.contains(&self.at) {
+                self.at = self.skip.end;
+                continue;
+            }
+            let at = self.at;
+            if at >= self.slow {
+                if let Some(before) = at.checked_sub(1)
+                    && let Some(before) = bytes[before..].first_chunk::<BLOCK>()
+                    && let Some(block) = bytes[at..].first_chunk::<BLOCK>()
+                {
+                    let mut any = 0;
+                    for i in 0..BLOCK {
+                        any |= may_stop(before[i], block[i]);
+                    }
+                    if any == 0 {
+                        self.at += BLOCK;
+                        continue;
+                    }
+                }
+                self.slow = at + BLOCK;
+            }
+            self.at += 1;
+            let alone = match at.checked_sub(1) {
+                Some(before) => may_stop(bytes[before], bytes[at]) != 0,
+                None => matches!(bytes[at], b'b' | b'h'),
+            };
+            if alone && may_end_csi(bytes, at) {
+                return Some(at);
+            }
+        }
+        None
+    }
+}
+
+/// The offset of the first ESC in `bytes`. Blocks with none are passed over in a loop
+/// that is all comparisons.
+fn find_escape(bytes: &[u8]) -> Option<usize> {
+    let (blocks, _) = bytes.as_chunks::<BLOCK>();
+    let mut offset = 0;
+    for block in blocks {
+        if block.iter().fold(false, |any, &byte| any | (byte == ESC)) {
+            break;
+        }
+        offset += BLOCK;
+    }
+    bytes[offset..]
+        .iter()
+        .position(|&byte| byte == ESC)
+        .map(|at| offset + at)
+}
+
+/// 1 when `byte` is a `b` or an `h` that, after `before`, may be a stop (see [`Stops`]),
+/// and 0 when not: a number, so that a block of them is one sum.
+#[inline(always)]
+fn may_stop(before: u8, byte: u8) -> u8 {
+    (u8::from(byte == b'b') | u8::from(byte == b'h')) & may_precede(before)
+}
+
+/// 1 when `byte` may come right before the final byte of a repeat or of the begin of a
+/// synchronized update: `[`, `0` to `;`, a control character, DEL, or above ASCII.
+#[inline(always)]
+fn may_precede(byte: u8) -> u8 {
+    u8::from(byte == b'[')
+        | u8::from((b'0'..=b';').contains(&byte))
+        | u8::from(!(0x20..0x7f).contains(&byte))
+}
+
+/// Whether the byte at `at` may be the final byte of a CSI sequence, going by the bytes
+/// before it: see [`Stops`].
+fn may_end_csi(bytes: &[u8], at: usize) -> bool {
+    let mut before = bytes[..at].iter().rev();
+    // Back to the `[`, and no other byte that would have ended the sequence.
+    loop {
+        match before.next() {
+            None => return true,
+            Some(b'[') => break,
+            Some(b'@'..=b'~') => return false,
+            Some(_) => {}
+        }
+    }
+    // From there back to the ESC, over what vte lets stand between the two.
+    loop {
+        match before.next() {
+            None | Some(&ESC) => return true,
+            Some(b' '..=b'~') => return false,
+            Some(_) => {}
+        }
+    }
 }
 
 /// `row` as the line with id `id`, sharing the previous snapshot's line when that one
@@ -697,8 +867,13 @@ struct Tracker<'a> {
     equal_from: Option<Point>,
     /// The screen's open synchronized update: when it times out.
     sync: &'a mut Option<Instant>,
-    /// A synchronized update began and nothing has been done since.
+    /// The last private mode set began a synchronized update. The bytes of a call end
+    /// with the sequence that sets it (see [`VtScreen::parse`]), so nothing came after.
     begun: bool,
+    /// How many more characters to take in this call; the rest are dropped. A screenful
+    /// when the call parses the end of what may be a repeat, and `None`, for no limit,
+    /// otherwise. See the module docs.
+    characters: Option<usize>,
 }
 
 impl Tracker<'_> {
@@ -706,7 +881,6 @@ impl Tracker<'_> {
     #[inline(always)]
     fn after(&mut self) {
         self.equal_from = None;
-        self.begun = false;
         self.absorb_scrolled();
     }
 
@@ -841,11 +1015,17 @@ impl Handler for Tracker<'_> {
         set_scp(char_path: ScpCharPath, update_mode: ScpUpdateMode);
     }
 
-    /// A character. A zero-width one joins a cell (see the module docs) unless that cell
-    /// is full, in which case it is dropped. In insert mode, one that would move a run of
-    /// equal cells is written without the move (see the module docs).
+    /// A character, unless this call has had its fill of them (a long repeat). A
+    /// zero-width one joins a cell unless that cell is full, in which case it is dropped.
+    /// In insert mode, one that would move a run of equal cells is written without the
+    /// move. See the module docs for all three.
     fn input(&mut self, c: char) {
-        self.begun = false;
+        if let Some(left) = &mut self.characters {
+            if *left == 0 {
+                return;
+            }
+            *left -= 1;
+        }
         let width = c.width();
         if width == Some(0) && self.zero_width_full() {
             return;
@@ -873,9 +1053,9 @@ impl Handler for Tracker<'_> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         Handler::set_private_mode(&mut *self.term, mode);
         self.after();
-        if mode == SYNC_UPDATE && self.sync.is_none() {
+        self.begun = mode == SYNC_UPDATE && self.sync.is_none();
+        if self.begun {
             *self.sync = Some(self.rows.at + SYNC_TIMEOUT);
-            self.begun = true;
         }
     }
 
@@ -954,10 +1134,14 @@ mod tests {
     }
 
     impl Sent {
-        fn write(&self, out: &mut Vec<u8>) {
+        fn write(&self, out: &mut Vec<u8>, screenful: usize) {
             match self {
                 Sent::Text(text) => out.extend_from_slice(text.as_bytes()),
-                Sent::Repeat(n) => out.extend_from_slice(format!("\x1b[{n}b").as_bytes()),
+                // No more than the screen caps it at, which Alacritty does not.
+                Sent::Repeat(n) => {
+                    let n = usize::from(*n).min(screenful);
+                    out.extend_from_slice(format!("\x1b[{n}b").as_bytes())
+                }
                 Sent::InsertMode(on) => {
                     out.extend_from_slice(if *on { b"\x1b[4h" } else { b"\x1b[4l" })
                 }
@@ -995,6 +1179,95 @@ mod tests {
         ]
     }
 
+    /// Notes where vte acts on a repeat or on the begin of a synchronized update, by
+    /// stopping the parser there.
+    #[derive(Default)]
+    struct Finder {
+        found: bool,
+    }
+
+    impl alacritty_terminal::vte::Perform for Finder {
+        fn csi_dispatch(
+            &mut self,
+            params: &alacritty_terminal::vte::Params,
+            intermediates: &[u8],
+            ignore: bool,
+            action: char,
+        ) {
+            // As vte's `ansi` module reads them.
+            self.found |= !ignore
+                && match (action, intermediates) {
+                    ('b', []) => true,
+                    ('h', [b'?']) => params.iter().any(|param| param[0] == 2026),
+                    _ => false,
+                };
+        }
+
+        fn terminated(&self) -> bool {
+            self.found
+        }
+    }
+
+    /// The offsets in `stream` of the final bytes of the repeats and update begins vte
+    /// finds in it.
+    fn stops_vte_acts_on(stream: &[u8]) -> Vec<usize> {
+        let mut parser = alacritty_terminal::vte::Parser::new();
+        let mut stops = Vec::new();
+        let mut at = 0;
+        while at < stream.len() {
+            let mut finder = Finder::default();
+            at += parser.advance_until_terminated(&mut finder, &stream[at..]);
+            if finder.found {
+                stops.push(at - 1);
+            }
+        }
+        stops
+    }
+
+    /// Bytes that sequences are made of, with the ones that matter here made likely.
+    fn sequence_soup() -> impl Strategy<Value = Vec<u8>> {
+        let byte = prop_oneof![
+            6 => Just(ESC),
+            6 => Just(b'['),
+            6 => Just(b'b'),
+            3 => Just(b'h'),
+            2 => Just(b'?'),
+            8 => prop_oneof![Just(b'2'), Just(b'0'), Just(b'6'), Just(b'9'), Just(b';'), Just(b':')],
+            // Intermediates, private markers, controls (CAN and SUB among them), DEL,
+            // bytes above ASCII, other final bytes, and what begins a string.
+            8 => prop::sample::select(
+                &b" !/<>=\n\r\t\x18\x1a\x7f\x80\x9b\xc3\xa9\xf0\x9fmlHa@~]PX^_\\\x07"[..]
+            ),
+        ];
+        proptest::collection::vec(byte, 0..120)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// However a stream is cut into chunks, `Stops` finds every repeat and every begin
+        /// of a synchronized update that vte acts on.
+        #[test]
+        fn stops_are_where_vte_acts(
+            stream in sequence_soup(),
+            chunk in 1usize..90,
+            lead in 0usize..90,
+        ) {
+            let wanted = stops_vte_acts_on(&stream);
+            let mut found = Vec::new();
+            // A first chunk of another length, so that cuts fall everywhere.
+            let (first, rest) = stream.split_at(lead.min(stream.len()));
+            let mut offset = 0;
+            for piece in std::iter::once(first).chain(rest.chunks(chunk)) {
+                found.extend(Stops::new(piece).map(|stop| offset + stop));
+                offset += piece.len();
+            }
+            for stop in &wanted {
+                prop_assert!(found.contains(stop), "missed {} in {:x?}", stop, stream);
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -1009,7 +1282,7 @@ mod tests {
         ) {
             let mut bytes = Vec::new();
             for sent in &stream {
-                sent.write(&mut bytes);
+                sent.write(&mut bytes, columns * rows);
             }
 
             // The screen in two chunks: what it remembers about a row does not outlive one.
