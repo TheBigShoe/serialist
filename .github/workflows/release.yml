@@ -46,12 +46,15 @@ jobs:
     # Cold release builds are long: gpui-pre, wgpu and gpui-kit compile from scratch with
     # thin LTO. The cache below shortens warm runs.
     timeout-minutes: 90
+    # A row marked `extra` may fail without failing the run: the draft is made from the
+    # rows that passed, as long as the three required packages are there (see the
+    # `release` job).
+    continue-on-error: ${{ matrix.extra == true }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macos-latest is Apple Silicon, so the .dmg is arm64. An Intel build needs an
-          # Intel runner (macos-15-intel or macos-26-intel) and another matrix row.
+          # macos-latest is Apple Silicon, so the .dmg is arm64.
           - name: macos
             os: macos-latest
           # ubuntu-22.04 rather than ubuntu-latest: a binary links against the glibc of the
@@ -61,6 +64,16 @@ jobs:
             os: ubuntu-22.04
           - name: windows
             os: windows-latest
+          # Each package is named by the architecture of the runner that built it
+          # (packaging/lib.sh, host_arch), so these rows add files and never replace the
+          # ones above: Serialist-<version>-macos-x86_64.dmg, and
+          # serialist-<version>-linux-aarch64.tar.gz with serialist_<version>-1_arm64.deb.
+          - name: macos-x86_64
+            os: macos-15-intel
+            extra: true
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            extra: true
     defaults:
       run:
         # Git Bash on Windows; packaging/package.sh is a bash script.
@@ -82,6 +95,12 @@ jobs:
       # arguments rustup installs the toolchain and components pinned in that file.
       - name: Install toolchain from rust-toolchain.toml
         run: rustup toolchain install --profile minimal --no-self-update
+
+      # Info.plist says macOS 11 or later. That is rustc's default deployment target on
+      # Apple Silicon; on Intel the default is older, so the Intel build is told.
+      - name: Target macOS 11 on Intel
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       # Same policy as ci.yml, adapted: only main saves the cache (here, by a manual run on
       # main), and a tag run restores the newest one from main and never saves. `key` keeps
@@ -192,7 +211,9 @@ jobs:
   release:
     name: draft release
     needs: package
-    if: github.ref_type == 'tag' || inputs.draft_release
+    # Not only on success: an `extra` row's failure must not stop the draft. The check
+    # below stops it when a required package is missing instead.
+    if: ${{ !cancelled() && (github.ref_type == 'tag' || inputs.draft_release) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -206,6 +227,22 @@ jobs:
           path: dist
           pattern: packages-*
           merge-multiple: true
+
+      # The packages of the three required rows. Without one of them there is no draft,
+      # as before the extra rows existed; an extra row's package is simply absent.
+      - name: Check the required packages are here
+        working-directory: dist
+        run: |
+          missing=0
+          for pattern in 'Serialist-*-macos-arm64.dmg' 'serialist-*-linux-x86_64.tar.gz' \
+              'serialist_*_amd64.deb' 'Serialist-*-windows-x86_64.msi'; do
+            if ! compgen -G "$pattern" >/dev/null; then
+              echo "::error::no $pattern in the packages: its package job failed"
+              missing=1
+            fi
+          done
+          ls -l
+          [ "$missing" = 0 ]
 
       - name: Checksums
         working-directory: dist

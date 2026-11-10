@@ -13,7 +13,16 @@ builds](#unsigned-builds)).
 | Linux (x86_64) | `serialist-<version>-linux-x86_64.tar.gz` | `packaging/linux/tarball.sh` |
 | Linux (x86_64) | `serialist_<version>-1_amd64.deb` | cargo-deb, from `[package.metadata.deb]` in `crates/serialist/Cargo.toml` |
 | Windows (x86_64) | `Serialist-<version>-windows-x86_64.msi` | cargo-wix, from `packaging/windows/main.wxs` and `[package.metadata.wix]` |
+| macOS (Intel), extra | `Serialist-<version>-macos-x86_64.dmg` | as for Apple Silicon, on `macos-15-intel` |
+| Linux (arm64), extra | `serialist-<version>-linux-aarch64.tar.gz` and `serialist_<version>-1_arm64.deb` | as for x86_64, on `ubuntu-22.04-arm` |
 | all | `SHA256SUMS` | the `release` job |
+
+The first four packages are required: the draft is made only when all of them are built.
+The rows marked extra are `extra: true` in the workflow's matrix: a failure there shows as a
+failed job, but the run does not fail and the draft is made without that package. Every
+file name carries the architecture of the runner that built it (`host_arch` in
+`packaging/lib.sh`; cargo-deb uses Debian's names), so an extra row never replaces a
+required package, and `SHA256SUMS` and the upload take whatever files are there.
 
 Every package carries `THIRD_PARTY_LICENSES.md`, the copyright and MIT license text of the
 bundled Fadetouched theme (a license condition: the notice must travel with the program, and
@@ -52,10 +61,12 @@ install prefix (`bin/`, `share/`) and has an `install.sh` that copies it to `~/.
 
    The tag must equal `v` plus the version in `Cargo.toml`. The workflow checks this first
    and fails fast if you tagged before bumping.
-5. **Watch the workflow** (Actions, Release). Three `package` jobs run in parallel, each
+5. **Watch the workflow** (Actions, Release). Five `package` jobs run in parallel, each
    building the release binary (the first run is slow: GPUI compiles from scratch), running
-   `--version` on it, and packaging. When all three pass, the `draft release` job downloads
-   their artifacts, adds `SHA256SUMS` and creates the draft.
+   `--version` on it, and packaging. When they are done, the `draft release` job downloads
+   their artifacts, checks that the four required packages are there, adds `SHA256SUMS` and
+   creates the draft. If an extra job failed, its package is missing from the draft: re-run
+   it, or say in the notes that it is missing.
 6. **Try the drafts.** Download each package on its OS and start it. On macOS use the steps
    under [Unsigned builds](#unsigned-builds). Check that the app icon shows and the app opens
    a window. Read the notes.
@@ -161,8 +172,27 @@ still match the other two packages. It does nothing on other targets.
 
 ## Known gaps
 
-- **macOS is arm64 only.** `macos-latest` is Apple Silicon. For an Intel build add a matrix
-  row on an Intel runner (`macos-15-intel`, `macos-26-intel`).
+- **The macOS Intel and Linux arm64 rows have never run.** They were added without a run
+  (nothing here can start the workflow). On the first manual run, check that: both jobs
+  start at all (`macos-15-intel` and `ubuntu-22.04-arm` are GitHub-hosted labels, and the
+  arm one is free only for public repositories); the Intel log says `packaging serialist
+  <version> for macos-x86_64` and `otool -l target/release/serialist` on the binary
+  (or `vtool -show-build`) reports `minos 11.0` (the workflow sets
+  `MACOSX_DEPLOYMENT_TARGET` for it); the arm64 log says `for linux-aarch64` and
+  `dpkg-deb --info` prints `Architecture: arm64`; the `draft release` job lists all seven
+  files and `SHA256SUMS` has a line for each; and, with `draft_release` ticked, an extra row
+  made to fail still leaves a draft with the four required packages. Then open the Intel
+  `.dmg` on an Intel Mac and the arm64 `.deb` on an arm64 Linux desktop (a Raspberry Pi 5
+  with a Vulkan driver, or an arm64 VM). Once both have passed a few releases, drop
+  `extra: true` and add their patterns to the check in the `release` job.
+- **Windows on ARM is not built.** A `windows-11-arm` row is not added, for three reasons
+  that nothing here can settle. The dependency tree has `ring` (through the HTTP client),
+  which needs `clang` to build for `aarch64-pc-windows-msvc`, and nothing shows that image
+  has it on `PATH`. The workflow relies on the image for `rustup`, WiX Toolset 3.14 and
+  Chocolatey (the WiX fallback), and none of them is confirmed there. And cargo-wix 0.3.9
+  must pass `-arch arm64` to WiX for an ARM64 `.msi`; `main.wxs` already picks the 64-bit
+  Program Files folder for `arm64`, but the pairing has not been built. Windows 11 on ARM
+  runs the x86_64 `.msi` under emulation, which is the answer until then (also untried).
 - **The Linux glibc floor** is that of the build runner (`ubuntu-22.04`, glibc 2.35). The
   tarball and `.deb` link the host's shared libraries: the `.deb` depends on what
   `dpkg-shlibdeps` finds plus `libvulkan1` (loaded at run time); a tarball user installs the
@@ -182,7 +212,6 @@ still match the other two packages. It does nothing on other targets.
   taken it yet, and nobody has opened Properties, Details on the result. The next Windows
   job of the release workflow links it; check the Details tab of the installed
   `serialist.exe`.
-- **Windows on ARM and Linux arm64** are not built.
 - **Linux and Windows packages are built but not tried.** The workflow has run three times
   (a manual run on `main` on 2026-09-30, then the `v0.1.0` and `v0.2.0` tags), and every
   job passed on all three systems: each built the release binary, ran `--version` on its
