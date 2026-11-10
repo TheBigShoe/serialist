@@ -206,4 +206,4 @@ How the API behaves without the app around it:
 |---|---|
 | 0 | The script's main chunk returned. (`--help` and `--version` also exit 0.) |
 | 1 | The script ended with an error: a syntax error, an uncaught runtime error (the message and the Lua traceback go to stderr), a memory error, an error in an `on_line` callback, or the port could not be opened. |
-| 2 | The script was stopped, or nothing ran: a bad flag, `--script` without `--port`, a script file that cannot be read, or a `--virtual` device that does not exist. |
+| 2 | The script was stopped, or nothing ran: a bad flag, `--script` without `--port` or with more than one, a script file that cannot be read, or a `--virtual` device that does not exist. |
