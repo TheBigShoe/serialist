@@ -13,11 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use jsonc_parser::ParseOptions;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::model::{
     Carried, CollectionSource, Command, CommandCollection, CommandGroup, Expect, Param, Payload,
+    Skipped,
 };
 use crate::settings::LineEnding;
 
@@ -61,20 +63,21 @@ pub struct LoadedCollection {
     pub warnings: Vec<String>,
 }
 
-/// The file's shape. `name` falls back to the file's name.
+/// The file's top-level shape. `name` falls back to the file's name. The groups are
+/// read one by one, so here they only have to be a list.
 #[derive(Deserialize)]
 struct CollectionFile {
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
-    groups: Vec<CommandGroup>,
+    #[serde(default, rename = "groups")]
+    _groups: Vec<IgnoredAny>,
 }
 
 /// The written form: the model's keys in the model's order, then what it carried.
 #[derive(Serialize)]
 struct CollectionOut<'a> {
     name: &'a str,
-    groups: Vec<GroupOut<'a>>,
+    groups: Vec<Entry<'a, GroupOut<'a>>>,
     #[serde(flatten)]
     carried: &'a Map<String, Value>,
 }
@@ -82,7 +85,7 @@ struct CollectionOut<'a> {
 #[derive(Serialize)]
 struct GroupOut<'a> {
     name: &'a str,
-    commands: Vec<CommandOut<'a>>,
+    commands: Vec<Entry<'a, CommandOut<'a>>>,
     #[serde(flatten)]
     carried: &'a Map<String, Value>,
 }
@@ -195,21 +198,34 @@ impl CommandCollection {
                 warnings: Vec::new(),
             });
         }
-        // Read the typed form straight from the text so an error carries a position.
+        // Read the top level straight from the text so a wrong shape there carries a
+        // position. Below it, a group or command that will not read is skipped alone.
         let file: CollectionFile = jsonc_parser::parse_to_serde_value(text, &options())
             .map_err(|e| invalid(origin, &e))?;
-        let mut collection = CommandCollection {
-            name: file
-                .name
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or(fallback),
-            source,
-            groups: file.groups,
-            carried: Carried::default(),
-        };
+        let name = file
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(fallback);
+        let mut collection = CommandCollection::new(name, source);
         let mut warnings = Vec::new();
-        unknown_keys(&value, &mut warnings);
-        collection.carry_unknown(&value);
+        collection.carried.keys = unknown_of(&value, COLLECTION_KEYS);
+        warn_unknown(&collection.carried.keys, "", &mut warnings);
+        for (g, value) in items(&value, "groups").iter().enumerate() {
+            match read_group(g, value, &mut warnings) {
+                Ok(group) => collection.groups.push(group),
+                Err(reason) => {
+                    let label = match value.get("name").and_then(Value::as_str) {
+                        Some(name) if !name.trim().is_empty() => format!("group `{name}`"),
+                        _ => format!("group {}", g + 1),
+                    };
+                    warnings.push(format!("{label} {reason}; {SKIPPED}"));
+                    collection.carried.skipped.push(Skipped {
+                        before: collection.groups.len(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
         collection.check(&mut warnings);
         Ok(LoadedCollection {
             collection,
@@ -226,47 +242,18 @@ impl CommandCollection {
         Self::parse(&text, source, path)
     }
 
-    /// Keeps the keys of `root`, the document this collection was read from, that the
-    /// model does not read, so that [`to_json`](Self::to_json) writes them back.
-    fn carry_unknown(&mut self, root: &Value) {
-        self.carried.keys = unknown_of(root, COLLECTION_KEYS);
-        let groups = items(root, "groups");
-        for (group, value) in self.groups.iter_mut().zip(groups) {
-            group.carried.keys = unknown_of(value, GROUP_KEYS);
-            for (command, value) in group.commands.iter_mut().zip(items(value, "commands")) {
-                command.carried = Carried {
-                    keys: unknown_of(value, COMMAND_KEYS),
-                    payload: value
-                        .get("payload")
-                        .map(|payload| unknown_of(payload, PAYLOAD_KEYS))
-                        .unwrap_or_default(),
-                    expect: value
-                        .get("expect")
-                        .map(|expect| unknown_of(expect, EXPECT_KEYS))
-                        .unwrap_or_default(),
-                };
-                for (param, value) in command.params.iter_mut().zip(items(value, "params")) {
-                    param.carried.keys = unknown_of(value, PARAM_KEYS);
-                }
-            }
-        }
-    }
-
     /// The file form: pretty JSON, two-space indent, ending in a newline. The model's
     /// keys come first, in its order, then every key the file held that this build does
-    /// not read ([`Carried`]), at the level it was found. Comments are not kept.
+    /// not read ([`Carried`]), at the level it was found; a group or command it could
+    /// not read is written back as it was, in its place. Comments are not kept.
     pub fn to_json(&self) -> String {
         let out = CollectionOut {
             name: &self.name,
-            groups: self
-                .groups
-                .iter()
-                .map(|group| GroupOut {
-                    name: &group.name,
-                    commands: group.commands.iter().map(CommandOut::new).collect(),
-                    carried: &group.carried.keys,
-                })
-                .collect(),
+            groups: interleave(&self.groups, &self.carried.skipped, |group| GroupOut {
+                name: &group.name,
+                commands: interleave(&group.commands, &group.carried.skipped, CommandOut::new),
+                carried: &group.carried.keys,
+            }),
             carried: &self.carried.keys,
         };
         // Serializing plain data cannot fail.
@@ -302,33 +289,116 @@ impl CommandCollection {
     }
 }
 
-fn unknown_keys(root: &Value, out: &mut Vec<String>) {
-    let mut check = |value: &Value, known: &[&str], path: &str| {
-        if let Value::Object(map) = value {
-            for key in map.keys().filter(|key| !known.contains(&key.as_str())) {
-                out.push(format!(
-                    "unknown key `{path}{key}` is not used, and is kept when saving"
-                ));
-            }
-        }
+/// The end of a warning about a group or command that was not read.
+const SKIPPED: &str = "it is skipped, and kept as it is when saving";
+
+/// Reads group `g` of the file, warning about each command in it that will not read and
+/// skipping that command alone. `Err` says why the group itself will not read.
+fn read_group(g: usize, value: &Value, warnings: &mut Vec<String>) -> Result<CommandGroup, String> {
+    let Value::Object(map) = value else {
+        return Err("is not an object".to_owned());
     };
-    check(root, COLLECTION_KEYS, "");
-    for (g, group) in items(root, "groups").iter().enumerate() {
-        check(group, GROUP_KEYS, &format!("groups[{g}]."));
-        for (c, command) in items(group, "commands").iter().enumerate() {
-            let at = format!("groups[{g}].commands[{c}].");
-            check(command, COMMAND_KEYS, &at);
-            if let Some(payload) = command.get("payload") {
-                check(payload, PAYLOAD_KEYS, &format!("{at}payload."));
-            }
-            if let Some(expect) = command.get("expect") {
-                check(expect, EXPECT_KEYS, &format!("{at}expect."));
-            }
-            for (p, param) in items(command, "params").iter().enumerate() {
-                check(param, PARAM_KEYS, &format!("{at}params[{p}]."));
+    let name = match map.get("name") {
+        Some(Value::String(name)) => name.clone(),
+        None | Some(Value::Null) => return Err("has no name".to_owned()),
+        Some(_) => return Err("has a name that is not text".to_owned()),
+    };
+    let commands = match map.get("commands") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(commands)) => commands.as_slice(),
+        Some(_) => return Err("has `commands` that is not a list".to_owned()),
+    };
+    let mut group = CommandGroup::new(name, Vec::new());
+    group.carried.keys = unknown_of(value, GROUP_KEYS);
+    warn_unknown(&group.carried.keys, &format!("groups[{g}]."), warnings);
+    for (c, value) in commands.iter().enumerate() {
+        let at = format!("groups[{g}].commands[{c}].");
+        match read_command(value, &at, warnings) {
+            Ok(command) => group.commands.push(command),
+            Err(reason) => {
+                let command = match value.get("name").and_then(Value::as_str) {
+                    Some(name) if !name.trim().is_empty() => format!("`{name}`"),
+                    _ => format!("command {}", c + 1),
+                };
+                warnings.push(format!(
+                    "`{}` \u{203a} {command}: this version cannot read it ({reason}); {SKIPPED}",
+                    group.name
+                ));
+                group.carried.skipped.push(Skipped {
+                    before: group.commands.len(),
+                    value: value.clone(),
+                });
             }
         }
     }
+    Ok(group)
+}
+
+/// Reads one command, carrying the keys the model does not read, at every level, and
+/// warning about them. `at` is its path in the file, for the warnings.
+fn read_command(value: &Value, at: &str, warnings: &mut Vec<String>) -> Result<Command, String> {
+    let mut command: Command = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let unknown = |key: &str, known: &[&str]| {
+        value
+            .get(key)
+            .map(|inner| unknown_of(inner, known))
+            .unwrap_or_default()
+    };
+    command.carried = Carried {
+        keys: unknown_of(value, COMMAND_KEYS),
+        payload: unknown("payload", PAYLOAD_KEYS),
+        expect: unknown("expect", EXPECT_KEYS),
+        skipped: Vec::new(),
+    };
+    warn_unknown(&command.carried.keys, at, warnings);
+    warn_unknown(&command.carried.payload, &format!("{at}payload."), warnings);
+    warn_unknown(&command.carried.expect, &format!("{at}expect."), warnings);
+    // Params read in file order, so they pair up with the file's.
+    for (p, (param, value)) in command
+        .params
+        .iter_mut()
+        .zip(items(value, "params"))
+        .enumerate()
+    {
+        param.carried.keys = unknown_of(value, PARAM_KEYS);
+        warn_unknown(&param.carried.keys, &format!("{at}params[{p}]."), warnings);
+    }
+    Ok(command)
+}
+
+fn warn_unknown(keys: &Map<String, Value>, path: &str, warnings: &mut Vec<String>) {
+    for key in keys.keys() {
+        warnings.push(format!(
+            "unknown key `{path}{key}` is not used, and is kept when saving"
+        ));
+    }
+}
+
+/// A list as written: each readable item through `write`, with the skipped ones put
+/// back where they were.
+fn interleave<'a, T, O>(
+    readable: &'a [T],
+    skipped: &'a [Skipped],
+    write: impl Fn(&'a T) -> O,
+) -> Vec<Entry<'a, O>> {
+    let mut out = Vec::with_capacity(readable.len() + skipped.len());
+    let mut skipped = skipped.iter().peekable();
+    for (index, item) in readable.iter().enumerate() {
+        while let Some(entry) = skipped.next_if(|s| s.before <= index) {
+            out.push(Entry::Skipped(&entry.value));
+        }
+        out.push(Entry::Read(write(item)));
+    }
+    out.extend(skipped.map(|entry| Entry::Skipped(&entry.value)));
+    out
+}
+
+/// One item of a written list: one this build read, or one it kept verbatim.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Entry<'a, O> {
+    Read(O),
+    Skipped(&'a Value),
 }
 
 /// The array under `key` in `value`, or nothing.
