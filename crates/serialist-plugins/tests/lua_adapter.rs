@@ -669,6 +669,56 @@ fn a_plugin_that_cannot_load_says_why() {
     assert!(missing.to_string().contains("/nonexistent/plugin.lua"));
 }
 
+/// A minimal plugin whose `describe()` carries `extra` (Lua table fields).
+fn plugin_with(extra: &str) -> String {
+    format!(
+        "return {{ describe = function() return {{ name = 'apit', {extra} }} end, \
+         decode = function() return {{}} end, encode = function() return '' end }}"
+    )
+}
+
+#[test]
+fn a_plugin_declares_the_codec_api_it_was_written_for() {
+    for extra in ["", "api = 1", "api = 1.0"] {
+        LuaCodec::from_source("p.lua", &plugin_with(extra), limits())
+            .unwrap_or_else(|err| panic!("{extra:?}: {err}"));
+    }
+    let message = match LuaCodec::from_source("p.lua", &plugin_with("api = 2"), limits()) {
+        Err(CodecError::Internal(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    assert!(message.starts_with("p.lua"), "{message}");
+    assert!(message.contains("apit"), "{message}");
+    assert!(message.contains("API 2"), "{message}");
+    assert!(message.contains("provides API 1"), "{message}");
+    for bad in [
+        "api = 0",
+        "api = -1",
+        "api = 1.5",
+        "api = '1'",
+        "api = true",
+        "api = {}",
+    ] {
+        match LuaCodec::from_source("p.lua", &plugin_with(bad), limits()) {
+            Err(CodecError::Internal(message)) => {
+                assert!(message.starts_with("p.lua"), "{bad}: {message}");
+                assert!(message.contains("positive integer"), "{bad}: {message}");
+            }
+            other => panic!("{bad}: {other:?}"),
+        }
+    }
+    assert_eq!(serialist_plugins::LUA_CODEC_API, 1);
+}
+
+#[test]
+fn the_host_api_number_is_codec_api() {
+    // describe() reads codec.api back, so the plugin can adapt to it.
+    let code = "return { describe = function() return { name = 'n' .. codec.api } end, \
+                decode = function() return {} end, encode = function() return '' end }";
+    let codec = LuaCodec::from_source("p.lua", code, limits()).unwrap();
+    assert_eq!(codec.info().name, "n1");
+}
+
 #[test]
 fn reload_picks_up_edits_and_keeps_the_old_plugin_on_failure() {
     let dir = TempDir::new("reload");

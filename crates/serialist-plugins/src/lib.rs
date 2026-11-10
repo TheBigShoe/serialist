@@ -60,7 +60,7 @@ pub use serialist_core::codec::{CodecFactory, CodecRegistry};
 
 pub use dir::{PluginDir, PluginKind, PluginWarning, find_plugins, load_plugins};
 pub use examples::{EXAMPLE_PLUGINS, ExamplePlugin, example_plugin};
-pub use lua::{LuaCodec, LuaCodecFactory, LuaLimits, PLUGIN_ERROR_KIND};
+pub use lua::{LUA_CODEC_API, LuaCodec, LuaCodecFactory, LuaLimits, PLUGIN_ERROR_KIND};
 pub use payload::{PayloadEncoder, PayloadError, encode_payload};
 pub use race::AirohaRace;
 pub use text_lines::TextLines;

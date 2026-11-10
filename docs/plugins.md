@@ -114,6 +114,7 @@ local M = {}
 function M.describe()
   return {
     name = "my-proto", version = "1.0.0", description = "…",
+    api = 1,       -- optional: the codec API this plugin was written for
     kinds = {      -- the frames decode produces, fields in display order
       { kind = "packet", description = "…", fields = {
           { name = "id", type = "uint", description = "…" },
@@ -199,8 +200,18 @@ return M
   `fields` are wrong, or whose kind `describe` does not list, becomes a `plugin_error` frame
   for just its own bytes; a frame outside `bytes`, or a result that is not a list of tables,
   fails the whole call.
+- **The API number.** `describe()` may return `api`, an integer: the Lua codec interface
+  the plugin was written for. Absent means `1`, so every plugin written before the number
+  existed keeps loading. This build provides API `1`, and a plugin can read it as
+  `codec.api` to adapt. Within 1.x the interface only gains things, and the number goes up
+  by one in each release that adds something. A plugin that asks for a higher one than the
+  build provides is refused at load, with a message naming the plugin, the API it asks for
+  and the API the build provides; so is an `api` that is not a positive integer.
+  (`codec.api` is `nil` on a build older than this one.) WebAssembly plugins declare theirs
+  in `plugin.toml` (`api = "1"`, see below).
 - **Refused at load.** A `plugin.lua` that does not return a table with `describe`,
-  `decode` and `encode` functions, or whose `describe` result is not valid.
+  `decode` and `encode` functions, or whose `describe` result is not valid, or whose `api`
+  is higher than the build provides or not a positive integer.
 - **Reloading.** `LuaCodec::reload` loads the file again into a fresh VM and starts decoding
   over; if the new file fails to load, the old one keeps running. The app reloads a plugin
   when a file in `plugins/` is saved: a session decoding with it switches to the new
