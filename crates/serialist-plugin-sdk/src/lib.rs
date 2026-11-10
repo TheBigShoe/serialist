@@ -40,10 +40,10 @@
 //! crate-type = ["cdylib"]
 //!
 //! [dependencies]
-//! serialist-plugin-sdk = "0.1"
+//! serialist-plugin-sdk = "0.2"
 //!
 //! [target.'cfg(target_arch = "wasm32")'.dependencies]
-//! serialist-plugin-sdk = { version = "0.1", features = ["rt"] }
+//! serialist-plugin-sdk = { version = "0.2", features = ["rt"] }
 //! ```
 //!
 //! A whole plugin, a line framer (`cargo build --target wasm32-wasip2 --release`):
